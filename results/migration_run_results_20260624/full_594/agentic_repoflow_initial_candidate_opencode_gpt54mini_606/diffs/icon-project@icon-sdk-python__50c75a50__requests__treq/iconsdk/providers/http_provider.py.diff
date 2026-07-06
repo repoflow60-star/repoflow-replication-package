@@ -1,0 +1,108 @@
+--- a/iconsdk/providers/http_provider.py
++++ b/iconsdk/providers/http_provider.py
+@@ -14,18 +14,62 @@
+ 
+ import json
+ import re
++import threading
+ from json.decoder import JSONDecodeError
++from dataclasses import dataclass
+ from time import time, monotonic
+ from typing import Union, Optional
+ from urllib.parse import urlparse, urlunparse
+ 
+-import requests
++import treq
+ from multimethod import multimethod
++from twisted.internet import reactor
++from twisted.internet.defer import inlineCallbacks, returnValue
++from twisted.internet.threads import blockingCallFromThread
+ from websocket import WebSocket, WebSocketTimeoutException
+ 
+ from iconsdk.exception import JSONRPCException, URLException
+ from iconsdk.providers.provider import Provider, MonitorSpec, Monitor, MonitorTimeoutException
+ from iconsdk.utils import to_dict
++
++
++@dataclass
++class _HTTPResponse:
++    content: bytes
++    ok: bool
++
++
++_REACTOR_THREAD = None
++_REACTOR_STARTED = threading.Event()
++_REACTOR_LOCK = threading.Lock()
++_REACTOR_ERROR = None
++
++
++def _ensure_reactor_thread():
++    if reactor.running:
++        return
++
++    global _REACTOR_THREAD, _REACTOR_ERROR
++    with _REACTOR_LOCK:
++        if _REACTOR_THREAD is None or not _REACTOR_THREAD.is_alive():
++            _REACTOR_STARTED.clear()
++            _REACTOR_ERROR = None
++
++            def _run_reactor():
++                global _REACTOR_ERROR
++                reactor.callWhenRunning(_REACTOR_STARTED.set)
++                try:
++                    reactor.run(installSignalHandlers=False)
++                except Exception as exc:
++                    _REACTOR_ERROR = exc
++                    _REACTOR_STARTED.set()
++
++            _REACTOR_THREAD = threading.Thread(target=_run_reactor, name='treq-reactor', daemon=True)
++            _REACTOR_THREAD.start()
++
++    _REACTOR_STARTED.wait()
++    if _REACTOR_ERROR is not None:
++        raise _REACTOR_ERROR
+ 
+ 
+ class HTTPProvider(Provider):
+@@ -119,11 +163,27 @@
+             yield key, value
+ 
+     @staticmethod
+-    def _make_post_request(request_url: str, data: dict, **kwargs) -> requests.Response:
+-        kwargs.setdefault('timeout', 10)
+-        with requests.Session() as session:
+-            response = session.post(url=request_url, data=json.dumps(data), **kwargs)
+-        return response
++    def _make_post_request(request_url: str, data: dict, **kwargs) -> _HTTPResponse:
++        timeout = kwargs.pop('timeout', 10)
++        kwargs.pop('verify', None)
++        kwargs.pop('allow_redirects', None)
++
++        _ensure_reactor_thread()
++        return blockingCallFromThread(
++            reactor,
++            HTTPProvider._perform_post_request,
++            request_url,
++            data,
++            kwargs,
++            timeout,
++        )
++
++    @staticmethod
++    @inlineCallbacks
++    def _perform_post_request(request_url: str, data: dict, kwargs: dict, timeout: float):
++        response = yield treq.post(request_url, data=json.dumps(data).encode(), timeout=timeout, **kwargs)
++        content = yield treq.content(response)
++        returnValue(_HTTPResponse(content=content, ok=response.code < 400))
+ 
+     def _make_id(self) -> int:
+         return int(time())
+@@ -147,7 +207,7 @@
+             raise JSONRPCException(f'Unknown response: {raw_response}')
+ 
+     @staticmethod
+-    def _return_custom_response(response: requests.Response, full_response: bool = False) -> Union[str, list, dict]:
++    def _return_custom_response(response: _HTTPResponse, full_response: bool = False) -> Union[str, list, dict]:
+         content = json.loads(response.content)
+         if full_response:
+             return content

@@ -1,0 +1,194 @@
+diff --git /dev/null b/sectxt/_http.py
+new file mode 100644
+index 0000000..a3b1f94
+--- /dev/null
++++ b/sectxt/_http.py
+@@ -0,0 +1,188 @@
++from dataclasses import dataclass, field
++from io import BytesIO
++from typing import Dict, List, Optional
++
++try:
++    import pycurl  # type: ignore
++except ModuleNotFoundError:  # pragma: no cover - exercised in this environment
++    pycurl = None
++
++
++USER_AGENT = (
++    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) "
++    "Gecko/20100101 Firefox/12.0"
++)
++
++
++class HTTPError(Exception):
++    pass
++
++
++class HTTPSSLError(HTTPError):
++    pass
++
++
++@dataclass
++class HTTPResponse:
++    url: str
++    status_code: int
++    headers: Dict[str, str]
++    content: bytes
++    history: List["HTTPResponse"] = field(default_factory=list)
++
++
++def _lower_headers(headers: Dict[str, str]) -> Dict[str, str]:
++    return {key.lower(): value for key, value in headers.items()}
++
++
++def _requests_get(
++    url: str,
++    headers: Dict[str, str],
++    timeout: int,
++    verify: bool,
++) -> HTTPResponse:
++    import requests
++
++    try:
++        resp = requests.get(url, headers=headers, timeout=timeout, verify=verify)
++    except requests.exceptions.SSLError as exc:
++        raise HTTPSSLError(str(exc)) from exc
++    except requests.exceptions.Timeout as exc:
++        raise HTTPError(str(exc)) from exc
++    except requests.exceptions.RequestException as exc:
++        raise HTTPError(str(exc)) from exc
++
++    history = [
++        HTTPResponse(
++            url=item.url,
++            status_code=item.status_code,
++            headers=_lower_headers(dict(item.headers)),
++            content=item.content,
++        )
++        for item in resp.history
++    ]
++    return HTTPResponse(
++        url=resp.url,
++        status_code=resp.status_code,
++        headers=_lower_headers(dict(resp.headers)),
++        content=resp.content,
++        history=history,
++    )
++
++
++def _parse_pycurl_headers(raw_headers: List[bytes]) -> List[Dict[str, str]]:
++    responses: List[Dict[str, str]] = []
++    current_headers: Dict[str, str] = {}
++    current_status = 0
++
++    for raw_line in raw_headers:
++        line = raw_line.decode("iso-8859-1").strip()
++        if not line:
++            continue
++
++        if line.startswith("HTTP/"):
++            if current_status:
++                responses.append(
++                    {"status_code": current_status, "headers": current_headers}
++                )
++            current_status = 0
++            current_headers = {}
++            parts = line.split(" ", 2)
++            if len(parts) >= 2 and parts[1].isdigit():
++                current_status = int(parts[1])
++            continue
++
++        if ":" in line:
++            key, value = line.split(":", 1)
++            current_headers[key.strip().lower()] = value.strip()
++
++    if current_status:
++        responses.append({"status_code": current_status, "headers": current_headers})
++
++    return responses
++
++
++def _pycurl_get(
++    url: str,
++    headers: Dict[str, str],
++    timeout: int,
++    verify: bool,
++) -> HTTPResponse:
++    if pycurl is None:
++        raise HTTPError("pycurl is not available")
++
++    body = BytesIO()
++    raw_headers: List[bytes] = []
++    curl = pycurl.Curl()
++
++    def _header_callback(chunk: bytes) -> int:
++        raw_headers.append(chunk)
++        return len(chunk)
++
++    try:
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.FOLLOWLOCATION, 1)
++        curl.setopt(pycurl.MAXREDIRS, 10)
++        curl.setopt(pycurl.NOSIGNAL, 1)
++        curl.setopt(pycurl.TIMEOUT, timeout)
++        curl.setopt(pycurl.CONNECTTIMEOUT, timeout)
++        curl.setopt(pycurl.USERAGENT, USER_AGENT)
++        curl.setopt(
++            pycurl.HTTPHEADER,
++            [f"{key}: {value}" for key, value in headers.items()],
++        )
++        curl.setopt(pycurl.WRITEFUNCTION, body.write)
++        curl.setopt(pycurl.HEADERFUNCTION, _header_callback)
++        if verify:
++            curl.setopt(pycurl.SSL_VERIFYPEER, 1)
++            curl.setopt(pycurl.SSL_VERIFYHOST, 2)
++        else:
++            curl.setopt(pycurl.SSL_VERIFYPEER, 0)
++            curl.setopt(pycurl.SSL_VERIFYHOST, 0)
++        curl.perform()
++        response_code = int(curl.getinfo(pycurl.RESPONSE_CODE))
++        effective_url = curl.getinfo(pycurl.EFFECTIVE_URL)
++    except pycurl.error as exc:
++        code = exc.args[0] if exc.args else None
++        message = str(exc).lower()
++        if code in {51, 58, 59, 60} or (
++            "ssl" in message and ("certificate" in message or "cert" in message)
++        ):
++            raise HTTPSSLError(str(exc)) from exc
++        raise HTTPError(str(exc)) from exc
++    finally:
++        curl.close()
++
++    parsed_responses = _parse_pycurl_headers(raw_headers)
++
++    response_headers = parsed_responses[-1]["headers"] if parsed_responses else {}
++    history: List[HTTPResponse] = []
++    if effective_url != url:
++        history.append(
++            HTTPResponse(
++                url=url,
++                status_code=parsed_responses[0]["status_code"] if parsed_responses else 0,
++                headers=parsed_responses[0]["headers"] if parsed_responses else {},
++                content=b"",
++            )
++        )
++
++    return HTTPResponse(
++        url=effective_url,
++        status_code=response_code,
++        headers=response_headers,
++        content=body.getvalue(),
++        history=history,
++    )
++
++
++def get(
++    url: str,
++    headers: Optional[Dict[str, str]] = None,
++    timeout: int = 5,
++    verify: bool = True,
++) -> HTTPResponse:
++    request_headers = headers or {}
++    if pycurl is not None:
++        return _pycurl_get(url, request_headers, timeout, verify)
++    return _requests_get(url, request_headers, timeout, verify)

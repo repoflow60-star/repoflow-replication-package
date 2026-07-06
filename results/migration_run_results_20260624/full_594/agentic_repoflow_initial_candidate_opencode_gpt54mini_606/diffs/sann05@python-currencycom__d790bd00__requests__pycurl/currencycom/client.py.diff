@@ -1,0 +1,221 @@
+--- a/currencycom/client.py
++++ b/currencycom/client.py
+@@ -1,10 +1,12 @@
+ import hashlib
+ import hmac
++import io
++import json
+ from datetime import datetime, timedelta
+ from enum import Enum
+-
+-import requests
+-from requests.models import RequestEncodingMixin
++from urllib.parse import urlencode
++
++import pycurl
+ 
+ 
+ class CurrencyComConstants(object):
+@@ -81,6 +83,16 @@
+     ACK = 'ACK'
+     RESULT = 'RESULT'
+     FULL = 'FULL'
++
++
++class _PycurlResponse(object):
++    def __init__(self, status_code, body):
++        self.status_code = status_code
++        self.content = body
++        self.text = body.decode('utf-8')
++
++    def json(self):
++        return json.loads(self.text)
+ 
+ 
+ class Client(object):
+@@ -146,11 +158,29 @@
+     def _get_params_with_signature(self, **kwargs):
+         t = self._to_epoch_miliseconds(datetime.now())
+         kwargs['timestamp'] = t
+-        # pylint: disable=no-member
+-        body = RequestEncodingMixin._encode_params(kwargs)
++        body = self._encode_params(kwargs)
+         sign = hmac.new(self.api_secret, bytes(body, 'utf-8'),
+                         hashlib.sha256).hexdigest()
+         return {'signature': sign, **kwargs}
++
++    @staticmethod
++    def _encode_params(params):
++        if not params:
++            return ''
++
++        encoded_params = []
++        for key, value in params.items():
++            if value is None:
++                continue
++            if isinstance(value, (list, tuple)):
++                for item in value:
++                    if item is None:
++                        continue
++                    encoded_params.append((key, item))
++            else:
++                encoded_params.append((key, value))
++
++        return urlencode(encoded_params)
+ 
+     def _get_header(self, **kwargs):
+         return {
+@@ -158,21 +188,67 @@
+             CurrencyComConstants.HEADER_API_KEY_NAME: self.api_key
+         }
+ 
++    def _request(self, method, url, signed=True, include_api_key=True,
++                 **kwargs):
++        params = self._get_params_with_signature(**kwargs) if signed else kwargs
++        query_string = self._encode_params(params)
++        full_url = url if not query_string else f'{url}?{query_string}'
++
++        body = io.BytesIO()
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, full_url)
++            curl.setopt(pycurl.WRITEFUNCTION, body.write)
++            if include_api_key:
++                curl.setopt(
++                    pycurl.HTTPHEADER,
++                    ['{}: {}'.format(key, value)
++                     for key, value in self._get_header().items()]
++                )
++            if method == 'GET':
++                curl.setopt(pycurl.HTTPGET, 1)
++            elif method == 'POST':
++                curl.setopt(pycurl.POST, 1)
++                curl.setopt(pycurl.POSTFIELDS, '')
++            else:
++                curl.setopt(pycurl.CUSTOMREQUEST, method)
++
++            curl.perform()
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++            return _PycurlResponse(status_code, body.getvalue())
++        finally:
++            curl.close()
++
+     def _get(self, url, **kwargs):
+-        return requests.get(url,
+-                            params=self._get_params_with_signature(**kwargs),
+-                            headers=self._get_header())
++        return self._request('GET', url, signed=True, include_api_key=True,
++                             **kwargs)
++
++    def _public_get(self, url, **kwargs):
++        return self._request('GET', url, signed=False, include_api_key=False,
++                             **kwargs)
++
++    @staticmethod
++    def _public_request(url, **kwargs):
++        query_string = Client._encode_params(kwargs)
++        full_url = url if not query_string else f'{url}?{query_string}'
++
++        body = io.BytesIO()
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, full_url)
++            curl.setopt(pycurl.WRITEFUNCTION, body.write)
++            curl.setopt(pycurl.HTTPGET, 1)
++            curl.perform()
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++            return _PycurlResponse(status_code, body.getvalue())
++        finally:
++            curl.close()
+ 
+     def _post(self, url, **kwargs):
+-        return requests.post(url,
+-                             params=self._get_params_with_signature(**kwargs),
+-                             headers=self._get_header())
++        return self._request('POST', url, **kwargs)
+ 
+     def _delete(self, url, **kwargs):
+-        return requests.delete(url,
+-                               params=self._get_params_with_signature(
+-                                   **kwargs),
+-                               headers=self._get_header())
++        return self._request('DELETE', url, **kwargs)
+ 
+     def get_account_info(self,
+                          show_zero_balance: bool = False,
+@@ -269,8 +345,8 @@
+         if end_time:
+             params['endTime'] = self._to_epoch_miliseconds(end_time)
+ 
+-        r = requests.get(CurrencyComConstants.AGGREGATE_TRADE_LIST_ENDPOINT,
+-                         params=params)
++        r = self._public_get(CurrencyComConstants.AGGREGATE_TRADE_LIST_ENDPOINT,
++                             **params)
+ 
+         return r.json()
+ 
+@@ -332,8 +408,9 @@
+           }
+         """
+         self._validate_limit(limit)
+-        r = requests.get(CurrencyComConstants.ORDER_BOOK_ENDPOINT,
+-                         params={'symbol': symbol, 'limit': limit})
++        r = self._public_get(CurrencyComConstants.ORDER_BOOK_ENDPOINT,
++                             symbol=symbol,
++                             limit=limit)
+         return r.json()
+ 
+     @staticmethod
+@@ -374,7 +451,9 @@
+           ]
+         }
+         """
+-        r = requests.get(CurrencyComConstants.EXCHANGE_INFORMATION_ENDPOINT)
++        r = Client._public_request(
++            CurrencyComConstants.EXCHANGE_INFORMATION_ENDPOINT
++        )
+         return r.json()
+ 
+     def get_klines(self, symbol,
+@@ -420,8 +499,8 @@
+             params['startTime'] = self._to_epoch_miliseconds(start_time)
+         if end_time:
+             params['endTime'] = self._to_epoch_miliseconds(end_time)
+-        r = requests.get(CurrencyComConstants.KLINES_DATA_ENDPOINT,
+-                         params=params)
++        r = self._public_get(CurrencyComConstants.KLINES_DATA_ENDPOINT,
++                             **params)
+         return r.json()
+ 
+     def get_leverage_settings(self, symbol, recv_window=None):
+@@ -445,7 +524,7 @@
+             ], // the possible leverage sizes;
+             "value": 20 // depicts a default leverage size which will be set in
+             case you don’t mention the ‘leverage’ parameter in the
+-            corresponding requests.
++            corresponding API calls.
+         }
+         """
+         self._validate_recv_window(recv_window)
+@@ -771,8 +850,10 @@
+           "count": 0
+         }
+         """
+-        r = requests.get(CurrencyComConstants.PRICE_CHANGE_24H_ENDPOINT,
+-                         params={'symbol': symbol} if symbol else {})
++        r = self._public_get(
++            CurrencyComConstants.PRICE_CHANGE_24H_ENDPOINT,
++            **({'symbol': symbol} if symbol else {})
++        )
+         return r.json()
+ 
+     @staticmethod
+@@ -786,7 +867,7 @@
+           "serverTime": 1499827319559
+         }
+         """
+-        r = requests.get(CurrencyComConstants.SERVER_TIME_ENDPOINT)
++        r = Client._public_request(CurrencyComConstants.SERVER_TIME_ENDPOINT)
+ 
+         return r.json()
+ 

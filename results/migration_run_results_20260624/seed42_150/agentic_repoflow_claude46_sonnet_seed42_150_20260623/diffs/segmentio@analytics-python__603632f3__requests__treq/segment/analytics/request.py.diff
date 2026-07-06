@@ -1,0 +1,123 @@
+--- a/segment/analytics/request.py
++++ b/segment/analytics/request.py
+@@ -3,14 +3,117 @@
+ from gzip import GzipFile
+ import logging
+ import json
++import threading
++import time as _time
+ from dateutil.tz import tzutc
+-from requests.auth import HTTPBasicAuth
+-from requests import sessions
++import treq
++from twisted.internet import reactor as _reactor, defer as _defer
++from twisted.internet import threads as _threads
+ 
+ from segment.analytics.version import VERSION
+ from segment.analytics.utils import remove_trailing_slash
+ 
+-_session = sessions.Session()
++_reactor_lock = threading.Lock()
++_reactor_started = False
++
++
++def _ensure_reactor():
++    global _reactor_started
++    with _reactor_lock:
++        if not _reactor_started:
++            t = threading.Thread(
++                target=_reactor.run,
++                kwargs={'installSignalHandlers': False},
++                daemon=True,
++            )
++            t.start()
++            _reactor_started = True
++    # Wait until reactor is actually running
++    deadline = _time.monotonic() + 5.0
++    while not _reactor.running:
++        if _time.monotonic() > deadline:
++            break
++        _time.sleep(0.005)
++
++
++class _CaseInsensitiveDict(dict):
++    """Case-insensitive dict for HTTP headers."""
++
++    def __setitem__(self, key, value):
++        super().__setitem__(key.lower(), value)
++
++    def __getitem__(self, key):
++        return super().__getitem__(key.lower())
++
++    def get(self, key, default=None):
++        return super().get(key.lower(), default)
++
++    def __contains__(self, key):
++        return super().__contains__(key.lower())
++
++
++class _TreqResponse:
++    """Adapter that wraps a treq/Twisted response to look like requests.Response."""
++
++    def __init__(self, twisted_response, body_bytes):
++        self._response = twisted_response
++        self._body = body_bytes
++        self.status_code = twisted_response.code
++        # Build a case-insensitive headers dict
++        self.headers = _CaseInsensitiveDict()
++        for name, values in twisted_response.headers.getAllRawHeaders():
++            key = name.decode('utf-8') if isinstance(name, bytes) else name
++            val = values[-1]
++            if isinstance(val, bytes):
++                val = val.decode('utf-8')
++            self.headers[key] = val
++        self.reason = self.headers.get('reason', '')
++
++    @property
++    def text(self):
++        return self._body.decode('utf-8', errors='replace') if isinstance(self._body, bytes) else self._body
++
++    def json(self):
++        return json.loads(self._body)
++
++
++class _TreqSession:
++    """Synchronous HTTP session backed by treq (Twisted)."""
++
++    def post(self, url, data=None, headers=None, timeout=None, proxies=None, **kwargs):
++        _ensure_reactor()
++        try:
++            response = _threads.blockingCallFromThread(
++                _reactor,
++                self._async_post,
++                url,
++                data=data,
++                headers=headers,
++                timeout=timeout,
++            )
++        except Exception:
++            raise
++        return response
++
++    def _async_post(self, url, data=None, headers=None, timeout=None):
++        treq_kwargs = {}
++        if data is not None:
++            treq_kwargs['data'] = data
++        if headers is not None:
++            treq_kwargs['headers'] = headers
++        if timeout is not None:
++            treq_kwargs['timeout'] = timeout
++
++        @_defer.inlineCallbacks
++        def do_request():
++            resp = yield treq.post(url, **treq_kwargs)
++            body = yield treq.content(resp)
++            _defer.returnValue(_TreqResponse(resp, body))
++
++        return do_request()
++
++
++_session = _TreqSession()
+ 
+ 
+ def post(write_key, host=None, gzip=False, timeout=15, proxies=None, oauth_manager=None, **kwargs):

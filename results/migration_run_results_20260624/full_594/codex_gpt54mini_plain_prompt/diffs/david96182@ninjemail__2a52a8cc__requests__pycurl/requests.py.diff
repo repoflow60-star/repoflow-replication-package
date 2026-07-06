@@ -1,0 +1,299 @@
+diff --git /dev/null b/requests.py
+new file mode 100644
+index 0000000..dff1b4e
+--- /dev/null
++++ b/requests.py
+@@ -0,0 +1,293 @@
++"""Minimal requests-compatible wrapper backed by pycurl.
++
++The project only needs a small subset of the requests API:
++`get`, `post`, response `.text`/`.json()`/`.raise_for_status()`, and a few
++exception types. This module keeps those call sites working while moving the
++transport implementation to pycurl.
++"""
++
++from __future__ import annotations
++
++import io
++import json
++from dataclasses import dataclass
++from typing import Any, Dict, Iterable, Optional, Tuple
++from urllib.error import HTTPError as UrllibHTTPError
++from urllib.error import URLError
++from urllib.parse import urlencode, urlsplit, urlunsplit
++from urllib.request import Request, urlopen
++
++try:
++    import pycurl  # type: ignore
++except Exception:  # pragma: no cover - fallback for environments without pycurl
++    pycurl = None
++
++
++class RequestException(Exception):
++    pass
++
++
++class HTTPError(RequestException):
++    pass
++
++
++class Timeout(RequestException):
++    pass
++
++
++class ConnectionError(RequestException):
++    pass
++
++
++class _Exceptions:
++    RequestException = RequestException
++    HTTPError = HTTPError
++    Timeout = Timeout
++    ConnectionError = ConnectionError
++
++
++exceptions = _Exceptions()
++
++
++@dataclass
++class Response:
++    url: str
++    status_code: int
++    headers: Dict[str, str]
++    _body: bytes
++
++    @property
++    def text(self) -> str:
++        return self._body.decode(self._encoding(), errors="replace")
++
++    @property
++    def content(self) -> bytes:
++        return self._body
++
++    def json(self) -> Any:
++        return json.loads(self.text)
++
++    def raise_for_status(self) -> None:
++        if 400 <= self.status_code:
++            reason = self.headers.get("_reason", "")
++            message = f"{self.status_code} Error"
++            if reason:
++                message = f"{self.status_code} {reason}"
++            raise HTTPError(message)
++
++    def _encoding(self) -> str:
++        content_type = self.headers.get("content-type", "")
++        for part in content_type.split(";"):
++            part = part.strip()
++            if part.startswith("charset="):
++                return part.split("=", 1)[1].strip() or "utf-8"
++        return "utf-8"
++
++
++def get(url: str, params: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None, timeout: Optional[float] = None, **kwargs: Any) -> Response:
++    return _request("GET", url, params=params, headers=headers, timeout=timeout, **kwargs)
++
++
++def post(url: str, params: Optional[Dict[str, Any]] = None, data: Any = None, json: Any = None, headers: Optional[Dict[str, str]] = None, timeout: Optional[float] = None, **kwargs: Any) -> Response:
++    return _request("POST", url, params=params, data=data, json=json, headers=headers, timeout=timeout, **kwargs)
++
++
++def _request(
++    method: str,
++    url: str,
++    *,
++    params: Optional[Dict[str, Any]] = None,
++    data: Any = None,
++    json: Any = None,
++    headers: Optional[Dict[str, str]] = None,
++    timeout: Optional[float] = None,
++    **kwargs: Any,
++) -> Response:
++    if params:
++        url = _merge_query(url, params)
++
++    if json is not None:
++        data = json_dumps(json)
++        headers = _merge_headers(headers, {"Content-Type": "application/json"})
++
++    if pycurl is not None:
++        return _request_pycurl(
++            method,
++            url,
++            data=data,
++            headers=headers,
++            timeout=timeout,
++        )
++    return _request_urllib(method, url, data=data, headers=headers, timeout=timeout)
++
++
++def _request_pycurl(
++    method: str,
++    url: str,
++    *,
++    data: Any = None,
++    headers: Optional[Dict[str, str]] = None,
++    timeout: Optional[float] = None,
++) -> Response:
++    buffer = io.BytesIO()
++    header_buffer = io.BytesIO()
++    curl = pycurl.Curl()
++    try:
++        curl.setopt(pycurl.URL, url.encode("utf-8"))
++        curl.setopt(pycurl.WRITEFUNCTION, buffer.write)
++        curl.setopt(pycurl.HEADERFUNCTION, header_buffer.write)
++        curl.setopt(pycurl.FOLLOWLOCATION, True)
++
++        if timeout is not None:
++            curl.setopt(pycurl.TIMEOUT, int(timeout))
++            curl.setopt(pycurl.CONNECTTIMEOUT, int(timeout))
++
++        header_list = []
++        for key, value in (headers or {}).items():
++            header_list.append(f"{key}: {value}")
++        if header_list:
++            curl.setopt(pycurl.HTTPHEADER, header_list)
++
++        if method == "GET":
++            curl.setopt(pycurl.HTTPGET, True)
++        elif method == "POST":
++            curl.setopt(pycurl.POST, True)
++            if data is None:
++                payload = b""
++            elif isinstance(data, bytes):
++                payload = data
++            elif isinstance(data, str):
++                payload = data.encode("utf-8")
++            elif isinstance(data, dict):
++                payload = urlencode(data, doseq=True).encode("utf-8")
++                if "Content-Type" not in (headers or {}):
++                    curl.setopt(
++                        pycurl.HTTPHEADER,
++                        header_list + ["Content-Type: application/x-www-form-urlencoded"],
++                    )
++            else:
++                payload = str(data).encode("utf-8")
++            curl.setopt(pycurl.POSTFIELDS, payload)
++        else:
++            curl.setopt(pycurl.CUSTOMREQUEST, method)
++
++        curl.perform()
++        status_code = int(curl.getinfo(pycurl.RESPONSE_CODE))
++        content = buffer.getvalue()
++        response_headers = _parse_headers(header_buffer.getvalue())
++        response_headers["_reason"] = _status_reason(status_code)
++        return Response(url=url, status_code=status_code, headers=response_headers, _body=content)
++    except pycurl.error as exc:
++        raise _map_pycurl_error(exc)
++    finally:
++        curl.close()
++
++
++def _request_urllib(
++    method: str,
++    url: str,
++    *,
++    data: Any = None,
++    headers: Optional[Dict[str, str]] = None,
++    timeout: Optional[float] = None,
++) -> Response:
++    body: Optional[bytes]
++    if data is None:
++        body = None
++    elif isinstance(data, bytes):
++        body = data
++    elif isinstance(data, str):
++        body = data.encode("utf-8")
++    elif isinstance(data, dict):
++        body = urlencode(data, doseq=True).encode("utf-8")
++        headers = _merge_headers(headers, {"Content-Type": "application/x-www-form-urlencoded"})
++    else:
++        body = str(data).encode("utf-8")
++
++    request = Request(url, data=body, method=method)
++    for key, value in (headers or {}).items():
++        request.add_header(key, value)
++
++    try:
++        with urlopen(request, timeout=timeout) as resp:
++            return Response(
++                url=resp.geturl(),
++                status_code=getattr(resp, "status", 200),
++                headers={k.lower(): v for k, v in resp.headers.items()},
++                _body=resp.read(),
++            )
++    except UrllibHTTPError as exc:
++        return Response(
++            url=exc.geturl() or url,
++            status_code=exc.code,
++            headers={k.lower(): v for k, v in (exc.headers or {}).items()},
++            _body=exc.read(),
++        )
++    except URLError as exc:
++        reason = getattr(exc, "reason", exc)
++        if isinstance(reason, TimeoutError):
++            raise Timeout(str(reason))
++        raise ConnectionError(str(reason))
++
++
++def _merge_query(url: str, params: Dict[str, Any]) -> str:
++    split = urlsplit(url)
++    query = split.query
++    extra = urlencode(params, doseq=True)
++    if query:
++        query = f"{query}&{extra}"
++    else:
++        query = extra
++    return urlunsplit((split.scheme, split.netloc, split.path, query, split.fragment))
++
++
++def _merge_headers(
++    base: Optional[Dict[str, str]],
++    extra: Dict[str, str],
++) -> Dict[str, str]:
++    merged = dict(base or {})
++    merged.update(extra)
++    return merged
++
++
++def _parse_headers(raw: bytes) -> Dict[str, str]:
++    headers: Dict[str, str] = {}
++    for line in raw.decode("iso-8859-1", errors="replace").splitlines():
++        if not line or ":" not in line:
++            continue
++        key, value = line.split(":", 1)
++        headers[key.strip().lower()] = value.strip()
++    return headers
++
++
++def _map_pycurl_error(exc: Exception) -> RequestException:
++    message = str(exc)
++    if pycurl is not None and isinstance(exc, pycurl.error):
++        code = exc.args[0] if exc.args else None
++        if code in {pycurl.E_OPERATION_TIMEDOUT, pycurl.E_COULDNT_CONNECT}:
++            return Timeout(message)
++        return RequestException(message)
++    return RequestException(message)
++
++
++def _status_reason(status_code: int) -> str:
++    reasons = {
++        200: "OK",
++        201: "Created",
++        202: "Accepted",
++        204: "No Content",
++        400: "Bad Request",
++        401: "Unauthorized",
++        403: "Forbidden",
++        404: "Not Found",
++        429: "Too Many Requests",
++        500: "Internal Server Error",
++        502: "Bad Gateway",
++        503: "Service Unavailable",
++    }
++    return reasons.get(status_code, "")
++
++
++def json_dumps(value: Any) -> str:
++    return json.dumps(value, separators=(",", ":"))
++

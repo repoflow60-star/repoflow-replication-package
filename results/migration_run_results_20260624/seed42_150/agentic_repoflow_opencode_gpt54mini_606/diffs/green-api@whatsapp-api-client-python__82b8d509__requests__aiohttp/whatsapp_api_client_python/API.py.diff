@@ -1,0 +1,255 @@
+--- a/whatsapp_api_client_python/API.py
++++ b/whatsapp_api_client_python/API.py
+@@ -1,9 +1,11 @@
++import asyncio
+ import json
+ import logging
+-from typing import Any, NoReturn, Optional
+-
+-from requests import Response, Session
+-from requests.adapters import HTTPAdapter, Retry
++from types import SimpleNamespace
++from typing import Any, Optional
++
++from aiohttp import ClientSession as Session
++from aiohttp import ClientTimeout, FormData
+ 
+ from .response import Response as GreenAPIResponse
+ from .tools import (
+@@ -49,7 +51,6 @@
+         self.idInstance = idInstance
+         self.apiTokenInstance = apiTokenInstance
+ 
+-        self.session = Session()
+         self.__prepare_session()
+ 
+         self.account = account.Account(self)
+@@ -73,20 +74,117 @@
+             payload: Optional[dict] = None,
+             files: Optional[dict] = None
+     ) -> GreenAPIResponse:
++        return asyncio.run(
++            self.__request(
++                method,
++                url,
++                payload,
++                files,
++                timeout=self.media_timeout if files else self.host_timeout
++            )
++        )
++
++    def raw_request(self, **arguments: Any) -> GreenAPIResponse:
++        method = arguments.pop("method")
++        url = arguments.pop("url")
++
++        return asyncio.run(self.__request(method, url, **arguments))
++
++    async def __request(
++            self,
++            method: str,
++            url: str,
++            payload: Optional[dict] = None,
++            files: Optional[dict] = None,
++            timeout: Optional[float] = None,
++            **arguments: Any
++    ) -> GreenAPIResponse:
+         url = url.replace("{{host}}", self.host)
+         url = url.replace("{{media}}", self.media)
+         url = url.replace("{{idInstance}}", self.idInstance)
+         url = url.replace("{{apiTokenInstance}}", self.apiTokenInstance)
+ 
+         try:
+-            if not files:
+-                response = self.session.request(
+-                    method=method, url=url, json=payload, timeout=self.host_timeout
++            async with Session(headers=self.session.headers) as session:
++                request_arguments = dict(arguments)
++                timeout_argument = request_arguments.pop("timeout", None)
++                request_arguments["headers"] = self.__prepare_headers(
++                    request_arguments.pop("headers", None)
+                 )
+-            else:
+-                response = self.session.request(
+-                    method=method, url=url, data=payload, files=files, timeout=self.media_timeout
++
++                if files and "data" not in request_arguments and "json" not in request_arguments:
++                    request_arguments["data"] = self.__prepare_form_data(
++                        payload, files
++                    )
++                    if timeout_argument is None:
++                        timeout_argument = (
++                            timeout if timeout is not None else self.media_timeout
++                        )
++                else:
++                    if (
++                            payload is not None
++                            and "json" not in request_arguments
++                            and "data" not in request_arguments
++                    ):
++                        request_arguments["json"] = payload
++
++                    if timeout_argument is None:
++                        timeout_argument = (
++                            timeout if timeout is not None else self.host_timeout
++                        )
++
++                if timeout_argument is not None:
++                    request_arguments["timeout"] = self.__prepare_timeout(
++                        timeout_argument
++                    )
++
++                request_result = session.request(
++                    method=method,
++                    url=url,
++                    **request_arguments
+                 )
++
++                if hasattr(request_result, "__aenter__"):
++                    async with request_result as response:
++                        status_code, text = await self.__extract_response(response)
++                elif hasattr(request_result, "__await__"):
++                    response = await request_result
++                    status_code, text = await self.__extract_response(response)
++                else:
++                    status_code, text = await self.__extract_response(request_result)
++
++                if status_code == 429:
++                    for attempt in range(3):
++                        await asyncio.sleep(1.0 * (2 ** attempt))
++                        request_result = session.request(
++                            method=method,
++                            url=url,
++                            **request_arguments
++                        )
++
++                        if hasattr(request_result, "__aenter__"):
++                            async with request_result as response:
++                                status_code, text = await self.__extract_response(
++                                    response
++                                )
++                        elif hasattr(request_result, "__await__"):
++                            response = await request_result
++                            status_code, text = await self.__extract_response(
++                                response
++                            )
++                        else:
++                            status_code, text = await self.__extract_response(
++                                request_result
++                            )
++
++                        if status_code != 429:
++                            break
++
++                self.__handle_response(status_code, text)
++
++                return GreenAPIResponse(status_code, text)
++        except GreenAPIError:
++            raise
+         except Exception as error:
+             error_message = f"Request was failed with error: {error}."
+ 
+@@ -96,35 +194,25 @@
+ 
+             return GreenAPIResponse(None, error_message)
+ 
+-        self.__handle_response(response)
+-
+-        return GreenAPIResponse(response.status_code, response.text)
+-
+-    def raw_request(self, **arguments: Any) -> GreenAPIResponse:
+-        try:
+-            response = self.session.request(**arguments)
+-        except Exception as error:
+-            error_message = f"Request was failed with error: {error}."
+-
+-            if self.raise_errors:
+-                raise GreenAPIError(error_message)
+-            self.logger.log(logging.CRITICAL, error_message)
+-
+-            return GreenAPIResponse(None, error_message)
+-
+-        self.__handle_response(response)
+-
+-        return GreenAPIResponse(response.status_code, response.text)
+-
+-    def __handle_response(self, response: Response) -> Optional[NoReturn]:
+-        status_code = response.status_code
++    @staticmethod
++    async def __extract_response(response: Any) -> Any:
++        status_code = getattr(response, "status_code", getattr(response, "status", None))
++        text = getattr(response, "text", "")
++
++        if callable(text):
++            text = text()
++
++            if asyncio.iscoroutine(text):
++                text = await text
++
++        return status_code, text
++
++    def __handle_response(self, status_code: int, text: str) -> None:
+         if status_code != 200 or self.debug_mode:
+             try:
+-                data = json.dumps(
+-                    json.loads(response.text), ensure_ascii=False, indent=4
+-                )
++                data = json.dumps(json.loads(text), ensure_ascii=False, indent=4)
+             except json.JSONDecodeError:
+-                data = response.text
++                data = text
+ 
+             if status_code != 200:
+                 error_message = (
+@@ -159,17 +247,41 @@
+             self.logger.setLevel(logging.DEBUG)
+ 
+     def __prepare_session(self) -> None:
+-        self.session.headers["Connection"] = "close"
+-
+-        retry = Retry(
+-            total=3,
+-            backoff_factor=1.0,
+-            allowed_methods=None,
+-            status_forcelist=[429]
+-        )
+-
+-        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
++        self.session = SimpleNamespace(headers={"Connection": "close"})
++
++    def __prepare_headers(self, headers: Optional[dict]) -> dict:
++        prepared_headers = dict(self.session.headers)
++
++        if headers:
++            prepared_headers.update(headers)
++
++        return prepared_headers
++
++    @staticmethod
++    def __prepare_timeout(timeout: Any) -> ClientTimeout:
++        if isinstance(timeout, ClientTimeout):
++            return timeout
++
++        return ClientTimeout(total=timeout)
++
++    @staticmethod
++    def __prepare_form_data(payload: Optional[dict], files: dict) -> FormData:
++        form_data = FormData()
++
++        if payload:
++            for key, value in payload.items():
++                form_data.add_field(str(key), str(value))
++
++        for field_name, file_payload in files.items():
++            file_name, file_object, content_type = file_payload
++            form_data.add_field(
++                field_name,
++                file_object,
++                filename=file_name,
++                content_type=content_type or "application/octet-stream"
++            )
++
++        return form_data
+ 
+ 
+ class GreenAPI(GreenApi):

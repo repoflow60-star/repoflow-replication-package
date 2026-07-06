@@ -1,0 +1,184 @@
+diff --git a/resend/request.py b/resend/request.py
+index fbd42f2..eea4644 100644
+--- a/resend/request.py
++++ b/resend/request.py
+@@ -1,17 +1,36 @@
++from dataclasses import dataclass
++from io import BytesIO
++import json
+ from typing import Any, Dict, Generic, List, Union, cast
++from urllib.error import HTTPError, URLError
++from urllib.request import Request as UrlRequest, urlopen
+ 
+-import requests
+ from typing_extensions import Literal, TypeVar
+ 
+ import resend
+ from resend.exceptions import NoContentError, raise_for_code_and_type
+ from resend.version import get_version
+ 
++try:
++    import pycurl
++except ImportError:  # pragma: no cover - exercised only when pycurl is absent
++    pycurl = None
++
+ RequestVerb = Literal["get", "post", "put", "patch", "delete"]
+ 
+ T = TypeVar("T")
+ 
+ 
++@dataclass
++class _Response:
++    status_code: int
++    headers: Dict[str, str]
++    text: str
++
++    def json(self) -> Any:
++        return json.loads(self.text)
++
++
+ # This class wraps the HTTP request creation logic
+ class Request(Generic[T]):
+     def __init__(
+@@ -33,7 +52,7 @@ class Request(Generic[T]):
+             Union[T, None]: A generic type of the Request class or None
+ 
+         Raises:
+-            requests.HTTPError: If the request fails
++            Exception: If the request fails
+         """
+         resp = self.make_request(url=f"{resend.api_url}{self.path}")
+ 
+@@ -43,7 +62,7 @@ class Request(Generic[T]):
+ 
+         # this is a safety net, if we get here it means the Resend API is having issues
+         # and most likely the gateway is returning htmls
+-        if "application/json" not in resp.headers["content-type"]:
++        if "application/json" not in resp.headers.get("content-type", ""):
+             raise_for_code_and_type(
+                 code=500,
+                 message="Failed to parse Resend API response. Please try again.",
+@@ -89,7 +108,7 @@ class Request(Generic[T]):
+             "User-Agent": f"resend-python:{get_version()}",
+         }
+ 
+-    def make_request(self, url: str) -> requests.Response:
++    def make_request(self, url: str) -> _Response:
+         """make_request is a helper function that makes the actual
+         HTTP request to the Resend API.
+ 
+@@ -97,16 +116,107 @@ class Request(Generic[T]):
+             url (str): The URL to make the request to
+ 
+         Returns:
+-            requests.Response: The response object from the request
++            _Response: The response object from the request
+ 
+         Raises:
+-            requests.HTTPError: If the request fails
++            Exception: If the request fails
+         """
+         headers = self.__get_headers()
+-        params = self.params
+-        verb = self.verb
++        payload = self._request_body()
++
++        if pycurl is not None:
++            return self._make_pycurl_request(url=url, headers=headers, payload=payload)
++        return self._make_urllib_request(url=url, headers=headers, payload=payload)
++
++    def _request_body(self) -> bytes:
++        if self.verb == "get":
++            return b""
++        return json.dumps(self.params).encode("utf-8")
++
++    def _make_pycurl_request(
++        self, url: str, headers: Dict[str, Any], payload: bytes
++    ) -> _Response:
++        body = BytesIO()
++        header_lines: List[str] = []
++
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(
++                pycurl.HTTPHEADER,
++                [f"{name}: {value}" for name, value in headers.items()]
++                + ["Content-Type: application/json"],
++            )
++            curl.setopt(pycurl.WRITEFUNCTION, body.write)
++            curl.setopt(
++                pycurl.HEADERFUNCTION,
++                lambda line: header_lines.append(line.decode("iso-8859-1")),
++            )
++            curl.setopt(pycurl.CUSTOMREQUEST, self.verb.upper())
++            if payload:
++                curl.setopt(pycurl.POSTFIELDS, payload)
++            curl.perform()
++            status_code = int(curl.getinfo(pycurl.RESPONSE_CODE))
++        finally:
++            curl.close()
++
++        return self._response_from_raw(
++            status_code=status_code,
++            header_lines=header_lines,
++            body=body.getvalue(),
++        )
++
++    def _make_urllib_request(
++        self, url: str, headers: Dict[str, Any], payload: bytes
++    ) -> _Response:
++        request = UrlRequest(
++            url=url,
++            data=payload or None,
++            headers={**headers, "Content-Type": "application/json"},
++            method=self.verb.upper(),
++        )
+ 
+         try:
+-            return requests.request(verb, url, json=params, headers=headers)
+-        except requests.HTTPError as e:
+-            raise e
++            with urlopen(request) as response:
++                body = response.read()
++                return self._response_from_raw(
++                    status_code=int(response.getcode() or 0),
++                    header_lines=[f"{k}: {v}" for k, v in response.headers.items()],
++                    body=body,
++                )
++        except HTTPError as error:
++            body = error.read()
++            return self._response_from_raw(
++                status_code=int(error.code),
++                header_lines=[f"{k}: {v}" for k, v in error.headers.items()],
++                body=body,
++            )
++        except URLError:
++            raise
++
++    def _response_from_raw(
++        self, status_code: int, header_lines: List[str], body: bytes
++    ) -> _Response:
++        headers: Dict[str, str] = {}
++        for line in header_lines:
++            stripped = line.strip()
++            if not stripped:
++                continue
++            if stripped.startswith("HTTP/"):
++                headers = {}
++                continue
++            if ":" not in stripped:
++                continue
++            name, value = stripped.split(":", 1)
++            headers[name.strip().lower()] = value.strip()
++
++        content_type = headers.get("content-type", "")
++        text = body.decode(self._response_encoding(content_type), errors="replace")
++        return _Response(status_code=status_code, headers=headers, text=text)
++
++    def _response_encoding(self, content_type: str) -> str:
++        for part in content_type.split(";"):
++            part = part.strip()
++            if part.lower().startswith("charset="):
++                return part.split("=", 1)[1].strip().strip('"')
++        return "utf-8"

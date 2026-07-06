@@ -1,0 +1,213 @@
+diff --git a/cf_speedtest/speedtest.py b/cf_speedtest/speedtest.py
+index 37b72d8..6f35e38 100644
+--- a/cf_speedtest/speedtest.py
++++ b/cf_speedtest/speedtest.py
+@@ -2,18 +2,194 @@
+ from __future__ import annotations
+ 
+ import argparse
++import io
+ import math
+ import statistics
+ import time
+ from timeit import default_timer as timer
+-
+-import requests
+-import urllib3
++from urllib.parse import unquote
++from urllib.parse import urlsplit
++from urllib.request import ProxyHandler
++from urllib.request import Request
++from urllib.request import build_opener
++from urllib.request import urlopen
++
++try:
++    import pycurl
++except ModuleNotFoundError:  # pragma: no cover - fallback for environments without pycurl
++    pycurl = None
++import ssl
+ 
+ import cf_speedtest.locations as locations
+ import cf_speedtest.options as options
+ 
+-REQ_SESSION = requests.Session()
++
++class CaseInsensitiveHeaders(dict):
++    def __setitem__(self, key: str, value: str) -> None:
++        super().__setitem__(key.lower(), value)
++
++    def __getitem__(self, key: str) -> str:
++        return super().__getitem__(key.lower())
++
++    def get(self, key: str, default=None):
++        return super().get(key.lower(), default)
++
++    def __contains__(self, key: object) -> bool:
++        if isinstance(key, str):
++            return super().__contains__(key.lower())
++        return super().__contains__(key)
++
++
++class HTTPResponse:
++    def __init__(self, url: str, status_code: int, headers: dict[str, str], content: bytes):
++        self.url = url
++        self.status_code = status_code
++        self.headers = CaseInsensitiveHeaders()
++        for key, value in headers.items():
++            self.headers[key] = value
++        self.content = content
++
++    @property
++    def text(self) -> str:
++        return self.content.decode('utf-8', errors='replace')
++
++    def raise_for_status(self) -> None:
++        if self.status_code >= 400:
++            raise RuntimeError(f'HTTP {self.status_code} for url: {self.url}')
++
++
++class PyCurlSession:
++    def _proxy_options(self, curl, proxies: dict | None, url: str) -> None:
++        if not proxies:
++            return
++
++        scheme = urlsplit(url).scheme
++        proxy = proxies.get(scheme) or proxies.get('http') or proxies.get('https')
++        if not proxy:
++            return
++
++        proxy_parts = urlsplit(proxy if '://' in proxy else f'http://{proxy}')
++        if proxy_parts.hostname:
++            proxy_host = proxy_parts.hostname
++            if proxy_parts.port:
++                proxy_host = f'{proxy_host}:{proxy_parts.port}'
++            curl.setopt(pycurl.PROXY, proxy_host)
++
++        if proxy_parts.username or proxy_parts.password:
++            username = unquote(proxy_parts.username or '')
++            password = unquote(proxy_parts.password or '')
++            curl.setopt(pycurl.PROXYUSERPWD, f'{username}:{password}')
++
++        proxy_scheme = proxy_parts.scheme.lower()
++        if proxy_scheme.startswith('socks5'):
++            proxy_type = getattr(pycurl, 'PROXYTYPE_SOCKS5_HOSTNAME', pycurl.PROXYTYPE_SOCKS5)
++            curl.setopt(pycurl.PROXYTYPE, proxy_type)
++        elif proxy_scheme.startswith('socks4'):
++            curl.setopt(pycurl.PROXYTYPE, pycurl.PROXYTYPE_SOCKS4)
++        else:
++            curl.setopt(pycurl.PROXYTYPE, pycurl.PROXYTYPE_HTTP)
++
++    def _request(
++        self,
++        method: str,
++        url: str,
++        *,
++        data: bytes | None = None,
++        headers: dict | None = None,
++        verify: bool = True,
++        proxies: dict | None = None,
++    ) -> HTTPResponse:
++        if pycurl is None:
++            request = Request(url, data=data, headers=headers or {}, method=method)
++            context = None
++            if url.startswith('https://') and not verify:
++                context = ssl._create_unverified_context()
++            opener = build_opener()
++            if proxies:
++                opener = build_opener(ProxyHandler(proxies))
++            with opener.open(request, context=context) as response:
++                content = response.read()
++                response_headers = {key: value for key, value in response.headers.items()}
++                return HTTPResponse(url, response.status, response_headers, content)
++
++        body = io.BytesIO()
++        header_lines: list[bytes] = []
++
++        def write_callback(chunk: bytes) -> int:
++            body.write(chunk)
++            return len(chunk)
++
++        def header_callback(chunk: bytes) -> int:
++            header_lines.append(chunk)
++            return len(chunk)
++
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.FOLLOWLOCATION, 1)
++            curl.setopt(pycurl.NOSIGNAL, 1)
++            curl.setopt(pycurl.ACCEPT_ENCODING, '')
++            curl.setopt(pycurl.WRITEFUNCTION, write_callback)
++            curl.setopt(pycurl.HEADERFUNCTION, header_callback)
++            curl.setopt(pycurl.SSL_VERIFYPEER, 1 if verify else 0)
++            curl.setopt(pycurl.SSL_VERIFYHOST, 2 if verify else 0)
++            self._proxy_options(curl, proxies, url)
++
++            if headers:
++                curl.setopt(
++                    pycurl.HTTPHEADER,
++                    [f'{key}: {value}' for key, value in headers.items()],
++                )
++
++            if method == 'POST':
++                payload = data or b''
++                curl.setopt(pycurl.POST, 1)
++                curl.setopt(pycurl.POSTFIELDS, payload)
++                curl.setopt(pycurl.POSTFIELDSIZE, len(payload))
++            else:
++                curl.setopt(pycurl.HTTPGET, 1)
++
++            curl.perform()
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        finally:
++            curl.close()
++
++        header_map: dict[str, str] = {}
++        for line in header_lines:
++            decoded = line.decode('iso-8859-1').strip()
++            if not decoded or decoded.startswith('HTTP/'):
++                continue
++            if ':' not in decoded:
++                continue
++            key, value = decoded.split(':', 1)
++            header_map[key.strip()] = value.strip()
++
++        return HTTPResponse(url, int(status_code), header_map, body.getvalue())
++
++    def get(self, url: str, *, verify: bool = True, proxies: dict | None = None):
++        return self._request('GET', url, verify=verify, proxies=proxies)
++
++    def post(
++        self,
++        url: str,
++        *,
++        data: bytes | bytearray | None = None,
++        headers: dict | None = None,
++        verify: bool = True,
++        proxies: dict | None = None,
++    ):
++        payload = bytes(data) if data is not None else None
++        return self._request(
++            'POST',
++            url,
++            data=payload,
++            headers=headers,
++            verify=verify,
++            proxies=proxies,
++        )
++
++
++REQ_SESSION = PyCurlSession()
+ 
+ CGI_ENDPOINT = 'https://speed.cloudflare.com/cdn-cgi/trace'
+ DOWNLOAD_ENDPOINT = 'https://speed.cloudflare.com/__down?measId=0&bytes={}'
+@@ -290,9 +466,6 @@ def run_standard_test(
+ 
+ def main(argv=None) -> int:
+     global PROXY_DICT, VERIFY_SSL, OUTPUT_FILE
+-    # disable annoying warning when using verify=False in requests.get("x", verify=False)
+-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+-
+     parser = argparse.ArgumentParser()
+     parser_with_args = options.add_run_options(parser)
+ 

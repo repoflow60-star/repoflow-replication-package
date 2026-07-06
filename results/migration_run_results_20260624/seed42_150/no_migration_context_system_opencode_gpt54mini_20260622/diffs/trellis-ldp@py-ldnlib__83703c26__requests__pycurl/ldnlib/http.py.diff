@@ -1,0 +1,244 @@
+--- a/ldnlib/http.py
++++ b/ldnlib/http.py
+@@ -0,0 +1,241 @@
++import io
++import json
++from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
++
++import pycurl
++
++
++class HTTPError(Exception):
++    def __init__(self, response):
++        self.response = response
++        super().__init__("HTTP {} for {}".format(response.status_code, response.url))
++
++
++def _normalize_headers(headers):
++    if not headers:
++        return []
++
++    if hasattr(headers, "items"):
++        iterable = headers.items()
++    else:
++        iterable = headers
++
++    return ["{}: {}".format(key, value) for key, value in iterable]
++
++
++def _merge_query(url, params):
++    if not params:
++        return url
++
++    parsed = urlsplit(url)
++
++    if isinstance(params, bytes):
++        params = params.decode('utf-8')
++    if isinstance(params, str):
++        query_string = params
++        if parsed.query:
++            query_string = parsed.query + '&' + query_string
++        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path,
++                          query_string, parsed.fragment))
++
++    query = parse_qsl(parsed.query, keep_blank_values=True)
++
++    if hasattr(params, "items"):
++        params = params.items()
++
++    query.extend(params)
++    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path,
++                      urlencode(query, doseq=True), parsed.fragment))
++
++
++def _parse_link_header(value):
++    links = {}
++    if not value:
++        return links
++
++    parts = []
++    chunk = []
++    in_quotes = False
++    in_angle = False
++
++    for char in value:
++        if char == '"' and not in_angle:
++            in_quotes = not in_quotes
++        elif char == '<' and not in_quotes:
++            in_angle = True
++        elif char == '>' and not in_quotes:
++            in_angle = False
++        elif char == ',' and not in_quotes and not in_angle:
++            part = ''.join(chunk).strip()
++            if part:
++                parts.append(part)
++            chunk = []
++            continue
++
++        chunk.append(char)
++
++    tail = ''.join(chunk).strip()
++    if tail:
++        parts.append(tail)
++
++    for part in parts:
++        segments = [segment.strip() for segment in part.split(';') if segment.strip()]
++        if not segments or not segments[0].startswith('<'):
++            continue
++
++        end = segments[0].find('>')
++        if end == -1:
++            continue
++
++        url = segments[0][1:end]
++        attrs = {}
++        rel = None
++
++        for segment in segments[1:]:
++            if '=' not in segment:
++                continue
++            key, value = segment.split('=', 1)
++            key = key.strip().lower()
++            value = value.strip().strip('"')
++            attrs[key] = value
++            if key == 'rel':
++                rel = value
++
++        if rel:
++            attrs['url'] = url
++            links[rel] = attrs
++
++    return links
++
++
++def _response_encoding(headers):
++    content_type = headers.get('content-type', '')
++    for part in content_type.split(';')[1:]:
++        part = part.strip()
++        if part.lower().startswith('charset='):
++            return part.split('=', 1)[1].strip().strip('"') or 'utf-8'
++    return 'utf-8'
++
++
++class Response(object):
++    def __init__(self, url, status_code, headers, body):
++        self.url = url
++        self.status_code = status_code
++        self.headers = headers
++        self.links = _parse_link_header(headers.get('link'))
++        encoding = _response_encoding(headers)
++        self.text = body.decode(encoding, errors='replace')
++
++    def json(self):
++        return json.loads(self.text)
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise HTTPError(self)
++
++
++def request(method, url, **kwargs):
++    method = method.upper()
++    headers = kwargs.pop('headers', {})
++    params = kwargs.pop('params', None)
++    data = kwargs.pop('data', None)
++    auth = kwargs.pop('auth', None)
++    timeout = kwargs.pop('timeout', None)
++    allow_redirects = kwargs.pop(
++        'allow_redirects', method == 'GET')
++    verify = kwargs.pop('verify', True)
++
++    url = _merge_query(url, params)
++
++    body = io.BytesIO()
++    header_sections = []
++    current_headers = None
++
++    def _write_header(data):
++        nonlocal current_headers
++
++        if not isinstance(data, str):
++            data = data.decode('iso-8859-1', errors='replace')
++
++        line = data.strip('\r\n')
++        if not line:
++            if current_headers is not None:
++                header_sections.append(current_headers)
++                current_headers = None
++            return len(data)
++
++        if line.startswith('HTTP/'):
++            current_headers = {}
++            return len(data)
++
++        if current_headers is None or ':' not in line:
++            return len(data)
++
++        key, value = line.split(':', 1)
++        key = key.strip().lower()
++        value = value.strip()
++        if key in current_headers:
++            current_headers[key] = current_headers[key] + ', ' + value
++        else:
++            current_headers[key] = value
++
++        return len(data)
++
++    curl = pycurl.Curl()
++    try:
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.NOSIGNAL, 1)
++        curl.setopt(pycurl.WRITEFUNCTION, body.write)
++        curl.setopt(pycurl.HEADERFUNCTION, _write_header)
++        curl.setopt(pycurl.HTTPHEADER, _normalize_headers(headers))
++
++        if timeout is not None:
++            curl.setopt(pycurl.TIMEOUT, timeout)
++
++        if auth is not None:
++            if isinstance(auth, (tuple, list)) and len(auth) == 2:
++                curl.setopt(pycurl.USERPWD, "{}:{}".format(auth[0], auth[1]))
++            else:
++                curl.setopt(pycurl.USERPWD, str(auth))
++
++        if verify is False:
++            curl.setopt(pycurl.SSL_VERIFYPEER, 0)
++            curl.setopt(pycurl.SSL_VERIFYHOST, 0)
++
++        if allow_redirects:
++            curl.setopt(pycurl.FOLLOWLOCATION, 1)
++            curl.setopt(pycurl.MAXREDIRS, 10)
++        else:
++            curl.setopt(pycurl.FOLLOWLOCATION, 0)
++
++        if method == 'HEAD':
++            curl.setopt(pycurl.NOBODY, 1)
++            curl.setopt(pycurl.CUSTOMREQUEST, 'HEAD')
++        elif method == 'OPTIONS':
++            curl.setopt(pycurl.CUSTOMREQUEST, 'OPTIONS')
++        elif method == 'POST':
++            curl.setopt(pycurl.POST, 1)
++            if data is not None:
++                if isinstance(data, bytes):
++                    payload = data
++                elif isinstance(data, str):
++                    payload = data.encode('utf-8')
++                else:
++                    payload = str(data).encode('utf-8')
++                curl.setopt(pycurl.POSTFIELDS, payload)
++                curl.setopt(pycurl.POSTFIELDSIZE, len(payload))
++        elif method != 'GET':
++            curl.setopt(pycurl.CUSTOMREQUEST, method)
++
++        curl.perform()
++        status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        effective_url = curl.getinfo(pycurl.EFFECTIVE_URL)
++    finally:
++        curl.close()
++
++    if current_headers is not None:
++        header_sections.append(current_headers)
++
++    raw_headers = header_sections[-1] if header_sections else {}
++    response = Response(effective_url, status_code, raw_headers, body.getvalue())
++    return response

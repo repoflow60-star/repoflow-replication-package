@@ -1,0 +1,131 @@
+--- a/ninjemail/sms_services/_treq.py
++++ b/ninjemail/sms_services/_treq.py
+@@ -0,0 +1,128 @@
++import threading
++from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
++
++import treq
++from twisted.internet import reactor
++
++
++class HTTPError(Exception):
++    pass
++
++
++_reactor_thread = None
++_reactor_lock = threading.Lock()
++
++
++def _ensure_reactor_running():
++    global _reactor_thread
++
++    if reactor.running:
++        return
++
++    with _reactor_lock:
++        if reactor.running:
++            return
++
++        if _reactor_thread is None or not _reactor_thread.is_alive():
++            _reactor_thread = threading.Thread(
++                target=reactor.run,
++                kwargs={"installSignalHandlers": False},
++                daemon=True,
++            )
++            _reactor_thread.start()
++
++    ready = threading.Event()
++    while not reactor.running:
++        ready.wait(0.01)
++
++
++def _await_deferred(factory):
++    _ensure_reactor_running()
++
++    done = threading.Event()
++    outcome = {}
++
++    def _callback(value):
++        outcome["value"] = value
++        done.set()
++        return value
++
++    def _errback(failure):
++        outcome["failure"] = failure
++        done.set()
++        return failure
++
++    def _attach():
++        try:
++            deferred = factory()
++        except BaseException as exc:
++            outcome["failure"] = exc
++            done.set()
++            return
++        deferred.addCallbacks(_callback, _errback)
++
++    reactor.callFromThread(_attach)
++    done.wait()
++
++    failure = outcome.get("failure")
++    if failure is not None:
++        if hasattr(failure, "raiseException"):
++            failure.raiseException()
++        raise failure
++
++    return outcome.get("value")
++
++
++def _add_params(url, params):
++    if not params:
++        return url
++
++    parts = urlsplit(url)
++    query = parse_qsl(parts.query, keep_blank_values=True)
++    query.extend((str(key), str(value)) for key, value in params.items())
++    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
++
++
++def _encode_data(data, headers):
++    if data is None or isinstance(data, (bytes, bytearray, str)):
++        return data, headers
++
++    if isinstance(data, dict):
++        encoded_headers = dict(headers or {})
++        encoded_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
++        return urlencode(data, doseq=True).encode("utf-8"), encoded_headers
++
++    return data, headers
++
++
++def request(method, url, headers=None, params=None, data=None):
++    body, headers = _encode_data(data, headers)
++    url = _add_params(url, params)
++    return _await_deferred(lambda: treq.request(method, url, headers=headers, data=body))
++
++
++def response_text(response):
++    body = _await_deferred(lambda: treq.content(response))
++    if isinstance(body, bytes):
++        return body.decode("utf-8")
++    return body
++
++
++def response_json(response):
++    body = response_text(response)
++    if not body:
++        return {}
++    import json
++
++    return json.loads(body)
++
++
++def raise_for_status(response, url):
++    code = getattr(response, "code", None)
++    if code is None or code < 400:
++        return
++
++    phrase = getattr(response, "phrase", b"")
++    if isinstance(phrase, bytes):
++        phrase = phrase.decode("utf-8", "ignore")
++    raise HTTPError(f"{code} Client Error: {phrase or 'Error'} for url: {url}")

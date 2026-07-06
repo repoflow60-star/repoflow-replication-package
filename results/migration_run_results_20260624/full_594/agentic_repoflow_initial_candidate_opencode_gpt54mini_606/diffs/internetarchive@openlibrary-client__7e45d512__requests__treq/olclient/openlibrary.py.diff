@@ -1,0 +1,253 @@
+--- a/olclient/openlibrary.py
++++ b/olclient/openlibrary.py
+@@ -8,12 +8,15 @@
+ import logging
+ import os
+ import re
+-from urllib.parse import urlencode
+ from urllib.request import pathname2url
+ 
+ import backoff
+-import requests
+-from requests import Response
++import threading
++from http.cookiejar import CookieJar
++from urllib.parse import urlencode, urljoin
++
++import treq
++from twisted.internet import reactor
+ 
+ from olclient import common
+ from olclient.config import Config
+@@ -21,6 +24,180 @@
+ from olclient.utils import merge_unique_lists
+ 
+ logger = logging.getLogger('openlibrary')
++
++
++class OpenLibraryRequestError(Exception):
++    def __init__(self, message, response=None):
++        super().__init__(message)
++        self.response = response
++
++
++class _CookieJar(CookieJar):
++    def __len__(self):
++        return sum(1 for _ in self)
++
++
++_REACTOR_STARTED = threading.Event()
++_REACTOR_THREAD = None
++
++
++def _run_reactor():
++    _REACTOR_STARTED.set()
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor_running():
++    global _REACTOR_THREAD
++    if reactor.running:
++        return
++    if _REACTOR_THREAD is None or not _REACTOR_THREAD.is_alive():
++        _REACTOR_THREAD = threading.Thread(target=_run_reactor, daemon=True)
++        _REACTOR_THREAD.start()
++        _REACTOR_STARTED.wait()
++
++
++class _TreqResponse:
++    def __init__(self, session, response, url):
++        self._session = session
++        self._response = response
++        self.url = url
++        self.code = response.code
++        self.status_code = response.code
++        self.headers = response.headers
++        self._body = None
++
++    def _load_body(self):
++        if self._body is None:
++            self._body = self._session._call_in_reactor(treq.content, self._response)
++        return self._body
++
++    def json(self):
++        return json.loads(self._load_body().decode('utf-8'))
++
++    def raise_for_status(self):
++        if self.code >= 400:
++            raise OpenLibraryRequestError(
++                f'HTTP {self.code} for {self.url}',
++                response=self,
++            )
++
++
++class _TreqSession:
++    REDIRECT_CODES = {301, 302, 303, 307, 308}
++
++    def __init__(self):
++        self.cookies = _CookieJar()
++
++    def _call_in_reactor(self, func, *args, **kwargs):
++        _ensure_reactor_running()
++        result = {}
++        done = threading.Event()
++
++        def _submit():
++            try:
++                value = func(*args, **kwargs)
++            except Exception as exc:
++                result['error'] = exc
++                done.set()
++                return
++
++            if hasattr(value, 'addCallbacks'):
++                def _ok(item):
++                    result['value'] = item
++                    done.set()
++                    return item
++
++                def _err(failure):
++                    result['failure'] = failure
++                    done.set()
++                    return failure
++
++                value.addCallbacks(_ok, _err)
++            else:
++                result['value'] = value
++                done.set()
++
++        reactor.callFromThread(_submit)
++        done.wait()
++        if 'error' in result:
++            raise OpenLibraryRequestError(str(result['error'])) from result['error']
++        if 'failure' in result:
++            failure = result['failure']
++            raise OpenLibraryRequestError(failure.getErrorMessage()) from failure.value
++        return result['value']
++
++    def _request_once(self, method, url, **kwargs):
++        _ensure_reactor_running()
++        if isinstance(kwargs.get('data'), str):
++            kwargs = dict(kwargs)
++            kwargs['data'] = kwargs['data'].encode('utf-8')
++        payload = {}
++        done = threading.Event()
++
++        def _submit():
++            try:
++                deferred = treq.request(method, url, cookies=self.cookies, **kwargs)
++            except Exception as exc:
++                payload['error'] = exc
++                done.set()
++                return
++
++            def _ok(response):
++                payload['response'] = _TreqResponse(self, response, url)
++                done.set()
++                return response
++
++            def _err(failure):
++                payload['failure'] = failure
++                done.set()
++                return failure
++
++            deferred.addCallbacks(_ok, _err)
++
++        reactor.callFromThread(_submit)
++        done.wait()
++        if 'error' in payload:
++            raise OpenLibraryRequestError(str(payload['error'])) from payload['error']
++        if 'failure' in payload:
++            failure = payload['failure']
++            raise OpenLibraryRequestError(failure.getErrorMessage()) from failure.value
++        return payload['response']
++
++    def _follow_redirects(self, method, response, **kwargs):
++        current_method = method
++        current_response = response
++        current_kwargs = dict(kwargs)
++
++        for _ in range(10):
++            if current_response.code not in self.REDIRECT_CODES:
++                return current_response
++            location = current_response.headers.getRawHeaders('Location', [None])[0]
++            if not location:
++                return current_response
++            next_url = urljoin(current_response.url, location)
++            if current_response.code in (301, 302, 303) and current_method.upper() not in ('GET', 'HEAD'):
++                current_method = 'GET'
++                current_kwargs = {
++                    'headers': current_kwargs.get('headers'),
++                    'params': current_kwargs.get('params'),
++                }
++            current_response = self._request_once(current_method, next_url, **current_kwargs)
++        return current_response
++
++    def request(self, method, url, allow_redirects=True, **kwargs):
++        response = self._request_once(method, url, **kwargs)
++        if allow_redirects:
++            response = self._follow_redirects(method, response, **kwargs)
++        return response
++
++    def get(self, url, **kwargs):
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, **kwargs):
++        return self.request('POST', url, **kwargs)
++
++    def put(self, url, **kwargs):
++        return self.request('PUT', url, **kwargs)
+ 
+ 
+ class OpenLibrary:
+@@ -51,9 +228,10 @@
+     VALID_IDS = ['isbn_10', 'isbn_13', 'lccn', 'ocaid']
+     BACKOFF_KWARGS = {
+         'wait_gen': backoff.expo,
+-        'exception': requests.exceptions.RequestException,
+-        'giveup': lambda e: hasattr(e.response, 'status_code')
+-        and 400 <= e.response.status_code < 500,
++        'exception': OpenLibraryRequestError,
++        'giveup': lambda e: hasattr(e, 'response')
++        and getattr(e.response, 'status_code', getattr(e.response, 'code', 0))
++        and 400 <= getattr(e.response, 'status_code', getattr(e.response, 'code', 0)) < 500,
+         'max_tries': 5,
+     }
+ 
+@@ -62,16 +240,14 @@
+     WORKS_PAGINATION_OFFSET = 0
+ 
+     def __init__(self, credentials=None, base_url='https://openlibrary.org'):
+-        self.session = requests.Session()
++        self.session = _TreqSession()
+         self.base_url = base_url
+         credentials = credentials or Config().get_config().get('s3', None)
+         if credentials:
+             self.login(credentials)
+ 
+     def login(self, credentials):
+-        """Login to Open Library with given credentials, ensures the requests
+-        session has valid cookies for future requests.
+-        """
++        """Login to Open Library with given credentials and keep session cookies."""
+ 
+         if 'username' in credentials._asdict():
+             headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+@@ -119,7 +295,7 @@
+         url = self._generate_url_from_olid(olid)
+         return self.session.put(url, data=data)
+ 
+-    def save_many(self, docs, comment) -> Response:
++    def save_many(self, docs, comment) -> Any:
+         """
+         Uses the Open Library save_many API endpoint to
+         write any number or combination of documents (Edition, Work, or Author)
+@@ -135,7 +311,7 @@
+             f'{self.base_url}/api/save_many', json.dumps(doc_json), headers=headers
+         )
+ 
+-    def delete_many(self, ol_ids: List[str], comment: str) -> Response:
++    def delete_many(self, ol_ids: List[str], comment: str) -> Any:
+         return self.save_many(
+             [self.Delete(ol_id) for ol_id in ol_ids],
+             comment=comment

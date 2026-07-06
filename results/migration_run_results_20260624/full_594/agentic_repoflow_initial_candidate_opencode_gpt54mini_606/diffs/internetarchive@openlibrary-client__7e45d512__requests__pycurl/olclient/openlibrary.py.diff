@@ -1,0 +1,277 @@
+--- a/olclient/openlibrary.py
++++ b/olclient/openlibrary.py
+@@ -2,18 +2,19 @@
+ 
+ 
+ import json
++from http.cookies import SimpleCookie
++from io import BytesIO
+ from typing import List, Dict, Optional, Any
+ 
+ import jsonschema
+ import logging
+ import os
+ import re
+-from urllib.parse import urlencode
++from urllib.parse import urlencode, parse_qsl, urlsplit, urlunsplit
+ from urllib.request import pathname2url
+ 
+ import backoff
+-import requests
+-from requests import Response
++import pycurl
+ 
+ from olclient import common
+ from olclient.config import Config
+@@ -21,6 +22,233 @@
+ from olclient.utils import merge_unique_lists
+ 
+ logger = logging.getLogger('openlibrary')
++
++
++class RequestException(Exception):
++    def __init__(self, message='', response=None):
++        super().__init__(message)
++        self.response = response
++
++
++class HTTPError(RequestException):
++    pass
++
++
++class PycurlResponse:
++    def __init__(self, status_code, url, body, headers=None):
++        self.status_code = status_code
++        self.url = url
++        self._body = body
++        self.headers = headers or {}
++        self.response = self
++
++    @property
++    def content(self):
++        return self._body
++
++    @property
++    def text(self):
++        return self._body.decode('utf-8', errors='replace')
++
++    def json(self):
++        return json.loads(self.text)
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise HTTPError(f'{self.status_code} Error for url: {self.url}', response=self)
++
++
++class PycurlSession:
++    def __init__(self):
++        self.cookies: Dict[str, str] = {}
++
++    @staticmethod
++    def _coerce_bytes(value):
++        if isinstance(value, bytes):
++            return value
++        if isinstance(value, bytearray):
++            return bytes(value)
++        return str(value).encode('utf-8')
++
++    @staticmethod
++    def _normalize_params(params):
++        if params is None:
++            return []
++        if hasattr(params, 'items'):
++            items = params.items()
++        else:
++            items = params
++        return [(key, value) for key, value in items if value is not None]
++
++    @classmethod
++    def _apply_params(cls, url, params):
++        items = cls._normalize_params(params)
++        if not items:
++            return url
++        parsed = list(urlsplit(url))
++        query = parse_qsl(parsed[3], keep_blank_values=True)
++        query.extend(items)
++        parsed[3] = urlencode(query, doseq=True)
++        return urlunsplit(parsed)
++
++    @staticmethod
++    def _encode_multipart(fields):
++        boundary = f'----olclient-{os.getpid()}-{id(fields)}'
++        body = bytearray()
++        for name, value in fields.items():
++            filename = None
++            content_type = None
++            content = value
++            if isinstance(value, tuple):
++                if len(value) == 3:
++                    filename, content, content_type = value
++                elif len(value) == 2:
++                    filename, content = value
++                else:
++                    content = value[-1]
++            body.extend(f'--{boundary}\r\n'.encode('utf-8'))
++            disposition = f'Content-Disposition: form-data; name="{name}"'
++            if filename:
++                disposition += f'; filename="{filename}"'
++            body.extend(f'{disposition}\r\n'.encode('utf-8'))
++            if content_type:
++                body.extend(f'Content-Type: {content_type}\r\n'.encode('utf-8'))
++            body.extend(b'\r\n')
++            body.extend(PycurlSession._coerce_bytes(content))
++            body.extend(b'\r\n')
++        body.extend(f'--{boundary}--\r\n'.encode('utf-8'))
++        return bytes(body), f'multipart/form-data; boundary={boundary}'
++
++    @staticmethod
++    def _encode_body(data=None, json_body=None, files=None):
++        if files is not None:
++            return PycurlSession._encode_multipart(files)
++        if json_body is not None:
++            return json.dumps(json_body).encode('utf-8'), 'application/json'
++        if data is None:
++            return None, None
++        if isinstance(data, (bytes, bytearray)):
++            return bytes(data), None
++        if isinstance(data, str):
++            return data.encode('utf-8'), None
++        if hasattr(data, 'items'):
++            return urlencode(list(data.items()), doseq=True).encode('utf-8'), 'application/x-www-form-urlencoded'
++        return str(data).encode('utf-8'), None
++
++    def _cookie_header(self):
++        return '; '.join(f'{key}={value}' for key, value in self.cookies.items())
++
++    def _update_cookies_from_handle(self, curl):
++        try:
++            cookie_list = curl.getinfo(pycurl.INFO_COOKIELIST)
++        except pycurl.error:
++            return
++        for cookie_line in cookie_list or []:
++            parts = cookie_line.split('\t')
++            if len(parts) >= 7:
++                self.cookies[parts[5]] = parts[6]
++
++    def _update_cookies_from_headers(self, raw_headers):
++        cookie = SimpleCookie()
++        for line in raw_headers.splitlines():
++            if line.lower().startswith('set-cookie:'):
++                cookie.load(line.split(':', 1)[1].strip())
++        for key, morsel in cookie.items():
++            self.cookies[key] = morsel.value
++
++    @staticmethod
++    def _parse_headers(raw_headers):
++        headers = {}
++        for line in raw_headers.splitlines():
++            if ': ' in line:
++                key, value = line.split(': ', 1)
++                headers[key.lower()] = value
++        return headers
++
++    def _request(self, method, url, params=None, data=None, json_body=None, headers=None, files=None, **kwargs):
++        if json_body is None and 'json' in kwargs:
++            json_body = kwargs.pop('json')
++
++        full_url = self._apply_params(url, params)
++        body, content_type = self._encode_body(data=data, json_body=json_body, files=files)
++        request_headers = []
++        if headers:
++            request_headers.extend(f'{key}: {value}' for key, value in headers.items())
++        if content_type:
++            request_headers.append(f'Content-Type: {content_type}')
++        if self.cookies:
++            request_headers.append(f'Cookie: {self._cookie_header()}')
++
++        body_buffer = BytesIO()
++        header_buffer = BytesIO()
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, full_url)
++            curl.setopt(pycurl.FOLLOWLOCATION, True)
++            curl.setopt(pycurl.COOKIEFILE, '')
++            curl.setopt(pycurl.WRITEFUNCTION, body_buffer.write)
++            curl.setopt(pycurl.HEADERFUNCTION, header_buffer.write)
++            if request_headers:
++                curl.setopt(pycurl.HTTPHEADER, request_headers)
++            method = method.upper()
++            if method == 'GET':
++                curl.setopt(pycurl.HTTPGET, True)
++            elif method == 'POST':
++                curl.setopt(pycurl.POST, True)
++            else:
++                curl.setopt(pycurl.CUSTOMREQUEST, method)
++            if body is not None:
++                curl.setopt(pycurl.POSTFIELDS, body)
++                curl.setopt(pycurl.POSTFIELDSIZE, len(body))
++            curl.perform()
++            raw_headers = header_buffer.getvalue().decode('utf-8', errors='replace')
++            self._update_cookies_from_handle(curl)
++            self._update_cookies_from_headers(raw_headers)
++            response = PycurlResponse(
++                curl.getinfo(pycurl.RESPONSE_CODE),
++                curl.getinfo(pycurl.EFFECTIVE_URL),
++                body_buffer.getvalue(),
++                headers=self._parse_headers(
++                    raw_headers
++                ),
++            )
++            return response
++        except pycurl.error as e:
++            raise RequestException(str(e))
++        finally:
++            curl.close()
++
++    def request(self, method, url, **kwargs):
++        return self._request(method, url, **kwargs)
++
++    def get(self, url, params=None, headers=None, **kwargs):
++        return self._request('GET', url, params=params, headers=headers, **kwargs)
++
++    def post(self, url, data=None, json=None, headers=None, files=None, params=None, **kwargs):
++        return self._request(
++            'POST',
++            url,
++            params=params,
++            data=data,
++            json_body=json,
++            headers=headers,
++            files=files,
++            **kwargs,
++        )
++
++    def put(self, url, data=None, json=None, headers=None, params=None, **kwargs):
++        return self._request(
++            'PUT',
++            url,
++            params=params,
++            data=data,
++            json_body=json,
++            headers=headers,
++            **kwargs,
++        )
++
++
++Response = PycurlResponse
+ 
+ 
+ class OpenLibrary:
+@@ -51,7 +279,7 @@
+     VALID_IDS = ['isbn_10', 'isbn_13', 'lccn', 'ocaid']
+     BACKOFF_KWARGS = {
+         'wait_gen': backoff.expo,
+-        'exception': requests.exceptions.RequestException,
++        'exception': RequestException,
+         'giveup': lambda e: hasattr(e.response, 'status_code')
+         and 400 <= e.response.status_code < 500,
+         'max_tries': 5,
+@@ -62,7 +290,7 @@
+     WORKS_PAGINATION_OFFSET = 0
+ 
+     def __init__(self, credentials=None, base_url='https://openlibrary.org'):
+-        self.session = requests.Session()
++        self.session = PycurlSession()
+         self.base_url = base_url
+         credentials = credentials or Config().get_config().get('s3', None)
+         if credentials:

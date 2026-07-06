@@ -1,0 +1,200 @@
+--- a/github_nonpublic_api/api.py
++++ b/github_nonpublic_api/api.py
+@@ -14,18 +14,82 @@
+ 
+ """An API to do things that aren't in the official public GitHub REST API."""
+ 
++from __future__ import annotations
++
+ import os.path
+ import functools
++import asyncio
+ from enum import Enum
+ import re
+ from urllib.parse import urljoin
+-
++from dataclasses import dataclass
++
++import aiohttp
+ import html5lib
+ import pyotp
+-import requests
+ from absl import logging
+ from configobj import ConfigObj
+-from typing import Optional
++from typing import Any, Optional
++
++
++@dataclass
++class _ResponseHistory:
++    url: str
++
++
++@dataclass
++class _Response:
++    url: str
++    text: str
++    content: bytes
++    history: list[_ResponseHistory]
++
++    def raise_for_status(self):
++        return None
++
++
++class _CookieJar:
++    def __init__(self):
++        self._cookies = {}
++
++    def clear(self):
++        self._cookies.clear()
++
++    def as_dict(self):
++        return dict(self._cookies)
++
++    def update(self, cookies):
++        for name, morsel in cookies.items():
++            value = getattr(morsel, "value", morsel)
++            self._cookies[name] = value
++
++
++class _AiohttpSession:
++    def __init__(self):
++        self.cookies = _CookieJar()
++
++    def get(self, url):
++        return self._request("GET", url)
++
++    def post(self, url, data=None):
++        return self._request("POST", url, data=data)
++
++    def _request(self, method, url, data=None):
++        return asyncio.run(self._request_async(method, url, data=data))
++
++    async def _request_async(self, method, url, data=None):
++        async with aiohttp.ClientSession(cookies=self.cookies.as_dict()) as session:
++            async with session.request(method, url, data=data) as response:
++                response.raise_for_status()
++                body = await response.read()
++                text = body.decode(response.charset or "utf-8", errors="replace")
++                self.cookies.update(session.cookie_jar.filter_cookies(response.url))
++                return _Response(
++                    url=str(response.url),
++                    text=text,
++                    content=body,
++                    history=[_ResponseHistory(url=str(item.url)) for item in response.history],
++                )
+ 
+ 
+ def _get_and_submit_form(
+@@ -85,10 +149,10 @@
+     username: str,
+     password: str,
+     tfa_callback,
+-    session: Optional[requests.Session] = None,
+-) -> requests.Session:
+-    """Create a requests.Session object with logged in GitHub cookies for the user."""
+-    session = session or requests.Session()
++    session: Optional[Any] = None,
++) -> Any:
++    """Create a session object with logged in GitHub cookies for the user."""
++    session = session or _AiohttpSession()
+ 
+     # Clear cookies before re-authentication
+     session.cookies.clear()
+@@ -150,7 +214,7 @@
+         username: str,
+         password: str,
+         tfa_callback=None,
+-        session: Optional[requests.Session] = None,
++        session: Optional[Any] = None,
+     ):
+         self._session = session or create_login_session(
+             username=username,
+@@ -159,7 +223,7 @@
+             session=session,
+         )
+ 
+-    def request_usage(self, enterprise_name: str, days: int = 30) -> requests.Response:
++    def request_usage(self, enterprise_name: str, days: int = 30):
+         """Requests a GitHub usage report.
+ 
+         Github will send an email link when the report is available.
+@@ -183,7 +247,7 @@
+         contact_email: str,
+         org_usage: OrganizationUsage,
+         business_name: Optional[str] = None,
+-    ) -> requests.Response:
++    ):
+         """Create the specified GitHub organization.
+ 
+         Right now, only creates free tier organizations.
+@@ -207,7 +271,7 @@
+ 
+     def install_application_in_organization(
+         self, app_name: str, org_id: int
+-    ) -> requests.Response:
++    ):
+         """Installs the specified app on the given organization."""
+         url = _INSTALL_APP_URL.format(app_name=app_name, org_id=org_id)
+ 
+@@ -223,7 +287,7 @@
+ 
+     def toggle_app_suspended(
+         self, org_name: str, app_install_id: int
+-    ) -> requests.Response:
++    ):
+         """Set this applicaiton install to be suspended or not."""
+         url = _APP_SUSPEND_URL.format(org_name=org_name, app_install_id=app_install_id)
+ 
+@@ -235,14 +299,14 @@
+ 
+     def download_usage_report(
+         self, enterprise_name: str, report_id: int
+-    ) -> requests.Response:
++    ):
+         """Download a usage report based on an id recieved in an email"""
+         url = _USAGE_REPORT_URL.format(
+             enterprise_name=enterprise_name, report_id=report_id
+         )
+         return _get_url_with_session(session=self._session, url=url)
+ 
+-    def request_dormant_users_report(self, enterprise_name: str) -> requests.Response:
++    def request_dormant_users_report(self, enterprise_name: str):
+         """Requests a GitHub dormant users report.
+ 
+         Github will send an email link when the report is available.
+@@ -256,13 +320,18 @@
+             form_matcher=lambda form: form.attrib.get("action") == action,
+         )
+ 
+-    def download_dormant_users_report(self, enterprise_name: str) -> requests.Response:
++    def download_dormant_users_report(self, enterprise_name: str):
+         """Download a usage report based on an id received in an email"""
+         url = _REQUEST_DORMANTUSERS_URL.format(enterprise_name=enterprise_name)
+         page = _get_url_with_session(session=self._session, url=url)
++        page_content = (
++            page.content.decode("utf-8", errors="replace")
++            if isinstance(page.content, bytes)
++            else page.content
++        )
+         link = re.search(
+             r"https://github.com/enterprises/alphabet/settings/dormant-users/exports/[0-9A-Fa-f]{8}\\-[0-9A-Fa-f]{4}\\-[0-9A-Fa-f]{4}\\-[0-9A-Fa-f]{4}\\-[0-9A-Fa-f]{12}",
+-            page.content,
++            page_content,
+         )
+         if link is None:
+             raise ValueError("Unable to find dormant users report link in content.")
+@@ -272,7 +341,7 @@
+         self,
+         org_name: str,
+         app_install_id: str,
+-    ) -> requests.Response:
++    ):
+         """Approve a request for updated permissions for a GitHub app installation in an org"""
+ 
+         return _get_and_submit_form(
+@@ -324,4 +393,4 @@
+         username=config["username"],
+         password=config["password"],
+         tfa_callback=lambda: pyotp.TOTP(config["otp_seed"]).now(),
+-    )+    )

@@ -1,0 +1,143 @@
+--- a/olclient/openlibrary.py
++++ b/olclient/openlibrary.py
+@@ -12,15 +12,117 @@
+ from urllib.request import pathname2url
+ 
+ import backoff
+-import requests
+-from requests import Response
++import urllib3
++from http.cookies import SimpleCookie
++from urllib.parse import parse_qsl, urlsplit, urlunsplit
+ 
+ from olclient import common
+ from olclient.config import Config
+ from olclient.entity_helpers.work import get_work_helper_class
+ from olclient.utils import merge_unique_lists
+ 
++
++class _HTTPResponseError(urllib3.exceptions.HTTPError):
++    def __init__(self, response):
++        self.response = response
++        super().__init__(f"{response.status_code} Error for url: {response.url}")
++
++
++class _ResponseAdapter:
++    def __init__(self, response, url):
++        self._response = response
++        self.url = response.geturl() if hasattr(response, 'geturl') else url
++        self.status_code = response.status
++        self.headers = response.headers
++
++    def json(self):
++        return json.loads(self._response.data.decode('utf-8'))
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise _HTTPResponseError(self)
++
++
++class _Urllib3Session:
++    def __init__(self):
++        self._pool = urllib3.PoolManager()
++        self.cookies = {}
++
++    def _cookie_header(self):
++        if not self.cookies:
++            return None
++        return '; '.join(f'{key}={value}' for key, value in self.cookies.items())
++
++    def _update_cookies(self, response):
++        set_cookie_headers = []
++        if hasattr(response.headers, 'getlist'):
++            set_cookie_headers = response.headers.getlist('Set-Cookie') or response.headers.getlist('set-cookie')
++        else:
++            header = response.headers.get('Set-Cookie') or response.headers.get('set-cookie')
++            if header:
++                set_cookie_headers = [header]
++
++        for header in set_cookie_headers:
++            cookie = SimpleCookie()
++            cookie.load(header)
++            for name, morsel in cookie.items():
++                self.cookies[name] = morsel.value
++
++    def request(self, method, url, data=None, headers=None, files=None, json_data=None, params=None):
++        request_headers = dict(headers or {})
++        cookie_header = self._cookie_header()
++        if cookie_header:
++            request_headers.setdefault('Cookie', cookie_header)
++
++        if params:
++            url_parts = urlsplit(url)
++            query = parse_qsl(url_parts.query, keep_blank_values=True)
++            if isinstance(params, dict):
++                for key, value in params.items():
++                    if isinstance(value, (list, tuple)):
++                        query.extend((key, item) for item in value)
++                    else:
++                        query.append((key, value))
++            else:
++                query.extend(params)
++            url = urlunsplit(url_parts._replace(query=urlencode(query, doseq=True)))
++
++        request_kwargs = {}
++        if json_data is not None:
++            request_kwargs['body'] = json.dumps(json_data).encode('utf-8')
++            request_headers.setdefault('Content-Type', 'application/json')
++        elif files is not None:
++            request_kwargs['fields'] = files
++            request_kwargs['encode_multipart'] = True
++        elif isinstance(data, dict):
++            request_kwargs['fields'] = data
++            request_kwargs['encode_multipart'] = False
++        elif data is not None:
++            request_kwargs['body'] = data.encode('utf-8') if isinstance(data, str) else data
++
++        response = self._pool.request(method.upper(), url, headers=request_headers, **request_kwargs)
++        self._update_cookies(response)
++        return _ResponseAdapter(response, url)
++
++    def get(self, url, **kwargs):
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, **kwargs):
++        return self.request('POST', url, **kwargs)
++
++    def put(self, url, **kwargs):
++        return self.request('PUT', url, **kwargs)
++
++
++Response = _ResponseAdapter
++
+ logger = logging.getLogger('openlibrary')
++
++
++def _should_give_up(error):
++    response = getattr(error, 'response', None)
++    status_code = getattr(response, 'status_code', None)
++    return status_code is not None and 400 <= status_code < 500
+ 
+ 
+ class OpenLibrary:
+@@ -51,9 +153,8 @@
+     VALID_IDS = ['isbn_10', 'isbn_13', 'lccn', 'ocaid']
+     BACKOFF_KWARGS = {
+         'wait_gen': backoff.expo,
+-        'exception': requests.exceptions.RequestException,
+-        'giveup': lambda e: hasattr(e.response, 'status_code')
+-        and 400 <= e.response.status_code < 500,
++        'exception': urllib3.exceptions.HTTPError,
++        'giveup': _should_give_up,
+         'max_tries': 5,
+     }
+ 
+@@ -62,7 +163,7 @@
+     WORKS_PAGINATION_OFFSET = 0
+ 
+     def __init__(self, credentials=None, base_url='https://openlibrary.org'):
+-        self.session = requests.Session()
++        self.session = _Urllib3Session()
+         self.base_url = base_url
+         credentials = credentials or Config().get_config().get('s3', None)
+         if credentials:

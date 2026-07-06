@@ -1,0 +1,154 @@
+--- a/bigcommerce/connection.py
++++ b/bigcommerce/connection.py
+@@ -6,6 +6,7 @@
+ import base64
+ import hashlib
+ import hmac
++import io
+ 
+ try:
+     from urllib import urlencode
+@@ -13,7 +14,7 @@
+     from urllib.parse import urlencode
+ 
+ import logging
+-import requests
++import pycurl
+ import jwt
+ 
+ from json import dumps, loads
+@@ -23,6 +24,107 @@
+ from bigcommerce.exception import *
+ 
+ log = logging.getLogger("bigcommerce.connection")
++
++# HTTP status reason phrases (subset covering common codes)
++_HTTP_REASON = {
++    200: 'OK', 201: 'Created', 202: 'Accepted', 204: 'No Content',
++    301: 'Moved Permanently', 302: 'Found', 304: 'Not Modified',
++    400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden',
++    404: 'Not Found', 405: 'Method Not Allowed', 409: 'Conflict',
++    422: 'Unprocessable Entity', 429: 'Too Many Requests',
++    500: 'Internal Server Error', 502: 'Bad Gateway', 503: 'Service Unavailable',
++}
++
++
++class _PyCurlResponse(object):
++    """Minimal response object that mimics requests.Response for our usage."""
++
++    def __init__(self, status_code, headers, body_bytes):
++        self.status_code = status_code
++        self.headers = headers
++        self.content = body_bytes.decode('utf-8', errors='replace') if isinstance(body_bytes, (bytes, bytearray)) else body_bytes
++        self.reason = _HTTP_REASON.get(status_code, 'Unknown')
++
++    def json(self):
++        return loads(self.content)
++
++
++class _PyCurlSession(object):
++    """
++    Session-like object wrapping pycurl.Curl that preserves the
++    requests.Session interface used by Connection and OAuthConnection.
++    """
++
++    def __init__(self):
++        self.auth = None      # (user, password) tuple or None
++        self.headers = {}     # dict of default headers
++
++    def request(self, method, url, data=None, timeout=7.0, headers=None):
++        if headers is None:
++            headers = {}
++
++        buf = io.BytesIO()
++        header_buf = io.BytesIO()
++
++        c = pycurl.Curl()
++        try:
++            c.setopt(pycurl.URL, url)
++            c.setopt(pycurl.WRITEDATA, buf)
++            c.setopt(pycurl.HEADERFUNCTION, header_buf.write)
++            c.setopt(pycurl.TIMEOUT_MS, int(timeout * 1000))
++            c.setopt(pycurl.FOLLOWLOCATION, 0)
++
++            # Basic auth
++            if self.auth:
++                user, pwd = self.auth
++                c.setopt(pycurl.USERPWD, '%s:%s' % (user, pwd))
++
++            # Merge session headers with per-request headers
++            merged_headers = {}
++            merged_headers.update(self.headers)
++            merged_headers.update(headers)
++            if merged_headers:
++                c.setopt(pycurl.HTTPHEADER,
++                         ['%s: %s' % (k, v) for k, v in merged_headers.items()])
++
++            method = method.upper()
++            if method == 'GET':
++                c.setopt(pycurl.HTTPGET, 1)
++            elif method == 'POST':
++                body = data.encode('utf-8') if isinstance(data, str) else (data or b'')
++                c.setopt(pycurl.POST, 1)
++                c.setopt(pycurl.POSTFIELDS, body)
++                c.setopt(pycurl.POSTFIELDSIZE, len(body))
++            elif method == 'PUT':
++                body = data.encode('utf-8') if isinstance(data, str) else (data or b'')
++                body_buf = io.BytesIO(body)
++                c.setopt(pycurl.UPLOAD, 1)
++                c.setopt(pycurl.READDATA, body_buf)
++                c.setopt(pycurl.INFILESIZE, len(body))
++            elif method == 'DELETE':
++                c.setopt(pycurl.CUSTOMREQUEST, 'DELETE')
++            else:
++                c.setopt(pycurl.CUSTOMREQUEST, method)
++                if data:
++                    body = data.encode('utf-8') if isinstance(data, str) else data
++                    body_buf = io.BytesIO(body)
++                    c.setopt(pycurl.READDATA, body_buf)
++                    c.setopt(pycurl.INFILESIZE, len(body))
++
++            c.perform()
++            status_code = c.getinfo(pycurl.RESPONSE_CODE)
++        finally:
++            c.close()
++
++        # Parse response headers
++        raw_headers = header_buf.getvalue().decode('iso-8859-1', errors='replace')
++        resp_headers = {}
++        for line in raw_headers.splitlines()[1:]:  # skip status line
++            if ':' in line:
++                hname, _, hval = line.partition(':')
++                resp_headers[hname.strip()] = hval.strip()
++
++        return _PyCurlResponse(status_code, resp_headers, buf.getvalue())
+ 
+ 
+ class Connection(object):
+@@ -39,7 +141,7 @@
+         log.info("API Host: %s/%s" % (self.host, self.api_path))
+ 
+         # set up the session
+-        self._session = requests.Session()
++        self._session = _PyCurlSession()
+         self._session.auth = auth
+         self._session.headers = {"Accept": "application/json"}
+ 
+@@ -196,7 +298,7 @@
+         self.timeout = 7.0  # can attach to session?
+         self.rate_limiting_management = rate_limiting_management
+ 
+-        self._session = requests.Session()
++        self._session = _PyCurlSession()
+         self._session.headers = {"Accept": "application/json",
+                                  "Accept-Encoding": "gzip"}
+         if access_token and store_hash:
+@@ -300,7 +402,7 @@
+         self.timeout = 7.0  # can attach to session?
+         self.rate_limiting_management = rate_limiting_management
+ 
+-        self._session = requests.Session()
++        self._session = _PyCurlSession()
+         self._session.headers = {"Accept": "application/json",
+                                  "Accept-Encoding": "gzip"}
+         if access_token and store_hash:

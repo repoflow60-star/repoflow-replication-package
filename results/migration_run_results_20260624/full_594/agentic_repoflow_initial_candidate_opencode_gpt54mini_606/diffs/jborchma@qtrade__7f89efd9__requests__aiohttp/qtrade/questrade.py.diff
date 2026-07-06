@@ -1,0 +1,154 @@
+--- a/qtrade/questrade.py
++++ b/qtrade/questrade.py
+@@ -1,9 +1,10 @@
+ """Core module for Questrade API wrapper."""
+ 
++import asyncio
+ import logging
+ from typing import Any, Dict, List, Optional, Union
+ 
+-import requests
++import aiohttp
+ import yaml
+ 
+ from .utility import TokenDict, get_access_token_yaml, validate_access_token
+@@ -38,7 +39,8 @@
+     ):
+         self.access_token: TokenDict
+         self.headers = None
+-        self.session = requests.Session()
++        self._loop = asyncio.new_event_loop()
++        self.session: Optional[aiohttp.ClientSession] = None
+ 
+         self.access_code = access_code
+         self.token_yaml = token_yaml
+@@ -50,13 +52,48 @@
+                 + " "
+                 + self.access_token["access_token"]
+             }
+-            # add headers to session
+-            self.session.headers.update(self.headers)
+         else:
+             self._get_access_token(save_yaml=save_yaml)
+ 
++        self._init_session()
++
+         self.account_id = None
+         self.positions = None
++
++    def _init_session(self) -> None:
++        self.session = self._loop.run_until_complete(self._create_session())
++
++    async def _create_session(self) -> aiohttp.ClientSession:
++        return aiohttp.ClientSession(headers=self.headers)
++
++    async def _request_json(
++        self,
++        method: str,
++        url: str,
++        params: Optional[Dict] = None,
++        data: Optional[Dict] = None,
++        json: Optional[Dict] = None,
++    ) -> Dict[str, Any]:
++        timeout = aiohttp.ClientTimeout(total=30)
++        if self.session is None:
++            raise RuntimeError("Session not initialized")
++        async with self.session.request(
++            method,
++            url,
++            params=params,
++            data=data,
++            json=json,
++            timeout=timeout,
++        ) as resp:
++            resp.raise_for_status()
++            return await resp.json()
++
++    async def _request_json_raw(self, url: str) -> Dict[str, Any]:
++        timeout = aiohttp.ClientTimeout(total=30)
++        async with aiohttp.ClientSession() as session:
++            async with session.get(url, timeout=timeout) as resp:
++                resp.raise_for_status()
++                return await resp.json()
+ 
+     def _send_message(
+         self,
+@@ -91,9 +128,9 @@
+         else:
+             log.error("Access token not set...")
+             raise Exception("Access token not set...")
+-        resp = self.session.request(method, url, params=params, data=data, json=json, timeout=30)
+-        resp.raise_for_status()
+-        return resp.json()
++        return self._loop.run_until_complete(
++            self._request_json(method, url, params=params, data=data, json=json)
++        )
+ 
+     def save_token_to_yaml(self, yaml_path: str = "access_token.yml"):
+         """Save the token payload as a yaml-file.
+@@ -131,9 +168,7 @@
+         """
+         url = TOKEN_URL + str(self.access_code)
+         log.info("Getting access token...")
+-        data = requests.get(url)
+-        data.raise_for_status()
+-        response = data.json()
++        response = self._loop.run_until_complete(self._request_json_raw(url))
+ 
+         # validate response
+         validate_access_token(**response)
+@@ -152,8 +187,6 @@
+             + self.access_token["access_token"]
+         }
+ 
+-        self.session.headers.update(self.headers)
+-
+         # save access token
+         if save_yaml:
+             log.info("Saving yaml file to {}...".format(yaml_path))  # pylint: disable=W1202
+@@ -191,9 +224,7 @@
+ 
+         url = TOKEN_URL + str(old_access_token["refresh_token"])
+         log.info("Refreshing access token...")
+-        data = requests.get(url)
+-        data.raise_for_status()
+-        response = data.json()
++        response = self._loop.run_until_complete(self._request_json_raw(url))
+ 
+         # validate response
+         validate_access_token(**response)
+@@ -213,7 +244,8 @@
+         }
+ 
+         # update headers
+-        self.session.headers.update(self.headers)
++        if self.session is not None:
++            self.session.headers.update(self.headers)
+ 
+         # save access token
+         if from_yaml:
+@@ -604,10 +636,7 @@
+         dict
+             Dictionary with the API response to the order submission.
+         """
+-        uri = self.access_token["api_server"] + "/v1/accounts/" + str(acct_id) + "/orders"
+         log.info("Posting order...")
+-        data = self.session.post(uri, json=order_dict)
+-        data.raise_for_status()
+         response = self._send_message(
+             "post", "accounts/" + str(acct_id) + "/orders", json=order_dict
+         )
+@@ -755,7 +784,12 @@
+ 
+     def __del__(self):
+         """Close session when class instance is deleted."""
+-        self.session.close()
++        session = getattr(self, "session", None)
++        loop = getattr(self, "_loop", None)
++        if loop is not None and not loop.is_closed():
++            if session is not None:
++                loop.run_until_complete(session.close())
++            loop.close()
+ 
+     @staticmethod
+     def _valid_intervals():

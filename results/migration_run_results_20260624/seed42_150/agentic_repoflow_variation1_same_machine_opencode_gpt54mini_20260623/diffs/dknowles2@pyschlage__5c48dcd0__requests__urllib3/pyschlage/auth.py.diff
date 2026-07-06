@@ -1,0 +1,258 @@
+--- a/pyschlage/auth.py
++++ b/pyschlage/auth.py
+@@ -2,13 +2,17 @@
+ 
+ from __future__ import annotations
+ 
++from json import JSONDecodeError, dumps, loads
+ from functools import wraps
+ from typing import Callable
++from urllib.parse import urlencode, urlsplit, urlunsplit
+ 
+ from botocore.exceptions import ClientError
+ import pycognito
+ from pycognito import utils
+-import requests
++import urllib3
++from urllib3.exceptions import HTTPError as Urllib3HTTPError
++from urllib3.response import HTTPResponse
+ 
+ from .exceptions import NotAuthorizedError, UnknownError
+ 
+@@ -26,15 +30,97 @@
+ CLIENT_SECRET = "1kfmt18bgaig51in4j4v1j3jbe7ioqtjhle5o6knqc5dat0tpuvo"
+ USER_POOL_REGION = "us-west-2"
+ USER_POOL_ID = USER_POOL_REGION + "_2zhrVs9d4"
++_POOL = urllib3.PoolManager()
++
++
++class Response:
++    """Minimal HTTP response wrapper."""
++
++    def __init__(self, response: HTTPResponse) -> None:
++        self._response = response
++
++    def __getattr__(self, name: str):
++        return getattr(self._response, name)
++
++    @property
++    def reason(self) -> str:
++        reason = getattr(self._response, "reason", None)
++        if reason:
++            return str(reason)
++        return f"HTTP {self._response.status}"
++
++    @property
++    def status(self) -> int:
++        return self._response.status
++
++    @property
++    def status_code(self) -> int:
++        return self._response.status
++
++    def json(self, **kwargs):
++        data = self._response.data
++        if not isinstance(data, (bytes, str)):
++            return data
++        if isinstance(data, bytes):
++            data = data.decode("utf-8")
++        return loads(data, **kwargs)
++
++    @property
++    def content(self):
++        return self._response.data
++
++    @property
++    def text(self):
++        data = self._response.data
++        if isinstance(data, bytes):
++            return data.decode("utf-8")
++        if data is None:
++            return ""
++        return str(data)
++
++    def raise_for_status(self) -> None:
++        if self._response.status >= 400:
++            raise Urllib3HTTPError(self.reason)
++
++
++class Request:
++    """Small request object used for signing and auth flows."""
++
++    def __init__(self, method: str | None = None, url: str | None = None) -> None:
++        self.method = method
++        self.url = url
++        self.headers: dict[str, str] = {}
++        self.body: bytes | str | None = None
++        self.data: bytes | str | None = None
++        self.params: dict[str, object] | None = None
++        self.json: object | None = None
++
++    @property
++    def path_url(self) -> str:
++        if not self.url:
++            return ""
++        split_url = urlsplit(self.url)
++        if split_url.query:
++            return f"{split_url.path}?{split_url.query}"
++        return split_url.path
++
++    def prepare(self):
++        return self
++
++    def __eq__(self, other: object) -> bool:
++        return (
++            getattr(other, "method", None) == self.method
++            and getattr(other, "url", None) == self.url
++        )
+ 
+ 
+ def _translate_auth_errors(
+     # pylint: disable=invalid-name
+-    fn: Callable[..., requests.Response],
++    fn: Callable[..., Response],
+     # pylint: enable=invalid-name
+-) -> Callable[..., requests.Response]:
++) -> Callable[..., Response]:
+     @wraps(fn)
+-    def wrapper(*args, **kwargs) -> requests.Response:
++    def wrapper(*args, **kwargs) -> Response:
+         try:
+             return fn(*args, **kwargs)
+         except ClientError as ex:
+@@ -50,21 +136,28 @@
+ 
+ def _translate_http_errors(
+     # pylint: disable=invalid-name
+-    fn: Callable[..., requests.Response],
++    fn: Callable[..., Response],
+     # pylint: enable=invalid-name
+-) -> Callable[..., requests.Response]:
++) -> Callable[..., Response]:
+     @wraps(fn)
+-    def wrapper(*args, **kwargs) -> requests.Response:
++    def wrapper(*args, **kwargs) -> Response:
+         resp = fn(*args, **kwargs)
++        status_code = getattr(resp, "status_code", None)
++        if isinstance(status_code, int) and status_code >= 400:
++            try:
++                payload = resp.json()
++                if isinstance(payload, dict):
++                    message = payload.get("message", resp.reason)
++                else:
++                    message = resp.reason
++            except (AttributeError, JSONDecodeError, TypeError, ValueError):
++                message = resp.reason
++            raise UnknownError(message)
+         try:
+             resp.raise_for_status()
+             return resp
+-        except requests.HTTPError as ex:
+-            try:
+-                message = resp.json().get("message", resp.reason)
+-            except requests.JSONDecodeError:
+-                message = resp.reason
+-            raise UnknownError(message) from ex
++        except Urllib3HTTPError as ex:
++            raise UnknownError(resp.reason) from ex
+ 
+     return wrapper
+ 
+@@ -100,7 +193,7 @@
+         :raise pyschlage.exceptions.NotAuthorizedError: When authentication fails.
+         :raise pyschlage.exceptions.UnknownError: On other errors.
+         """
+-        self.auth(requests.Request())
++        self.auth(Request())
+ 
+     @property
+     def user_id(self) -> str:
+@@ -117,15 +210,80 @@
+     @_translate_auth_errors
+     def request(
+         self, method: str, path: str, base_url: str = BASE_URL, **kwargs
+-    ) -> requests.Response:
++    ) -> Response:
+         """Performs a request against the Schlage WiFi cloud service.
+ 
+         :meta private:
+         """
+-        kwargs["auth"] = self.auth
+-        if "headers" not in kwargs:
+-            kwargs["headers"] = {}
+-        kwargs["headers"]["X-Api-Key"] = API_KEY
+-        kwargs.setdefault("timeout", _DEFAULT_TIMEOUT)
+-        # pylint: disable=missing-timeout
+-        return requests.request(method, f"{base_url}/{path.lstrip('/')}", **kwargs)
++        params = kwargs.pop("params", None)
++        body = kwargs.pop("body", kwargs.pop("data", None))
++        json_body = kwargs.pop("json", None)
++        headers = dict(kwargs.pop("headers", {}) or {})
++        timeout = kwargs.pop("timeout", _DEFAULT_TIMEOUT)
++
++        for key in (
++            "auth",
++            "allow_redirects",
++            "cert",
++            "cookies",
++            "files",
++            "hooks",
++            "proxies",
++            "stream",
++            "trust_env",
++            "verify",
++        ):
++            kwargs.pop(key, None)
++
++        url = f"{base_url}/{path.lstrip('/')}"
++        if params:
++            split_url = urlsplit(url)
++            query = urlencode(params, doseq=True)
++            if split_url.query:
++                query = f"{split_url.query}&{query}"
++            url = urlunsplit(
++                (
++                    split_url.scheme,
++                    split_url.netloc,
++                    split_url.path,
++                    query,
++                    split_url.fragment,
++                )
++            )
++
++        if json_body is not None:
++            body = dumps(json_body).encode("utf-8")
++            headers.setdefault("Content-Type", "application/json")
++        elif isinstance(body, str):
++            body = body.encode("utf-8")
++        elif isinstance(body, (dict, list, tuple)):
++            body = urlencode(body, doseq=True).encode("utf-8")
++            headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
++        elif body is not None and not isinstance(body, bytes):
++            body = str(body).encode("utf-8")
++
++        headers["X-Api-Key"] = API_KEY
++
++        request = Request(method, url)
++        request.headers.update(headers)
++        request.body = body
++        request.data = body
++        request.params = params
++        request.json = json_body
++        for key, value in kwargs.items():
++            setattr(request, key, value)
++
++        signed_request = self.auth(request)
++        if signed_request is not None:
++            request = signed_request
++
++        request_method = str(getattr(request, "method", None) or method).upper()
++        response = _POOL.request(
++            request_method,
++            getattr(request, "url", None) or url,
++            body=getattr(request, "body", None),
++            headers=dict(getattr(request, "headers", {}) or {}),
++            timeout=timeout,
++            retries=False,
++        )
++        return Response(response)

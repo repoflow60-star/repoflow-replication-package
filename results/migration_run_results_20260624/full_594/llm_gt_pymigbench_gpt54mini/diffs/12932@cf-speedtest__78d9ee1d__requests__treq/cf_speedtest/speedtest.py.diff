@@ -1,0 +1,279 @@
+--- a/cf_speedtest/speedtest.py
++++ b/cf_speedtest/speedtest.py
+@@ -7,13 +7,15 @@
+ import time
+ from timeit import default_timer as timer
+ 
+-import requests
++import treq
+ import urllib3
++from twisted.internet import defer
++from twisted.internet.task import react
+ 
+ import cf_speedtest.locations as locations
+ import cf_speedtest.options as options
+ 
+-REQ_SESSION = requests.Session()
++REQ_SESSION = None
+ 
+ CGI_ENDPOINT = 'https://speed.cloudflare.com/cdn-cgi/trace'
+ DOWNLOAD_ENDPOINT = 'https://speed.cloudflare.com/__down?measId=0&bytes={}'
+@@ -58,19 +60,22 @@
+ # given an amount of bytes, upload it and return the elapsed seconds taken
+ 
+ 
++@defer.inlineCallbacks
+ def upload_test(total_bytes: int) -> int | float:
+     start = timer()
+ 
+-    r = REQ_SESSION.post(
++    r = yield treq.post(
+         UPLOAD_ENDPOINT, data=bytearray(
+             total_bytes,
+         ), headers=UPLOAD_HEADERS, verify=VERIFY_SSL, proxies=PROXY_DICT,
+     )
+-    r.raise_for_status()
++    if r.code >= 400:
++        raise Exception(f'HTTP error {r.code}')
+     total_time_taken = timer() - start
+ 
+     # trust what the server says as time taken
+-    server_time_taken = get_server_timing(r.headers['Server-Timing'])
++    server_timing = yield treq.get_header(r, 'Server-Timing')
++    server_time_taken = get_server_timing(server_timing)
+ 
+     if OUTPUT_FILE:
+         with open(OUTPUT_FILE, 'a', encoding='utf-8') as datafile:
+@@ -78,22 +83,26 @@
+                 f'{time.time()},up,{total_bytes},{total_time_taken},{server_time_taken}\n',
+             )
+ 
+-    return total_bytes, server_time_taken
++    defer.returnValue((total_bytes, server_time_taken))
+ 
+ # given an amount of bytes, download it and return the elapsed seconds taken
+ 
+ 
++@defer.inlineCallbacks
+ def download_test(total_bytes: int) -> int | float:
+     endpoint = DOWNLOAD_ENDPOINT.format(total_bytes)
+     start = timer()
+ 
+-    r = REQ_SESSION.get(endpoint, verify=VERIFY_SSL, proxies=PROXY_DICT)
+-    r.raise_for_status()
++    r = yield treq.get(endpoint, verify=VERIFY_SSL, proxies=PROXY_DICT)
++    if r.code >= 400:
++        raise Exception(f'HTTP error {r.code}')
+ 
+     total_time_taken = timer() - start
+ 
+-    content_size = len(r.content)
+-    server_time_taken = get_server_timing(r.headers['Server-Timing'])
++    content = yield treq.content(r)
++    content_size = len(content)
++    server_timing = yield treq.get_header(r, 'Server-Timing')
++    server_time_taken = get_server_timing(server_timing)
+ 
+     if OUTPUT_FILE:
+         with open(OUTPUT_FILE, 'a', encoding='utf-8') as datafile:
+@@ -101,37 +110,43 @@
+                 f'{time.time()},down,{content_size},{total_time_taken},{server_time_taken}\n',
+             )
+ 
+-    return content_size, total_time_taken - server_time_taken
++    defer.returnValue((content_size, total_time_taken - server_time_taken))
+ 
+ # calculates http "latency" by measuring download of an empty payload
+ 
+ 
++@defer.inlineCallbacks
+ def latency_test() -> float:
+     endpoint = DOWNLOAD_ENDPOINT.format(0)
+ 
+     start = timer()
+-    r = REQ_SESSION.get(endpoint, verify=VERIFY_SSL,  proxies=PROXY_DICT)
+-    r.raise_for_status()
++    r = yield treq.get(endpoint, verify=VERIFY_SSL,  proxies=PROXY_DICT)
++    if r.code >= 400:
++        raise Exception(f'HTTP error {r.code}')
+ 
+     total_time_taken = timer() - start
+-    server_time_taken = get_server_timing(r.headers['Server-Timing'])
++    server_timing = yield treq.get_header(r, 'Server-Timing')
++    server_time_taken = get_server_timing(server_timing)
+ 
+     if OUTPUT_FILE:
++        content = yield treq.content(r)
+         with open(OUTPUT_FILE, 'a', encoding='utf-8') as datafile:
+             datafile.write(
+-                f'{time.time()},down,{len(r.content)},{total_time_taken},{server_time_taken}\n',
+-            )
+-
+-    return total_time_taken - server_time_taken
++                f'{time.time()},down,{len(content)},{total_time_taken},{server_time_taken}\n',
++            )
++
++    defer.returnValue(total_time_taken - server_time_taken)
+ 
+ # See https://speed.cloudflare.com/cdn-cgi/trace
+ 
+ 
++@defer.inlineCallbacks
+ def get_our_country() -> str:
+-    r = REQ_SESSION.get(CGI_ENDPOINT, verify=VERIFY_SSL,  proxies=PROXY_DICT)
+-    r.raise_for_status()
+-
+-    cgi_data = r.text
++    r = yield treq.get(CGI_ENDPOINT, verify=VERIFY_SSL,  proxies=PROXY_DICT)
++    if r.code >= 400:
++        raise Exception(f'HTTP error {r.code}')
++
++    cgi_data = yield treq.text(r)
+     cgi_dict = {
+         k: v for k, v in [
+             line.split(
+@@ -140,16 +155,18 @@
+         ]
+     }
+ 
+-    return cgi_dict.get('loc') or 'Unknown'
+-
+-
++    defer.returnValue(cgi_dict.get('loc') or 'Unknown')
++
++
++@defer.inlineCallbacks
+ def preamble() -> str:
+-    r = REQ_SESSION.get(
++    r = yield treq.get(
+         DOWNLOAD_ENDPOINT.format(
+             0,
+         ), verify=VERIFY_SSL,  proxies=PROXY_DICT,
+     )
+-    r.raise_for_status()
++    if r.code >= 400:
++        raise Exception(f'HTTP error {r.code}')
+ 
+     our_ip = r.headers.get('cf-meta-ip')
+     colo = r.headers.get('cf-meta-colo')
+@@ -161,34 +178,36 @@
+             ) or 'Unknown' for loc in locations.SERVER_LOCATIONS if loc['iata'] == colo.upper()
+         ), 'Unknown',
+     )
+-    preamble_str = f'Your IP:\t{our_ip} ({get_our_country()})\nServer loc:\t{server_city} ({colo}) - ({server_country})'
+-
+-    return preamble_str
++    preamble_str = f'Your IP:\t{our_ip} ({yield get_our_country()})\nServer loc:\t{server_city} ({colo}) - ({server_country})'
++
++    defer.returnValue(preamble_str)
+ 
+ # runs x amount of y-byte tests, given a test_type ("down" or "up")
+ # returns a list of measurements in bits per second
+ 
+ 
++@defer.inlineCallbacks
+ def run_tests(test_type: str, bytes_to_xfer: int, iteration_count: int = 8) -> list:
+     measurements = []
+ 
+     for i in range(0, iteration_count):
+         if test_type == 'down':
+-            xferd_bytes_total, seconds_taken = download_test(bytes_to_xfer)
++            xferd_bytes_total, seconds_taken = yield download_test(bytes_to_xfer)
+         elif test_type == 'up':
+-            xferd_bytes_total, seconds_taken = upload_test(bytes_to_xfer)
++            xferd_bytes_total, seconds_taken = yield upload_test(bytes_to_xfer)
+         else:
+-            return measurements
++            defer.returnValue(measurements)
+ 
+         bits_per_second = (int(xferd_bytes_total) / seconds_taken) * 8
+         measurements.append(bits_per_second)
+ 
+-    return measurements
++    defer.returnValue(measurements)
+ 
+ # runs a standard test of upload and download, similar to what
+ # simulates what is ran on speed.cloudflare.com
+ 
+ 
++@defer.inlineCallbacks
+ def run_standard_test(
+     measurement_sizes: list,
+     measurement_percentile: int = 90,
+@@ -200,11 +219,11 @@
+     UPLOAD_MEASUREMENTS = []
+ 
+     if verbose:
+-        print(preamble(), '\n')
+-
+-    latency_test()  # ignore first request as it contains http connection setup
++        print(yield preamble(), '\n')
++
++    yield latency_test()  # ignore first request as it contains http connection setup
+     for i in range(0, 20):
+-        LATENCY_MEASUREMENTS.append(latency_test() * 1000)
++        LATENCY_MEASUREMENTS.append((yield latency_test()) * 1000)
+ 
+     # Assume the median latency is our latency (just like the website)
+     latency = percentile(LATENCY_MEASUREMENTS, 50)
+@@ -235,7 +254,7 @@
+ 
+         if continue_dl_test:
+             # print(f"Testing download ({measurement / 1_000_000:.2f}MiB) ({download_test_count} time(s))")
+-            DOWNLOAD_MEASUREMENTS += run_tests(
++            DOWNLOAD_MEASUREMENTS += yield run_tests(
+                 'down',
+                 measurement, download_test_count,
+             )
+@@ -257,7 +276,7 @@
+ 
+         if continue_ul_test:
+             # print(f"Testing upload ({measurement / 1_000_000:.2f}MiB) ({upload_test_count} time(s))")
+-            UPLOAD_MEASUREMENTS += run_tests(
++            UPLOAD_MEASUREMENTS += yield run_tests(
+                 'up',
+                 measurement, upload_test_count,
+             )
+@@ -277,7 +296,7 @@
+     download_stdev = statistics.stdev(DOWNLOAD_MEASUREMENTS)
+     upload_stdev = statistics.stdev(UPLOAD_MEASUREMENTS)
+ 
+-    return {
++    defer.returnValue({
+         'download_measurements': DOWNLOAD_MEASUREMENTS,
+         'upload_measurements': UPLOAD_MEASUREMENTS,
+         'latency_measurements': LATENCY_MEASUREMENTS,
+@@ -285,9 +304,10 @@
+         'upload_speed': pctile_upload,
+         'download_stdev': download_stdev,
+         'upload_stdev': upload_stdev,
+-    }
+-
+-
++    })
++
++
++@defer.inlineCallbacks
+ def main(argv=None) -> int:
+     global PROXY_DICT, VERIFY_SSL, OUTPUT_FILE
+     # disable annoying warning when using verify=False in requests.get("x", verify=False)
+@@ -333,7 +353,7 @@
+             250_000_000,
+         ]
+ 
+-    speeds = run_standard_test(measurement_sizes, percentile, True, patience)
++    speeds = yield run_standard_test(measurement_sizes, percentile, True, patience)
+ 
+     d = speeds['download_speed']
+     u = speeds['upload_speed']
+@@ -345,8 +365,8 @@
+         f'Up: {u/1_000_000:.2f} Mbit/sec',
+     )
+ 
+-    return 0
++    defer.returnValue(0)
+ 
+ 
+ if __name__ == '__main__':
+-    raise SystemExit(main())
++    raise SystemExit(react(main))

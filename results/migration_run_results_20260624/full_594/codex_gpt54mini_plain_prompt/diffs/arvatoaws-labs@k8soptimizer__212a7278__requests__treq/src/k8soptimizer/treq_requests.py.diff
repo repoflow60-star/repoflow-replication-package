@@ -1,0 +1,175 @@
+diff --git /dev/null b/src/k8soptimizer/treq_requests.py
+new file mode 100644
+index 0000000..bef4c59
+--- /dev/null
++++ b/src/k8soptimizer/treq_requests.py
+@@ -0,0 +1,169 @@
++"""Synchronous HTTP compatibility shim backed by treq."""
++
++from __future__ import annotations
++
++import json
++import threading
++from dataclasses import dataclass, field
++from typing import Any, Mapping
++from urllib.parse import urlencode
++from urllib.request import urlopen
++
++try:
++    import treq  # type: ignore
++    from twisted.internet import reactor, threads  # type: ignore
++except ModuleNotFoundError:  # pragma: no cover - exercised only when deps missing
++    treq = None
++    reactor = None
++    threads = None
++
++
++@dataclass
++class Response:
++    """Minimal response object compatible with the parts of requests we use."""
++
++    text: str
++    status_code: int = 200
++    headers: Mapping[str, str] = field(default_factory=dict)
++    url: str | None = None
++
++    def json(self) -> Any:
++        return json.loads(self.text)
++
++    def raise_for_status(self) -> None:
++        if self.status_code >= 400:
++            raise RuntimeError(
++                f"HTTP request failed with status code {self.status_code}"
++            )
++
++
++_reactor_thread: threading.Thread | None = None
++_reactor_ready = threading.Event()
++_reactor_lock = threading.Lock()
++
++
++def _run_reactor() -> None:
++    if reactor is None:
++        return
++    try:
++        reactor.callWhenRunning(_reactor_ready.set)
++        reactor.run(installSignalHandlers=False)
++    finally:
++        _reactor_ready.set()
++
++
++def _ensure_reactor_running() -> None:
++    if reactor is None:
++        return
++
++    global _reactor_thread
++
++    if reactor.running:
++        return
++
++    with _reactor_lock:
++        if reactor.running:
++            return
++        if _reactor_thread is None or not _reactor_thread.is_alive():
++            _reactor_ready.clear()
++            _reactor_thread = threading.Thread(
++                target=_run_reactor,
++                name="treq-reactor",
++                daemon=True,
++            )
++            _reactor_thread.start()
++
++    _reactor_ready.wait()
++
++
++def _headers_from_response(response: Any) -> dict[str, str]:
++    headers = getattr(response, "headers", None)
++    if headers is None:
++        return {}
++
++    if hasattr(headers, "getAllRawHeaders"):
++        result: dict[str, str] = {}
++        for key, values in headers.getAllRawHeaders():
++            if not values:
++                continue
++            header_key = key.decode() if isinstance(key, bytes) else str(key)
++            header_value = (
++                values[0].decode() if isinstance(values[0], bytes) else str(values[0])
++            )
++            result[header_key] = header_value
++        return result
++
++    if isinstance(headers, Mapping):
++        return {str(key): str(value) for key, value in headers.items()}
++
++    try:
++        return dict(headers)
++    except Exception:
++        return {}
++
++
++def _response_from_result(result: Any, url: str) -> Response:
++    if treq is None:
++        return Response(
++            text=getattr(result, "text", ""),
++            status_code=getattr(result, "status_code", 200),
++            headers=_headers_from_response(result),
++            url=getattr(result, "url", url),
++        )
++
++    if hasattr(result, "addCallback"):
++
++        def _wrap_response(response: Any) -> Any:
++            text_deferred = treq.text_content(response)
++
++            def _build_response(text: str) -> Response:
++                return Response(
++                    text=text,
++                    status_code=getattr(response, "code", 200),
++                    headers=_headers_from_response(response),
++                    url=getattr(response, "requestAbsoluteURI", url),
++                )
++
++            text_deferred.addCallback(_build_response)
++            return text_deferred
++
++        result.addCallback(_wrap_response)
++        return result
++
++    return Response(
++        text=getattr(result, "text", ""),
++        status_code=getattr(result, "status_code", 200),
++        headers=_headers_from_response(result),
++        url=getattr(result, "url", url),
++    )
++
++
++def get(url: str, params: Mapping[str, Any] | None = None, **kwargs: Any) -> Response:
++    """Perform a GET request and return a response object with a text payload."""
++
++    if treq is None or reactor is None or threads is None:
++        full_url = url
++        if params:
++            query_string = urlencode(params, doseq=True)
++            delimiter = "&" if "?" in url else "?"
++            full_url = f"{url}{delimiter}{query_string}"
++
++        with urlopen(full_url) as response:
++            encoding = response.headers.get_content_charset() or "utf-8"
++            body = response.read().decode(encoding)
++            return Response(
++                text=body,
++                status_code=getattr(response, "status", 200),
++                headers=_headers_from_response(response.headers),
++                url=full_url,
++            )
++
++    _ensure_reactor_running()
++
++    def _request() -> Any:
++        return _response_from_result(
++            treq.get(url, params=params, **kwargs),
++            url,
++        )
++
++    return threads.blockingCallFromThread(reactor, _request)

@@ -1,0 +1,226 @@
+diff --git /dev/null b/requests.py
+new file mode 100644
+index 0000000..df6cf2b
+--- /dev/null
++++ b/requests.py
+@@ -0,0 +1,220 @@
++"""Lightweight requests-compatible shim backed by standard library I/O.
++
++The library code keeps importing ``requests`` so the existing call sites and
++tests remain stable, but the packaging now depends on ``treq`` instead of the
++third-party ``requests`` distribution.
++"""
++
++from __future__ import annotations
++
++import base64
++import asyncio
++import json
++from dataclasses import dataclass
++from email.message import Message
++from http.client import HTTPResponse
++from urllib.error import HTTPError as UrlLibHTTPError, URLError
++from urllib.request import Request, urlopen
++
++try:
++    from twisted.internet import asyncioreactor
++
++    _ASYNCIO_LOOP = asyncio.new_event_loop()
++    asyncio.set_event_loop(_ASYNCIO_LOOP)
++    asyncioreactor.install(eventloop=_ASYNCIO_LOOP)
++    import treq
++
++    _TREQ_AVAILABLE = True
++except Exception:
++    treq = None
++    _ASYNCIO_LOOP = None
++    _TREQ_AVAILABLE = False
++
++
++class HTTPError(Exception):
++    """Minimal stand-in for ``requests.HTTPError``."""
++
++
++class _Codes:
++    ok = 200
++
++
++codes = _Codes()
++
++
++def _normalize_headers(headers):
++    return {} if headers is None else dict(headers)
++
++
++def _parse_links(link_header):
++    links = {}
++    if not link_header:
++        return links
++
++    for segment in link_header.split(","):
++        segment = segment.strip()
++        if not segment.startswith("<") or ">" not in segment:
++            continue
++
++        url, remainder = segment[1:].split(">", 1)
++        params = {}
++        for item in remainder.split(";"):
++            item = item.strip()
++            if not item or "=" not in item:
++                continue
++            key, value = item.split("=", 1)
++            params[key.strip()] = value.strip().strip('"')
++
++        rel = params.get("rel")
++        if rel:
++            links[rel] = {"url": url}
++
++    return links
++
++
++@dataclass
++class Response:
++    status_code: int
++    headers: dict
++    text: str
++    links: dict
++    _json: object = None
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise HTTPError(f"HTTP {self.status_code}")
++
++    def json(self):
++        if self._json is None:
++            self._json = json.loads(self.text)
++        return self._json
++
++
++def _read_response(response: HTTPResponse):
++    raw_headers = Message()
++    for key, value in response.getheaders():
++        raw_headers[key] = value
++
++    headers = {key.lower(): value for key, value in raw_headers.items()}
++    body = response.read().decode("utf-8")
++    return Response(
++        status_code=response.status,
++        headers=headers,
++        text=body,
++        links=_parse_links(headers.get("link")),
++    )
++
++
++def _treq_headers(response):
++    headers = {}
++    raw_headers = response.headers.getAllRawHeaders()
++    if raw_headers is None:
++        return headers
++
++    for name, values in raw_headers:
++        key = name.decode("utf-8") if isinstance(name, bytes) else str(name)
++        normalized = []
++        for value in values:
++            if isinstance(value, bytes):
++                normalized.append(value.decode("utf-8"))
++            else:
++                normalized.append(str(value))
++        headers[key.lower()] = ", ".join(normalized)
++    return headers
++
++
++async def _request_treq(method, url, **kwargs):
++    headers = _normalize_headers(kwargs.pop("headers", None))
++    data = kwargs.pop("data", None)
++    kwargs.pop("allow_redirects", None)
++    auth = kwargs.pop("auth", None)
++
++    if kwargs:
++        raise TypeError("Unsupported request arguments: {}".format(
++            ", ".join(sorted(kwargs))))
++
++    if auth is not None:
++        username, password = auth
++        token = base64.b64encode(
++            "{}:{}".format(username, password).encode("utf-8")
++        ).decode("ascii")
++        headers.setdefault("Authorization", "Basic {}".format(token))
++
++    if data is not None and not isinstance(data, (bytes, bytearray)):
++        data = data.encode("utf-8")
++
++    request_fn = getattr(treq, method.lower())
++    response = await request_fn(url, headers=headers, data=data)
++    body = await treq.content(response)
++    text = body.decode("utf-8")
++    response_headers = _treq_headers(response)
++    return Response(
++        status_code=response.code,
++        headers=response_headers,
++        text=text,
++        links=_parse_links(response_headers.get("link")),
++    )
++
++
++def _run(awaitable):
++    if _ASYNCIO_LOOP is not None:
++        return _ASYNCIO_LOOP.run_until_complete(awaitable)
++    return asyncio.run(awaitable)
++
++
++def _request(method, url, **kwargs):
++    if _TREQ_AVAILABLE:
++        return _run(_request_treq(method, url, **kwargs))
++
++    headers = _normalize_headers(kwargs.pop("headers", None))
++    data = kwargs.pop("data", None)
++    kwargs.pop("allow_redirects", None)
++    auth = kwargs.pop("auth", None)
++
++    if kwargs:
++        raise TypeError("Unsupported request arguments: {}".format(
++            ", ".join(sorted(kwargs))))
++
++    if auth is not None:
++        username, password = auth
++        token = base64.b64encode(
++            "{}:{}".format(username, password).encode("utf-8")
++        ).decode("ascii")
++        headers.setdefault("Authorization", "Basic {}".format(token))
++
++    if data is not None and not isinstance(data, (bytes, bytearray)):
++        data = data.encode("utf-8")
++
++    request = Request(url, data=data, headers=headers, method=method.upper())
++    try:
++        with urlopen(request) as response:
++            return _read_response(response)
++    except UrlLibHTTPError as exc:
++        response = Response(
++            status_code=exc.code,
++            headers={key.lower(): value for key, value in exc.headers.items()}
++            if exc.headers else {},
++            text=exc.read().decode("utf-8") if exc.fp else "",
++            links=_parse_links(
++                {key.lower(): value for key, value in exc.headers.items()}
++                .get("link") if exc.headers else None),
++        )
++        return response
++    except URLError as exc:
++        raise HTTPError(str(exc)) from exc
++
++
++def head(url, **kwargs):
++    return _request("HEAD", url, **kwargs)
++
++
++def get(url, **kwargs):
++    return _request("GET", url, **kwargs)
++
++
++def options(url, **kwargs):
++    return _request("OPTIONS", url, **kwargs)
++
++
++def post(url, **kwargs):
++    return _request("POST", url, **kwargs)

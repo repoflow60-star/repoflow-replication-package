@@ -1,0 +1,225 @@
+diff --git /dev/null b/httpx.py
+new file mode 100644
+index 0000000..fb0ef93
+--- /dev/null
++++ b/httpx.py
+@@ -0,0 +1,219 @@
++"""Minimal httpx-compatible helpers used by this repository.
++
++This module implements the small subset of the ``httpx`` API that the codebase
++needs: ``get``, ``post``, ``head`` and a response object with status, headers,
++content, JSON parsing, redirect detection, and byte iteration.
++
++The implementation is intentionally lightweight so the repository can run even
++when the external ``httpx`` package is not available in the execution
++environment.
++"""
++
++from __future__ import annotations
++
++import io
++import json
++import socket
++import ssl
++import urllib.error
++import urllib.parse
++import urllib.request
++
++
++class RequestError(Exception):
++    """Base exception for request failures."""
++
++
++class TimeoutException(RequestError):
++    """Raised when a request times out."""
++
++
++class HTTPStatusError(RequestError):
++    """Raised by :meth:`Response.raise_for_status` for HTTP error codes."""
++
++    def __init__(self, message, response=None):
++        super().__init__(message)
++        self.response = response
++
++
++class Headers(dict):
++    """Simple case-insensitive header mapping."""
++
++    def __init__(self, mapping=None):
++        super().__init__()
++        if mapping:
++            for key, value in mapping.items():
++                self[key] = value
++
++    def __setitem__(self, key, value):
++        super().__setitem__(key.lower(), value)
++
++    def __getitem__(self, key):
++        return super().__getitem__(key.lower())
++
++    def get(self, key, default=None):
++        return super().get(key.lower(), default)
++
++    def __contains__(self, key):
++        return super().__contains__(key.lower())
++
++
++class Response:
++    """Small HTTP response wrapper."""
++
++    def __init__(self, status_code, headers=None, content=b"", url=None):
++        self.status_code = status_code
++        self.headers = Headers(headers or {})
++        self.content = content or b""
++        self.url = url
++        self.is_closed = False
++
++    @property
++    def is_redirect(self):
++        return 300 <= self.status_code < 400 and self.headers.get("location") is not None
++
++    @property
++    def encoding(self):
++        content_type = self.headers.get("content-type")
++        if not content_type:
++            return None
++        parts = [part.strip() for part in content_type.split(";")]
++        for part in parts[1:]:
++            if part.lower().startswith("charset="):
++                return part.split("=", 1)[1].strip().strip('"')
++        return None
++
++    @property
++    def text(self):
++        encoding = self.encoding or "utf-8"
++        return self.content.decode(encoding, errors="replace")
++
++    def json(self):
++        return json.loads(self.text)
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise HTTPStatusError(
++                "HTTP error {} for url {}".format(self.status_code, self.url or ""),
++                response=self,
++            )
++
++    def iter_bytes(self, chunk_size=65536):
++        for start in range(0, len(self.content), chunk_size):
++            yield self.content[start:start + chunk_size]
++
++    def close(self):
++        self.is_closed = True
++
++
++class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
++    def redirect_request(self, req, fp, code, msg, headers, newurl):
++        return None
++
++
++def _ssl_context(verify):
++    if not verify:
++        return ssl._create_unverified_context()
++    return ssl.create_default_context()
++
++
++def _prepare_url(url, params):
++    if not params:
++        return url
++    query = urllib.parse.urlencode(params, doseq=True)
++    separator = "&" if urllib.parse.urlparse(url).query else "?"
++    return url + separator + query
++
++
++def _prepare_data(data):
++    if data is None:
++        return None
++    if isinstance(data, bytes):
++        return data
++    if isinstance(data, str):
++        return data.encode("utf-8")
++    if isinstance(data, dict):
++        return urllib.parse.urlencode(data, doseq=True).encode("utf-8")
++    return data
++
++
++def _build_response(source, url):
++    if isinstance(source, urllib.error.HTTPError):
++        content = source.read() or b""
++        headers = dict(source.headers.items())
++        response = Response(source.code, headers=headers, content=content, url=url)
++        source.close()
++        return response
++
++    content = source.read() or b""
++    headers = dict(source.headers.items())
++    return Response(getattr(source, "status", source.getcode()), headers=headers, content=content, url=source.geturl())
++
++
++def _open_request(req, timeout, verify, follow_redirects):
++    context = _ssl_context(verify)
++    if follow_redirects:
++        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=context))
++        return opener.open(req, timeout=timeout)
++    opener = urllib.request.build_opener(
++        _NoRedirectHandler(),
++        urllib.request.HTTPSHandler(context=context),
++    )
++    return opener.open(req, timeout=timeout)
++
++
++def request(method, url, *, params=None, data=None, headers=None, verify=True, timeout=None, follow_redirects=True):
++    url = _prepare_url(url, params)
++    req = urllib.request.Request(
++        url,
++        data=_prepare_data(data),
++        headers=headers or {},
++        method=method.upper(),
++    )
++
++    try:
++        source = _open_request(req, timeout, verify, follow_redirects)
++    except urllib.error.HTTPError as error:
++        return _build_response(error, req.full_url)
++    except urllib.error.URLError as error:
++        if isinstance(error.reason, (socket.timeout, TimeoutError)):
++            raise TimeoutException(str(error.reason))
++        raise RequestError(str(error.reason))
++
++    with source:
++        return _build_response(source, req.full_url)
++
++
++def get(url, *, params=None, headers=None, verify=True, timeout=None, follow_redirects=True):
++    return request(
++        "GET",
++        url,
++        params=params,
++        headers=headers,
++        verify=verify,
++        timeout=timeout,
++        follow_redirects=follow_redirects,
++    )
++
++
++def post(url, *, data=None, headers=None, verify=True, timeout=None, follow_redirects=True):
++    return request(
++        "POST",
++        url,
++        data=data,
++        headers=headers,
++        verify=verify,
++        timeout=timeout,
++        follow_redirects=follow_redirects,
++    )
++
++
++def head(url, *, headers=None, verify=True, timeout=None, follow_redirects=False):
++    return request(
++        "HEAD",
++        url,
++        headers=headers,
++        verify=verify,
++        timeout=timeout,
++        follow_redirects=follow_redirects,
++    )

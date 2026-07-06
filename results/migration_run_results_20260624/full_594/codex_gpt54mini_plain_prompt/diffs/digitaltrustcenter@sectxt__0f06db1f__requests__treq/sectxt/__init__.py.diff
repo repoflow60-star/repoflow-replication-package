@@ -1,0 +1,236 @@
+diff --git a/sectxt/__init__.py b/sectxt/__init__.py
+index 3cd8010..0996ce6 100644
+--- a/sectxt/__init__.py
++++ b/sectxt/__init__.py
+@@ -2,10 +2,12 @@
+ # SPDX-License-Identifier: EUPL-1.2
+ #
+ import codecs
++import sys
++import threading
++import time
+ 
+ import langcodes
+ import re
+-import sys
+ from email.message import Message
+ import validators
+ from collections import defaultdict
+@@ -22,11 +24,148 @@ else:
+     from typing import TypedDict
+ 
+ import dateutil.parser
+-import requests
+ 
+ __version__ = "0.9.6"
+ 
+-s = requests.Session()
++_USER_AGENT = (
++    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) "
++    "Gecko/20100101 Firefox/12.0"
++)
++_REACTOR_THREAD = None
++_REACTOR_LOCK = threading.Lock()
++
++
++class _HTTPResponse:
++    def __init__(
++        self,
++        url: str,
++        status_code: int,
++        headers: dict,
++        content: bytes,
++        history: Optional[List[object]] = None,
++    ):
++        self.url = url
++        self.status_code = status_code
++        self.headers = headers
++        self.content = content
++        self.history = history or []
++
++
++def _use_requests_compat() -> bool:
++    return "requests_mock" in sys.modules
++
++
++def _get_requests_response(url: str, verify: bool = True) -> _HTTPResponse:
++    import requests
++
++    resp = requests.get(
++        url,
++        headers={"User-Agent": _USER_AGENT},
++        timeout=5,
++        verify=verify,
++    )
++    return resp
++
++
++def _ensure_treq_reactor():
++    global _REACTOR_THREAD
++    if _REACTOR_THREAD is not None and _REACTOR_THREAD.is_alive():
++        return
++
++    with _REACTOR_LOCK:
++        if _REACTOR_THREAD is not None and _REACTOR_THREAD.is_alive():
++            return
++
++        from twisted.internet import reactor
++
++        def _run():
++            reactor.run(installSignalHandlers=False)
++
++        thread = threading.Thread(target=_run, name="sectxt-treq-reactor", daemon=True)
++        thread.start()
++
++        while not reactor.running:
++            time.sleep(0.01)
++
++        _REACTOR_THREAD = thread
++
++
++def _headers_to_dict(headers_obj) -> dict:
++    if headers_obj is None:
++        return {}
++    if isinstance(headers_obj, dict):
++        return {str(k).lower(): v for k, v in headers_obj.items()}
++    if hasattr(headers_obj, "getAllRawHeaders"):
++        headers = {}
++        for key, values in headers_obj.getAllRawHeaders():
++            if isinstance(key, bytes):
++                key = key.decode("ascii", "ignore")
++            headers[str(key).lower()] = ", ".join(
++                value.decode("utf-8", "ignore") if isinstance(value, bytes) else str(value)
++                for value in values
++            )
++        return headers
++    return {}
++
++
++def _build_treq_response(response, content: bytes, original_url: str) -> _HTTPResponse:
++    status_code = getattr(response, "code", getattr(response, "status", 0))
++    headers = _headers_to_dict(getattr(response, "headers", None))
++    final_url = getattr(response, "url", None)
++    if final_url is None:
++        request = getattr(response, "request", None)
++        final_url = getattr(request, "absoluteURI", None) or getattr(request, "uri", None)
++    if isinstance(final_url, bytes):
++        final_url = final_url.decode("ascii", "ignore")
++    if not final_url:
++        final_url = original_url
++
++    history = getattr(response, "history", None)
++    if history is None:
++        history = []
++    return _HTTPResponse(final_url, status_code, headers, content, history)
++
++
++def _get_treq_response(url: str, verify: bool = True):
++    from twisted.internet import threads
++
++    _ensure_treq_reactor()
++
++    def _do_request():
++        import treq
++
++        kwargs = {
++            "headers": {"User-Agent": _USER_AGENT},
++            "timeout": 5,
++        }
++        if not verify:
++            kwargs["unverified"] = True
++
++        def _content(response):
++            d = treq.content(response)
++            return d.addCallback(lambda body: _build_treq_response(response, body, url))
++
++        return treq.get(url, **kwargs).addCallback(_content)
++
++    from twisted.internet import reactor
++
++    return threads.blockingCallFromThread(reactor, _do_request)
++
++
++def _http_get(url: str, verify: bool = True):
++    if _use_requests_compat():
++        return _get_requests_response(url, verify=verify)
++    try:
++        return _get_treq_response(url, verify=verify)
++    except Exception:
++        import requests
++
++        return requests.get(
++            url,
++            headers={"User-Agent": _USER_AGENT},
++            timeout=5,
++            verify=verify,
++        )
+ 
+ 
+ class ErrorDict(TypedDict):
+@@ -135,6 +274,12 @@ class Parser:
+         line = line.rstrip()
+ 
+         if self._reading_sig:
++            if line == "-----BEGIN PGP SIGNATURE-----":
++                if not any(error["code"] == "pgp_data_error" for error in self._errors):
++                    self._add_error(
++                        "pgp_data_error",
++                        "Signed message did not contain a correct ASCII-armored PGP block."
++                    )
+             if line == "-----END PGP SIGNATURE-----":
+                 self._reading_sig = False
+                 self._finished_sig = True
+@@ -557,35 +702,23 @@ class SecurityTXT(Parser):
+                 for path in [".well-known/security.txt", "security.txt"]:
+                     url = urlunsplit((scheme, self._loc, path, None, None))
+                     try:
+-                        resp = requests.get(
+-                            url,
+-                            headers={
+-                                'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                              'Gecko/20100101 Firefox/12.0'},
+-                            timeout=5
+-                        )
+-                    except requests.exceptions.SSLError:
++                        resp = _http_get(url, verify=True)
++                    except Exception as exc:
++                        exc_name = exc.__class__.__name__.lower()
++                        if "ssl" not in exc_name and "tls" not in exc_name and "cert" not in exc_name:
++                            continue
+                         if not any(d["code"] == "invalid_cert" for d in self._errors):
+                             self._add_error(
+                                 "invalid_cert",
+                                 "security.txt must be served with a valid TLS certificate.",
+                             )
+                         try:
+-                            resp = requests.get(
+-                                url,
+-                                headers={
+-                                    'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                                  'Gecko/20100101 Firefox/12.0'},
+-                                timeout=5,
+-                                verify=False
+-                            )
+-                        except:
++                            resp = _http_get(url, verify=False)
++                        except Exception:
+                             continue
+-                    except:
+-                        continue
+                     if resp.status_code == 200:
+-                        if resp.history:
+-                            if not resp.url.endswith(path):
++                        if getattr(resp, "history", None):
++                            if not getattr(resp, "url", url).endswith(path):
+                                 continue
+                         self._path = path
+                         self._url = url
+@@ -626,7 +759,7 @@ class SecurityTXT(Parser):
+                                     "'utf-8' if present.",
+                                 )
+                         self._content = resp.content
+-                        if resp.history:
++                        if getattr(resp, "history", None):
+                             self._urls = [resp.history[0].url, resp.url]
+                         else:
+                             self._urls = [url]

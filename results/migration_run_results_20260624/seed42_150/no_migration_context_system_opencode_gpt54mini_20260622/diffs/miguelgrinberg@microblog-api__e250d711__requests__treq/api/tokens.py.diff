@@ -1,0 +1,143 @@
+--- a/api/tokens.py
++++ b/api/tokens.py
+@@ -1,10 +1,12 @@
+ import secrets
++import threading
+ from urllib.parse import urlencode
+ 
+ from flask import Blueprint, request, abort, current_app, url_for, session
+ from werkzeug.http import dump_cookie
+ from apifairy import authenticate, body, response, other_responses
+-import requests
++import treq
++from twisted.internet import defer, reactor, threads
+ 
+ from api.app import db
+ from api.auth import basic_auth, token_auth
+@@ -13,9 +15,68 @@
+ from api.schemas import TokenSchema, PasswordResetRequestSchema, \
+     PasswordResetSchema, OAuth2Schema, EmptySchema
+ 
++requests = treq
++
+ tokens = Blueprint('tokens', __name__)
+ token_schema = TokenSchema()
+ oauth2_schema = OAuth2Schema()
++_reactor_ready = threading.Event()
++_reactor_lock = threading.Lock()
++_reactor_started = False
++
++
++def _ensure_reactor():
++    global _reactor_started
++    if reactor.running:
++        _reactor_ready.set()
++        _reactor_started = True
++        return
++    if _reactor_started:
++        return
++    with _reactor_lock:
++        if _reactor_started:
++            return
++
++        def run_reactor():
++            reactor.callWhenRunning(_reactor_ready.set)
++            reactor.run(installSignalHandlers=False)
++
++        threading.Thread(target=run_reactor, daemon=True).start()
++        _reactor_ready.wait()
++        _reactor_started = True
++
++
++def _response_status(response):
++    status_code = getattr(response, 'status_code', None)
++    if status_code is not None:
++        return status_code
++    return getattr(response, 'code', None)
++
++
++def _response_json(response):
++    json = getattr(response, 'json', None)
++    if callable(json):
++        return json()
++    return treq.json_content(response)
++
++
++@defer.inlineCallbacks
++def _treq_json(method, url, **kwargs):
++    response = getattr(requests, method)(url, **kwargs)
++    if isinstance(response, defer.Deferred):
++        response = yield response
++    if _response_status(response) != 200:
++        defer.returnValue((False, None))
++    payload = _response_json(response)
++    if isinstance(payload, defer.Deferred):
++        payload = yield payload
++    defer.returnValue((True, payload))
++
++
++def _blocking_treq_json(method, url, **kwargs):
++    _ensure_reactor()
++    return threads.blockingCallFromThread(reactor, _treq_json, method, url,
++                                          **kwargs)
+ 
+ 
+ def token_response(token):
+@@ -166,26 +227,39 @@
+         abort(404)
+     if args['state'] != session.get('oauth2_state'):
+         abort(401)
+-    response = requests.post(provider_data['access_token_url'], data={
+-        'client_id': provider_data['client_id'],
+-        'client_secret': provider_data['client_secret'],
+-        'code': args['code'],
+-        'grant_type': 'authorization_code',
+-        'redirect_uri': current_app.config['OAUTH2_REDIRECT_URI'].format(
+-            provider=provider),
+-    }, headers={'Accept': 'application/json'})
+-    if response.status_code != 200:
+-        abort(401)
+-    oauth2_token = response.json().get('access_token')
++    redirect_uri = current_app.config['OAUTH2_REDIRECT_URI'].format(
++        provider=provider)
++    try:
++        ok, payload = _blocking_treq_json(
++            'post', provider_data['access_token_url'],
++            data=urlencode({
++                'client_id': provider_data['client_id'],
++                'client_secret': provider_data['client_secret'],
++                'code': args['code'],
++                'grant_type': 'authorization_code',
++                'redirect_uri': redirect_uri,
++            }).encode(),
++            headers={'Accept': 'application/json',
++                     'Content-Type': 'application/x-www-form-urlencoded'},
++        )
++    except Exception:
++        abort(401)
++    if not ok:
++        abort(401)
++    oauth2_token = payload.get('access_token')
+     if not oauth2_token:
+         abort(401)
+-    response = requests.get(provider_data['get_user']['url'], headers={
+-        'Authorization': 'Bearer ' + oauth2_token,
+-        'Accept': 'application/json',
+-    })
+-    if response.status_code != 200:
+-        abort(401)
+-    email = provider_data['get_user']['email'](response.json())
++    try:
++        ok, payload = _blocking_treq_json(
++            'get', provider_data['get_user']['url'], headers={
++                'Authorization': 'Bearer ' + oauth2_token,
++                'Accept': 'application/json',
++            })
++    except Exception:
++        abort(401)
++    if not ok:
++        abort(401)
++    email = provider_data['get_user']['email'](payload)
+     user = db.session.scalar(User.select().where(User.email == email))
+     if user is None:
+         user = User(email=email, username=email.split('@')[0])

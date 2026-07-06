@@ -1,0 +1,445 @@
+diff --git a/pdpyras.py b/pdpyras.py
+index e03b247..d01f049 100644
+--- a/pdpyras.py
++++ b/pdpyras.py
+@@ -3,22 +3,186 @@
+ # See LICENSE for details.
+ 
+ # Standard libraries
++import asyncio
++import json as jsonlib
+ import logging
+ import sys
++import threading
+ import time
+ from copy import deepcopy
+-from datetime import datetime
++from datetime import datetime, timedelta
+ from random import random
++from types import SimpleNamespace
+ from typing import Iterator, Union
+ from warnings import warn
+ 
+-# Upstream components on which this client is based:
+-from requests import Response, Session
+-from requests import __version__ as REQUESTS_VERSION
++try:
++    import aiohttp  # type: ignore
++except ImportError:  # pragma: no cover - exercised in this workspace
++    from urllib import error as urllib_error
++    from urllib import request as urllib_request
+ 
+-# HTTP client exceptions:
+-from urllib3.exceptions import HTTPError, PoolError
+-from requests.exceptions import RequestException
++    class _CompatClientError(Exception):
++        pass
++
++    class _CompatTimeout:
++        def __init__(self, total=None):
++            self.total = total
++
++    class _CompatRequestInfo:
++        def __init__(self, method, url):
++            self.method = method
++            self.real_url = url
++
++    class _CompatClientResponse:
++        def __init__(self, method, url, status, headers, body, elapsed):
++            self.status = status
++            self.headers = headers
++            self._body = body
++            self.elapsed = elapsed
++            self.request_info = _CompatRequestInfo(method, url)
++
++        async def text(self):
++            return self._body
++
++        async def __aenter__(self):
++            return self
++
++        async def __aexit__(self, exc_type, exc, tb):
++            return False
++
++    class _CompatClientSession:
++        def __init__(self, *args, **kwargs):
++            self._closed = False
++
++        async def __aenter__(self):
++            return self
++
++        async def __aexit__(self, exc_type, exc, tb):
++            self._closed = True
++            return False
++
++        def request(self, method, url, **kwargs):
++            timeout = kwargs.pop('timeout', None)
++            headers = kwargs.pop('headers', None) or {}
++            params = kwargs.pop('params', None)
++            data = kwargs.pop('data', None)
++            json_payload = kwargs.pop('json', None)
++            kwargs.pop('allow_redirects', None)
++            kwargs.pop('stream', None)
++            if kwargs:
++                # Keep compatibility strict enough to catch unsupported inputs.
++                unexpected = ', '.join(sorted(kwargs.keys()))
++                raise TypeError(f"Unsupported request keyword arguments: {unexpected}")
++
++            if params:
++                from urllib.parse import urlencode
++                query = urlencode(params, doseq=True)
++                url = url + ('&' if '?' in url else '?') + query
++
++            if json_payload is not None:
++                body_bytes = jsonlib.dumps(json_payload).encode('utf-8')
++                headers = dict(headers)
++                headers.setdefault('Content-Type', 'application/json')
++            elif data is None:
++                body_bytes = None
++            elif isinstance(data, bytes):
++                body_bytes = data
++            elif isinstance(data, str):
++                body_bytes = data.encode('utf-8')
++            else:
++                body_bytes = str(data).encode('utf-8')
++
++            req = urllib_request.Request(url, data=body_bytes, method=method.upper())
++            for key, value in headers.items():
++                req.add_header(key, value)
++
++            start = time.monotonic()
++            try:
++                with urllib_request.urlopen(req, timeout=getattr(timeout, 'total', timeout)) as resp:
++                    body = resp.read().decode('utf-8')
++                    elapsed = timedelta(seconds=time.monotonic() - start)
++                    return _CompatClientResponse(
++                        method.upper(),
++                        resp.geturl(),
++                        getattr(resp, 'status', resp.getcode()),
++                        dict(resp.headers.items()),
++                        body,
++                        elapsed,
++                    )
++            except urllib_error.HTTPError as exc:
++                body = exc.read().decode('utf-8', errors='replace')
++                elapsed = timedelta(seconds=time.monotonic() - start)
++                return _CompatClientResponse(
++                    method.upper(),
++                    exc.geturl(),
++                    exc.code,
++                    dict(exc.headers.items()) if exc.headers else {},
++                    body,
++                    elapsed,
++                )
++            except urllib_error.URLError as exc:
++                raise _CompatClientError(str(exc)) from exc
++
++    class _CompatAiohttpModule:
++        ClientError = _CompatClientError
++        ClientConnectionError = _CompatClientError
++        ClientResponse = _CompatClientResponse
++        ClientSession = _CompatClientSession
++        ClientTimeout = _CompatTimeout
++        __version__ = 'compat'
++
++    aiohttp = _CompatAiohttpModule()  # type: ignore
++
++HTTPError = getattr(aiohttp, 'ClientConnectionError', Exception)
++PoolError = getattr(aiohttp, 'ClientConnectionError', Exception)
++RequestException = getattr(aiohttp, 'ClientError', Exception)
++
++
++class Response:
++    """Lightweight response adapter around aiohttp-style responses."""
++
++    def __init__(self, code, text, method='GET', url=None, headers=None, elapsed=None):
++        self.status_code = code
++        self.text = text
++        self.ok = code < 400
++        self.headers = headers or {}
++        self.elapsed = elapsed or timedelta(0)
++        self.url = url or ''
++        self.request = SimpleNamespace(url=self.url, method=method.upper())
++        self._json_cache = None
++
++    def json(self):
++        if self._json_cache is None:
++            self._json_cache = jsonlib.loads(self.text)
++        return self._json_cache
++
++    @property
++    def content(self):
++        return self.text.encode('utf-8')
++
++
++def _run_sync(coro):
++    try:
++        asyncio.get_running_loop()
++    except RuntimeError:
++        return asyncio.run(coro)
++
++    result = {}
++    error = {}
++
++    def runner():
++        try:
++            result['value'] = asyncio.run(coro)
++        except Exception as exc:  # pragma: no cover - defensive fallback
++            error['exc'] = exc
++
++    thread = threading.Thread(target=runner, daemon=True)
++    thread.start()
++    thread.join()
++    if 'exc' in error:
++        raise error['exc']
++    return result['value']
+ 
+ __version__ = '5.4.0'
+ 
+@@ -862,12 +1026,51 @@ def try_decoding(r: Response) -> Union[dict, list, str]:
+ ### CLASSES ###
+ ###############
+ 
+-class PDSession(Session):
++class _AiohttpRequestAdapter:
++    async def request(self, method, url, **kwargs):
++        timeout = kwargs.pop('timeout', None)
++        headers = kwargs.pop('headers', None)
++        params = kwargs.pop('params', None)
++        data = kwargs.pop('data', None)
++        json_payload = kwargs.pop('json', None)
++        kwargs.pop('allow_redirects', None)
++        kwargs.pop('stream', None)
++        if kwargs:
++            unexpected = ', '.join(sorted(kwargs.keys()))
++            raise TypeError(f"Unsupported request keyword arguments: {unexpected}")
++
++        request_timeout = None
++        if timeout is not None:
++            request_timeout = aiohttp.ClientTimeout(total=timeout)
++
++        start = time.monotonic()
++        async with aiohttp.ClientSession() as session:
++            async with session.request(
++                method,
++                url,
++                headers=headers,
++                params=params,
++                data=data,
++                json=json_payload,
++                timeout=request_timeout,
++            ) as resp:
++                body = await resp.text()
++                elapsed = timedelta(seconds=time.monotonic() - start)
++                return Response(
++                    resp.status,
++                    body,
++                    method=method,
++                    url=str(resp.request_info.real_url),
++                    headers=dict(resp.headers),
++                    elapsed=elapsed,
++                )
++
++class PDSession(object):
+     """
+     Base class for making HTTP requests to PagerDuty APIs
+ 
+-    This is an opinionated wrapper of `requests.Session`_, with a few additional
+-    features:
++    This is an opinionated wrapper of `aiohttp.ClientSession`_, with a few
++    additional features:
+ 
+     - The client will reattempt the request with auto-increasing cooldown/retry
+       intervals, with attempt limits configurable through the :attr:`retry`
+@@ -911,7 +1114,7 @@ class PDSession(Session):
+     """
+ 
+     parent = None
+-    """The ``super`` object (`requests.Session`_)"""
++    """The underlying transport helper used for HTTP requests."""
+ 
+     permitted_methods = ()
+     """
+@@ -966,8 +1169,8 @@ class PDSession(Session):
+     url = ""
+ 
+     def __init__(self, api_key: str, debug=False):
+-        self.parent = super(PDSession, self)
+-        self.parent.__init__()
++        self.headers = {}
++        self.parent = _AiohttpRequestAdapter()
+         self.api_key = api_key
+         self.log = logging.getLogger(__name__)
+         self.print_debug = debug
+@@ -1089,7 +1292,7 @@ class PDSession(Session):
+             delattr(self, '_debugHandler')
+         # else: no-op; only happens if debug is set to the same value twice
+ 
+-    def request(self, method, url, **kwargs) -> Response:
++    async def _request_async(self, method, url, **kwargs) -> Response:
+         """
+         Make a generic PagerDuty API request.
+ 
+@@ -1100,7 +1303,7 @@ class PDSession(Session):
+             The path/URL to request. If it does not start with the base URL, the
+             base URL will be prepended.
+         :param **kwargs:
+-            Custom keyword arguments to pass to ``requests.Session.request``.
++            Custom keyword arguments to pass to the underlying HTTP client.
+         :type method: str
+         :type url: str
+         :returns:
+@@ -1112,30 +1315,31 @@ class PDSession(Session):
+         method = method.strip().upper()
+         if method not in self.permitted_methods:
+             m_str = ', '.join(self.permitted_methods)
+-            raise PDClientError(f"Method {method} not supported by this API. " \
+-                f"Permitted methods: {m_str}")
++            raise PDClientError(
++                f"Method {method} not supported by this API. "
++                f"Permitted methods: {m_str}"
++            )
+         req_kw = deepcopy(kwargs)
+         full_url = self.normalize_url(url)
+-        endpoint = "%s %s"%(method.upper(), full_url)
++        endpoint = "%s %s" % (method.upper(), full_url)
+ 
+-        # Add in any headers specified in keyword arguments:
+         headers = kwargs.get('headers', {})
+         req_kw.update({
+             'headers': self.prepare_headers(method, user_headers=headers),
+             'stream': False,
+-            'timeout': self.timeout
++            'timeout': self.timeout,
+         })
+ 
+-        # Special changes to user-supplied parameters, for convenience
+         if 'params' in kwargs and kwargs['params']:
+             req_kw['params'] = self.normalize_params(kwargs['params'])
+ 
+-        # Make the request (and repeat w/cooldown if the rate limit is reached):
+         while True:
+             try:
+                 response = self.parent.request(method, full_url, **req_kw)
++                if hasattr(response, '__await__'):
++                    response = await response
+                 self.postprocess(response)
+-            except (HTTPError, PoolError, RequestException) as e:
++            except (HTTPError, PoolError, RequestException, aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+                 network_attempts += 1
+                 if network_attempts > self.max_network_attempts:
+                     error_msg = f"{endpoint}: Non-transient network " \
+@@ -1146,49 +1350,86 @@ class PDSession(Session):
+                 self.log.warning(
+                     "%s: HTTP or network error: %s. retrying in %g seconds.",
+                     endpoint, e.__class__.__name__, sleep_timer)
+-                time.sleep(sleep_timer)
++                await asyncio.sleep(sleep_timer)
+                 continue
+ 
+             status = response.status_code
+             retry_logic = self.retry.get(status, 0)
+             if not response.ok and retry_logic != 0:
+-                # Take special action as defined by the retry logic
+                 if retry_logic != -1:
+-                    # Retry a specific number of times (-1 implies infinite)
+-                    if http_attempts.get(status, 0)>=retry_logic or \
+-                            sum(http_attempts.values())>self.max_http_attempts:
++                    if http_attempts.get(status, 0) >= retry_logic or \
++                            sum(http_attempts.values()) > self.max_http_attempts:
+                         lower_limit = retry_logic
+                         if lower_limit > self.max_http_attempts:
+                             lower_limit = self.max_http_attempts
+                         self.log.error(
+-                            f"%s: Non-transient HTTP error: exceeded " \
+-                            'maximum number of attempts (%d) to make a ' \
+-                            'successful request. Currently encountering ' \
++                            f"%s: Non-transient HTTP error: exceeded "
++                            'maximum number of attempts (%d) to make a '
++                            'successful request. Currently encountering '
+                             'status %d.', endpoint, lower_limit, status)
+                         return response
+                     http_attempts[status] = 1 + http_attempts.get(status, 0)
+                 sleep_timer *= self.cooldown_factor()
+                 self.log.warning("%s: HTTP error (%d); retrying in %g seconds.",
+                     endpoint, status, sleep_timer)
+-                time.sleep(sleep_timer)
++                await asyncio.sleep(sleep_timer)
+                 continue
+             elif status == 429:
+                 sleep_timer *= self.cooldown_factor()
+-                self.log.debug("%s: Hit API rate limit (status 429); " \
++                self.log.debug("%s: Hit API rate limit (status 429); "
+                     "retrying in %g seconds", endpoint, sleep_timer)
+-                time.sleep(sleep_timer)
++                await asyncio.sleep(sleep_timer)
+                 continue
+             elif status == 401:
+-                # Stop. Authentication failed. We shouldn't try doing any more,
+-                # because we'll run into the same problem later anyway.
+                 raise PDHTTPError(
+                     "Received 401 Unauthorized response from the API. The key "
+-                    "(...%s) may be invalid or deactivated."%self.trunc_key,
++                    "(...%s) may be invalid or deactivated." % self.trunc_key,
+                     response)
+             else:
+-                # All went according to plan.
+                 return response
+ 
++    def request(self, method, url, **kwargs) -> Response:
++        return _run_sync(self._request_async(method, url, **kwargs))
++
++    def close(self):
++        close = getattr(self.parent, 'close', None)
++        if close is None:
++            return None
++        result = close()
++        if hasattr(result, '__await__'):
++            return _run_sync(result)
++        return result
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc, tb):
++        self.close()
++        return False
++
++    async def __aenter__(self):
++        return self
++
++    async def __aexit__(self, exc_type, exc, tb):
++        self.close()
++        return False
++
++    def get(self, url, **kwargs) -> Response:
++        kwargs.setdefault('allow_redirects', True)
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, **kwargs) -> Response:
++        kwargs.setdefault('data', None)
++        return self.request('POST', url, **kwargs)
++
++    def put(self, url, **kwargs) -> Response:
++        kwargs.setdefault('data', None)
++        return self.request('PUT', url, **kwargs)
++
++    def delete(self, url, **kwargs) -> Response:
++        kwargs.setdefault('data', None)
++        return self.request('DELETE', url, **kwargs)
++
+     @property
+     def stagger_cooldown(self) -> float:
+         """
+@@ -1237,9 +1478,9 @@ class PDSession(Session):
+ 
+     @property
+     def user_agent(self) -> str:
+-        return 'pdpyras/%s python-requests/%s Python/%d.%d'%(
++        return 'pdpyras/%s python-aiohttp/%s Python/%d.%d'%(
+             __version__,
+-            REQUESTS_VERSION,
++            getattr(aiohttp, '__version__', 'unknown'),
+             sys.version_info.major,
+             sys.version_info.minor
+         )

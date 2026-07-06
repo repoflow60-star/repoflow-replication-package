@@ -1,0 +1,268 @@
+--- a/whatsapp_api_client_python/API.py
++++ b/whatsapp_api_client_python/API.py
+@@ -1,9 +1,11 @@
++import io
+ import json
+ import logging
+-from typing import Any, NoReturn, Optional
+-
+-from requests import Response, Session
+-from requests.adapters import HTTPAdapter, Retry
++import time
++import uuid
++from typing import Any, List, NoReturn, Optional, Tuple
++
++import pycurl
+ 
+ from .response import Response as GreenAPIResponse
+ from .tools import (
+@@ -20,6 +22,17 @@
+ )
+ 
+ 
++class _SessionState:
++    def __init__(self) -> None:
++        self.headers = {}
++
++
++class _PycurlResponse:
++    def __init__(self, status_code: int, text: str):
++        self.status_code = status_code
++        self.text = text
++
++
+ class GreenApi:
+     host: str
+     media: str
+@@ -49,7 +62,7 @@
+         self.idInstance = idInstance
+         self.apiTokenInstance = apiTokenInstance
+ 
+-        self.session = Session()
++        self.session = _SessionState()
+         self.__prepare_session()
+ 
+         self.account = account.Account(self)
+@@ -79,14 +92,13 @@
+         url = url.replace("{{apiTokenInstance}}", self.apiTokenInstance)
+ 
+         try:
+-            if not files:
+-                response = self.session.request(
+-                    method=method, url=url, json=payload, timeout=self.host_timeout
+-                )
+-            else:
+-                response = self.session.request(
+-                    method=method, url=url, data=payload, files=files, timeout=self.media_timeout
+-                )
++            response = self.__perform_request(
++                method=method,
++                url=url,
++                payload=payload,
++                files=files,
++                timeout=self.media_timeout if files else self.host_timeout,
++            )
+         except Exception as error:
+             error_message = f"Request was failed with error: {error}."
+ 
+@@ -102,7 +114,18 @@
+ 
+     def raw_request(self, **arguments: Any) -> GreenAPIResponse:
+         try:
+-            response = self.session.request(**arguments)
++            payload = arguments.pop("json", None)
++            data = arguments.pop("data", None)
++
++            response = self.__perform_request(
++                method=arguments.pop("method"),
++                url=arguments.pop("url"),
++                payload=payload,
++                data=data,
++                headers=arguments.pop("headers", None),
++                files=arguments.pop("files", None),
++                timeout=arguments.pop("timeout", self.host_timeout),
++            )
+         except Exception as error:
+             error_message = f"Request was failed with error: {error}."
+ 
+@@ -116,7 +139,7 @@
+ 
+         return GreenAPIResponse(response.status_code, response.text)
+ 
+-    def __handle_response(self, response: Response) -> Optional[NoReturn]:
++    def __handle_response(self, response: Any) -> Optional[NoReturn]:
+         status_code = response.status_code
+         if status_code != 200 or self.debug_mode:
+             try:
+@@ -161,15 +184,164 @@
+     def __prepare_session(self) -> None:
+         self.session.headers["Connection"] = "close"
+ 
+-        retry = Retry(
+-            total=3,
+-            backoff_factor=1.0,
+-            allowed_methods=None,
+-            status_forcelist=[429]
++    def __perform_request(
++            self,
++            method: str,
++            url: str,
++            payload: Optional[dict] = None,
++            data: Optional[Any] = None,
++            headers: Optional[dict] = None,
++            files: Optional[dict] = None,
++            timeout: Optional[float] = None,
++    ) -> _PycurlResponse:
++        request_body, request_headers = self.__build_request_body_and_headers(
++            payload=payload,
++            data=data,
++            headers=headers,
++            files=files,
+         )
+ 
+-        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
++        last_error: Optional[Exception] = None
++
++        for attempt in range(3):
++            buffer = io.BytesIO()
++            curl = pycurl.Curl()
++
++            try:
++                curl.setopt(pycurl.URL, url)
++                curl.setopt(pycurl.CUSTOMREQUEST, method)
++                curl.setopt(pycurl.WRITEDATA, buffer)
++                curl.setopt(pycurl.NOSIGNAL, 1)
++
++                if timeout is not None:
++                    curl.setopt(pycurl.TIMEOUT, int(timeout))
++
++                if request_headers:
++                    curl.setopt(pycurl.HTTPHEADER, request_headers)
++
++                if request_body is not None:
++                    curl.setopt(pycurl.POSTFIELDS, request_body)
++                    curl.setopt(pycurl.POSTFIELDSIZE, len(request_body))
++
++                curl.perform()
++                status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++                response_text = buffer.getvalue().decode("utf-8", errors="replace")
++
++                if status_code == 429 and attempt < 2:
++                    time.sleep(1.0 * (2 ** attempt))
++                    continue
++
++                return _PycurlResponse(status_code, response_text)
++            except pycurl.error as error:
++                last_error = error
++
++                if attempt < 2:
++                    time.sleep(1.0 * (2 ** attempt))
++                    continue
++
++                raise error
++            finally:
++                curl.close()
++
++        if last_error is not None:
++            raise last_error
++
++        raise RuntimeError("Request was failed without response.")
++
++    def __build_request_body_and_headers(
++            self,
++            payload: Optional[dict] = None,
++            data: Optional[Any] = None,
++            headers: Optional[dict] = None,
++            files: Optional[dict] = None,
++    ) -> Tuple[Optional[bytes], List[str]]:
++        request_headers = {
++            **self.session.headers,
++            **{
++                key: value for key, value in (headers or {}).items()
++                if value is not None
++            },
++        }
++
++        if files:
++            body, content_type = self.__build_multipart_body(payload or {}, files)
++            request_headers["Content-Type"] = content_type
++            return body, self.__serialize_headers(request_headers)
++
++        if payload is not None:
++            request_headers.setdefault("Content-Type", "application/json")
++            return (
++                json.dumps(payload).encode("utf-8"),
++                self.__serialize_headers(request_headers)
++            )
++
++        if data is None:
++            return None, self.__serialize_headers(request_headers)
++
++        if isinstance(data, bytes):
++            return data, self.__serialize_headers(request_headers)
++
++        if isinstance(data, bytearray):
++            return bytes(data), self.__serialize_headers(request_headers)
++
++        if isinstance(data, str):
++            return data.encode("utf-8"), self.__serialize_headers(request_headers)
++
++        if isinstance(data, dict):
++            request_headers.setdefault("Content-Type", "application/json")
++            return (
++                json.dumps(data).encode("utf-8"),
++                self.__serialize_headers(request_headers)
++            )
++
++        return str(data).encode("utf-8"), self.__serialize_headers(request_headers)
++
++    def __build_multipart_body(
++            self,
++            payload: dict,
++            files: dict,
++    ) -> Tuple[bytes, str]:
++        boundary = f"----whatsapp-api-client-python-{uuid.uuid4().hex}"
++        body = bytearray()
++
++        for key, value in payload.items():
++            body.extend(f"--{boundary}\r\n".encode("utf-8"))
++            body.extend(
++                f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode(
++                    "utf-8"
++                )
++            )
++            body.extend(str(value).encode("utf-8"))
++            body.extend(b"\r\n")
++
++        for key, value in files.items():
++            file_name, file_object, content_type = value
++            file_data = file_object.read()
++
++            if isinstance(file_data, str):
++                file_data = file_data.encode("utf-8")
++
++            body.extend(f"--{boundary}\r\n".encode("utf-8"))
++            body.extend(
++                (
++                    f'Content-Disposition: form-data; name="{key}"; '
++                    f'filename="{file_name}"\r\n'
++                ).encode("utf-8")
++            )
++            body.extend(
++                (
++                    f"Content-Type: {content_type or 'application/octet-stream'}\r\n\r\n"
++                ).encode("utf-8")
++            )
++            body.extend(file_data)
++            body.extend(b"\r\n")
++
++        body.extend(f"--{boundary}--\r\n".encode("utf-8"))
++
++        return bytes(body), f"multipart/form-data; boundary={boundary}"
++
++    def __serialize_headers(self, headers: dict) -> List[str]:
++        return [f"{key}: {value}" for key, value in headers.items()]
+ 
+ 
+ class GreenAPI(GreenApi):

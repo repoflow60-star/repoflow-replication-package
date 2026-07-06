@@ -1,0 +1,140 @@
+--- a/py_clob_client/http_helpers/helpers.py
++++ b/py_clob_client/http_helpers/helpers.py
+@@ -1,4 +1,8 @@
+-import requests
++import json
++import threading
++
++import treq
++from twisted.internet import reactor
+ 
+ from py_clob_client.clob_types import (
+     DropNotificationParams,
+@@ -16,6 +20,104 @@
+ DELETE = "DELETE"
+ PUT = "PUT"
+ 
++_reactor_thread = None
++_reactor_thread_lock = threading.Lock()
++_reactor_started = threading.Event()
++
++
++def _ensure_reactor_running():
++    global _reactor_thread
++
++    if reactor.running:
++        _reactor_started.set()
++        return
++
++    with _reactor_thread_lock:
++        if reactor.running:
++            _reactor_started.set()
++            return
++
++        if _reactor_thread is None or not _reactor_thread.is_alive():
++            reactor.callWhenRunning(_reactor_started.set)
++            _reactor_thread = threading.Thread(
++                target=reactor.run,
++                kwargs={"installSignalHandlers": False},
++                daemon=True,
++            )
++            _reactor_thread.start()
++
++    _reactor_started.wait()
++
++
++def _parse_response_body(body):
++    if isinstance(body, bytes):
++        body = body.decode("utf-8", errors="replace")
++
++    try:
++        return json.loads(body)
++    except (TypeError, ValueError):
++        return body
++
++
++def _run_request(method: str, endpoint: str, headers=None, data=None):
++    _ensure_reactor_running()
++
++    result = {}
++    completed = threading.Event()
++
++    def execute():
++        try:
++            deferred = treq.request(
++                method,
++                endpoint,
++                headers=headers,
++                json=data if data else None,
++            )
++        except Exception:
++            result["error"] = PolyApiException(error_msg="Request exception!")
++            completed.set()
++            return
++
++        def handle_response(resp):
++            content_deferred = treq.content(resp)
++
++            def parse_content(body):
++                parsed_body = _parse_response_body(body)
++                if resp.code != 200:
++                    raise PolyApiException(
++                        error_msg=parsed_body,
++                        status_code=resp.code,
++                    )
++                return parsed_body
++
++            return content_deferred.addCallback(parse_content)
++
++        def store_result(value):
++            result["value"] = value
++            completed.set()
++            return value
++
++        def store_error(failure):
++            error = failure.value
++            if isinstance(error, PolyApiException):
++                result["error"] = error
++            else:
++                result["error"] = PolyApiException(error_msg="Request exception!")
++            completed.set()
++            return None
++
++        deferred.addCallback(handle_response)
++        deferred.addCallback(store_result)
++        deferred.addErrback(store_error)
++
++    reactor.callFromThread(execute)
++    completed.wait()
++
++    if "error" in result:
++        raise result["error"]
++
++    return result["value"]
++
+ 
+ def overloadHeaders(method: str, headers: dict) -> dict:
+     if headers is None:
+@@ -35,18 +137,10 @@
+ def request(endpoint: str, method: str, headers=None, data=None):
+     try:
+         headers = overloadHeaders(method, headers)
+-        resp = requests.request(
+-            method=method, url=endpoint, headers=headers, json=data if data else None
+-        )
+-        if resp.status_code != 200:
+-            raise PolyApiException(resp)
+-
+-        try:
+-            return resp.json()
+-        except requests.JSONDecodeError:
+-            return resp.text
+-
+-    except requests.RequestException:
++        return _run_request(method, endpoint, headers, data)
++    except PolyApiException:
++        raise
++    except Exception:
+         raise PolyApiException(error_msg="Request exception!")
+ 
+ 

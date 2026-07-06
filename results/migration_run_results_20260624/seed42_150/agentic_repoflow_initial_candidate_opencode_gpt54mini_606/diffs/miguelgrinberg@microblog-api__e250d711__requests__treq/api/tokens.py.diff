@@ -1,0 +1,109 @@
+--- a/api/tokens.py
++++ b/api/tokens.py
+@@ -1,10 +1,12 @@
+ import secrets
++from threading import Event, Thread
+ from urllib.parse import urlencode
+ 
+ from flask import Blueprint, request, abort, current_app, url_for, session
+ from werkzeug.http import dump_cookie
+ from apifairy import authenticate, body, response, other_responses
+-import requests
++import treq
++from twisted.internet import reactor, threads
+ 
+ from api.app import db
+ from api.auth import basic_auth, token_auth
+@@ -16,6 +18,42 @@
+ tokens = Blueprint('tokens', __name__)
+ token_schema = TokenSchema()
+ oauth2_schema = OAuth2Schema()
++_reactor_ready = Event()
++_reactor_started = False
++
++
++def _run_reactor():
++    _reactor_ready.set()
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor_running():
++    global _reactor_started
++    if reactor.running:
++        return
++    if not _reactor_started:
++        _reactor_started = True
++        Thread(target=_run_reactor, daemon=True).start()
++        _reactor_ready.wait()
++
++
++def _treq_call(func, *args, **kwargs):
++    _ensure_reactor_running()
++    return threads.blockingCallFromThread(reactor, func, *args, **kwargs)
++
++
++def _response_code(response):
++    code = getattr(response, 'status_code', None)
++    if code is None:
++        code = response.code
++    return code
++
++
++def _response_json(response):
++    json_method = getattr(response, 'json', None)
++    if callable(json_method):
++        return json_method()
++    return _treq_call(treq.json_content, response)
+ 
+ 
+ def token_response(token):
+@@ -166,26 +204,31 @@
+         abort(404)
+     if args['state'] != session.get('oauth2_state'):
+         abort(401)
+-    response = requests.post(provider_data['access_token_url'], data={
+-        'client_id': provider_data['client_id'],
+-        'client_secret': provider_data['client_secret'],
+-        'code': args['code'],
+-        'grant_type': 'authorization_code',
+-        'redirect_uri': current_app.config['OAUTH2_REDIRECT_URI'].format(
+-            provider=provider),
+-    }, headers={'Accept': 'application/json'})
+-    if response.status_code != 200:
+-        abort(401)
+-    oauth2_token = response.json().get('access_token')
++    response = _treq_call(
++        treq.post, provider_data['access_token_url'],
++        data={
++            'client_id': provider_data['client_id'],
++            'client_secret': provider_data['client_secret'],
++            'code': args['code'],
++            'grant_type': 'authorization_code',
++            'redirect_uri': current_app.config['OAUTH2_REDIRECT_URI'].format(
++                provider=provider),
++        },
++        headers={'Accept': 'application/json'})
++    if _response_code(response) != 200:
++        abort(401)
++    oauth2_token = _response_json(response).get('access_token')
+     if not oauth2_token:
+         abort(401)
+-    response = requests.get(provider_data['get_user']['url'], headers={
+-        'Authorization': 'Bearer ' + oauth2_token,
+-        'Accept': 'application/json',
+-    })
+-    if response.status_code != 200:
+-        abort(401)
+-    email = provider_data['get_user']['email'](response.json())
++    response = _treq_call(
++        treq.get, provider_data['get_user']['url'],
++        headers={
++            'Authorization': 'Bearer ' + oauth2_token,
++            'Accept': 'application/json',
++        })
++    if _response_code(response) != 200:
++        abort(401)
++    email = provider_data['get_user']['email'](_response_json(response))
+     user = db.session.scalar(User.select().where(User.email == email))
+     if user is None:
+         user = User(email=email, username=email.split('@')[0])

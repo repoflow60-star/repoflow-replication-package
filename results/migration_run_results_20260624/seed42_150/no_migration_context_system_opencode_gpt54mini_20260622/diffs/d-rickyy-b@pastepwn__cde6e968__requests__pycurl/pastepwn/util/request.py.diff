@@ -1,0 +1,178 @@
+--- a/pastepwn/util/request.py
++++ b/pastepwn/util/request.py
+@@ -1,8 +1,12 @@
++import io
+ import logging
++import os
+ from threading import Lock
++from urllib.parse import unquote, urlencode, urlsplit
+ 
+-from requests import Session, utils
+-from requests.exceptions import Timeout
++import pycurl
++
++from .network import get_ip_resolve_option
+ 
+ 
+ class Request:
+@@ -22,28 +26,151 @@
+     def __init__(self, proxies=None, headers=None):
+         if not self._initialized:
+             self.logger = logging.getLogger(__name__)
+-            self.session = Session()
+             self.proxies = proxies
+             self.headers = headers
+             self.logger.info("Using the following custom proxies: %s", proxies)
+-            system_proxies = utils.get_environ_proxies("https://example.com")
+-            self.logger.info("Using the following system proxies: %s", system_proxies)
++            self.system_proxies = self._get_system_proxies()
++            self.no_proxy = os.environ.get("NO_PROXY") or os.environ.get("no_proxy")
++            self.logger.info("Using the following system proxies: %s", self.system_proxies)
+             Request._initialized = True
+ 
++    @staticmethod
++    def _get_system_proxies():
++        from urllib.request import getproxies
++
++        return getproxies()
++
++    @staticmethod
++    def _encode_payload(data):
++        if data is None:
++            return None
++
++        if isinstance(data, bytes):
++            return data
++
++        if isinstance(data, str):
++            return data.encode("utf-8")
++
++        return urlencode(data, doseq=True).encode("utf-8")
++
++    @staticmethod
++    def _has_header(headers, name):
++        return any(key.lower() == name for key in headers)
++
++    def _apply_proxy(self, curl, request_url):
++        proxies = {}
++        if getattr(self, "system_proxies", None):
++            proxies.update(self.system_proxies)
++        if self.proxies:
++            proxies.update(self.proxies)
++
++        if not proxies:
++            return
++
++        scheme = urlsplit(request_url).scheme
++        proxy_url = proxies.get(scheme)
++        if proxy_url is None and scheme == "https":
++            proxy_url = proxies.get("http")
++        if proxy_url is None:
++            proxy_url = proxies.get("all")
++        if not proxy_url:
++            return
++
++        normalized_proxy_url = proxy_url if "://" in proxy_url else f"//{proxy_url}"
++        parsed = urlsplit(normalized_proxy_url)
++        if not parsed.hostname:
++            return
++
++        if self.no_proxy and hasattr(pycurl, "NOPROXY"):
++            curl.setopt(pycurl.NOPROXY, self.no_proxy)
++
++        curl.setopt(pycurl.PROXY, parsed.hostname)
++        if parsed.port is not None:
++            curl.setopt(pycurl.PROXYPORT, parsed.port)
++
++        if parsed.username is not None or parsed.password is not None:
++            username = unquote(parsed.username or "")
++            password = unquote(parsed.password or "")
++            curl.setopt(pycurl.PROXYUSERPWD, f"{username}:{password}")
++
++        if parsed.scheme == "socks4a" and hasattr(pycurl, "PROXYTYPE_SOCKS4A"):
++            curl.setopt(pycurl.PROXYTYPE, pycurl.PROXYTYPE_SOCKS4A)
++        elif parsed.scheme == "socks4" and hasattr(pycurl, "PROXYTYPE_SOCKS4"):
++            curl.setopt(pycurl.PROXYTYPE, pycurl.PROXYTYPE_SOCKS4)
++        elif parsed.scheme == "socks5h" and hasattr(pycurl, "PROXYTYPE_SOCKS5_HOSTNAME"):
++            curl.setopt(pycurl.PROXYTYPE, pycurl.PROXYTYPE_SOCKS5_HOSTNAME)
++        elif parsed.scheme == "socks5" and hasattr(pycurl, "PROXYTYPE_SOCKS5"):
++            curl.setopt(pycurl.PROXYTYPE, pycurl.PROXYTYPE_SOCKS5)
++
+     def _request_wrapper(self, data, timeout, *args, **kwargs):
++        if args:
++            kwargs.setdefault("method", args[0])
++        if len(args) > 1:
++            kwargs.setdefault("url", args[1])
++
++        method = str(kwargs.get("method", "GET")).upper()
++        url = kwargs.get("url")
+         headers = {"User-Agent": "pastepwn (https://github.com/d-Rickyy-b/pastepwn)"}
+ 
+         if self.headers is not None:
+             headers.update(self.headers)
+ 
+         try:
+-            response = self.session.request(*args, headers=headers, proxies=self.proxies, data=data, timeout=timeout, **kwargs)
+-        except Timeout:
+-            url = kwargs.get("url")
+-            self.logger.warning("Timeout while requesting %s!", url)
+-            return ""
++            payload = self._encode_payload(data)
++            if method != "GET" and payload is not None and not isinstance(data, (bytes, str)) and not self._has_header(headers, "content-type"):
++                headers["Content-Type"] = "application/x-www-form-urlencoded"
+ 
+-        return response.content.decode("utf-8")
++            buffer = io.BytesIO()
++            curl = pycurl.Curl()
++
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.WRITEFUNCTION, buffer.write)
++            curl.setopt(pycurl.NOSIGNAL, 1)
++            curl.setopt(pycurl.FOLLOWLOCATION, 1)
++            curl.setopt(pycurl.ACCEPT_ENCODING, "")
++            curl.setopt(pycurl.TIMEOUT, timeout)
++            curl.setopt(pycurl.CONNECTTIMEOUT, timeout)
++            curl.setopt(pycurl.HTTPHEADER, [f"{key}: {value}" for key, value in headers.items()])
++
++            ip_resolve = get_ip_resolve_option()
++            if ip_resolve is not None:
++                curl.setopt(pycurl.IPRESOLVE, ip_resolve)
++
++            self._apply_proxy(curl, url)
++
++            if method == "POST":
++                curl.setopt(pycurl.POST, 1)
++                if payload is not None:
++                    curl.setopt(pycurl.POSTFIELDS, payload)
++                    curl.setopt(pycurl.POSTFIELDSIZE, len(payload))
++            elif method == "PUT":
++                curl.setopt(pycurl.CUSTOMREQUEST, "PUT")
++                if payload is not None:
++                    curl.setopt(pycurl.POSTFIELDS, payload)
++                    curl.setopt(pycurl.POSTFIELDSIZE, len(payload))
++            elif method == "DELETE":
++                curl.setopt(pycurl.CUSTOMREQUEST, "DELETE")
++                if payload is not None:
++                    curl.setopt(pycurl.POSTFIELDS, payload)
++                    curl.setopt(pycurl.POSTFIELDSIZE, len(payload))
++            elif method != "GET":
++                curl.setopt(pycurl.CUSTOMREQUEST, method)
++                if payload is not None:
++                    curl.setopt(pycurl.POSTFIELDS, payload)
++                    curl.setopt(pycurl.POSTFIELDSIZE, len(payload))
++
++            curl.perform()
++        except pycurl.error as exc:
++            error_code = exc.args[0] if exc.args else None
++            if error_code == getattr(pycurl, "E_OPERATION_TIMEDOUT", 28):
++                self.logger.warning("Timeout while requesting %s!", url)
++                return ""
++            raise
++        finally:
++            if "curl" in locals():
++                curl.close()
++
++        return buffer.getvalue().decode("utf-8")
+ 
+     def get(self, url, data=None, timeout=5):
+         return self._request_wrapper(method="GET", url=url, data=data, timeout=timeout)

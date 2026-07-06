@@ -1,0 +1,123 @@
+--- a/segment/analytics/request.py
++++ b/segment/analytics/request.py
+@@ -3,14 +3,98 @@
+ from gzip import GzipFile
+ import logging
+ import json
++import threading
++from http.client import responses as HTTP_RESPONSES
+ from dateutil.tz import tzutc
+-from requests.auth import HTTPBasicAuth
+-from requests import sessions
++import treq
++from twisted.internet import defer, reactor, threads
+ 
+ from segment.analytics.version import VERSION
+ from segment.analytics.utils import remove_trailing_slash
+ 
+-_session = sessions.Session()
++_reactor_lock = threading.Lock()
++_reactor_thread = None
++_reactor_started = threading.Event()
++
++
++class _ResponseHeaders(dict):
++    def __getitem__(self, key):
++        return super().__getitem__(key.lower())
++
++    def get(self, key, default=None):
++        return super().get(key.lower(), default)
++
++    def __contains__(self, key):
++        return super().__contains__(key.lower())
++
++
++class _Response(object):
++    def __init__(self, status_code, reason, headers, body):
++        self.status_code = status_code
++        self.code = status_code
++        self.reason = reason
++        self.headers = headers
++        self.content = body
++        self.text = body.decode('utf-8', 'replace')
++
++    def json(self, *args, **kwargs):
++        return json.loads(self.text, *args, **kwargs)
++
++
++def _ensure_reactor_running():
++    global _reactor_thread
++    if reactor.running:
++        return
++
++    with _reactor_lock:
++        if reactor.running:
++            return
++        if _reactor_thread and _reactor_thread.is_alive():
++            _reactor_started.wait()
++            return
++
++        _reactor_started.clear()
++
++        def run_reactor():
++            reactor.callWhenRunning(_reactor_started.set)
++            reactor.run(installSignalHandlers=False)
++
++        _reactor_thread = threading.Thread(
++            target=run_reactor,
++            name='segment-twisted-reactor',
++            daemon=True,
++        )
++        _reactor_thread.start()
++
++    _reactor_started.wait()
++
++
++def _normalize_header_value(value):
++    if isinstance(value, bytes):
++        return value.decode('utf-8', 'replace')
++    return value
++
++
++def _response_headers(response):
++    headers = _ResponseHeaders()
++    raw_headers = response.headers.getAllRawHeaders() or []
++    for name, values in raw_headers:
++        key = _normalize_header_value(name).lower()
++        headers[key] = ', '.join(_normalize_header_value(value) for value in values)
++    return headers
++
++
++@defer.inlineCallbacks
++def _post_response(url, data, headers, timeout):
++    response = yield treq.post(url, data=data, headers=headers, timeout=timeout)
++    body = yield treq.content(response)
++    reason = getattr(response, 'phrase', None) or HTTP_RESPONSES.get(response.code, '')
++    defer.returnValue(_Response(response.code, reason, _response_headers(response), body))
++
++
++def http_post(url, data, headers, timeout):
++    _ensure_reactor_running()
++    return threads.blockingCallFromThread(reactor, _post_response, url, data, headers, timeout)
+ 
+ 
+ def post(write_key, host=None, gzip=False, timeout=15, proxies=None, oauth_manager=None, **kwargs):
+@@ -42,17 +126,9 @@
+             gz.write(data.encode('utf-8'))
+         data = buf.getvalue()
+ 
+-    kwargs = {
+-        "data": data,
+-        "headers": headers,
+-        "timeout": 15,
+-    }
+-
+-    if proxies:
+-        kwargs['proxies'] = proxies
+     res = None
+     try:
+-        res = _session.post(url, data=data, headers=headers, timeout=timeout)
++        res = http_post(url, data=data, headers=headers, timeout=timeout)
+     except Exception as e:
+         log.error(e)
+         raise e

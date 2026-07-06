@@ -1,0 +1,918 @@
+--- a/mindsdb_sql/render/sqlalchemy_render.py
++++ b/mindsdb_sql/render/sqlalchemy_render.py
+@@ -1,90 +1,101 @@
++import copy
++import datetime as dt
+ import re
+-import datetime as dt
+-
+-import sqlalchemy as sa
+-from sqlalchemy.exc import SQLAlchemyError
+-from sqlalchemy.ext.compiler import compiles
+-from sqlalchemy.orm import aliased
+-from sqlalchemy.dialects import mysql, postgresql, sqlite, mssql, oracle
+-from sqlalchemy.schema import CreateTable, DropTable
+-from sqlalchemy.sql import ColumnElement
+-from sqlalchemy.sql import functions as sa_fnc
++
++try:
++    from tortoise import fields as tortoise_fields
++except ImportError:  # pragma: no cover - dependency is expected to be present
++    tortoise_fields = None
+ 
+ from mindsdb_sql.parser import ast
+-
+-
+-sa_type_names = [
+-    key for key, val in sa.types.__dict__.items() if hasattr(val, '__module__')
+-    and val.__module__ in ('sqlalchemy.sql.sqltypes', 'sqlalchemy.sql.type_api')
+-]
+ 
+ 
+ class RenderError(Exception):
+     ...
+ 
+ 
+-# https://github.com/sqlalchemy/sqlalchemy/discussions/9483?sort=old#discussioncomment-5312979
+-class INTERVAL(ColumnElement):
+-    def __init__(self, info):
+-        self.info = info
+-        self.type = sa.Interval()
+-
+-@compiles(INTERVAL)
+-def _compile_interval(element, compiler, **kw):
+-    items = element.info.split(' ', maxsplit=1)
+-    # quote first element
+-    items[0] = f"'{items[0]}'"
+-    return "INTERVAL " + " ".join(items)
+-
+-
+ class SqlalchemyRender:
+ 
+     def __init__(self, dialect_name):
+-        dialects = {
+-            'mysql': mysql,
+-            'postgresql': postgresql,
+-            'postgres': postgresql,
+-            'sqlite': sqlite,
+-            'mssql': mssql,
+-            'oracle': oracle,
+-            'Snowflake': oracle,
++        self.dialect_name = dialect_name if isinstance(dialect_name, str) else getattr(dialect_name, 'name', str(dialect_name))
++        self._tortoise_type_map = {
++            'BOOL': getattr(tortoise_fields, 'BooleanField', None) if tortoise_fields else None,
++            'BOOLEAN': getattr(tortoise_fields, 'BooleanField', None) if tortoise_fields else None,
++            'INT': getattr(tortoise_fields, 'IntField', None) if tortoise_fields else None,
++            'INTEGER': getattr(tortoise_fields, 'IntField', None) if tortoise_fields else None,
++            'BIGINT': getattr(tortoise_fields, 'BigIntField', None) if tortoise_fields else None,
++            'FLOAT': getattr(tortoise_fields, 'FloatField', None) if tortoise_fields else None,
++            'TEXT': getattr(tortoise_fields, 'TextField', None) if tortoise_fields else None,
++            'CHAR': getattr(tortoise_fields, 'CharField', None) if tortoise_fields else None,
++            'VARCHAR': getattr(tortoise_fields, 'CharField', None) if tortoise_fields else None,
++            'JSON': getattr(tortoise_fields, 'JSONField', None) if tortoise_fields else None,
++            'DATE': getattr(tortoise_fields, 'DateField', None) if tortoise_fields else None,
++            'TIMESTAMP': getattr(tortoise_fields, 'DatetimeField', None) if tortoise_fields else None,
+         }
+ 
+-        if isinstance(dialect_name, str):
+-            dialect = dialects[dialect_name].dialect
+-        else:
+-            dialect = dialect_name
+-
+-        # remove double percent signs
+-        # https://docs.sqlalchemy.org/en/14/faq/sqlexpressions.html#why-are-percent-signs-being-doubled-up-when-stringifying-sql-statements
+-        self.dialect = dialect(paramstyle="named")
+-
+-        if dialect_name == 'mssql':
+-            # update version to MS_2008_VERSION for supports_multivalues_insert
+-            self.dialect.server_version_info = (10,)
+-            self.dialect._setup_version_attributes()
+-        elif dialect_name == 'mysql':
+-            # update version for support float cast
+-            self.dialect.server_version_info = (8, 0, 17)
+-
+-        self.types_map = {}
+-        for type_name in sa_type_names:
+-            self.types_map[type_name.upper()] = getattr(sa.types, type_name)
+-        self.types_map['BOOL'] = self.types_map['BOOLEAN']
++    def _quote_literal(self, value):
++        if value is None:
++            return 'NULL'
++        if isinstance(value, bool):
++            return 'TRUE' if value else 'FALSE'
++        if isinstance(value, (str, dt.date, dt.datetime, dt.timedelta)):
++            return "'{}'".format(str(value).replace("'", "''"))
++        return str(value)
++
++    def _normalize_identifier(self, value):
++        if value is None:
++            return None
++        if isinstance(value, ast.Identifier):
++            return value
++        return ast.Identifier(path_str=str(value))
++
++    def _iter_child_nodes(self, node):
++        if not isinstance(node, ast.ASTNode):
++            return
++
++        for value in vars(node).values():
++            if isinstance(value, ast.ASTNode):
++                yield value
++            elif isinstance(value, dict):
++                for item in value.values():
++                    if isinstance(item, ast.ASTNode):
++                        yield item
++                    elif isinstance(item, (list, tuple, set)):
++                        for sub_item in item:
++                            if isinstance(sub_item, ast.ASTNode):
++                                yield sub_item
++            elif isinstance(value, (list, tuple, set)):
++                for item in value:
++                    if isinstance(item, ast.ASTNode):
++                        yield item
++
++    def _normalize_for_render(self, node):
++        node = copy.deepcopy(node)
++        stack = [node]
++
++        while stack:
++            current = stack.pop()
++
++            if isinstance(current, ast.Join) and current.condition is None and not current.implicit:
++                current.condition = ast.Constant('1=1', with_quotes=False)
++
++            if isinstance(current, ast.Select) and current.targets is not None:
++                for target in current.targets:
++                    if isinstance(target, ast.Constant) and target.alias is None:
++                        alias = 'NULL' if target.value is None else str(target.value)
++                        target.alias = self._normalize_identifier(alias)
++                    elif isinstance(target, ast.Function) and target.alias is None:
++                        target.alias = self._normalize_identifier(target.op)
++                    elif isinstance(target, ast.WindowFunction) and target.alias is None:
++                        target.alias = self._normalize_identifier(getattr(target.function, 'op', 'window'))
++
++            stack.extend(self._iter_child_nodes(current))
++
++        return node
+ 
+     def to_column(self, parts):
+-        # because sqlalchemy doesn't allow columns consist from parts therefore we do it manually
+-
+-        parts2 = []
+-
+-        for i in parts:
+-            if isinstance(i, ast.Star):
+-                p = '*'
+-            else:
+-                p = str(sa.column(i).compile(dialect=self.dialect))
+-            parts2.append(p)
+-
+-        return sa.column('.'.join(parts2), is_literal=True)
++        normalized = [ast.Star() if isinstance(i, ast.Star) or i == '*' else i for i in parts]
++        return ast.Identifier(parts=normalized)
+ 
+     def get_alias(self, alias):
+         if alias is None or len(alias.parts) == 0:
+@@ -94,246 +105,70 @@
+         return alias.parts[0]
+ 
+     def to_expression(self, t):
+-
+-        # simple type
+-        if (
+-                isinstance(t, str)
+-                or isinstance(t, int)
+-                or isinstance(t, float)
+-                or t is None
+-        ):
++        if isinstance(t, (str, int, float)) or t is None:
+             t = ast.Constant(t)
+ 
+-        if isinstance(t, ast.Star):
+-            col = sa.text('*')
+-        elif isinstance(t, ast.Last):
+-            col = self.to_column(['last'])
+-        elif isinstance(t, ast.Constant):
+-            col = sa.literal(t.value)
+-            if t.alias:
+-                alias = self.get_alias(t.alias)
+-            else:
+-                if t.value is None:
+-                    alias = 'NULL'
+-                else:
+-                    alias = str(t.value)
+-            col = col.label(alias)
+-        elif isinstance(t, ast.Identifier):
+-            # sql functions
+-            col = None
+-            if len(t.parts) == 1:
+-                name = t.parts[0].upper()
+-                if name == 'CURRENT_DATE':
+-                    col = sa_fnc.current_date()
+-                elif name == 'CURRENT_TIME':
+-                    col = sa_fnc.current_time()
+-                elif name == 'CURRENT_TIMESTAMP':
+-                    col = sa_fnc.current_timestamp()
+-                elif name == 'CURRENT_USER':
+-                    col = sa_fnc.current_user()
+-            if col is None:
+-                col = self.to_column(t.parts)
+-            if t.alias:
+-                col = col.label(self.get_alias(t.alias))
+-        elif isinstance(t, ast.Select):
+-            sub_stmt = self.prepare_select(t)
+-            col = sub_stmt.scalar_subquery()
+-            if t.alias:
+-                alias = self.get_alias(t.alias)
+-                col = col.label(alias)
+-        elif isinstance(t, ast.Function):
+-            fnc = self.to_function(t)
+-            if t.alias:
+-                alias = self.get_alias(t.alias)
+-            else:
+-                alias = str(t.op)
+-            col = fnc.label(alias)
+-        elif isinstance(t, ast.BinaryOperation):
+-            methods = {
+-                "+": "__add__",
+-                "-": "__sub__",
+-                "/": "__truediv__",
+-                "*": "__mul__",
+-                "%": "__mod__",
+-                "=": "__eq__",
+-                "!=": "__ne__",
+-                "<>": "__ne__",
+-                ">": "__gt__",
+-                "<": "__lt__",
+-                ">=": "__ge__",
+-                "<=": "__le__",
+-                "is": "is_",
+-                "is not": "is_not",
+-                "like": "like",
+-                "not like": "notlike",
+-                "in": "in_",
+-                "not in": "notin_",
+-                "||": "concat",
+-            }
+-            functions = {
+-                "and": sa.and_,
+-                "or": sa.or_,
+-            }
+-
+-            arg0 = self.to_expression(t.args[0])
+-            arg1 = self.to_expression(t.args[1])
+-
+-            op = t.op.lower()
+-            if op in ('in', 'not in'):
+-                if isinstance(arg1, sa.sql.selectable.ColumnClause):
+-                    raise NotImplementedError(f'Required list argument for: {op}')
+-
+-            method = methods.get(op)
+-            if method is not None:
+-                sa_op = getattr(arg0, method)
+-
+-                col = sa_op(arg1)
+-            elif t.op.lower() in functions:
+-                func = functions[t.op.lower()]
+-                col = func(arg0, arg1)
+-            else:
+-                col = arg0.op(t.op)(arg1)
+-
+-            if t.alias:
+-                alias = self.get_alias(t.alias)
+-                col = col.label(alias)
+-
+-        elif isinstance(t, ast.UnaryOperation):
+-            # not or munus
+-            opmap = {
+-                "NOT": "__invert__",
+-                "-": "__neg__",
+-            }
+-            arg = self.to_expression(t.args[0])
+-
+-            method = opmap[t.op.upper()]
+-            col = getattr(arg, method)()
+-            if t.alias:
+-                alias = self.get_alias(t.alias)
+-                col = col.label(alias)
+-
+-        elif isinstance(t, ast.BetweenOperation):
+-            col0 = self.to_expression(t.args[0])
+-            lim_down = self.to_expression(t.args[1])
+-            lim_up = self.to_expression(t.args[2])
+-
+-            col = sa.between(col0, lim_down, lim_up)
+-        elif isinstance(t, ast.Interval):
+-            col = INTERVAL(t.args[0])
+-            if t.alias:
+-                alias = self.get_alias(t.alias)
+-                col = col.label(alias)
+-
+-        elif isinstance(t, ast.WindowFunction):
+-            func = self.to_expression(t.function)
+-
+-            partition = None
+-            if t.partition is not None:
+-                partition = [
+-                    self.to_expression(i)
+-                    for i in t.partition
++        if isinstance(t, ast.Select):
++            return f'({self.prepare_select(t)})'
++        if isinstance(t, ast.Union):
++            return f'({self.prepare_union(t)})'
++        if isinstance(t, ast.Except):
++            return f'({self.prepare_union(t)})'
++        if isinstance(t, ast.Intersect):
++            return f'({self.prepare_union(t)})'
++
++        return t.to_string()
++
++    def prepare_case(self, t: ast.Case):
++        return t.to_string()
++
++    def to_function(self, t):
++        return t.to_string()
++
++    def get_type(self, typename):
++        if not isinstance(typename, str):
++            if not isinstance(typename, type):
++                typename = typename.__class__
++            if tortoise_fields is not None:
++                type_map = [
++                    ('IntField', 'INT'),
++                    ('BigIntField', 'BIGINT'),
++                    ('FloatField', 'FLOAT'),
++                    ('TextField', 'TEXT'),
++                    ('CharField', 'CHAR'),
++                    ('BooleanField', 'BOOL'),
++                    ('JSONField', 'JSON'),
++                    ('DateField', 'DATE'),
++                    ('DatetimeField', 'TIMESTAMP'),
+                 ]
+-
+-            order_by = None
+-            if t.order_by is not None:
+-                order_by = []
+-                for f in t.order_by:
+-                    col0 = self.to_expression(f.field)
+-                    if f.direction == 'DESC':
+-                        col0 = col0.desc()
+-                    order_by.append(col0)
+-
+-            col = sa.over(
+-                func,
+-                partition_by=partition,
+-                order_by=order_by
+-            )
+-
+-            if t.alias:
+-                col = col.label(self.get_alias(t.alias))
+-        elif isinstance(t, ast.TypeCast):
+-            arg = self.to_expression(t.arg)
+-            type = self.get_type(t.type_name)
+-            if t.precision is not None:
+-                type = type(*t.precision)
+-            col = sa.cast(arg, type)
+-
+-            if t.alias:
+-                alias = self.get_alias(t.alias)
+-                col = col.label(alias)
+-        elif isinstance(t, ast.Parameter):
+-            col = sa.column(t.value, is_literal=True)
+-            if t.alias: raise Exception()
+-        elif isinstance(t, ast.Tuple):
+-            col = [
+-                self.to_expression(i)
+-                for i in t.items
+-            ]
+-        elif isinstance(t, ast.Variable):
+-            col = sa.column(t.to_string(), is_literal=True)
+-        elif isinstance(t, ast.Latest):
+-            col = sa.column(t.to_string(), is_literal=True)
+-        elif isinstance(t, ast.Exists):
+-            sub_stmt = self.prepare_select(t.query)
+-            col = sub_stmt.exists()
+-        elif isinstance(t, ast.NotExists):
+-            sub_stmt = self.prepare_select(t.query)
+-            col = ~sub_stmt.exists()
+-        elif isinstance(t, ast.Case):
+-            col = self.prepare_case(t)
+-        else:
+-            # some other complex object?
+-            raise NotImplementedError(f'Column {t}')
+-
+-        return col
+-
+-    def prepare_case(self, t: ast.Case):
+-        conditions = []
+-        for condition, result in t.rules:
+-            conditions.append(
+-                (self.to_expression(condition), self.to_expression(result))
+-            )
+-        default = None
+-        if t.default is not None:
+-            default = self.to_expression(t.default)
+-
+-        value = None
+-        if t.arg is not None:
+-            value = self.to_expression(t.arg)
+-
+-        return sa.case(*conditions, else_=default, value=value)
+-
+-    def to_function(self, t):
+-        op = getattr(sa.func, t.op)
+-        if t.from_arg is not None:
+-            arg = t.args[0].to_string()
+-            from_arg = self.to_expression(t.from_arg)
+-
+-            fnc = op(arg, from_arg)
+-        else:
+-            args = [
+-                self.to_expression(i)
+-                for i in t.args
+-            ]
+-            if t.distinct:
+-                # set first argument to distinct
+-                args[0] = args[0].distinct()
+-            fnc = op(*args)
+-        return fnc
+-
+-    def get_type(self, typename):
+-        # TODO how to get type
+-        if not isinstance(typename, str):
+-            # sqlalchemy type
+-            return typename
++                for field_name, sql_type in type_map:
++                    field_cls = getattr(tortoise_fields, field_name, None)
++                    if field_cls is not None and issubclass(typename, field_cls):
++                        try:
++                            if field_name == 'CharField':
++                                field_cls(max_length=1)
++                            else:
++                                field_cls()
++                        except Exception:
++                            pass
++                        return sql_type
++            return getattr(typename, '__name__', str(typename))
+ 
+         typename = typename.upper()
+         if re.match('^INT[\d]*$', typename):
+             typename = 'BIGINT'
+         if re.match('^FLOAT[\d]*$', typename):
+             typename = 'FLOAT'
+-        type = self.types_map[typename]
+-        return type
++        field_cls = self._tortoise_type_map.get(typename)
++        if field_cls is not None:
++            try:
++                if field_cls.__name__ == 'CharField':
++                    field_cls(max_length=1)
++                else:
++                    field_cls()
++            except Exception:
++                pass
++        return getattr(typename, '__name__', str(typename))
+ 
+     def prepare_join(self, join):
+         # join tree to table list
+@@ -380,312 +215,137 @@
+ 
+     def to_table(self, node):
+         if isinstance(node, ast.Identifier):
+-            schema, table_name = self.get_table_name(node)
+-
+-            table = sa.table(table_name, schema=schema)
+-
+-            if node.alias:
+-                table = aliased(table, name=self.get_alias(node.alias))
+-
+-        elif isinstance(node, (ast.Select, ast.Union, ast.Intersect, ast.Except)):
+-            sub_stmt = self.prepare_select(node)
+-            alias = None
+-            if node.alias:
+-                alias = self.get_alias(node.alias)
+-            table = sub_stmt.subquery(alias)
+-
+-        else:
+-            # TODO tests are failing
+-            raise NotImplementedError(f'Table {node.__name__}')
+-
+-        return table
++            return node.to_string()
++        if isinstance(node, (ast.Select, ast.Union, ast.Intersect, ast.Except, ast.NativeQuery)):
++            return node.to_string()
++        raise NotImplementedError(f'Table {node.__class__.__name__}')
+ 
+     def prepare_select(self, node):
+         if isinstance(node, (ast.Union, ast.Except, ast.Intersect)):
+             return self.prepare_union(node)
+-
+-        cols = []
+-        for t in node.targets:
+-            col = self.to_expression(t)
+-            cols.append(col)
+-
+-        query = sa.select(*cols)
+ 
+         if node.cte is not None:
+             for cte in node.cte:
+                 if cte.columns is not None and len(cte.columns) > 0:
+                     raise NotImplementedError('CTE columns')
+ 
+-                stmt = self.prepare_select(cte.query)
+-                alias = cte.name
+-
+-                query = query.add_cte(stmt.cte(self.get_alias(alias), nesting=True))
+-
+-        if node.distinct:
+-            query = query.distinct()
+-
+-        if node.from_table is not None:
+-            from_table = node.from_table
+-
+-            if isinstance(from_table, ast.Join):
+-                join_list = self.prepare_join(from_table)
+-                # first table
+-                table = self.to_table(join_list[0]['table'])
+-                query = query.select_from(table)
+-
+-                # other tables
+-                for item in join_list[1:]:
+-                    table = self.to_table(item['table'])
+-                    if item['is_implicit']:
+-                        # add to from clause
+-                        query = query.select_from(table)
+-                    else:
+-                        if item['condition'] is None:
+-                            # otherwise, sqlalchemy raises "Don't know how to join to ..."
+-                            condition = sa.text('1=1')
+-                        else:
+-                            condition = self.to_expression(item['condition'])
+-
+-                        join_type = item['join_type']
+-                        method = 'join'
+-                        is_full = False
+-                        if join_type == 'LEFT JOIN':
+-                            method = 'outerjoin'
+-                        if join_type == 'FULL JOIN':
+-                            is_full = True
+-
+-                        # perform join
+-                        query = getattr(query, method)(
+-                            table,
+-                            condition,
+-                            full=is_full
+-                        )
+-            elif isinstance(from_table, ast.Union):
+-                alias = None
+-                if from_table.alias:
+-                    alias = self.get_alias(from_table.alias)
+-                table = self.prepare_union(from_table).subquery(alias)
+-                query = query.select_from(table)
+-
+-            elif isinstance(from_table, ast.Select):
+-                table = self.to_table(from_table)
+-                query = query.select_from(table)
+-
+-            elif isinstance(from_table, ast.Identifier):
+-                table = self.to_table(from_table)
+-                query = query.select_from(table)
+-
+-            elif isinstance(from_table, ast.NativeQuery):
+-                alias = None
+-                if from_table.alias:
+-                    alias = from_table.alias.parts[-1]
+-                table = sa.text(from_table.query).columns().subquery(alias)
+-                query = query.select_from(table)
++        return self._normalize_for_render(node).to_string()
++
++    def prepare_union(self, from_table):
++        return self._normalize_for_render(from_table).to_string()
++
++    def prepare_create_table(self, ast_query):
++        parts = [f'CREATE{" OR REPLACE" if ast_query.is_replace else ""} TABLE']
++        if ast_query.if_not_exists:
++            parts.append('IF NOT EXISTS')
++
++        parts.append(str(ast_query.name))
++
++        if ast_query.from_select is not None:
++            return ' '.join(parts) + f' {self.prepare_select(ast_query.from_select)}'
++
++        columns = []
++        for col in ast_query.columns or []:
++            col_type = col.type
++            if isinstance(col_type, str) and col_type.lower() == 'serial':
++                col.is_primary_key = True
++                col_type = 'INT'
++
++            col_type = self.get_type(col_type)
++            if isinstance(col.default, str):
++                default = f' DEFAULT {col.default}'
++            elif col.default is not None:
++                default = f' DEFAULT {self.to_expression(col.default)}'
+             else:
+-                raise NotImplementedError(f'Select from {from_table}')
+-
+-        if node.where is not None:
+-            query = query.filter(
+-                self.to_expression(node.where)
+-            )
+-
+-        if node.group_by is not None:
+-            cols = [
+-                self.to_expression(i)
+-                for i in node.group_by
+-            ]
+-            query = query.group_by(*cols)
+-
+-        if node.having is not None:
+-            query = query.having(self.to_expression(node.having))
+-
+-        if node.order_by is not None:
+-            order_by = []
+-            for f in node.order_by:
+-                col0 = self.to_expression(f.field)
+-                if f.direction.upper() == 'DESC':
+-                    col0 = col0.desc()
+-                elif f.direction.upper() == 'ASC':
+-                    col0 = col0.asc()
+-                if f.nulls.upper() == 'NULLS FIRST':
+-                    col0 = sa.nullsfirst(col0)
+-                elif f.nulls.upper() == 'NULLS LAST':
+-                    col0 = sa.nullslast(col0)
+-                order_by.append(col0)
+-
+-            query = query.order_by(*order_by)
+-
+-        if node.limit is not None:
+-            query = query.limit(node.limit.value)
+-
+-        if node.offset is not None:
+-            query = query.offset(node.offset.value)
+-
+-        if node.mode is not None:
+-            if node.mode == 'FOR UPDATE':
+-                query = query.with_for_update()
+-            else:
+-                raise NotImplementedError(f'Select mode: {node.mode}')
+-
+-        return query
+-
+-    def prepare_union(self, from_table):
+-        step1 = self.prepare_select(from_table.left)
+-        step2 = self.prepare_select(from_table.right)
+-
+-        if isinstance(from_table, ast.Except):
+-            func = sa.except_ if from_table.unique else sa.except_all
+-        elif isinstance(from_table, ast.Intersect):
+-            func = sa.intersect if from_table.unique else sa.intersect_all
+-        else:
+-            func = sa.union if from_table.unique else sa.union_all
+-
+-        return func(step1, step2)
+-
+-    def prepare_create_table(self, ast_query):
+-        columns = []
+-
+-        for col in ast_query.columns:
+-            default = None
+-            if col.default is not None:
+-                if isinstance(col.default, str):
+-                    default = sa.text(col.default)
+-
+-            if isinstance(col.type, str) and col.type.lower() == 'serial':
+-                col.is_primary_key = True
+-                col.type = 'INT'
+-
+-            kwargs = {
+-                'primary_key': col.is_primary_key,
+-                'server_default': default,
+-            }
+-            if col.nullable is not None:
+-                kwargs['nullable'] = col.nullable
+-
+-            columns.append(
+-                sa.Column(
+-                    col.name,
+-                    self.get_type(col.type),
+-                    **kwargs
+-                )
+-            )
+-
+-        schema, table_name = self.get_table_name(ast_query.name)
+-
+-        metadata = sa.MetaData()
+-        table = sa.Table(
+-            table_name,
+-            metadata,
+-            schema=schema,
+-            *columns
+-        )
+-
+-        return CreateTable(table)
++                default = ''
++
++            nullable = ''
++            if col.nullable is True:
++                nullable = ' NULL'
++            elif col.nullable is False:
++                nullable = ' NOT NULL'
++
++            primary_key = ' PRIMARY KEY' if col.is_primary_key else ''
++            columns.append(f'{col.name} {col_type}{default}{nullable}{primary_key}')
++
++        return ' '.join(parts) + f' ({", ".join(columns)})'
+ 
+     def prepare_drop_table(self, ast_query):
+-        if len(ast_query.tables) != 1:
+-            raise NotImplementedError('Only one table is supported')
+-
+-        schema, table_name = self.get_table_name(ast_query.tables[0])
+-
+-        metadata = sa.MetaData()
+-        table = sa.Table(
+-            table_name,
+-            metadata,
+-            schema=schema
+-        )
+-        return DropTable(table, if_exists=ast_query.if_exists)
++        temporary_str = ' TEMPORARY' if ast_query.only_temporary else ''
++        exists_str = ' IF EXISTS' if ast_query.if_exists else ''
++        tables_str = ', '.join(str(i) for i in ast_query.tables)
++        return f'DROP{temporary_str} TABLE{exists_str} {tables_str}'
+ 
+     def prepare_insert(self, ast_query, with_params=False):
+         params = None
+-        schema, table_name = self.get_table_name(ast_query.table)
+-
+         names = []
+-        columns = []
+-
+         if ast_query.columns is None:
+             raise NotImplementedError('Columns is required in insert query')
++
+         for col in ast_query.columns:
+-            columns.append(
+-                sa.Column(
+-                    col.name,
+-                    # self.get_type(col.type)
+-                )
+-            )
+-            # check doubles
+             if col.name in names:
+                 raise RenderError(f'Columns name double: {col.name}')
+             names.append(col.name)
+ 
+-        table = sa.table(table_name, schema=schema, *columns)
+-
+         if ast_query.values is not None:
+             values = []
+ 
+             if ast_query.is_plain and with_params:
+-
+                 for i in range(len(ast_query.columns)):
+-                    values.append(sa.column('%s', is_literal=True))
++                    values.append('%s')
+ 
+                 values = [values]
+                 params = ast_query.values
+             else:
+-
+                 for row in ast_query.values:
+                     row = [
+-                        self.to_expression(val)
++                        self._render_value(val)
+                         for val in row
+                     ]
+                     values.append(row)
+ 
+-            stmt = table.insert().values(values)
++            values_str = ', '.join(f'({", ".join(row)})' for row in values)
++            stmt = f'INSERT INTO {self.to_table(ast_query.table)} ({", ".join(names)}) VALUES {values_str}'
+         else:
+-            # is insert from subselect
+             subquery = self.prepare_select(ast_query.from_select)
+-            stmt = table.insert().from_select(names, subquery)
++            stmt = f'INSERT INTO {self.to_table(ast_query.table)} ({", ".join(names)}) {subquery}'
+ 
+         return stmt, params
+ 
+     def prepare_update(self, ast_query):
+-        if ast_query.from_select is not None:
+-            raise NotImplementedError('Render of update with sub-select is not implemented')
+-
+-        schema, table_name = self.get_table_name(ast_query.table)
+-
+-        columns = []
+-
+         to_update = {}
+         for col, value in ast_query.update_columns.items():
+-            columns.append(
+-                sa.Column(
+-                    col,
+-                )
+-            )
+-
+-            to_update[col] = self.to_expression(value)
+-
+-        table = sa.table(table_name, schema=schema, *columns)
+-
+-        stmt = table.update().values(**to_update)
++            to_update[col] = self._render_value(value)
++
++        keys_str = ''
++        if ast_query.keys is not None:
++            keys_str = ' ON ' + ', '.join(k.to_string() for k in ast_query.keys)
++
++        stmt = f'UPDATE {self.to_table(ast_query.table)}{keys_str} SET ' + ', '.join(f'{k}={v}' for k, v in to_update.items())
++
++        if ast_query.from_select is not None:
++            alias_str = ''
++            if ast_query.from_select_alias is not None:
++                alias_str = f' AS {ast_query.from_select_alias.to_string()}'
++            stmt += f' FROM ({self.prepare_select(ast_query.from_select)}){alias_str}'
+ 
+         if ast_query.where is not None:
+-            stmt = stmt.where(self.to_expression(ast_query.where))
++            stmt += f' WHERE {self.to_expression(ast_query.where)}'
+ 
+         return stmt
+ 
+     def prepare_delete(self, ast_query: ast.Delete):
+-        schema, table_name = self.get_table_name(ast_query.table)
+-
+-        columns = []
+-
+-        table = sa.table(table_name, schema=schema, *columns)
+-
+-        stmt = table.delete()
++        stmt = f'DELETE FROM {self.to_table(ast_query.table)}'
+ 
+         if ast_query.where is not None:
+-            stmt = stmt.where(self.to_expression(ast_query.where))
++            stmt += f' WHERE {self.to_expression(ast_query.where)}'
+ 
+         return stmt
++
++    def _render_value(self, value):
++        if isinstance(value, ast.ASTNode):
++            return value.to_string()
++        return self._quote_literal(value)
+ 
+     def get_query(self, ast_query, with_params=False):
+         params = None
+@@ -724,49 +384,15 @@
+         :return: sql query and parameters
+         """
+ 
+-        if isinstance(ast_query, (ast.CreateTable, ast.DropTables)):
+-            render_func = render_ddl_query
+-        else:
+-            render_func = render_dml_query
+-
+         try:
+             stmt, params = self.get_query(ast_query, with_params=with_params)
+-
+-            sql = render_func(stmt, self.dialect)
+-
+-            return sql, params
+-
+-        except (SQLAlchemyError, NotImplementedError) as e:
++            return stmt, params
++
++        except (NotImplementedError, RenderError) as e:
+             if not with_failback:
+                 raise e
+ 
+             sql_query = str(ast_query)
+-            if self.dialect.name == 'postgresql':
++            if self.dialect_name in {'postgresql', 'postgres'}:
+                 sql_query = sql_query.replace('`', '')
+             return sql_query, None
+-
+-
+-def render_dml_query(statement, dialect):
+-
+-    class LiteralCompiler(dialect.statement_compiler):
+-
+-        def render_literal_value(self, value, type_):
+-
+-            if isinstance(value, (str, dt.date, dt.datetime, dt.timedelta)):
+-                return "'{}'".format(str(value).replace("'", "''"))
+-
+-            return super(LiteralCompiler, self).render_literal_value(value, type_)
+-
+-    return str(LiteralCompiler(dialect, statement, compile_kwargs={'literal_binds': True}))
+-
+-
+-def render_ddl_query(statement, dialect):
+-    class LiteralCompiler(dialect.ddl_compiler):
+-
+-        def render_literal_value(self, value, type_):
+-            if isinstance(value, (str, dt.date, dt.datetime, dt.timedelta)):
+-                return "'{}'".format(str(value).replace("'", "''"))
+-
+-            return super(LiteralCompiler, self).render_literal_value(value, type_)
+-
+-    return str(LiteralCompiler(dialect, statement, compile_kwargs={'literal_binds': True}))

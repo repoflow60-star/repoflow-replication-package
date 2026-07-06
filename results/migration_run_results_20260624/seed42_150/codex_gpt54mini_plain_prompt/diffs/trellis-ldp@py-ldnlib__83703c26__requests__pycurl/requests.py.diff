@@ -1,0 +1,274 @@
+diff --git /dev/null b/requests.py
+new file mode 100644
+index 0000000..3ae965f
+--- /dev/null
++++ b/requests.py
+@@ -0,0 +1,268 @@
++"""Compatibility layer that mimics the subset of ``requests`` used by ldnlib.
++
++The implementation prefers ``pycurl`` and falls back to ``urllib`` when
++``pycurl`` is unavailable so the library remains usable in constrained
++environments.
++"""
++
++from __future__ import annotations
++
++import base64
++from dataclasses import dataclass
++from io import BytesIO
++import json
++from types import SimpleNamespace
++from urllib.error import HTTPError as UrllibHTTPError
++from urllib.error import URLError
++from urllib.parse import urlencode
++from urllib.request import HTTPRedirectHandler
++from urllib.request import Request, build_opener
++
++try:
++    import pycurl
++except ImportError:  # pragma: no cover - exercised only when pycurl is absent.
++    pycurl = None
++
++
++codes = SimpleNamespace(ok=200)
++
++
++class HTTPError(Exception):
++    def __init__(self, message, response=None):
++        super().__init__(message)
++        self.response = response
++
++
++@dataclass
++class Response:
++    status_code: int
++    headers: dict
++    text: str
++    url: str = ""
++    content: bytes = b""
++
++    def __post_init__(self):
++        self.headers = {key.lower(): value for key, value in self.headers.items()}
++        if not self.content and self.text:
++            self.content = self.text.encode("utf-8")
++        self.links = _parse_links(self.headers.get("link", ""))
++
++    def json(self):
++        return json.loads(self.text)
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise HTTPError(
++                "HTTP {} for {}".format(self.status_code, self.url or "request"),
++                response=self,
++            )
++
++
++def get(url, **kwargs):
++    return _request("GET", url, allow_redirects=kwargs.pop("allow_redirects", True), **kwargs)
++
++
++def head(url, **kwargs):
++    return _request("HEAD", url, allow_redirects=kwargs.pop("allow_redirects", False), **kwargs)
++
++
++def post(url, **kwargs):
++    return _request("POST", url, allow_redirects=kwargs.pop("allow_redirects", False), **kwargs)
++
++
++def options(url, **kwargs):
++    return _request("OPTIONS", url, allow_redirects=kwargs.pop("allow_redirects", False), **kwargs)
++
++
++def _request(method, url, headers=None, data=None, auth=None, timeout=None,
++             allow_redirects=False, params=None, **kwargs):
++    if params:
++        separator = "&" if "?" in url else "?"
++        url = "{}{}{}".format(url, separator, urlencode(params, doseq=True))
++
++    headers = dict(headers or {})
++    if auth:
++        headers.setdefault("authorization", _basic_auth_header(auth))
++
++    if pycurl is not None:
++        return _request_pycurl(
++            method, url, headers=headers, data=data, auth=auth,
++            timeout=timeout, allow_redirects=allow_redirects, **kwargs
++        )
++    return _request_urllib(
++        method, url, headers=headers, data=data, timeout=timeout,
++        allow_redirects=allow_redirects, **kwargs
++    )
++
++
++def _request_pycurl(method, url, headers, data, auth, timeout,
++                    allow_redirects, **kwargs):
++    curl = pycurl.Curl()
++    body_buffer = BytesIO()
++    header_buffer = BytesIO()
++
++    try:
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.FOLLOWLOCATION, 1 if allow_redirects else 0)
++        curl.setopt(pycurl.MAXREDIRS, 10)
++        curl.setopt(pycurl.HEADERFUNCTION, header_buffer.write)
++        curl.setopt(pycurl.WRITEFUNCTION, body_buffer.write)
++
++        if timeout is not None:
++            curl.setopt(pycurl.TIMEOUT, timeout)
++
++        if auth:
++            curl.setopt(pycurl.HTTPAUTH, pycurl.HTTPAUTH_BASIC)
++            curl.setopt(pycurl.USERPWD, "{}:{}".format(auth[0], auth[1]))
++
++        if headers:
++            curl.setopt(
++                pycurl.HTTPHEADER,
++                ["{}: {}".format(key, value) for key, value in headers.items()],
++            )
++
++        if method == "GET":
++            curl.setopt(pycurl.HTTPGET, 1)
++        elif method == "HEAD":
++            curl.setopt(pycurl.NOBODY, 1)
++            curl.setopt(pycurl.CUSTOMREQUEST, "HEAD")
++        elif method == "OPTIONS":
++            curl.setopt(pycurl.NOBODY, 1)
++            curl.setopt(pycurl.CUSTOMREQUEST, "OPTIONS")
++        elif method == "POST":
++            curl.setopt(pycurl.POST, 1)
++            curl.setopt(pycurl.CUSTOMREQUEST, "POST")
++            if data is not None:
++                payload = _coerce_bytes(data)
++                curl.setopt(pycurl.POSTFIELDS, payload)
++                curl.setopt(pycurl.POSTFIELDSIZE, len(payload))
++        else:
++            curl.setopt(pycurl.CUSTOMREQUEST, method)
++            if data is not None:
++                payload = _coerce_bytes(data)
++                curl.setopt(pycurl.POSTFIELDS, payload)
++                curl.setopt(pycurl.POSTFIELDSIZE, len(payload))
++
++        curl.perform()
++        status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        final_url = curl.getinfo(pycurl.EFFECTIVE_URL)
++    finally:
++        curl.close()
++
++    body = body_buffer.getvalue()
++    raw_headers = header_buffer.getvalue().decode("iso-8859-1", errors="replace")
++    response_headers = _parse_header_blocks(raw_headers)
++    text = _decode_body(body, response_headers)
++    return Response(
++        status_code=status_code,
++        headers=response_headers,
++        text=text,
++        url=final_url,
++        content=body,
++    )
++
++
++def _request_urllib(method, url, headers, data, timeout, allow_redirects, **kwargs):
++    request_data = None
++    if data is not None:
++        request_data = _coerce_bytes(data)
++
++    request = Request(url, data=request_data, headers=headers, method=method)
++
++    try:
++        opener = build_opener() if allow_redirects else build_opener(
++            _NoRedirectHandler()
++        )
++        with opener.open(request, timeout=timeout) as response:
++            body = response.read()
++            response_headers = dict(response.headers.items())
++            status_code = response.getcode()
++            final_url = response.geturl()
++    except UrllibHTTPError as exc:
++        body = exc.read()
++        response_headers = dict(exc.headers.items()) if exc.headers else {}
++        status_code = exc.code
++        final_url = exc.geturl()
++    except URLError:
++        raise
++
++    text = _decode_body(body, response_headers)
++    return Response(
++        status_code=status_code,
++        headers=response_headers,
++        text=text,
++        url=final_url,
++        content=body,
++    )
++
++
++def _coerce_bytes(data):
++    if isinstance(data, bytes):
++        return data
++    if isinstance(data, str):
++        return data.encode("utf-8")
++    if hasattr(data, "read"):
++        chunk = data.read()
++        return chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8")
++    return str(data).encode("utf-8")
++
++
++def _decode_body(body, headers):
++    content_type = headers.get("content-type", "")
++    charset = "utf-8"
++    if "charset=" in content_type:
++        charset = content_type.split("charset=", 1)[1].split(";", 1)[0].strip()
++    try:
++        return body.decode(charset)
++    except (LookupError, UnicodeDecodeError):
++        return body.decode("utf-8", errors="replace")
++
++
++def _parse_header_blocks(raw_headers):
++    blocks = [block for block in raw_headers.split("\r\n\r\n") if block.strip()]
++    block = blocks[-1] if blocks else raw_headers
++    headers = {}
++    for line in block.splitlines():
++        if not line or ":" not in line:
++            continue
++        key, value = line.split(":", 1)
++        key = key.strip().lower()
++        value = value.strip()
++        if key in headers:
++            headers[key] = "{}, {}".format(headers[key], value)
++        else:
++            headers[key] = value
++    return headers
++
++
++def _parse_links(link_header):
++    links = {}
++    if not link_header:
++        return links
++
++    for entry in link_header.split(","):
++        entry = entry.strip()
++        if not entry or "<" not in entry or ">" not in entry:
++            continue
++        target = entry[entry.find("<") + 1:entry.find(">")]
++        params = {}
++        for part in entry[entry.find(">") + 1:].split(";"):
++            part = part.strip()
++            if not part or "=" not in part:
++                continue
++            key, value = part.split("=", 1)
++            params[key.strip()] = value.strip().strip('"')
++        rel = params.get("rel")
++        if rel:
++            links[rel] = {"url": target, **params}
++    return links
++
++
++def _basic_auth_header(auth):
++    token = "{}:{}".format(auth[0], auth[1]).encode("utf-8")
++    return "Basic {}".format(base64.b64encode(token).decode("ascii"))
++
++
++class _NoRedirectHandler(HTTPRedirectHandler):
++    def redirect_request(self, req, fp, code, msg, headers, newurl):
++        return None

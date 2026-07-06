@@ -1,0 +1,124 @@
+--- a/octodns_ddns/__init__.py
++++ b/octodns_ddns/__init__.py
+@@ -14,9 +14,10 @@
+ )
+ 
+ from logging import getLogger
++from threading import Event, Lock, Thread
+ 
+-from requests import Session
+-from requests.exceptions import ConnectionError
++import treq
++from twisted.internet import defer, reactor, threads
+ 
+ from octodns import __VERSION__ as octodns_version
+ from octodns.record import Record
+@@ -24,6 +25,90 @@
+ 
+ # TODO: remove __VERSION__ with the next major version release
+ __version__ = __VERSION__ = '0.2.1'
++
++
++_reactor_started = Event()
++_reactor_lock = Lock()
++
++
++def _ensure_reactor_running():
++    if reactor.running or _reactor_started.is_set():
++        return
++
++    with _reactor_lock:
++        if reactor.running or _reactor_started.is_set():
++            return
++
++        def _run():
++            reactor.callWhenRunning(_reactor_started.set)
++            reactor.run(installSignalHandlers=False)
++
++        Thread(target=_run, daemon=True).start()
++
++    _reactor_started.wait()
++
++
++class _Response(object):
++    def __init__(self, code, content, reason='', checker=None):
++        self.code = code
++        if content is None:
++            content = b''
++        if isinstance(content, str):
++            content = content.encode('utf-8')
++        self.content = content
++        self.reason = reason
++        self._checker = checker
++
++    def raise_for_status(self):
++        if self._checker is not None:
++            self._checker()
++            return
++        if self.code >= 400:
++            raise Exception(self.reason or 'HTTP {}'.format(self.code))
++
++
++class _Session(object):
++    def __init__(self):
++        self.headers = {}
++
++    def get(self, url):
++        _ensure_reactor_running()
++
++        def _request():
++            def _response(resp):
++                checker = getattr(resp, 'raise_for_status', None)
++                content = getattr(resp, 'content', None)
++                if content is not None and not callable(content):
++                    reason = getattr(resp, 'phrase', '') or ''
++                    if isinstance(reason, bytes):
++                        reason = reason.decode('utf-8')
++                    return _Response(
++                        getattr(resp, 'code', 200),
++                        content,
++                        reason,
++                        checker,
++                    )
++
++                def _content(content):
++                    reason = getattr(resp, 'phrase', '') or ''
++                    if isinstance(reason, bytes):
++                        reason = reason.decode('utf-8')
++                    return _Response(
++                        getattr(resp, 'code', 200),
++                        content,
++                        reason,
++                        checker,
++                    )
++
++                return defer.maybeDeferred(treq.content, resp).addCallback(
++                    _content
++                )
++
++            return defer.maybeDeferred(
++                treq.get, url, headers=self.headers
++            ).addCallback(_response)
++
++        return threads.blockingCallFromThread(reactor, _request)
+ 
+ 
+ class DdnsSource(BaseSource):
+@@ -41,7 +126,7 @@
+             'AAAA': urls.get('AAAA', 'https://v6.ident.me/'),
+         }
+ 
+-        self._sess = Session()
++        self._sess = _Session()
+         self._sess.headers.update(
+             {
+                 'User-Agent': f'octodns/{octodns_version} octodns-ddns/{__VERSION__}'
+@@ -52,7 +137,7 @@
+         self.log.debug('_get_addr: type=%s', _type)
+         try:
+             resp = self._sess.get(self.urls[_type])
+-        except ConnectionError:
++        except Exception:
+             raise Exception(
+                 'Failed to get ip address for type={}'.format(_type)
+             )

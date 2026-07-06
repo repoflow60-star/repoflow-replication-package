@@ -1,0 +1,232 @@
+diff --git /dev/null b/requests.py
+new file mode 100644
+index 0000000..6b6211f
+--- /dev/null
++++ b/requests.py
+@@ -0,0 +1,226 @@
++"""Compatibility layer that exposes a small requests-like API on top of urllib3."""
++
++
++from __future__ import annotations
++
++import json as _json
++from http.cookies import SimpleCookie
++from types import SimpleNamespace
++from typing import Any, Dict, Mapping, Optional
++from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
++
++import urllib3
++from urllib3.exceptions import HTTPError as _Urllib3HTTPError
++
++
++class RequestException(Exception):
++    """Base exception for request failures."""
++
++    def __init__(self, *args, response=None, request=None):
++        super().__init__(*args)
++        self.response = response
++        self.request = request
++
++
++class HTTPError(RequestException):
++    """Raised for HTTP error responses."""
++
++
++exceptions = SimpleNamespace(RequestException=RequestException)
++
++
++class Response:
++    """Minimal response object compatible with the parts of requests we use."""
++
++    status_code = 0
++
++    def __init__(
++        self,
++        response: Optional[urllib3.response.HTTPResponse] = None,
++        *,
++        status_code: Optional[int] = None,
++        headers: Optional[Mapping[str, Any]] = None,
++        data: Optional[bytes] = None,
++        url: Optional[str] = None,
++    ):
++        self._response = response
++        if response is not None:
++            self.status_code = response.status
++            self.headers = response.headers
++            self.data = response.data
++            self.url = getattr(response, "url", url)
++        else:
++            if status_code is not None:
++                self.status_code = status_code
++            self.headers = headers or {}
++            self.data = data or b""
++            self.url = url
++
++    @property
++    def content(self):
++        return self.data
++
++    @property
++    def text(self):
++        if isinstance(self.data, bytes):
++            encoding = self._encoding()
++            return self.data.decode(encoding, errors="replace")
++        return str(self.data)
++
++    def _encoding(self):
++        headers = self.headers
++        if hasattr(headers, "get_content_charset"):
++            encoding = headers.get_content_charset()
++            if encoding:
++                return encoding
++        content_type = headers.get("Content-Type") if hasattr(headers, "get") else None
++        if content_type and "charset=" in content_type:
++            return content_type.split("charset=", 1)[1].split(";", 1)[0].strip()
++        return "utf-8"
++
++    def json(self):
++        if self.data in (None, b"", ""):
++            raise ValueError("No JSON content")
++        payload = self.text if isinstance(self.data, bytes) else self.data
++        return _json.loads(payload)
++
++    def raise_for_status(self):
++        if 400 <= int(self.status_code) < 600:
++            raise HTTPError(
++                f"{self.status_code} Server Error",
++                response=self,
++            )
++
++    def __getattr__(self, item):
++        if self._response is not None:
++            return getattr(self._response, item)
++        raise AttributeError(item)
++
++
++class Session:
++    """Small urllib3-backed drop-in replacement for the requests Session used here."""
++
++    def __init__(self):
++        self._pool = urllib3.PoolManager()
++        self.cookies: Dict[str, str] = {}
++
++    def close(self):
++        self._pool.clear()
++
++    def _cookie_header(self):
++        if not self.cookies:
++            return None
++        return "; ".join(f"{name}={value}" for name, value in self.cookies.items())
++
++    def _apply_cookies(self, headers):
++        if headers is None:
++            headers = {}
++        else:
++            headers = dict(headers)
++        cookie_header = self._cookie_header()
++        if cookie_header and "Cookie" not in headers:
++            headers["Cookie"] = cookie_header
++        return headers
++
++    def _store_cookies(self, response):
++        headers = response.headers
++        cookie_headers = []
++        if hasattr(headers, "getlist"):
++            cookie_headers = headers.getlist("Set-Cookie") or headers.getlist("set-cookie")
++        if not cookie_headers and hasattr(headers, "get"):
++            cookie_header = headers.get("Set-Cookie") or headers.get("set-cookie")
++            if cookie_header:
++                cookie_headers = [cookie_header]
++        for cookie_header in cookie_headers:
++            cookie = SimpleCookie()
++            cookie.load(cookie_header)
++            for morsel in cookie.values():
++                self.cookies[morsel.key] = morsel.value
++
++    def _request(
++        self,
++        method: str,
++        url: str,
++        body=None,
++        headers=None,
++        params=None,
++        files=None,
++        data=None,
++        json=None,
++        timeout=None,
++        **kwargs,
++    ):
++        if params:
++            split = urlsplit(url)
++            existing = parse_qsl(split.query, keep_blank_values=True)
++            if isinstance(params, Mapping):
++                existing.extend(list(params.items()))
++            else:
++                existing.extend(list(params))
++            url = urlunsplit(
++                (split.scheme, split.netloc, split.path, urlencode(existing, doseq=True), split.fragment)
++            )
++
++        if json is not None:
++            body = _json.dumps(json).encode("utf-8")
++            headers = self._apply_cookies(headers)
++            headers.setdefault("Content-Type", "application/json")
++        elif body is None and data is not None:
++            body = data
++        if isinstance(body, str):
++            body = body.encode("utf-8")
++        if isinstance(body, dict) and files is None:
++            body = urlencode(body, doseq=True).encode("utf-8")
++
++        request_headers = self._apply_cookies(headers)
++
++        request_kwargs = {
++            "headers": request_headers,
++            "preload_content": True,
++            "retries": False,
++        }
++        if timeout is not None:
++            request_kwargs["timeout"] = timeout
++        if files is not None:
++            request_kwargs["fields"] = files
++            if body is not None:
++                request_kwargs["body"] = body
++        elif body is not None:
++            request_kwargs["body"] = body
++
++        try:
++            raw_response = self._pool.request(method, url, **request_kwargs)
++        except _Urllib3HTTPError as exc:
++            raise RequestException(str(exc)) from exc
++
++        self._store_cookies(raw_response)
++        return Response(raw_response)
++
++    def request(self, method, url, **kwargs):
++        return self._request(method, url, **kwargs)
++
++    def get(self, url, params=None, headers=None, **kwargs):
++        return self._request("GET", url, params=params, headers=headers, **kwargs)
++
++    def post(self, url, data=None, headers=None, params=None, files=None, **kwargs):
++        return self._request(
++            "POST",
++            url,
++            body=data,
++            headers=headers,
++            params=params,
++            files=files,
++            **kwargs,
++        )
++
++    def put(self, url, data=None, headers=None, params=None, files=None, **kwargs):
++        return self._request(
++            "PUT",
++            url,
++            body=data,
++            headers=headers,
++            params=params,
++            files=files,
++            **kwargs,
++        )
++

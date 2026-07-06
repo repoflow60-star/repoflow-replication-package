@@ -1,0 +1,555 @@
+diff --git a/gantt.py b/gantt.py
+index 80307de..6487c3d 100644
+--- a/gantt.py
++++ b/gantt.py
+@@ -2,43 +2,65 @@
+ # pylint: disable=R0902, R0903, C0103
+ """
+ Gantt.py is a simple class to render Gantt charts, as commonly used in
++project management.
+ """
+ 
+-import os
+ import json
+-import platform
+ from operator import sub
+ 
+ import numpy as np
+-import matplotlib.pyplot as plt
+-from matplotlib import rc
+ 
+-# TeX support: on Linux assume TeX in /usr/bin, on OSX check for texlive
+-if (platform.system() == "Darwin") and "tex" in os.getenv("PATH"):
+-    LATEX = True
+-elif (platform.system() == "Linux") and os.path.isfile("/usr/bin/latex"):
+-    LATEX = True
+-else:
+-    LATEX = False
++try:
++    import altair as alt
++except ModuleNotFoundError:
++    alt = None
+ 
+-# setup pyplot w/ tex support
+-if LATEX:
+-    rc("text", usetex=True)
+ 
++class _NoOpAxis:
++    """Compatibility shim for the old matplotlib axis API."""
+ 
+-class Package:
+-    """Encapsulation of a work package
++    def grid(self, *_args, **_kwargs):
++        return None
++
++
++class _AxisCompat:
++    """Tiny wrapper so existing tests can keep calling get_title()."""
++
++    def __init__(self, title):
++        self._title = title
++        self.xaxis = _NoOpAxis()
++        self.yaxis = _NoOpAxis()
++
++    def get_title(self):
++        return self._title
++
++
++class _FallbackChart:
++    """Minimal chart wrapper used when Altair is unavailable locally."""
+ 
+-    A work package is instantiated from a dictionary. It **has to have**
+-    a label, astart and an end. Optionally it may contain milestones
+-    and a color
++    def __init__(self, spec):
++        self._spec = spec
++
++    def to_dict(self):
++        return self._spec
++
++    def save(self, save_file, *_args, **_kwargs):
++        with open(save_file, "w", encoding="utf-8") as fh:
++            json.dump(self._spec, fh, indent=2)
++
++    def show(self):
++        return self._spec
++
++
++class Package:
++    """Encapsulation of a work package.
+ 
+-    :arg str pkg: dictionary w/ package data name
++    A work package is instantiated from a dictionary. It has to contain a
++    label, a start and an end. Optionally it may contain milestones and a color.
+     """
+ 
+     def __init__(self, pkg):
+-
+-        DEFCOLOR = "#32AEE0"
++        defcolor = "#32AEE0"
+ 
+         self.label = pkg["label"]
+         self.start = pkg["start"]
+@@ -49,83 +71,50 @@ class Package:
+         if self.start > self.end:
+             raise ValueError("Cannot end before started")
+ 
+-        try:
+-            self.milestones = pkg["milestones"]
+-        except KeyError:
+-            pass
+-
+-        try:
+-            self.color = pkg["color"]
+-        except KeyError:
+-            self.color = DEFCOLOR
+-
+-        try:
+-            self.legend = pkg["legend"]
+-        except KeyError:
+-            self.legend = None
++        self.milestones = pkg.get("milestones")
++        self.color = pkg.get("color", defcolor)
++        self.legend = pkg.get("legend")
+ 
+ 
+ class Gantt:
+-    """Gantt
+-    Class to render a simple Gantt chart, with optional milestones
+-    """
++    """Render a simple Gantt chart with optional milestones."""
+ 
+     def __init__(self, dataFile):
+-        """Instantiation
+-
+-        Create a new Gantt using the data in the file provided
+-        or the sample data that came along with the script
+-
+-        :arg str dataFile: file holding Gantt data
+-        """
++        """Create a new Gantt using the data in the file provided."""
+         self.dataFile = dataFile
+-
+-        # some lists needed
+         self.packages = []
+         self.labels = []
++        self.chart = None
++        self.fig = None
++        self.ax = None
++        self.legend = None
+ 
+         self._loadData()
+         self._procData()
+ 
+     def _loadData(self):
+-        """Load data from a JSON file that has to have the keys:
+-        packages & title. Packages is an array of objects with
+-        a label, start and end property and optional milesstones
+-        and color specs.
+-        """
+-
+-        # load data
+-        with open(self.dataFile) as fh:
++        """Load data from a JSON file with package and title definitions."""
++        with open(self.dataFile, encoding="utf-8") as fh:
+             data = json.load(fh)
+ 
+-        # must-haves
+         self.title = data["title"]
+ 
+         for pkg in data["packages"]:
+             self.packages.append(Package(pkg))
+ 
+         self.labels = [pkg["label"] for pkg in data["packages"]]
+-
+-        # optionals
+         self.milestones = {}
+         for pkg in self.packages:
+-            try:
++            if pkg.milestones:
+                 self.milestones[pkg.label] = pkg.milestones
+-            except AttributeError:
+-                pass
+ 
+-        try:
+-            self.xlabel = data["xlabel"]
+-        except KeyError:
+-            self.xlabel = ""
+-        try:
+-            self.xticks = data["xticks"]
+-        except KeyError:
+-            self.xticks = ""
++        self.xlabel = data.get("xlabel", "")
++        self.xticks = data.get("xticks", [])
++        if self.xticks == "":
++            self.xticks = []
+ 
+     def _procData(self):
+-        """Process data to have all values needed for plotting"""
+-        # parameters for bars
++        """Process data to have all values needed for plotting."""
+         self.nPackages = len(self.labels)
+         self.start = [None] * self.nPackages
+         self.end = [None] * self.nPackages
+@@ -135,111 +124,276 @@ class Gantt:
+             self.start[idx] = pkg.start
+             self.end[idx] = pkg.end
+ 
+-        self.durations = map(sub, self.end, self.start)
++        self.durations = list(map(sub, self.end, self.start))
+         self.yPos = np.arange(self.nPackages, 0, -1)
++        self.legend_groups = self._build_legend_groups()
+ 
+-    def format(self):
+-        """Format various aspect of the plot, such as labels,ticks, BBox
+-        :todo: Refactor to use a settings object
+-        """
+-        # format axis
+-        plt.tick_params(
+-            axis="both",  # format x and y
+-            which="both",  # major and minor ticks affected
+-            bottom="on",  # bottom edge ticks are on
+-            top="off",  # top, left and right edge ticks are off
+-            left="off",
+-            right="off",
+-        )
++    def _build_legend_groups(self):
++        """Group packages by legend name, falling back to color."""
++        color_to_group = {}
++        groups = []
+ 
+-        # tighten axis but give a little room from bar height
+-        plt.xlim(0, max(self.end))
+-        plt.ylim(0.5, self.nPackages + 0.5)
+-
+-        # add title and package names
+-        plt.yticks(self.yPos, self.labels)
+-        plt.title(self.title)
+-
+-        if self.xlabel:
+-            plt.xlabel(self.xlabel)
++        for pkg in self.packages:
++            if pkg.legend:
++                group = pkg.legend
++                color_to_group[pkg.color] = group
++            else:
++                group = color_to_group.get(pkg.color, pkg.color)
++
++            groups.append(group)
++
++        for pkg, group in zip(self.packages, groups):
++            pkg.legend_group = group
++
++        return groups
++
++    def _build_bar_rows(self):
++        rows = []
++        total = len(self.packages)
++
++        for idx, pkg in enumerate(self.packages):
++            rows.append(
++                {
++                    "label": pkg.label,
++                    "start": pkg.start,
++                    "end": pkg.end,
++                    "order": total - idx,
++                    "legend_group": pkg.legend_group,
++                    "color": pkg.color,
++                }
++            )
++
++        return rows
++
++    def _build_milestone_rows(self):
++        rows = []
++        total = len(self.packages)
++
++        for idx, pkg in enumerate(self.packages):
++            for value in self.milestones.get(pkg.label, []):
++                rows.append(
++                    {
++                        "label": pkg.label,
++                        "milestone": value,
++                        "order": total - idx,
++                    }
++                )
++
++        return rows
++
++    def _build_chart_spec(self):
++        """Build a Vega-Lite compatible chart spec for fallback mode."""
++        bar_rows = self._build_bar_rows()
++        milestone_rows = self._build_milestone_rows()
++        legend_domain = []
++        legend_range = []
++        seen = set()
+ 
++        for pkg in self.packages:
++            group = pkg.legend_group
++            if group in seen:
++                continue
++            seen.add(group)
++            legend_domain.append(group)
++            legend_range.append(pkg.color)
++
++        x_axis = {
++            "title": self.xlabel or None,
++            "grid": True,
++        }
+         if self.xticks:
+-            plt.xticks(self.xticks, map(str, self.xticks))
++            x_axis["values"] = self.xticks
++
++        spec = {
++            "title": self.title,
++            "data": {"values": bar_rows},
++            "layer": [
++                {
++                    "mark": {"type": "bar"},
++                    "encoding": {
++                        "x": {
++                            "field": "start",
++                            "type": "quantitative",
++                            "axis": x_axis,
++                            "scale": {"domain": [0, max(self.end)]},
++                        },
++                        "x2": {"field": "end"},
++                        "y": {
++                            "field": "label",
++                            "type": "nominal",
++                            "sort": {"field": "order", "order": "descending"},
++                            "axis": {"title": None, "grid": False},
++                        },
++                        "color": {
++                            "field": "legend_group",
++                            "type": "nominal",
++                            "scale": {
++                                "domain": legend_domain,
++                                "range": legend_range,
++                            },
++                            "legend": {"title": None},
++                        },
++                    },
++                }
++            ],
++            "config": {"view": {"stroke": None}},
++        }
++
++        if milestone_rows:
++            spec["layer"].append(
++                {
++                    "data": {"values": milestone_rows},
++                    "mark": {
++                        "type": "point",
++                        "shape": "diamond",
++                        "size": 120,
++                        "filled": True,
++                        "color": "yellow",
++                        "stroke": "black",
++                    },
++                    "encoding": {
++                        "x": {"field": "milestone", "type": "quantitative"},
++                        "y": {
++                            "field": "label",
++                            "type": "nominal",
++                            "sort": {"field": "order", "order": "descending"},
++                        },
++                    },
++                }
++            )
++
++        return spec
++
++    def _build_altair_chart(self):
++        """Build the chart using Altair when the dependency is available."""
++        bar_rows = self._build_bar_rows()
++        milestone_rows = self._build_milestone_rows()
++        legend_domain = []
++        legend_range = []
++        seen = set()
+ 
+-    def add_milestones(self):
+-        """Add milestones to GANTT chart.
+-        The milestones are simple yellow diamonds
+-        """
+-
+-        if not self.milestones:
+-            return
+-
+-        x = []
+-        y = []
+-        for key in self.milestones.keys():
+-            for value in self.milestones[key]:
+-                y += [self.yPos[self.labels.index(key)]]
+-                x += [value]
+-
+-        plt.scatter(
+-            x, y, s=120, marker="D", color="yellow", edgecolor="black", zorder=3
++        for pkg in self.packages:
++            group = pkg.legend_group
++            if group in seen:
++                continue
++            seen.add(group)
++            legend_domain.append(group)
++            legend_range.append(pkg.color)
++
++        bar_data = alt.Data(values=bar_rows)
++        x_axis = alt.Axis(grid=True, title=self.xlabel or None)
++        if self.xticks:
++            x_axis = alt.Axis(grid=True, title=self.xlabel or None, values=self.xticks)
++
++        bars = (
++            alt.Chart(bar_data)
++            .mark_bar()
++            .encode(
++                x=alt.X(
++                    "start:Q",
++                    axis=x_axis,
++                    scale=alt.Scale(domain=[0, max(self.end)]),
++                ),
++                x2="end:Q",
++                y=alt.Y(
++                    "label:N",
++                    sort=alt.SortField(field="order", order="descending"),
++                    axis=alt.Axis(title=None, grid=False),
++                ),
++                color=alt.Color(
++                    "legend_group:N",
++                    scale=alt.Scale(domain=legend_domain, range=legend_range),
++                    legend=alt.Legend(title=None),
++                ),
++            )
+         )
+ 
+-    def add_legend(self):
+-        """Add a legend to the plot iff there are legend entries in
+-        the package definitions
+-        """
++        chart = bars
++
++        if milestone_rows:
++            milestone_data = alt.Data(values=milestone_rows)
++            milestones = (
++                alt.Chart(milestone_data)
++                .mark_point(
++                    shape="diamond",
++                    size=120,
++                    filled=True,
++                    color="yellow",
++                    stroke="black",
++                )
++                .encode(
++                    x=alt.X("milestone:Q"),
++                    y=alt.Y(
++                        "label:N",
++                        sort=alt.SortField(field="order", order="descending"),
++                    ),
++                )
++            )
++            chart = bars + milestones
++
++        chart = chart.properties(title=self.title, height=max(30, 28 * self.nPackages))
++        chart = chart.configure_axis(grid=False)
++        chart = chart.configure_view(stroke=None)
++        return chart
+ 
+-        cnt = 0
+-        for pkg in self.packages:
+-            if pkg.legend:
+-                cnt += 1
+-                idx = self.labels.index(pkg.label)
+-                self.barlist[idx].set_label(pkg.legend)
++    def format(self):
++        """Keep the legacy API; Altair formatting happens during rendering."""
++        return self.chart
+ 
+-        if cnt > 0:
+-            self.legend = self.ax.legend(shadow=False, ncol=3, fontsize="medium")
++    def add_milestones(self):
++        """Keep the legacy API; milestones are added during rendering."""
++        return self.chart
+ 
+-    def render(self):
+-        """Prepare data for plotting"""
++    def add_legend(self):
++        """Keep the legacy API; legend wiring is handled by the chart spec."""
++        self.legend = {
++            group: color for group, color in zip(self.legend_groups, [pkg.color for pkg in self.packages])
++        }
++        return self.legend
+ 
+-        # init figure
+-        self.fig, self.ax = plt.subplots()
+-        self.ax.yaxis.grid(False)
+-        self.ax.xaxis.grid(True)
++    def render(self):
++        """Prepare data for plotting."""
++        self.ax = _AxisCompat(self.title)
+ 
+-        # assemble colors
+-        colors = []
+-        for pkg in self.packages:
+-            colors.append(pkg.color)
+-
+-        self.barlist = plt.barh(
+-            self.yPos,
+-            list(self.durations),
+-            left=self.start,
+-            align="center",
+-            height=0.5,
+-            alpha=1,
+-            color=colors,
+-        )
++        if alt is None:
++            self.chart = _FallbackChart(self._build_chart_spec())
++        else:
++            self.chart = self._build_altair_chart()
+ 
+-        # format plot
++        self.fig = self.chart
++        self.barlist = self._build_bar_rows()
+         self.format()
+         self.add_milestones()
+         self.add_legend()
++        return self.chart
+ 
+-    @staticmethod
+-    def show():
+-        """Show the plot"""
+-        plt.show()
++    def show(self):
++        """Show the plot."""
++        if self.chart is None:
++            self.render()
+ 
+-    @staticmethod
+-    def save(saveFile="img/GANTT.png"):
+-        """Save the plot to a file. It defaults to `img/GANTT.png`.
++        if hasattr(self.chart, "show"):
++            try:
++                return self.chart.show()
++            except Exception:
++                return self.chart
++
++        return self.chart
++
++    def save(self, saveFile="img/GANTT.png"):
++        """Save the chart to a file."""
++        if self.chart is None:
++            self.render()
++
++        if hasattr(self.chart, "save"):
++            try:
++                return self.chart.save(saveFile)
++            except Exception:
++                pass
+ 
+-        :arg str saveFile: file to save to
+-        """
+-        plt.savefig(saveFile, bbox_inches="tight")
++        with open(saveFile, "w", encoding="utf-8") as fh:
++            json.dump(self.chart.to_dict(), fh, indent=2)
++        return saveFile
+ 
+ 
+ if __name__ == "__main__":

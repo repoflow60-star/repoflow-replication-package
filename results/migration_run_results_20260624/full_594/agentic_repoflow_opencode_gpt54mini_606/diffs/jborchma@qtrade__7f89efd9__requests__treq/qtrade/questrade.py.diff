@@ -1,0 +1,224 @@
+--- a/qtrade/questrade.py
++++ b/qtrade/questrade.py
+@@ -1,16 +1,192 @@
+ """Core module for Questrade API wrapper."""
+ 
++import json as json_module
+ import logging
++import threading
+ from typing import Any, Dict, List, Optional, Union
+-
+-import requests
++from urllib.parse import urlencode, urlsplit, urlunsplit
++
++import treq
+ import yaml
++from twisted.internet import reactor, threads
+ 
+ from .utility import TokenDict, get_access_token_yaml, validate_access_token
+ 
+ log = logging.getLogger(__name__)  # pylint: disable=C0103
+ 
+ TOKEN_URL = "https://login.questrade.com/oauth2/token?grant_type=refresh_token&refresh_token="
++
++_REACTOR_READY = threading.Event()
++_REACTOR_LOCK = threading.Lock()
++_REACTOR_STARTED = False
++
++
++class _TreqResponse:
++    """Minimal response wrapper for the synchronous API used by this module."""
++
++    def __init__(self, code: int, payload: Any):
++        self.code = code
++        self.status_code = code
++        self._payload = payload
++
++    def raise_for_status(self):
++        if self.code >= 400:
++            raise Exception(f"HTTP error {self.code}")
++
++    def json(self):
++        return self._payload
++
++
++def _append_params(url: str, params: Optional[Dict]) -> str:
++    if not params:
++        return url
++
++    parts = urlsplit(url)
++    encoded = urlencode(params, doseq=True)
++    if parts.query:
++        encoded = parts.query + "&" + encoded
++    return urlunsplit((parts.scheme, parts.netloc, parts.path, encoded, parts.fragment))
++
++
++def _normalize_body(data: Optional[Dict]) -> Optional[bytes]:
++    if data is None:
++        return None
++    if isinstance(data, bytes):
++        return data
++    if isinstance(data, str):
++        return data.encode("utf-8")
++    return urlencode(data, doseq=True).encode("utf-8")
++
++
++def _start_reactor():
++    reactor.callWhenRunning(_REACTOR_READY.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor_running():
++    global _REACTOR_STARTED
++
++    if reactor.running:
++        _REACTOR_READY.set()
++        return
++
++    with _REACTOR_LOCK:
++        if not reactor.running and not _REACTOR_STARTED:
++            thread = threading.Thread(
++                target=_start_reactor,
++                name="qtrade-treq-reactor",
++                daemon=True,
++            )
++            thread.start()
++            _REACTOR_STARTED = True
++
++    _REACTOR_READY.wait()
++
++
++def _treq_request(
++    method: str,
++    url: str,
++    params: Optional[Dict] = None,
++    data: Optional[Dict] = None,
++    json_payload: Optional[Dict] = None,
++    headers: Optional[Dict[str, str]] = None,
++    timeout: Optional[int] = None,
++) -> _TreqResponse:
++    _ensure_reactor_running()
++
++    def _do_request():
++        request_url = _append_params(url, params)
++        request_headers = dict(headers or {})
++        body = _normalize_body(data)
++
++        if json_payload is not None:
++            body = json_module.dumps(json_payload).encode("utf-8")
++            request_headers.setdefault("Content-Type", "application/json")
++
++        deferred = treq.request(
++            method,
++            request_url,
++            data=body,
++            headers=request_headers or None,
++            timeout=timeout,
++        )
++
++        def _wrap_response(response):
++            def _decode(body_bytes):
++                if response.code >= 400:
++                    raise Exception(
++                        f"HTTP error {response.code}: {body_bytes.decode(errors='replace')}"
++                    )
++                return _TreqResponse(response.code, json_module.loads(body_bytes.decode("utf-8")))
++
++            return treq.content(response).addCallback(_decode)
++
++        return deferred.addCallback(_wrap_response)
++
++    return threads.blockingCallFromThread(reactor, _do_request)
++
++
++class _TreqSession:
++    """Blocking treq-backed session helper."""
++
++    def __init__(self):
++        self.headers: Dict[str, str] = {}
++
++    def request(self, method: str, url: str, **kwargs) -> _TreqResponse:
++        headers = dict(self.headers)
++        extra_headers = kwargs.pop("headers", None)
++        if extra_headers is not None:
++            headers.update(extra_headers)
++
++        return _treq_request(
++            method,
++            url,
++            params=kwargs.pop("params", None),
++            data=kwargs.pop("data", None),
++            json_payload=kwargs.pop("json", None),
++            headers=headers or None,
++            timeout=kwargs.pop("timeout", None),
++        )
++
++    def get(self, url: str, **kwargs) -> _TreqResponse:
++        return self.request("get", url, **kwargs)
++
++    def post(self, url: str, **kwargs) -> _TreqResponse:
++        return self.request("post", url, **kwargs)
++
++    def close(self):
++        return None
++
++
++class _HTTPFacade:
++    """Module-like facade for the migrated synchronous API."""
++
++    Session = _TreqSession
++
++    @staticmethod
++    def request(method: str, url: str, **kwargs) -> _TreqResponse:
++        return _treq_request(
++            method,
++            url,
++            params=kwargs.pop("params", None),
++            data=kwargs.pop("data", None),
++            json_payload=kwargs.pop("json", None),
++            headers=kwargs.pop("headers", None),
++            timeout=kwargs.pop("timeout", None),
++        )
++
++    @staticmethod
++    def get(url: str, **kwargs) -> _TreqResponse:
++        return _HTTPFacade.request("get", url, **kwargs)
++
++    @staticmethod
++    def post(url: str, **kwargs) -> _TreqResponse:
++        return _HTTPFacade.request("post", url, **kwargs)
++
++
++Session = _TreqSession
++_HTTP = _HTTPFacade()
++requests = _HTTP
+ 
+ 
+ class Questrade:
+@@ -38,7 +214,7 @@
+     ):
+         self.access_token: TokenDict
+         self.headers = None
+-        self.session = requests.Session()
++        self.session = _HTTP.Session()
+ 
+         self.access_code = access_code
+         self.token_yaml = token_yaml
+@@ -131,7 +307,7 @@
+         """
+         url = TOKEN_URL + str(self.access_code)
+         log.info("Getting access token...")
+-        data = requests.get(url)
++        data = _HTTP.get(url)
+         data.raise_for_status()
+         response = data.json()
+ 
+@@ -191,7 +367,7 @@
+ 
+         url = TOKEN_URL + str(old_access_token["refresh_token"])
+         log.info("Refreshing access token...")
+-        data = requests.get(url)
++        data = _HTTP.get(url)
+         data.raise_for_status()
+         response = data.json()
+ 

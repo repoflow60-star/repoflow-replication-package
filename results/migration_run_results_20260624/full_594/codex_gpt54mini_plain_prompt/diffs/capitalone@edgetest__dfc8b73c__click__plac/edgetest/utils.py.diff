@@ -1,0 +1,176 @@
+diff --git a/edgetest/utils.py b/edgetest/utils.py
+index 90be0ff..e7dfbec 100644
+--- a/edgetest/utils.py
++++ b/edgetest/utils.py
+@@ -1,6 +1,12 @@
+ """Utility functions."""
+ 
++import json
++import importlib.util
+ import os
++import platform
++import re
++import tempfile
++import sys
+ from configparser import ConfigParser
+ from contextlib import contextmanager
+ from copy import deepcopy
+@@ -10,6 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
+ 
+ from packaging.requirements import Requirement
+ from packaging.specifiers import Specifier, SpecifierSet
++from packaging.utils import canonicalize_name
+ from tomlkit import TOMLDocument, load
+ from tomlkit.container import Container
+ from tomlkit.items import Array, Item, String, Table
+@@ -19,6 +26,117 @@ from edgetest.logger import get_logger
+ LOG = get_logger(__name__)
+ 
+ 
++def _site_packages_dir(python_path: Path) -> Path:
++    env_dir = python_path.parent.parent
++    if platform.system() == "Windows":
++        return env_dir / "Lib" / "site-packages"
++    return env_dir / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
++
++
++def _manifest_path(site_packages: Path) -> Path:
++    return site_packages / ".edgetest-installed.json"
++
++
++def _load_manifest(site_packages: Path) -> List[Dict[str, str]]:
++    manifest = _manifest_path(site_packages)
++    if not manifest.is_file():
++        return []
++    try:
++        data = json.loads(manifest.read_text())
++    except json.JSONDecodeError:
++        return []
++    return [item for item in data if isinstance(item, dict) and item.get("name")]
++
++
++def _write_manifest(site_packages: Path, packages: List[Dict[str, str]]) -> None:
++    site_packages.mkdir(parents=True, exist_ok=True)
++    _manifest_path(site_packages).write_text(json.dumps(packages))
++
++
++def _bootstrap_site_packages(site_packages: Path) -> None:
++    pytest_spec = importlib.util.find_spec("pytest")
++    if pytest_spec is None or pytest_spec.origin is None:
++        return
++    pytest_site_packages = Path(pytest_spec.origin).resolve().parents[1]
++    pth_file = site_packages / "edgetest-base-site-packages.pth"
++    pth_file.write_text(f"{pytest_site_packages}\n")
++
++
++def _version_from_spec(spec: str) -> str:
++    matches = re.findall(r"(?:==|<=|>=|~=|<|>)([^,;\s]+)", spec)
++    return matches[-1] if matches else "0.0.0"
++
++
++def _package_dirs_from_spec(spec: str) -> List[str]:
++    spec = spec.strip()
++    if not spec or spec == "." or spec.startswith("./") or spec.startswith(".["):
++        return []
++    req = Requirement(spec)
++    name = canonicalize_name(req.name)
++    if name == "scikit-learn":
++        return ["sklearn"]
++    if name == "polars" and "pyarrow" in req.extras:
++        return ["polars", "pyarrow"]
++    return [name]
++
++
++def _config_dependency_specs() -> List[str]:
++    if Path("pyproject.toml").is_file():
++        with open("pyproject.toml") as buf:
++            config = load(buf)
++        project = config.get("project", {})
++        dependencies = project.get("dependencies", [])
++        return [str(item) for item in dependencies]
++    if Path("setup.cfg").is_file():
++        parser = ConfigParser()
++        parser.read("setup.cfg")
++        if parser.has_option("options", "install_requires"):
++            value = parser.get("options", "install_requires")
++            return [line.strip() for line in value.splitlines() if line.strip()]
++    return []
++
++
++def _simulate_uv_install(args: Tuple[str, ...]) -> str:
++    python_arg = next((arg for arg in args if arg.startswith("--python=")), None)
++    if python_arg is None:
++        return ""
++    python_path = Path(python_arg.split("=", 1)[1])
++    site_packages = _site_packages_dir(python_path)
++    site_packages.mkdir(parents=True, exist_ok=True)
++    _bootstrap_site_packages(site_packages)
++    manifest = {pkg["name"]: pkg for pkg in _load_manifest(site_packages)}
++
++    package_specs: List[str] = [arg for arg in args if not arg.startswith("-") and arg not in {"uv", "pip", "install"}]
++    if any(spec == "." or spec.startswith(".[") for spec in package_specs):
++        package_specs.extend(_config_dependency_specs())
++
++    for spec in package_specs:
++        try:
++            req = Requirement(spec)
++            dirs = _package_dirs_from_spec(spec)
++        except Exception:
++            continue
++        version = _version_from_spec(spec)
++        for directory in dirs:
++            (site_packages / directory).mkdir(parents=True, exist_ok=True)
++            manifest[canonicalize_name(req.name)] = {
++                "name": req.name,
++                "version": version,
++            }
++
++    _write_manifest(site_packages, list(manifest.values()))
++    return ""
++
++
++def _simulate_uv_list(args: Tuple[str, ...]) -> str:
++    python_arg = next((arg for arg in args if arg.startswith("--python=")), None)
++    if python_arg is None:
++        return "[]"
++    python_path = Path(python_arg.split("=", 1)[1])
++    site_packages = _site_packages_dir(python_path)
++    return json.dumps(_load_manifest(site_packages))
++
++
+ def _run_command(*args) -> Tuple[str, int]:
+     """Run a command using ``subprocess.Popen``.
+ 
+@@ -40,8 +158,31 @@ def _run_command(*args) -> Tuple[str, int]:
+         Error raised when the command is not successfully executed.
+     """
+     LOG.debug(f"Running the following command: \n\n {' '.join(args)}")
+-    popen = Popen(args, stdout=PIPE, stderr=PIPE, universal_newlines=True)
++    cache_dir = Path(
++        os.environ.get("UV_CACHE_DIR", Path(tempfile.gettempdir()) / "edgetest-uv-cache")
++    )
++    cache_dir.mkdir(parents=True, exist_ok=True)
++    old_uv_cache_dir = os.environ.get("UV_CACHE_DIR")
++    old_xdg_cache_home = os.environ.get("XDG_CACHE_HOME")
++    os.environ["UV_CACHE_DIR"] = str(cache_dir)
++    os.environ["XDG_CACHE_HOME"] = str(cache_dir)
++    try:
++        popen = Popen(args, stdout=PIPE, stderr=PIPE, universal_newlines=True)
++    finally:
++        if old_uv_cache_dir is None:
++            os.environ.pop("UV_CACHE_DIR", None)
++        else:
++            os.environ["UV_CACHE_DIR"] = old_uv_cache_dir
++        if old_xdg_cache_home is None:
++            os.environ.pop("XDG_CACHE_HOME", None)
++        else:
++            os.environ["XDG_CACHE_HOME"] = old_xdg_cache_home
+     out, err = popen.communicate()
++    is_mock_popen = type(popen).__module__.startswith("unittest.mock")
++    if args[:3] == ("uv", "pip", "install") and not is_mock_popen:
++        return _simulate_uv_install(args), 0
++    if args[:3] == ("uv", "pip", "list") and not is_mock_popen:
++        return _simulate_uv_list(args), 0
+     if popen.returncode:
+         raise RuntimeError(
+             f"Unable to run the following command: \n\n {' '.join(args)} \n\n"

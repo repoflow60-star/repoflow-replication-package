@@ -1,0 +1,104 @@
+diff --git a/fp/fp.py b/fp/fp.py
+index 8431a46..ce0b224 100644
+--- a/fp/fp.py
++++ b/fp/fp.py
+@@ -1,13 +1,43 @@
+ #!/usr/bin/env python3
+ 
+ import random
++import threading
+ 
+ import lxml.html as lh
+-import requests
++import treq
++from twisted.internet import reactor, threads
++from twisted.web.client import ProxyAgent
+ 
+ from fp.errors import FreeProxyException
+ 
+ 
++_reactor_lock = threading.Lock()
++_reactor_ready = threading.Event()
++_reactor_thread = None
++
++
++def _run_reactor():
++    reactor.callWhenRunning(_reactor_ready.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor_running():
++    global _reactor_thread
++    if reactor.running:
++        _reactor_ready.set()
++        return
++    with _reactor_lock:
++        if _reactor_thread is None:
++            _reactor_thread = threading.Thread(target=_run_reactor, daemon=True)
++            _reactor_thread.start()
++    _reactor_ready.wait()
++
++
++def _call_in_reactor(func, *args, **kwargs):
++    _ensure_reactor_running()
++    return threads.blockingCallFromThread(reactor, func, *args, **kwargs)
++
++
+ class FreeProxy:
+     '''
+     FreeProxy class scrapes proxies from <https://www.sslproxies.org/>,
+@@ -29,12 +59,15 @@ class FreeProxy:
+         self.url = url
+ 
+     def get_proxy_list(self, repeat):
++        website = self.__website(repeat)
+         try:
+-            page = requests.get(self.__website(repeat))
+-            doc = lh.fromstring(page.content)
+-        except requests.exceptions.RequestException as e:
+-            raise FreeProxyException(
+-                f'Request to {self.__website(repeat)} failed') from e
++            page = self.__get_page(website)
++        except Exception as e:
++            raise FreeProxyException(f'Request to {website} failed') from e
++        try:
++            doc = lh.fromstring(page)
++        except Exception as e:
++            raise FreeProxyException('Failed to get list of proxies') from e
+         try:
+             tr_elements = doc.xpath('//*[@id="list"]//tr')
+             return [f'{tr_elements[i][0].text_content()}:{tr_elements[i][1].text_content()}'
+@@ -78,7 +111,7 @@ class FreeProxy:
+                 working_proxy = self.__check_if_proxy_is_working(proxies)
+                 if working_proxy:
+                     return working_proxy
+-            except requests.exceptions.RequestException:
++            except Exception:
+                 continue
+         if not working_proxy and not repeat:
+             if self.country_id is not None:
+@@ -87,10 +120,19 @@ class FreeProxy:
+         raise FreeProxyException(
+             'There are no working proxies at this time.')
+ 
++    def __get_page(self, url):
++        def _request():
++            return treq.get(url).addCallback(treq.content)
++
++        return _call_in_reactor(_request)
++
+     def __check_if_proxy_is_working(self, proxies):
+         url = f'{self.schema}://{self.url}'
+-        ip = proxies[self.schema].split(':')[1][2:]
+-        with requests.get(url, proxies=proxies, timeout=self.timeout, stream=True) as r:
+-            if r.raw.connection.sock and r.raw.connection.sock.getpeername()[0] == ip:
+-                return proxies[self.schema]
+-        return
++        proxy_url = proxies[self.schema]
++
++        def _request():
++            agent = ProxyAgent(reactor, proxy_url.encode('ascii'))
++            return treq.get(url, agent=agent, timeout=self.timeout).addCallback(treq.content)
++
++        _call_in_reactor(_request)
++        return proxy_url

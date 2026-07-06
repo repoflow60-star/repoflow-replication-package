@@ -1,0 +1,765 @@
+--- a/maproulette/api/maproulette_server.py
++++ b/maproulette/api/maproulette_server.py
+@@ -1,9 +1,11 @@
+-"""This module contains the basic methods that handle API calls to the MapRoulette API. It uses the requests library to
+
++"""This module contains the basic methods that handle API calls to the MapRoulette API. It uses the pycurl library to
+
+ accomplish this."""
+
+ 
+
+-import requests
+
++import pycurl
+
+ import json
+
+ import time
+
++from io import BytesIO
+
++from urllib.parse import urlencode
+
+ from .errors import HttpError, InvalidJsonError, ConnectionUnavailableError, UnauthorizedError, NotFoundError
+
+ 
+
+ 
+
+@@ -16,10 +18,86 @@
+         self.certs = configuration.certs
+
+         self.verify = configuration.verify
+
+         if self.__check_health():
+
+-            self.session = requests.Session()
+
+-            self.session.headers = self.headers
+
+-            self.session.verify = self.verify
+
+-            self.session.cert = self.certs
+
++            self.session = None
+
++
+
++    def __perform_request(self, method, url, params=None, body=None, files=None):
+
++        buffer = BytesIO()
+
++        header_buffer = BytesIO()
+
++        curl = pycurl.Curl()
+
++        try:
+
++            if params:
+
++                url = url + '?' + urlencode(params, doseq=True)
+
++            curl.setopt(pycurl.URL, url)
+
++            curl.setopt(pycurl.WRITEDATA, buffer)
+
++            curl.setopt(pycurl.HEADERFUNCTION, header_buffer.write)
+
++            curl.setopt(pycurl.CUSTOMREQUEST, method)
+
++            curl.setopt(pycurl.FOLLOWLOCATION, True)
+
++
+
++            if self.headers:
+
++                header_list = []
+
++                for key, value in self.headers.items():
+
++                    header_list.append(f"{key}: {value}")
+
++                curl.setopt(pycurl.HTTPHEADER, header_list)
+
++
+
++            if self.verify is False:
+
++                curl.setopt(pycurl.SSL_VERIFYPEER, False)
+
++                curl.setopt(pycurl.SSL_VERIFYHOST, False)
+
++
+
++            if self.certs:
+
++                if isinstance(self.certs, tuple) and len(self.certs) > 0:
+
++                    curl.setopt(pycurl.SSLCERT, self.certs[0])
+
++                if isinstance(self.certs, tuple) and len(self.certs) > 1:
+
++                    curl.setopt(pycurl.SSLKEY, self.certs[1])
+
++
+
++            if method in ['POST', 'PUT'] and body is not None and files is None:
+
++                curl.setopt(pycurl.POSTFIELDS, json.dumps(body))
+
++                if self.headers and 'Content-Type' not in self.headers and 'content-type' not in self.headers:
+
++                    curl.setopt(pycurl.HTTPHEADER, [f"{key}: {value}" for key, value in self.headers.items()] + ['Content-Type: application/json'])
+
++
+
++            if files is not None:
+
++                form = []
+
++                for key, value in files.items():
+
++                    form.append((key, (pycurl.FORM_FILE, value)))
+
++                curl.setopt(pycurl.HTTPPOST, form)
+
++
+
++            curl.perform()
+
++            status = curl.getinfo(pycurl.RESPONSE_CODE)
+
++            response_text = buffer.getvalue().decode('utf-8')
+
++            return {
+
++                "data": json.loads(response_text),
+
++                "status": status
+
++            }
+
++        except pycurl.error as e:
+
++            status = 0
+
++            response_text = buffer.getvalue().decode('utf-8')
+
++            try:
+
++                status = curl.getinfo(pycurl.RESPONSE_CODE)
+
++            except Exception:
+
++                pass
+
++            if status == 404:
+
++                raise NotFoundError(
+
++                    message=self.parse_response_message(type('obj', (object,), {'text': response_text})()),
+
++                    status=status
+
++                ) from None
+
++            elif status == 400:
+
++                raise InvalidJsonError(
+
++                    message=self.parse_response_message(type('obj', (object,), {'text': response_text})()),
+
++                    status=status
+
++                ) from None
+
++            elif status == 401:
+
++                raise UnauthorizedError(
+
++                    message=self.parse_response_message(type('obj', (object,), {'text': response_text})()),
+
++                    status=status
+
++                ) from None
+
++            elif status != 0:
+
++                raise HttpError(
+
++                    message=self.parse_response_message(type('obj', (object,), {'text': response_text})()),
+
++                    status=status
+
++                ) from None
+
++            else:
+
++                raise ConnectionUnavailableError(e) from None
+
++        finally:
+
++            curl.close()
+
+ 
+
+     def __check_health(self, retries=3, delay=5):
+
+         """Checks health of connection to host by pinging the URL set in the configuration
+
+@@ -30,18 +108,16 @@
+         """
+
+         for i in range(retries):
+
+             try:
+
+-                response = requests.get(
+
+-                    self.base_url + '/ping',
+
+-                    headers=self.headers,
+
+-                    verify=self.verify,
+
+-                    cert=self.certs
+
++                response = self.__perform_request(
+
++                    'GET',
+
++                    self.base_url + '/ping'
+
+                 )
+
+-                if not response.ok:
+
++                if response["status"] < 200 or response["status"] >= 300:
+
+                     print(f"Unsuccessful connection. Retrying in {str(delay)} seconds")
+
+                     time.sleep(delay)
+
+                 else:
+
+                     return True
+
+-            except requests.exceptions.ConnectionError:
+
++            except ConnectionUnavailableError:
+
+                 print(f"Connection not available. Attempt {str(i+1)} out of {str(retries)}")
+
+                 time.sleep(delay)
+
+ 
+
+@@ -57,37 +133,20 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+
+             was successful. If not, the response text is returned.
+
+         """
+
+-        response = self.session.get(
+
++        response = self.__perform_request(
+
++            'GET',
+
+             self.url + endpoint,
+
+             params=params
+
+         )
+
+         try:
+
+-            response.raise_for_status()
+
+-        except requests.exceptions.HTTPError as e:
+
+-            if e.response.status_code == 404:
+
+-                raise NotFoundError(
+
+-                    message=self.parse_response_message(e.response),
+
+-                    status=e.response.status_code
+
+-                ) from None
+
+-            else:
+
+-                raise HttpError(
+
+-                    message=self.parse_response_message(e.response),
+
+-                    status=e.response.status_code
+
+-                ) from None
+
+-        except (requests.ConnectionError, requests.Timeout) as e:
+
+-            raise ConnectionUnavailableError(
+
+-                message=self.parse_response_message(e.response),
+
+-                status=e.response.status_code
+
+-            ) from None
+
+-        try:
+
+-            return {
+
+-                "data": response.json(),
+
+-                "status": response.status_code
+
+-            }
+
+-        except ValueError:
+
+-            return {
+
+-                "data": response.text,
+
+-                "status": response.status_code
+
++            return {
+
++                "data": response["data"],
+
++                "status": response["status"]
+
++            }
+
++        except ValueError:
+
++            return {
+
++                "data": response["data"],
+
++                "status": response["status"]
+
+             }
+
+ 
+
+     def post(self, endpoint, body=None, params=None):
+
+@@ -99,40 +158,21 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+
+             was successful. If not, the response text is returned.
+
+         """
+
+-        response = self.session.post(
+
++        response = self.__perform_request(
+
++            'POST',
+
+             self.url + endpoint,
+
+             params=params,
+
+-            json=body
+
+-        )
+
+-        try:
+
+-            response.raise_for_status()
+
+-        except requests.exceptions.HTTPError as e:
+
+-            if e.response.status_code == 400:
+
+-                raise InvalidJsonError(
+
+-                    message=self.parse_response_message(e.response),
+
+-                    status=e.response.status_code
+
+-                ) from None
+
+-            elif e.response.status_code == 401:
+
+-                raise UnauthorizedError(
+
+-                    message=self.parse_response_message(e.response),
+
+-                    status=e.response.status_code
+
+-                ) from None
+
+-            else:
+
+-                raise HttpError(
+
+-                    message=self.parse_response_message(e.response),
+
+-                    status=e.response.status_code
+
+-                ) from None
+
+-        except (requests.ConnectionError, requests.Timeout) as e:
+
+-            raise ConnectionUnavailableError(e) from None
+
+-        try:
+
+-            return {
+
+-                "data": response.json(),
+
+-                "status": response.status_code
+
+-            }
+
+-        except ValueError:
+
+-            return {
+
+-                "data": response.text,
+
+-                "status": response.status_code
+
++            body=body
+
++        )
+
++        try:
+
++            return {
+
++                "data": response["data"],
+
++                "status": response["status"]
+
++            }
+
++        except ValueError:
+
++            return {
+
++                "data": response["data"],
+
++                "status": response["status"]
+
+             }
+
+ 
+
+     def put(self, endpoint, body=None, params=None):
+
+@@ -144,40 +184,21 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+
+             was successful. If not, the response text is returned.
+
+         """
+
+-        response = self.session.put(
+
++        response = self.__perform_request(
+
++            'PUT',
+
+             self.url + endpoint,
+
+             params=params,
+
+-            json=body
+
+-        )
+
+-        try:
+
+-            response.raise_for_status()
+
+-        except requests.exceptions.HTTPError as e:
+
+-            if e.response.status_code == 400:
+
+-                raise InvalidJsonError(
+
+-                    message=self.parse_response_message(e.response),
+
+-                    status=e.response.status_code
+
+-                ) from None
+
+-            elif e.response.status_code == 401:
+
+-                raise UnauthorizedError(
+
+-                    message=self.parse_response_message(e.response),
+
+-                    status=e.response.status_code
+
+-                ) from None
+
+-            else:
+
+-                raise HttpError(
+
+-                    message=self.parse_response_message(e.response),
+
+-                    status=e.response.status_code
+
+-                ) from None
+
+-        except (requests.ConnectionError, requests.Timeout) as e:
+
+-            raise ConnectionUnavailableError(e) from None
+
+-        try:
+
+-            return {
+
+-                "data": response.json(),
+
+-                "status": response.status_code
+
+-            }
+
+-        except ValueError:
+
+-            return {
+
+-                "data": response.text,
+
+-                "status": response.status_code
+
++            body=body
+
++        )
+
++        try:
+
++            return {
+
++                "data": response["data"],
+
++                "status": response["status"]
+
++            }
+
++        except ValueError:
+
++            return {
+
++                "data": response["data"],
+
++                "status": response["status"]
+
+             }
+
+ 
+
+     def put_file(self, endpoint, body=None, params=None):
+
+@@ -189,40 +210,21 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+
+             was successful. If not, the response text is returned.
+
+         """
+
+-        response = self.session.put(
+
++        response = self.__perform_request(
+
++            'PUT',
+
+             self.url + endpoint,
+
+             params=params,
+
+             files=body
+
+         )
+
+         try:
+
+-            response.raise_for_status()
+
+-        except requests.exceptions.HTTPError as e:
+
+-            if e.response.status_code == 400:
+
+-                raise InvalidJsonError(
+
+-                    message=self.parse_response_message(e.response),
+
+-                    status=e.response.status_code
+
+-                ) from None
+
+-            elif e.response.status_code == 401:
+
+-                raise UnauthorizedError(
+
+-                    message=self.parse_response_message(e.response),
+
+-                    status=e.response.status_code
+
+-                ) from None
+
+-            else:
+
+-                raise HttpError(
+
+-                    message=self.parse_response_message(e.response),
+
+-                    status=e.response.status_code
+
+-                ) from None
+
+-        except (requests.ConnectionError, requests.Timeout) as e:
+
+-            raise ConnectionUnavailableError(e) from None
+
+-        try:
+
+-            return {
+
+-                "data": response.json(),
+
+-                "status": response.status_code
+
+-            }
+
+-        except ValueError:
+
+-            return {
+
+-                "data": response.text,
+
+-                "status": response.status_code
+
++            return {
+
++                "data": response["data"],
+
++                "status": response["status"]
+
++            }
+
++        except ValueError:
+
++            return {
+
++                "data": response["data"],
+
++                "status": response["status"]
+
+             }
+
+ 
+
+     def delete(self, endpoint, params=None):
+
+@@ -233,39 +235,20 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+
+             was successful. If not, the response text is returned.
+
+         """
+
+-        response = self.session.delete(
+
++        response = self.__perform_request(
+
++            'DELETE',
+
+             self.url + endpoint,
+
+             params=params
+
+         )
+
+         try:
+
+-            response.raise_for_status()
+
+-        except requests.exceptions.HTTPError as e:
+
+-            if e.response.status_code == 401:
+
+-                raise UnauthorizedError(
+
+-                    message=self.parse_response_message(e.response),
+
+-                    status=e.response.status_code
+
+-                ) from None
+
+-            elif e.response.status_code == 404:
+
+-                raise NotFoundError(
+
+-                    message=self.parse_response_message(e.response),
+
+-                    status=e.response.status_code
+
+-                ) from None
+
+-            else:
+
+-                raise HttpError(
+
+-                    message=self.parse_response_message(e.response),
+
+-                    status=e.response.status_code
+
+-                ) from None
+
+-        except (requests.ConnectionError, requests.Timeout) as e:
+
+-            raise ConnectionUnavailableError(e) from None
+
+-        try:
+
+-            return {
+
+-                "data": response.json(),
+
+-                "status": response.status_code
+
+-            }
+
+-        except ValueError:
+
+-            return {
+
+-                "data": response.text,
+
+-                "status": response.status_code
+
++            return {
+
++                "data": response["data"],
+
++                "status": response["status"]
+
++            }
+
++        except ValueError:
+
++            return {
+
++                "data": response["data"],
+
++                "status": response["status"]
+
+             }
+
+ 
+
+     @staticmethod

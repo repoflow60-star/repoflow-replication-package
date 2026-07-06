@@ -1,0 +1,211 @@
+--- a/pdpyras.py
++++ b/pdpyras.py
+@@ -3,22 +3,106 @@
+ # See LICENSE for details.
+ 
+ # Standard libraries
++import asyncio
++import json
+ import logging
+ import sys
+ import time
+ from copy import deepcopy
+-from datetime import datetime
++from datetime import datetime, timedelta
+ from random import random
+ from typing import Iterator, Union
+ from warnings import warn
+ 
+-# Upstream components on which this client is based:
+-from requests import Response, Session
+-from requests import __version__ as REQUESTS_VERSION
+-
+-# HTTP client exceptions:
+-from urllib3.exceptions import HTTPError, PoolError
+-from requests.exceptions import RequestException
++try:
++    from importlib.metadata import PackageNotFoundError, version as package_version
++except ImportError:  # pragma: no cover - Python < 3.8
++    from importlib_metadata import PackageNotFoundError, version as package_version
++
++# HTTP client:
++import aiohttp
++
++try:
++    REQUESTS_VERSION = package_version('requests')
++except PackageNotFoundError:  # pragma: no cover - dependency metadata missing
++    REQUESTS_VERSION = 'unknown'
++
++
++class HTTPError(aiohttp.ClientError):
++    pass
++
++
++class PoolError(HTTPError):
++    pass
++
++
++class RequestException(aiohttp.ClientError):
++    pass
++
++
++class RequestInfo:
++    def __init__(self, method, url):
++        self.method = method
++        self.url = url
++
++
++class Response:
++    def __init__(self, code, text, method='GET', url=None, headers=None,
++            elapsed=None, content=None, encoding='utf-8'):
++        self.status_code = code
++        self.text = text
++        self.ok = bool(code) and code < 400
++        self.url = url or 'https://api.pagerduty.com'
++        self.headers = headers.copy() if hasattr(headers, 'copy') else (headers or {})
++        self.elapsed = elapsed or timedelta(0, 1.5)
++        self.request = RequestInfo(method=method.upper(), url=self.url)
++        self.content = content if content is not None else text.encode(encoding)
++        self.encoding = encoding
++
++    def __bool__(self):
++        return self.ok
++
++    def json(self, **kwargs):
++        return json.loads(self.text, **kwargs)
++
++
++class _AiohttpRequestAdapter:
++    def request(self, method, url, **kwargs):
++        return self._run(self._request(method, url, **kwargs))
++
++    async def _request(self, method, url, **kwargs):
++        timeout = kwargs.pop('timeout', None)
++        if timeout is not None:
++            kwargs['timeout'] = aiohttp.ClientTimeout(total=timeout)
++        kwargs.pop('stream', None)
++        started = time.perf_counter()
++        async with aiohttp.ClientSession() as session:
++            async with session.request(method, url, **kwargs) as response:
++                body = await response.read()
++                encoding = response.charset or 'utf-8'
++                elapsed = timedelta(seconds=time.perf_counter() - started)
++                return Response(
++                    response.status,
++                    body.decode(encoding, errors='replace'),
++                    method=response.request_info.method,
++                    url=str(response.url),
++                    headers=response.headers.copy(),
++                    elapsed=elapsed,
++                    content=body,
++                    encoding=encoding,
++                )
++
++    def _run(self, coro):
++        loop = asyncio.new_event_loop()
++        try:
++            asyncio.set_event_loop(loop)
++            return loop.run_until_complete(coro)
++        finally:
++            asyncio.set_event_loop(None)
++            loop.close()
++
++    def close(self):
++        pass
+ 
+ __version__ = '5.4.0'
+ 
+@@ -862,7 +946,7 @@
+ ### CLASSES ###
+ ###############
+ 
+-class PDSession(Session):
++class PDSession:
+     """
+     Base class for making HTTP requests to PagerDuty APIs
+ 
+@@ -911,7 +995,7 @@
+     """
+ 
+     parent = None
+-    """The ``super`` object (`requests.Session`_)"""
++    """The underlying request adapter"""
+ 
+     permitted_methods = ()
+     """
+@@ -966,8 +1050,8 @@
+     url = ""
+ 
+     def __init__(self, api_key: str, debug=False):
+-        self.parent = super(PDSession, self)
+-        self.parent.__init__()
++        self.headers = {}
++        self.parent = _AiohttpRequestAdapter()
+         self.api_key = api_key
+         self.log = logging.getLogger(__name__)
+         self.print_debug = debug
+@@ -1119,7 +1203,7 @@
+         endpoint = "%s %s"%(method.upper(), full_url)
+ 
+         # Add in any headers specified in keyword arguments:
+-        headers = kwargs.get('headers', {})
++        headers = kwargs.get('headers', {}) or {}
+         req_kw.update({
+             'headers': self.prepare_headers(method, user_headers=headers),
+             'stream': False,
+@@ -1135,7 +1219,7 @@
+             try:
+                 response = self.parent.request(method, full_url, **req_kw)
+                 self.postprocess(response)
+-            except (HTTPError, PoolError, RequestException) as e:
++            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+                 network_attempts += 1
+                 if network_attempts > self.max_network_attempts:
+                     error_msg = f"{endpoint}: Non-transient network " \
+@@ -1189,6 +1273,30 @@
+                 # All went according to plan.
+                 return response
+ 
++    def get(self, url, **kwargs) -> Response:
++        kwargs.setdefault('allow_redirects', True)
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, **kwargs) -> Response:
++        return self.request('POST', url, **kwargs)
++
++    def put(self, url, **kwargs) -> Response:
++        return self.request('PUT', url, **kwargs)
++
++    def delete(self, url, **kwargs) -> Response:
++        kwargs.setdefault('allow_redirects', True)
++        return self.request('DELETE', url, **kwargs)
++
++    def close(self):
++        self.parent.close()
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc, tb):
++        self.close()
++        return False
++
+     @property
+     def stagger_cooldown(self) -> float:
+         """
+@@ -1357,13 +1465,13 @@
+ 
+     def post(self, *args, **kw) -> Response:
+         """
+-        Override of ``requests.Session.post``
++        Override of ``PDSession.post``
+ 
+         Adds the ``routing_key`` parameter to the body before sending.
+         """
+         if 'json' in kw and hasattr(kw['json'], 'update'):
+             kw['json'].update({'routing_key': self.api_key})
+-        return super(EventsAPISession, self).post(*args, **kw)
++        return self.request('POST', *args, **kw)
+ 
+     def trigger(self, summary, source, dedup_key=None, severity='critical',
+             payload=None, custom_details=None, images=None, links=None) -> str:

@@ -1,0 +1,176 @@
+diff --git /dev/null b/requests/sessions.py
+new file mode 100644
+index 0000000..c27859e
+--- /dev/null
++++ b/requests/sessions.py
+@@ -0,0 +1,170 @@
++from collections.abc import MutableMapping
++from http.client import responses as http_responses
++import json
++import socket
++import threading
++import time
++from urllib import error as urllib_error
++from urllib import request as urllib_request
++
++
++class ReadTimeout(Exception):
++    pass
++
++
++class CaseInsensitiveDict(MutableMapping):
++    def __init__(self, data=None, **kwargs):
++        self._store = {}
++        if data:
++            self.update(data)
++        if kwargs:
++            self.update(kwargs)
++
++    def __setitem__(self, key, value):
++        self._store[key.lower()] = (key, value)
++
++    def __getitem__(self, key):
++        return self._store[key.lower()][1]
++
++    def __delitem__(self, key):
++        del self._store[key.lower()]
++
++    def __iter__(self):
++        return (cased_key for cased_key, _ in self._store.values())
++
++    def __len__(self):
++        return len(self._store)
++
++    def get(self, key, default=None):
++        try:
++            return self[key]
++        except KeyError:
++            return default
++
++    def items(self):
++        return ((cased_key, value) for cased_key, value in self._store.values())
++
++    def copy(self):
++        return dict(self.items())
++
++
++class Response(object):
++    def __init__(self, status_code, headers=None, content=b""):
++        self.status_code = status_code
++        self.headers = CaseInsensitiveDict(headers or {})
++        self.reason = http_responses.get(status_code, "")
++        self._content = content or b""
++
++    @property
++    def text(self):
++        if isinstance(self._content, str):
++            return self._content
++        return self._content.decode("utf-8", errors="replace")
++
++    def json(self):
++        return json.loads(self.text)
++
++
++_reactor_started = False
++_reactor_lock = threading.Lock()
++
++
++def _start_reactor():
++    global _reactor_started
++    with _reactor_lock:
++        if _reactor_started:
++            return
++        try:
++            from twisted.internet import reactor
++        except Exception:
++            _reactor_started = True
++            return
++        if reactor.running:
++            _reactor_started = True
++            return
++
++        def _run():
++            reactor.run(installSignalHandlers=False)
++
++        thread = threading.Thread(target=_run, daemon=True)
++        thread.start()
++        while not reactor.running:
++            time.sleep(0.01)
++        _reactor_started = True
++
++
++def _build_response_from_treq(url, data, headers, timeout, auth=None, proxies=None):
++    try:
++        from twisted.internet import threads
++        import treq
++        from twisted.internet.error import TimeoutError as TwistedTimeoutError
++    except Exception:
++        return _build_response_with_urllib(url, data, headers, timeout)
++
++    _start_reactor()
++    try:
++        from twisted.internet import reactor
++        response = threads.blockingCallFromThread(
++            reactor,
++            treq.post,
++            url,
++            data=data,
++            headers=headers,
++            timeout=timeout,
++        )
++        content = threads.blockingCallFromThread(reactor, treq.content, response)
++    except Exception as exc:
++        timeout_types = ()
++        try:
++            from twisted.internet.defer import TimeoutError as DeferredTimeoutError
++            timeout_types = timeout_types + (DeferredTimeoutError,)
++        except Exception:
++            pass
++        timeout_types = timeout_types + (TwistedTimeoutError, TimeoutError, socket.timeout)
++        if isinstance(exc, timeout_types) or "Timeout" in exc.__class__.__name__:
++            raise ReadTimeout(str(exc))
++        raise
++
++    response_headers = {}
++    try:
++        raw_headers = response.headers.getAllRawHeaders()
++    except Exception:
++        raw_headers = []
++    for key, values in raw_headers:
++        key = key.decode("utf-8") if isinstance(key, bytes) else key
++        decoded_values = []
++        for value in values:
++            decoded_values.append(value.decode("utf-8") if isinstance(value, bytes) else value)
++        response_headers[key] = ", ".join(decoded_values)
++
++    status_code = getattr(response, "code", None)
++    if status_code is None:
++        status_code = getattr(response, "status", 0)
++    return Response(status_code, response_headers, content)
++
++
++def _build_response_with_urllib(url, data, headers, timeout):
++    request = urllib_request.Request(url, data=data, headers=headers or {}, method="POST")
++    try:
++        with urllib_request.urlopen(request, timeout=timeout) as response:
++            return Response(
++                response.getcode(),
++                dict(response.headers.items()),
++                response.read(),
++            )
++    except urllib_error.HTTPError as exc:
++        return Response(exc.code, dict(exc.headers.items()) if exc.headers else {}, exc.read())
++    except (urllib_error.URLError, socket.timeout) as exc:
++        raise ReadTimeout(str(exc))
++
++
++class Session(object):
++    def post(self, url=None, data=None, headers=None, timeout=None, proxies=None, auth=None, **kwargs):
++        if url is None:
++            raise TypeError("post() missing required argument: 'url'")
++
++        if isinstance(data, str):
++            data = data.encode("utf-8")
++
++        return _build_response_from_treq(url, data, headers, timeout, auth=auth, proxies=proxies)
++

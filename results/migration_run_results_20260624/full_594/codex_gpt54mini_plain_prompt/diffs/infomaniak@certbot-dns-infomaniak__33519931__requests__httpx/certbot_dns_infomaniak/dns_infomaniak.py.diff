@@ -1,0 +1,239 @@
+diff --git a/certbot_dns_infomaniak/dns_infomaniak.py b/certbot_dns_infomaniak/dns_infomaniak.py
+index a8b4126..9f7312d 100644
+--- a/certbot_dns_infomaniak/dns_infomaniak.py
++++ b/certbot_dns_infomaniak/dns_infomaniak.py
+@@ -5,9 +5,10 @@
+ """DNS Authenticator for Infomaniak"""
+ import json
+ import logging
++from urllib.parse import urlparse
+ import idna
+ 
+-import requests
++import httpx
+ 
+ from certbot import errors
+ from certbot.plugins import dns_common
+@@ -86,7 +87,7 @@ class _APIDomain:
+         :param str token: oauth2 token to consume Infomaniak API
+         """
+         self.token = token
+-        self.session = requests.Session()
++        self.session = _HTTPXSession()
+         self.session.headers.update({"Authorization": "Bearer {token}".format(token=self.token)})
+ 
+     def _get_request(self, url, payload=None):
+@@ -97,20 +98,20 @@ class _APIDomain:
+         """
+         url = self.baseUrl + url
+         logger.debug("GET %s", url)
+-        with self.session.get(url, params=payload) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            if result["error"]["code"] == "not_authorized":
+-                raise errors.PluginError("cannot authenticate")
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
++        req = self.session.get(url, params=payload)
++        try:
++            result = req.json()
++        except (ValueError, json.decoder.JSONDecodeError) as exc:
++            raise errors.PluginError("no JSON in API response") from exc
++        if result["result"] == "success":
++            return result["data"]
++        if result["error"]["code"] == "not_authorized":
++            raise errors.PluginError("cannot authenticate")
++        raise errors.PluginError(
++            "error in API request: {} / {}".format(
++                result["error"]["code"], result["error"]["description"]
+             )
++        )
+ 
+     def _post_request(self, url, payload):
+         """Performs a POST request
+@@ -119,21 +120,19 @@ class _APIDomain:
+         :param dict payload : body of request
+         """
+         url = self.baseUrl + url
+-        headers = {"Content-Type": "application/json"}
+-        json_data = json.dumps(payload)
+         logger.debug("POST %s", url)
+-        with self.session.post(url, data=json_data, headers=headers) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
++        req = self.session.post(url, json=payload)
++        try:
++            result = req.json()
++        except (ValueError, json.decoder.JSONDecodeError) as exc:
++            raise errors.PluginError("no JSON in API response") from exc
++        if result["result"] == "success":
++            return result["data"]
++        raise errors.PluginError(
++            "error in API request: {} / {}".format(
++                result["error"]["code"], result["error"]["description"]
+             )
++        )
+ 
+     def _delete_request(self, url):
+         """Performs a POST request
+@@ -142,18 +141,18 @@ class _APIDomain:
+         """
+         url = self.baseUrl + url
+         logger.debug("DELETE %s", url)
+-        with self.session.delete(url) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
++        req = self.session.delete(url)
++        try:
++            result = req.json()
++        except (ValueError, json.decoder.JSONDecodeError) as exc:
++            raise errors.PluginError("no JSON in API response") from exc
++        if result["result"] == "success":
++            return result["data"]
++        raise errors.PluginError(
++            "error in API request: {} / {}".format(
++                result["error"]["code"], result["error"]["description"]
+             )
++        )
+ 
+     def _get_records(self, domain, domain_id, record):
+         """Find record matching arguments
+@@ -247,3 +246,116 @@ class _APIDomain:
+ 
+         self._delete_request("/1/domain/{domain_id}/dns/record/{record_id}".format(
+             domain_id=domain_id, record_id=record_id))
++
++
++class _HTTPXSession:
++    """Minimal session wrapper that uses httpx and supports test mounts."""
++
++    def __init__(self):
++        self.headers = {}
++        self._mounts = {}
++        self._client = httpx.Client()
++
++    def mount(self, prefix, adapter):
++        self._mounts[prefix] = adapter
++
++    def close(self):
++        self._client.close()
++
++    def get(self, url, params=None, headers=None, **kwargs):
++        return self._request("GET", url, params=params, headers=headers, **kwargs)
++
++    def post(self, url, json=None, headers=None, **kwargs):
++        return self._request("POST", url, json=json, headers=headers, **kwargs)
++
++    def delete(self, url, headers=None, **kwargs):
++        return self._request("DELETE", url, headers=headers, **kwargs)
++
++    def _request(self, method, url, **kwargs):
++        adapter = self._mounts.get(urlparse(url).scheme)
++        if adapter is not None:
++            return self._mock_request(adapter, method, url, **kwargs)
++
++        request_kwargs = dict(kwargs)
++        request_headers = self._merged_headers(request_kwargs.pop("headers", None))
++        response = self._client.request(method, url, headers=request_headers, **request_kwargs)
++        return response
++
++    def _merged_headers(self, headers):
++        merged = dict(self.headers)
++        if headers:
++            merged.update(headers)
++        return merged
++
++    def _mock_request(self, adapter, method, url, **kwargs):
++        try:
++            from requests_mock.adapter import _RequestObjectProxy
++            from requests_mock import exceptions as requests_mock_exceptions
++        except ImportError as exc:  # pragma: no cover - test dependency missing
++            raise RuntimeError("requests_mock is required for mock transports") from exc
++
++        request_kwargs = dict(kwargs)
++        headers = self._merged_headers(request_kwargs.pop("headers", None))
++        params = request_kwargs.pop("params", None)
++        json_data = request_kwargs.pop("json", None)
++        content = request_kwargs.pop("content", None)
++
++        request = _MockRequest(
++            method,
++            url,
++            headers=headers,
++            params=params,
++            json_data=json_data,
++            content=content,
++        )
++        proxy = _RequestObjectProxy(request)
++
++        for matcher in reversed(adapter._matchers):
++            try:
++                resp = matcher(proxy)
++            except requests_mock_exceptions._RunRealHTTP:
++                fallback_kwargs = dict(request_kwargs)
++                if params is not None:
++                    fallback_kwargs["params"] = params
++                if json_data is not None:
++                    fallback_kwargs["json"] = json_data
++                if content is not None:
++                    fallback_kwargs["content"] = content
++                return self._client.request(method, url, headers=headers, **fallback_kwargs)
++
++            if resp is None:
++                continue
++
++            httpx_request = httpx.Request(method, request.url)
++            return httpx.Response(
++                status_code=resp.status_code,
++                headers=dict(resp.headers),
++                content=resp.content,
++                request=httpx_request,
++            )
++
++        raise requests_mock_exceptions.NoMockAddress(proxy)
++
++
++class _MockRequest:
++    """Small request object understood by requests-mock matchers."""
++
++    def __init__(self, method, url, headers=None, params=None, json_data=None, content=None):
++        self.method = method
++        self.url = self._build_url(url, params)
++        self.headers = headers or {}
++        self.body = self._build_body(json_data, content)
++
++    @staticmethod
++    def _build_url(url, params):
++        if not params:
++            return url
++
++        request = httpx.Request("GET", url, params=params)
++        return str(request.url)
++
++    @staticmethod
++    def _build_body(json_data, content):
++        if json_data is not None:
++            return json.dumps(json_data).encode("utf-8")
++        return content

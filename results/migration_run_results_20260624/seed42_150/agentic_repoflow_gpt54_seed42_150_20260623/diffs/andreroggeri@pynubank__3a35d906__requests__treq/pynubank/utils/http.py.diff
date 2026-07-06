@@ -1,0 +1,196 @@
+--- a/pynubank/utils/http.py
++++ b/pynubank/utils/http.py
+@@ -1,7 +1,166 @@
+-from requests import Response
+-from requests_pkcs12 import get, post
++import json as json_module
++import threading
++from typing import Optional
++
++import treq
++from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, pkcs12
++from twisted.internet import defer, reactor, ssl
++from twisted.internet.threads import blockingCallFromThread
++from twisted.web.client import Agent
++from twisted.web.http_headers import Headers
+ 
+ from pynubank import NuRequestException
++
++
++class ResponseHeaders(dict):
++    def __init__(self, headers=None):
++        normalized = {}
++
++        if hasattr(headers, 'items'):
++            headers = headers.items()
++
++        for name, values in headers or []:
++            if not values:
++                continue
++
++            key = name.decode() if isinstance(name, bytes) else name
++            value = values[0] if isinstance(values, (list, tuple)) else values
++
++            if isinstance(value, bytes):
++                value = value.decode()
++
++            normalized[key.lower()] = value
++
++        super().__init__(normalized)
++
++    def get(self, name, default=None):
++        return super().get(name.lower(), default)
++
++
++class HttpResponse:
++    def __init__(self, url: str, status_code: int, headers: Optional[ResponseHeaders] = None, content: bytes = b''):
++        self.url = url
++        self.status_code = status_code
++        self.headers = headers or ResponseHeaders()
++        self._content = content
++
++    @property
++    def content(self) -> bytes:
++        return self._content
++
++    def json(self):
++        return json_module.loads(self._content.decode())
++
++
++def _load_private_certificate(pkcs12_data: bytes, pkcs12_password: str):
++    passwords = [pkcs12_password.encode()] if pkcs12_password else [b'', None]
++    last_error = None
++
++    for password in passwords:
++        try:
++            private_key, certificate, extra_certificates = pkcs12.load_key_and_certificates(pkcs12_data, password)
++            break
++        except ValueError as exc:
++            last_error = exc
++    else:
++        raise last_error
++
++    if private_key is None or certificate is None:
++        raise ValueError('Invalid PKCS12 certificate data')
++
++    pem_parts = [
++        private_key.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption()),
++        certificate.public_bytes(Encoding.PEM),
++    ]
++
++    for extra_certificate in extra_certificates or []:
++        pem_parts.append(extra_certificate.public_bytes(Encoding.PEM))
++
++    return ssl.PrivateCertificate.loadPEM(b''.join(pem_parts))
++
++
++class _ClientCertificatePolicy:
++    def __init__(self, pkcs12_data: bytes, password: str):
++        self._private_certificate = _load_private_certificate(pkcs12_data, password)
++
++    def creatorForNetloc(self, hostname, port):
++        server_name = hostname.decode() if isinstance(hostname, bytes) else hostname
++        return ssl.optionsForClientTLS(server_name, clientCertificate=self._private_certificate)
++
++
++_reactor_lock = threading.Lock()
++_reactor_ready = threading.Event()
++_reactor_thread = None
++
++
++def _start_reactor():
++    reactor.callWhenRunning(_reactor_ready.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor():
++    global _reactor_thread
++
++    if reactor.running:
++        _reactor_ready.set()
++        return
++
++    with _reactor_lock:
++        if reactor.running:
++            _reactor_ready.set()
++            return
++
++        if _reactor_thread is None:
++            _reactor_thread = threading.Thread(target=_start_reactor, daemon=True)
++            _reactor_thread.start()
++
++    _reactor_ready.wait()
++
++
++def _build_headers(headers: Optional[dict] = None) -> Headers:
++    normalized = {}
++
++    for name, value in (headers or {}).items():
++        header_name = name.encode() if isinstance(name, str) else name
++
++        if isinstance(value, (list, tuple)):
++            header_values = [item.encode() if isinstance(item, str) else item for item in value]
++        else:
++            header_values = [value.encode() if isinstance(value, str) else value]
++
++        normalized[header_name] = header_values
++
++    return Headers(normalized)
++
++
++@defer.inlineCallbacks
++def _request(method: str, url: str, headers: Optional[dict] = None, payload: Optional[dict] = None,
++             pkcs12_data: bytes = None, pkcs12_password: str = ''):
++    kwargs = {'headers': _build_headers(headers)}
++
++    if payload is not None:
++        kwargs['data'] = json_module.dumps(payload).encode()
++
++    if pkcs12_data is not None:
++        kwargs['agent'] = Agent(reactor, contextFactory=_ClientCertificatePolicy(pkcs12_data, pkcs12_password))
++
++    response = yield treq.request(method, url, **kwargs)
++    content = yield treq.content(response)
++    return HttpResponse(url, response.code, ResponseHeaders(response.headers.getAllRawHeaders()), content)
++
++
++def get(url: str, headers: Optional[dict] = None, pkcs12_data: bytes = None,
++        pkcs12_password: str = '') -> HttpResponse:
++    _ensure_reactor()
++    return blockingCallFromThread(reactor, _request, 'GET', url, headers=headers, pkcs12_data=pkcs12_data,
++                                  pkcs12_password=pkcs12_password)
++
++
++def post(url: str, json: Optional[dict] = None, headers: Optional[dict] = None, pkcs12_data: bytes = None,
++         pkcs12_password: str = '') -> HttpResponse:
++    _ensure_reactor()
++    return blockingCallFromThread(reactor, _request, 'POST', url, headers=headers, payload=json,
++                                  pkcs12_data=pkcs12_data, pkcs12_password=pkcs12_password)
+ 
+ 
+ class HttpClient:
+@@ -30,20 +189,20 @@
+     def _cert_args(self):
+         return {'pkcs12_data': self._cert, 'pkcs12_password': ''} if self._cert else {}
+ 
+-    def _handle_response(self, response: Response) -> dict:
++    def _handle_response(self, response) -> dict:
+         if response.status_code != 200:
+             raise NuRequestException(response)
+ 
+         return response.json()
+ 
+-    def raw_get(self, url: str) -> Response:
++    def raw_get(self, url: str) -> HttpResponse:
+         return get(url, headers=self._headers, **self._cert_args)
+ 
+-    def raw_post(self, url: str, json: dict) -> Response:
++    def raw_post(self, url: str, json: dict) -> HttpResponse:
+         return post(url, json=json, headers=self._headers, **self._cert_args)
+ 
+     def get(self, url: str) -> dict:
+         return self._handle_response(self.raw_get(url))
+ 
+     def post(self, url: str, json: dict) -> dict:
+-        return self._handle_response(post(url, json=json, headers=self._headers, **self._cert_args))
++        return self._handle_response(self.raw_post(url, json))

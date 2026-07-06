@@ -1,0 +1,154 @@
+--- a/ldnlib/http.py
++++ b/ldnlib/http.py
+@@ -0,0 +1,151 @@
++import io
++import json
++
++import pycurl
++
++
++class HTTPError(Exception):
++    pass
++
++
++def _decode_body(body, headers):
++    content_type = headers.get('content-type', '')
++    charset = 'utf-8'
++    for part in content_type.split(';')[1:]:
++        part = part.strip()
++        if part.lower().startswith('charset='):
++            charset = part.split('=', 1)[1].strip() or charset
++            break
++
++    try:
++        return body.decode(charset)
++    except (LookupError, UnicodeDecodeError):
++        return body.decode('utf-8', errors='replace')
++
++
++def _parse_links(link_header):
++    links = {}
++    if not link_header:
++        return links
++
++    parts = []
++    current = []
++    in_quotes = False
++    for char in link_header:
++        if char == '"':
++            in_quotes = not in_quotes
++        if char == ',' and not in_quotes:
++            part = ''.join(current).strip()
++            if part:
++                parts.append(part)
++            current = []
++            continue
++        current.append(char)
++
++    part = ''.join(current).strip()
++    if part:
++        parts.append(part)
++
++    for part in parts:
++        if not part.startswith('<') or '>' not in part:
++            continue
++        url, params = part[1:].split('>', 1)
++        rel = None
++        for param in params.split(';'):
++            param = param.strip()
++            if param.startswith('rel='):
++                rel = param.split('=', 1)[1].strip().strip('"')
++                break
++        if rel:
++            links[rel] = {'url': url}
++
++    return links
++
++
++class Response(object):
++
++    def __init__(self, status_code, headers, body, url):
++        self.status_code = status_code
++        self.headers = {k.lower(): v for (k, v) in headers.items()}
++        self.content = body
++        self.text = _decode_body(body, self.headers)
++        self.url = url
++        self.links = _parse_links(self.headers.get('link'))
++
++    def json(self):
++        return json.loads(self.text)
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise HTTPError('HTTP {}'.format(self.status_code))
++
++
++def request(method, url, **kwargs):
++    headers = kwargs.pop('headers', dict())
++    data = kwargs.pop('data', None)
++    allow_redirects = kwargs.pop('allow_redirects', True)
++    timeout = kwargs.pop('timeout', None)
++    connect_timeout = kwargs.pop('connect_timeout', None)
++
++    curl = pycurl.Curl()
++    body_buffer = io.BytesIO()
++    header_lines = []
++
++    def _write_body(chunk):
++        if isinstance(chunk, str):
++            chunk = chunk.encode('utf-8')
++        body_buffer.write(chunk)
++
++    def _write_header(chunk):
++        if isinstance(chunk, str):
++            chunk = chunk.encode('iso-8859-1')
++        header_lines.append(chunk)
++
++    status_code = 0
++    response_url = url
++
++    try:
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.NOSIGNAL, 1)
++        curl.setopt(pycurl.FOLLOWLOCATION, 1 if allow_redirects else 0)
++        curl.setopt(pycurl.WRITEFUNCTION, _write_body)
++        curl.setopt(pycurl.HEADERFUNCTION, _write_header)
++
++        if timeout is not None:
++            curl.setopt(pycurl.TIMEOUT, timeout)
++        if connect_timeout is not None:
++            curl.setopt(pycurl.CONNECTTIMEOUT, connect_timeout)
++
++        header_list = ['{}: {}'.format(key, value) for (key, value) in headers.items()]
++        if header_list:
++            curl.setopt(pycurl.HTTPHEADER, header_list)
++
++        upper_method = method.upper()
++        if upper_method == 'HEAD':
++            curl.setopt(pycurl.NOBODY, 1)
++        elif upper_method == 'GET':
++            curl.setopt(pycurl.HTTPGET, 1)
++        else:
++            curl.setopt(pycurl.CUSTOMREQUEST, upper_method)
++            if data is not None:
++                if isinstance(data, str):
++                    data = data.encode('utf-8')
++                curl.setopt(pycurl.POSTFIELDS, data)
++
++        curl.perform()
++        status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        response_url = curl.getinfo(pycurl.EFFECTIVE_URL)
++    except pycurl.error as exc:
++        raise HTTPError(str(exc))
++    finally:
++        curl.close()
++
++    parsed_headers = {}
++    for raw_line in header_lines:
++        line = raw_line.decode('iso-8859-1').strip()
++        if not line or ':' not in line:
++            continue
++        key, value = line.split(':', 1)
++        parsed_headers[key.strip().lower()] = value.strip()
++
++    return Response(status_code, parsed_headers, body_buffer.getvalue(), response_url)

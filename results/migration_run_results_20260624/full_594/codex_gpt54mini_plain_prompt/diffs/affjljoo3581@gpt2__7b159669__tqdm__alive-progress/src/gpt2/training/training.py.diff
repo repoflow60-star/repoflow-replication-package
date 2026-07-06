@@ -1,0 +1,149 @@
+diff --git a/src/gpt2/training/training.py b/src/gpt2/training/training.py
+index 0fa4919..e929380 100644
+--- a/src/gpt2/training/training.py
++++ b/src/gpt2/training/training.py
+@@ -1,4 +1,4 @@
+-import tqdm
++from contextlib import contextmanager
+ import torch
+ import torch.nn as nn
+ import torch.optim as optim
+@@ -16,6 +16,19 @@ except ModuleNotFoundError:
+ import warnings
+ warnings.filterwarnings(action='ignore')
+ 
++try:
++    from alive_progress import alive_bar
++except ModuleNotFoundError:
++    @contextmanager
++    def alive_bar(*args, **kwargs):
++        class _NoOpBar:
++            text = ''
++
++            def __call__(self, *args, **kwargs):
++                pass
++
++        yield _NoOpBar()
++
+ 
+ class Trainer(object):
+     def __init__(self, spec: TrainingSpec, config: TrainConfig):
+@@ -93,59 +106,70 @@ class Trainer(object):
+             torch.cuda.empty_cache()
+ 
+         if rank == 0:
+-            # Create tqdm iterator in master process to show the progress of
+-            # training.
+-            training_iters = tqdm.tqdm(
+-                range(start_step + 1, self.config.total_steps),
+-                total=self.config.total_steps,
+-                desc=self.config.description,
+-                dynamic_ncols=True)
+-            training_iters.update(start_step + 1)
++            # Show training progress in the master process only.
++            with alive_bar(self.config.total_steps,
++                           title=self.config.description) as progress:
++                for _ in range(start_step + 1):
++                    progress()
++
++                for step in range(start_step + 1, self.config.total_steps):
++                    # Clear CUDA cache which is used for training.
++                    torch.cuda.empty_cache()
++
++                    recorder.record(
++                        self._train_step(rank, train_dataset, model,
++                                         optimizer, scheduler),
++                        scope='train')
++
++                    # Clear CUDA cache which is used for evaluation.
++                    torch.cuda.empty_cache()
++
++                    if (step + 1) % self.config.eval_steps == 0:
++                        recorder.record(
++                            self._eval_step(rank, eval_dataset, model),
++                            scope='eval')
++                        recorder.stamp(step)
++                        progress.text = recorder.format(self.config.log_format)
++
++                    # Save training states to checkpoint file.
++                    if (step + 1) % self.config.save_steps == 0:
++                        ckpt = {'step': step,
++                                'recorder': recorder,
++                                'model': model.state_dict(),
++                                'optimizer': optimizer.state_dict(),
++                                'scheduler': scheduler.state_dict(),
++                                'train_dataset': train_dataset.where(),
++                                'eval_dataset': eval_dataset.where()}
++
++                        if self.config.use_amp:
++                            ckpt['amp'] = amp.state_dict()
++
++                        torch.save(ckpt, self.config.save_checkpoint_path)
++
++                        # Because the checkpoint data allocates quite a lot of GPU
++                        # memories, we need to free the memories explicitly.
++                        del ckpt
++                        torch.cuda.empty_cache()
++                    progress()
+         else:
+-            # In other processes, use simple iterator rather than tqdm one.
+-            training_iters = range(start_step + 1, self.config.total_steps)
+-
+-        for step in training_iters:
+-            # Clear CUDA cache which is used for training.
+-            torch.cuda.empty_cache()
+-
+-            recorder.record(
+-                self._train_step(rank, train_dataset, model, optimizer,
+-                                 scheduler),
+-                scope='train')
+-
+-            # Clear CUDA cache which is used for evaluation.
+-            torch.cuda.empty_cache()
++            # In other processes, use simple iterator rather than progress UI.
++            for step in range(start_step + 1, self.config.total_steps):
++                # Clear CUDA cache which is used for training.
++                torch.cuda.empty_cache()
+ 
+-            if (step + 1) % self.config.eval_steps == 0:
+                 recorder.record(
+-                    self._eval_step(rank, eval_dataset, model), scope='eval')
+-                recorder.stamp(step)
+-
+-                if rank == 0:
+-                    training_iters.set_postfix_str(
+-                        recorder.format(self.config.log_format))
+-
+-            # Save training states to checkpoint file.
+-            if rank == 0 and (step + 1) % self.config.save_steps == 0:
+-                ckpt = {'step': step,
+-                        'recorder': recorder,
+-                        'model': model.state_dict(),
+-                        'optimizer': optimizer.state_dict(),
+-                        'scheduler': scheduler.state_dict(),
+-                        'train_dataset': train_dataset.where(),
+-                        'eval_dataset': eval_dataset.where()}
+-
+-                if self.config.use_amp:
+-                    ckpt['amp'] = amp.state_dict()
+-
+-                torch.save(ckpt, self.config.save_checkpoint_path)
+-
+-                # Because the checkpoint data allocates quite a lot of GPU
+-                # memories, we need to free the memories explicitly.
+-                del ckpt
++                    self._train_step(rank, train_dataset, model, optimizer,
++                                     scheduler),
++                    scope='train')
++
++                # Clear CUDA cache which is used for evaluation.
+                 torch.cuda.empty_cache()
+ 
++                if (step + 1) % self.config.eval_steps == 0:
++                    recorder.record(
++                        self._eval_step(rank, eval_dataset, model), scope='eval')
++                    recorder.stamp(step)
++
+         # Since the model is wrapped with `DistributedDataParallel` class in
+         # distributed training environment, the original model can be accessed
+         # by `module` attribute.

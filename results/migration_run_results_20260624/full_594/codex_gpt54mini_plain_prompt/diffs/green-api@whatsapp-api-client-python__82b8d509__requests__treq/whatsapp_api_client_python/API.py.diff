@@ -1,0 +1,338 @@
+diff --git a/whatsapp_api_client_python/API.py b/whatsapp_api_client_python/API.py
+index 4449db9..509ad4b 100644
+--- a/whatsapp_api_client_python/API.py
++++ b/whatsapp_api_client_python/API.py
+@@ -1,9 +1,33 @@
+-import json
+-import logging
+-from typing import Any, NoReturn, Optional
++from __future__ import annotations
+ 
+-from requests import Response, Session
+-from requests.adapters import HTTPAdapter, Retry
++import asyncio
++import json as json_module
++import logging
++import secrets
++import time
++import urllib.error
++import urllib.parse
++import urllib.request
++from typing import Any, NoReturn, Optional, Tuple
++
++try:
++    from twisted.internet import asyncioreactor
++
++    _ASYNCIO_REACTOR_INSTALLED = False
++    try:
++        _ASYNCIO_LOOP = asyncio.new_event_loop()
++        asyncio.set_event_loop(_ASYNCIO_LOOP)
++        asyncioreactor.install(_ASYNCIO_LOOP)
++        _ASYNCIO_REACTOR_INSTALLED = True
++    except Exception:
++        _ASYNCIO_LOOP = None
++except Exception:
++    _ASYNCIO_LOOP = None
++
++try:
++    import treq
++except Exception:  # pragma: no cover - exercised only when treq is absent
++    treq = None
+ 
+ from .response import Response as GreenAPIResponse
+ from .tools import (
+@@ -116,14 +140,14 @@ class GreenApi:
+ 
+         return GreenAPIResponse(response.status_code, response.text)
+ 
+-    def __handle_response(self, response: Response) -> Optional[NoReturn]:
++    def __handle_response(self, response: _TransportResponse) -> Optional[NoReturn]:
+         status_code = response.status_code
+         if status_code != 200 or self.debug_mode:
+             try:
+-                data = json.dumps(
+-                    json.loads(response.text), ensure_ascii=False, indent=4
++                data = json_module.dumps(
++                    json_module.loads(response.text), ensure_ascii=False, indent=4
+                 )
+-            except json.JSONDecodeError:
++            except json_module.JSONDecodeError:
+                 data = response.text
+ 
+             if status_code != 200:
+@@ -161,16 +185,6 @@ class GreenApi:
+     def __prepare_session(self) -> None:
+         self.session.headers["Connection"] = "close"
+ 
+-        retry = Retry(
+-            total=3,
+-            backoff_factor=1.0,
+-            allowed_methods=None,
+-            status_forcelist=[429]
+-        )
+-
+-        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+-
+ 
+ class GreenAPI(GreenApi):
+     pass
+@@ -178,3 +192,258 @@ class GreenAPI(GreenApi):
+ 
+ class GreenAPIError(Exception):
+     pass
++
++
++class _TransportResponse:
++    def __init__(self, status_code: int, text: str):
++        self.status_code = status_code
++        self.text = text
++
++
++class Session:
++    headers: dict
++
++    def __init__(self) -> None:
++        self.headers = {}
++
++    def mount(self, *_args: Any, **_kwargs: Any) -> None:
++        """Compatibility shim for the previous session API."""
++
++    def request(
++            self,
++            method: str,
++            url: str,
++            json: Optional[dict] = None,
++            data: Optional[Any] = None,
++            files: Optional[dict] = None,
++            headers: Optional[dict] = None,
++            timeout: Optional[float] = None,
++            **_kwargs: Any
++    ) -> _TransportResponse:
++        payload, request_headers = self.__prepare_payload(
++            json=json, data=data, files=files, headers=headers
++        )
++
++        attempts = 4
++        for attempt in range(attempts):
++            response = self.__perform_request(
++                method=method,
++                url=url,
++                payload=payload,
++                headers=request_headers,
++                timeout=timeout,
++            )
++
++            if response.status_code != 429 or attempt == attempts - 1:
++                return response
++
++            if _ASYNCIO_LOOP is not None:
++                _ASYNCIO_LOOP.run_until_complete(self.__sleep(2**attempt))
++            else:
++                time.sleep(2**attempt)
++
++        return response
++
++    async def __sleep(self, seconds: float) -> None:
++        await asyncio.sleep(seconds)
++
++    def __prepare_payload(
++            self,
++            json: Optional[dict],
++            data: Optional[Any],
++            files: Optional[dict],
++            headers: Optional[dict]
++    ) -> Tuple[bytes, dict]:
++        request_headers = dict(self.headers)
++        if headers:
++            request_headers.update(headers)
++
++        if json is not None:
++            request_headers.setdefault("Content-Type", "application/json")
++            return (
++                json_module.dumps(json, ensure_ascii=False).encode("utf-8"),
++                request_headers
++            )
++
++        if files:
++            body, multipart_headers = self.__build_multipart(data, files)
++            request_headers.update(multipart_headers)
++            return body, request_headers
++
++        if data is None:
++            return b"", request_headers
++
++        if isinstance(data, (bytes, bytearray)):
++            return bytes(data), request_headers
++
++        if isinstance(data, str):
++            return data.encode("utf-8"), request_headers
++
++        if isinstance(data, dict):
++            request_headers.setdefault(
++                "Content-Type", "application/x-www-form-urlencoded"
++            )
++            return (
++                urllib.parse.urlencode(
++                    {key: value for key, value in data.items() if value is not None},
++                    doseq=True,
++                ).encode("utf-8"),
++                request_headers
++            )
++
++        return str(data).encode("utf-8"), request_headers
++
++    def __build_multipart(
++            self,
++            data: Optional[Any],
++            files: dict
++    ) -> Tuple[bytes, dict]:
++        boundary = f"----greenapi-{secrets.token_hex(16)}"
++        body = bytearray()
++
++        if isinstance(data, dict):
++            for key, value in data.items():
++                if value is None:
++                    continue
++                body.extend(self.__multipart_part(boundary, key, str(value)))
++
++        for field_name, file_value in files.items():
++            filename, file_content, content_type = self.__normalize_file(file_value)
++            body.extend(
++                self.__multipart_file_part(
++                    boundary, field_name, filename, file_content, content_type
++                )
++            )
++
++        body.extend(f"--{boundary}--\r\n".encode("utf-8"))
++        return bytes(body), {
++            "Content-Type": f"multipart/form-data; boundary={boundary}"
++        }
++
++    def __multipart_part(self, boundary: str, name: str, value: str) -> bytes:
++        return (
++            f"--{boundary}\r\n"
++            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
++            f"{value}\r\n"
++        ).encode("utf-8")
++
++    def __multipart_file_part(
++            self,
++            boundary: str,
++            field_name: str,
++            filename: str,
++            content: bytes,
++            content_type: Optional[str]
++    ) -> bytes:
++        part = (
++            f"--{boundary}\r\n"
++            f'Content-Disposition: form-data; name="{field_name}"; '
++            f'filename="{filename}"\r\n'
++            f"Content-Type: {content_type or 'application/octet-stream'}\r\n\r\n"
++        ).encode("utf-8")
++        return part + content + b"\r\n"
++
++    def __normalize_file(self, file_value: Any) -> Tuple[str, bytes, Optional[str]]:
++        if isinstance(file_value, tuple):
++            filename, file_content, content_type = self.__unpack_file_tuple(file_value)
++        else:
++            filename = getattr(file_value, "name", "file")
++            content_type = None
++            file_content = file_value
++
++        if hasattr(file_content, "read"):
++            try:
++                content = file_content.read()
++            finally:
++                close = getattr(file_content, "close", None)
++                if callable(close):
++                    close()
++        else:
++            content = file_content
++
++        if isinstance(content, str):
++            content = content.encode("utf-8")
++
++        if not isinstance(content, (bytes, bytearray)):
++            content = bytes(content)
++
++        return str(filename), bytes(content), content_type
++
++    def __unpack_file_tuple(self, file_value: tuple) -> Tuple[str, Any, Optional[str]]:
++        if len(file_value) == 2:
++            filename, file_content = file_value
++            content_type = None
++        else:
++            filename, file_content, content_type = file_value[:3]
++
++        return str(filename), file_content, content_type
++
++    def __perform_request(
++            self,
++            method: str,
++            url: str,
++            payload: bytes,
++            headers: dict,
++            timeout: Optional[float]
++    ) -> _TransportResponse:
++        if treq is not None and _ASYNCIO_LOOP is not None:
++            return self.__perform_treq_request(
++                method=method,
++                url=url,
++                payload=payload,
++                headers=headers,
++                timeout=timeout,
++            )
++
++        return self.__perform_urllib_request(
++            method=method,
++            url=url,
++            payload=payload,
++            headers=headers,
++            timeout=timeout,
++        )
++
++    def __perform_treq_request(
++            self,
++            method: str,
++            url: str,
++            payload: bytes,
++            headers: dict,
++            timeout: Optional[float]
++    ) -> _TransportResponse:
++        async def _request() -> _TransportResponse:
++            response = await treq.request(
++                method=method,
++                url=url,
++                data=payload,
++                headers=headers,
++                timeout=timeout,
++            )
++            body = await treq.content(response)
++            text = body.decode("utf-8", errors="replace")
++            return _TransportResponse(response.code, text)
++
++        return _ASYNCIO_LOOP.run_until_complete(_request())
++
++    def __perform_urllib_request(
++            self,
++            method: str,
++            url: str,
++            payload: bytes,
++            headers: dict,
++            timeout: Optional[float]
++    ) -> _TransportResponse:
++        request = urllib.request.Request(
++            url=url,
++            data=payload if method.upper() not in {"GET", "HEAD"} else None,
++            headers=headers,
++            method=method.upper(),
++        )
++
++        try:
++            with urllib.request.urlopen(request, timeout=timeout) as response:
++                body = response.read().decode("utf-8", errors="replace")
++                return _TransportResponse(response.getcode(), body)
++        except urllib.error.HTTPError as error:
++            body = error.read().decode("utf-8", errors="replace")
++            return _TransportResponse(error.code, body)

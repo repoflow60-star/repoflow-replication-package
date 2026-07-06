@@ -1,0 +1,144 @@
+diff --git /dev/null b/bigcommerce/http_client.py
+new file mode 100644
+index 0000000..19406db
+--- /dev/null
++++ b/bigcommerce/http_client.py
+@@ -0,0 +1,138 @@
++"""Synchronous HTTP client used by the Bigcommerce connection layer.
++
++The public API in this repository is synchronous, while treq itself is
++Twisted-based and returns Deferreds.  This adapter keeps the existing calling
++conventions intact and provides a session-like surface for the connection
++code.
++"""
++from __future__ import annotations
++
++import base64
++import json
++from dataclasses import dataclass
++from typing import Dict, Optional, Tuple
++from urllib.error import HTTPError, URLError
++from urllib.parse import urlencode
++from urllib.request import Request, urlopen
++
++try:
++    import asyncio
++    import treq as _treq
++except ImportError:  # pragma: no cover - exercised only when treq is installed
++    asyncio = None
++    _treq = None
++
++
++def _basic_auth_header(auth: Tuple[str, str]) -> str:
++    token = "%s:%s" % auth
++    encoded = base64.b64encode(token.encode("utf-8")).decode("ascii")
++    return "Basic %s" % encoded
++
++
++def _decode_header_value(value):
++    if isinstance(value, bytes):
++        return value.decode("latin-1")
++    return str(value)
++
++
++def _headers_to_dict(headers) -> Dict[str, str]:
++    result = {}
++
++    if headers is None:
++        return result
++
++    if hasattr(headers, "getAllRawHeaders"):
++        for name, values in headers.getAllRawHeaders() or []:
++            result[_decode_header_value(name)] = ", ".join(_decode_header_value(v) for v in values)
++        return result
++
++    if hasattr(headers, "items"):
++        for name, value in headers.items():
++            result[_decode_header_value(name)] = _decode_header_value(value)
++        return result
++
++    return {str(headers): ""}
++
++
++@dataclass
++class Response:
++    status_code: int
++    headers: Dict[str, str]
++    content: bytes
++    reason: str = ""
++
++    def json(self):
++        body = self.content.decode("utf-8") if isinstance(self.content, (bytes, bytearray)) else self.content
++        return json.loads(body)
++
++
++class Session(object):
++    def __init__(self):
++        self.auth = None
++        self.headers = {}
++
++    def request(self, method, url, data=None, timeout=None, headers=None):
++        request_headers = {}
++        request_headers.update(self.headers or {})
++        if headers:
++            request_headers.update(headers)
++
++        if self.auth and "Authorization" not in request_headers:
++            request_headers["Authorization"] = _basic_auth_header(self.auth)
++
++        body = data
++        if isinstance(body, dict):
++            content_type = request_headers.get("Content-Type", "")
++            if content_type == "application/x-www-form-urlencoded":
++                body = urlencode(body).encode("utf-8")
++            else:
++                body = json.dumps(body).encode("utf-8")
++                request_headers.setdefault("Content-Type", "application/json")
++        elif isinstance(body, str):
++            body = body.encode("utf-8")
++
++        if _treq is not None:
++            return self._request_with_treq(method, url, body, timeout, request_headers)
++
++        return self._request_with_urllib(method, url, body, timeout, request_headers)
++
++    @staticmethod
++    def _response_from_parts(status_code, headers, content, reason=""):
++        return Response(status_code, headers, content, reason)
++
++    def _request_with_treq(self, method, url, body, timeout, request_headers):
++        loop = asyncio.new_event_loop()
++        try:
++            asyncio.set_event_loop(loop)
++
++            async def _do_request():
++                response = await _treq.request(method, url, headers=request_headers, data=body)
++                content = await response.content()
++                headers = _headers_to_dict(response.headers)
++                reason = _decode_header_value(getattr(response, "phrase", "") or "")
++                return self._response_from_parts(response.code, headers, content, reason)
++
++            if timeout is not None:
++                return loop.run_until_complete(asyncio.wait_for(_do_request(), timeout=timeout))
++            return loop.run_until_complete(_do_request())
++        finally:
++            asyncio.set_event_loop(None)
++            loop.close()
++
++    def _request_with_urllib(self, method, url, body, timeout, request_headers):
++        req = Request(url, data=body, headers=request_headers, method=method)
++        try:
++            with urlopen(req, timeout=timeout) as res:
++                content = res.read()
++                response_headers = dict(res.headers.items())
++                reason = getattr(res, "reason", "") or ""
++                return self._response_from_parts(res.status, response_headers, content, str(reason))
++        except HTTPError as exc:
++            return self._response_from_parts(
++                exc.code,
++                dict(exc.headers.items()) if exc.headers else {},
++                exc.read() if hasattr(exc, "read") else b"",
++                str(getattr(exc, "reason", "") or ""),
++            )
++        except URLError:
++            raise

@@ -1,0 +1,285 @@
+--- a/git_pw/api.py
++++ b/git_pw/api.py
+@@ -3,15 +3,17 @@
+ """
+ 
+ from functools import update_wrapper
++import json
+ import logging
+ import os.path
+ import re
+ import sys
+ import tempfile
+ import typing as ty
++from urllib.parse import urlencode
+ 
+ import click
+-import requests
++import pycurl
+ 
+ import git_pw
+ from git_pw import config
+@@ -22,18 +24,28 @@
+ Filters = ty.List[ty.Tuple[str, str]]
+ 
+ 
+-class HTTPTokenAuth(requests.auth.AuthBase):
+-    """Attaches HTTP Token Authentication to the given Request object."""
++class RequestException(Exception):
++    def __init__(
++        self,
++        message: str,
++        response: ty.Optional['Response'] = None,
++    ):
++        super().__init__(message)
++        self.response = response
++
++
++class HTTPError(RequestException):
++    pass
++
++
++class HTTPTokenAuth:
++    """Attach HTTP token authentication to a request."""
+ 
+     def __init__(self, token: str):
+         self.token = token
+ 
+-    def __call__(
+-        self,
+-        r: requests.PreparedRequest,
+-    ) -> requests.PreparedRequest:
+-        r.headers['Authorization'] = self._token_auth_str(self.token)
+-        return r
++    def header(self) -> str:
++        return 'Authorization: {}'.format(self._token_auth_str(self.token))
+ 
+     @staticmethod
+     def _token_auth_str(token: str) -> str:
+@@ -41,11 +53,36 @@
+         return 'Token {}'.format(token.strip())
+ 
+ 
+-def _get_auth(optional: bool = False) -> ty.Optional[requests.auth.AuthBase]:
++class Response:
++    def __init__(
++        self,
++        content: bytes,
++        status_code: int,
++        headers: ty.Dict[str, str],
++    ):
++        self.content = content
++        self.status_code = status_code
++        self.headers = headers
++
++    def json(self) -> ty.Any:
++        return json.loads(self.content.decode('utf-8'))
++
++    def iter_content(self, chunk_size: int = 1) -> ty.Iterator[bytes]:
++        for start in range(0, len(self.content), chunk_size):
++            yield self.content[start:start + chunk_size]
++
++    def raise_for_status(self) -> None:
++        if self.status_code >= 400:
++            raise HTTPError('HTTP error', response=self)
++
++
++def _get_auth(
++    optional: bool = False,
++) -> ty.Optional[ty.Union[HTTPTokenAuth, ty.Tuple[str, str]]]:
+     if CONF.token:
+         return HTTPTokenAuth(CONF.token)
+     elif CONF.username and CONF.password:
+-        return requests.auth.HTTPBasicAuth(CONF.username, CONF.password)
++        return (CONF.username, CONF.password)
+     elif not optional:
+         LOG.error('Authentication information missing')
+         LOG.error(
+@@ -60,6 +97,90 @@
+     return {
+         'User-Agent': 'git-pw ({})'.format(git_pw.__version__),
+     }
++
++
++def _build_url(url: str, params: ty.Optional[Filters]) -> str:
++    if not params:
++        return url
++
++    query = urlencode(params, doseq=True)
++    if not query:
++        return url
++
++    separator = '&' if '?' in url else '?'
++    return '{}{}{}'.format(url, separator, query)
++
++
++def _header_callback(
++    response_headers: ty.Dict[str, str],
++    line: bytes,
++) -> int:
++    header = line.decode('iso-8859-1').strip()
++    if ':' in header:
++        name, value = header.split(':', 1)
++        response_headers[name.strip().lower()] = value.strip()
++    return len(line)
++
++
++def _request(
++    method: str,
++    url: str,
++    params: ty.Optional[Filters] = None,
++    data: ty.Optional[ty.List[ty.Tuple[str, ty.Any]]] = None,
++    optional_auth: bool = False,
++) -> Response:
++    request_url = _build_url(url, params)
++    response_headers: ty.Dict[str, str] = {}
++    content = bytearray()
++    curl = pycurl.Curl()
++
++    def write_callback(chunk: bytes) -> int:
++        content.extend(chunk)
++        return len(chunk)
++
++    try:
++        curl.setopt(pycurl.URL, request_url)
++        curl.setopt(pycurl.WRITEFUNCTION, write_callback)
++        curl.setopt(
++            pycurl.HEADERFUNCTION,
++            lambda line: _header_callback(response_headers, line),
++        )
++        curl.setopt(
++            pycurl.USERAGENT,
++            _get_headers()['User-Agent'],
++        )
++
++        auth = _get_auth(optional=optional_auth)
++        headers = []
++        if isinstance(auth, HTTPTokenAuth):
++            headers.append(auth.header())
++        elif auth:
++            curl.setopt(pycurl.USERPWD, '{}:{}'.format(*auth))
++            curl.setopt(pycurl.HTTPAUTH, pycurl.HTTPAUTH_BASIC)
++
++        if headers:
++            curl.setopt(pycurl.HTTPHEADER, headers)
++
++        if method == 'POST':
++            curl.setopt(pycurl.POSTFIELDS, urlencode(data or [], doseq=True))
++        elif method == 'PATCH':
++            curl.setopt(pycurl.POSTFIELDS, urlencode(data or [], doseq=True))
++            curl.setopt(pycurl.CUSTOMREQUEST, 'PATCH')
++        elif method == 'DELETE':
++            curl.setopt(pycurl.CUSTOMREQUEST, 'DELETE')
++
++        curl.perform()
++        response = Response(
++            bytes(content),
++            curl.getinfo(pycurl.RESPONSE_CODE),
++            response_headers,
++        )
++        response.raise_for_status()
++        return response
++    except pycurl.error as exc:
++        raise RequestException(str(exc)) from exc
++    finally:
++        curl.close()
+ 
+ 
+ def _get_server() -> str:
+@@ -107,7 +228,7 @@
+ 
+ def _handle_error(
+     operation: str,
+-    exc: requests.exceptions.RequestException,
++    exc: RequestException,
+ ) -> None:
+     if exc.response is not None and exc.response.content:
+         # server errors should always be reported
+@@ -140,23 +261,13 @@
+     url: str,
+     params: ty.Optional[Filters] = None,
+     stream: bool = False,
+-) -> requests.Response:
++) -> Response:
+     """Make GET request and handle errors."""
+     LOG.debug('GET %s', url)
+ 
+     try:
+-        # TODO(stephenfin): We only use a subset of the types possible for
+-        # 'params' (namely a list of tuples) but it doesn't seem possible to
+-        # indicate this
+-        rsp = requests.get(
+-            url,
+-            auth=_get_auth(optional=True),
+-            headers=_get_headers(),
+-            stream=stream,
+-            params=params,
+-        )  # type: ignore
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++        rsp = _request('GET', url, params=params, optional_auth=True)
++    except RequestException as exc:
+         _handle_error('fetch', exc)
+ 
+     LOG.debug('Got response')
+@@ -167,16 +278,13 @@
+ def _post(
+     url: str,
+     data: ty.List[ty.Tuple[str, ty.Any]],
+-) -> requests.Response:
++) -> Response:
+     """Make POST request and handle errors."""
+     LOG.debug('POST %s, data=%r', url, data)
+ 
+     try:
+-        rsp = requests.post(
+-            url, auth=_get_auth(), headers=_get_headers(), data=data
+-        )
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++        rsp = _request('POST', url, data=data)
++    except RequestException as exc:
+         _handle_error('create', exc)
+ 
+     LOG.debug('Got response')
+@@ -187,19 +295,13 @@
+ def _patch(
+     url: str,
+     data: ty.List[ty.Tuple[str, ty.Any]],
+-) -> requests.Response:
++) -> Response:
+     """Make PATCH request and handle errors."""
+     LOG.debug('PATCH %s, data=%r', url, data)
+ 
+     try:
+-        rsp = requests.patch(
+-            url,
+-            auth=_get_auth(),
+-            headers=_get_headers(),
+-            data=data,
+-        )
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++        rsp = _request('PATCH', url, data=data)
++    except RequestException as exc:
+         _handle_error('update', exc)
+ 
+     LOG.debug('Got response')
+@@ -207,14 +309,13 @@
+     return rsp
+ 
+ 
+-def _delete(url: str) -> requests.Response:
++def _delete(url: str) -> Response:
+     """Make DELETE request and handle errors."""
+     LOG.debug('DELETE %s', url)
+ 
+     try:
+-        rsp = requests.delete(url, auth=_get_auth(), headers=_get_headers())
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++        rsp = _request('DELETE', url)
++    except RequestException as exc:
+         _handle_error('delete', exc)
+ 
+     LOG.debug('Got response')

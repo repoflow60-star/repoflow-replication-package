@@ -1,0 +1,157 @@
+diff --git a/pastepwn/util/request.py b/pastepwn/util/request.py
+index ea0fcb0..58af431 100644
+--- a/pastepwn/util/request.py
++++ b/pastepwn/util/request.py
+@@ -1,8 +1,12 @@
++import io
+ import logging
+ from threading import Lock
++from urllib.parse import urlencode, urlsplit, urlunsplit
++from urllib.request import getproxies
+ 
+-from requests import Session, utils
+-from requests.exceptions import Timeout
++import pycurl
++
++from pastepwn.util.network import get_ip_version
+ 
+ 
+ class Request:
+@@ -22,37 +26,122 @@ class Request:
+     def __init__(self, proxies=None, headers=None):
+         if not self._initialized:
+             self.logger = logging.getLogger(__name__)
+-            self.session = Session()
+             self.proxies = proxies
+             self.headers = headers
+             self.logger.info("Using the following custom proxies: %s", proxies)
+-            system_proxies = utils.get_environ_proxies("https://example.com")
+-            self.logger.info("Using the following system proxies: %s", system_proxies)
++            self.logger.info("Using the following system proxies: %s", getproxies())
+             Request._initialized = True
+ 
+-    def _request_wrapper(self, data, timeout, *args, **kwargs):
+-        headers = {"User-Agent": "pastepwn (https://github.com/d-Rickyy-b/pastepwn)"}
++    def _proxy_for_url(self, url):
++        if not self.proxies:
++            return None
++
++        scheme = urlsplit(url).scheme
++        proxy = self.proxies.get(scheme) or self.proxies.get("all") or self.proxies.get("http") or self.proxies.get("https")
++        return proxy
++
++    def _encode_body(self, data, headers):
++        if data is None:
++            return None
++
++        if isinstance(data, bytes):
++            return data
++
++        if isinstance(data, str):
++            return data.encode("utf-8")
++
++        if isinstance(data, dict):
++            content_type = next((value for key, value in headers.items() if key.lower() == "content-type"), None)
++            if content_type is None:
++                headers["Content-Type"] = "application/x-www-form-urlencoded"
++            return urlencode(data, doseq=True).encode("utf-8")
++
++        return str(data).encode("utf-8")
++
++    def _get_url_for_get(self, url, data):
++        if not isinstance(data, dict) or not data:
++            return url
+ 
++        parts = urlsplit(url)
++        query = parts.query
++        encoded = urlencode(data, doseq=True)
++        if query:
++            query = f"{query}&{encoded}"
++        else:
++            query = encoded
++        return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
++
++    def _request_wrapper(self, data, timeout, method, url):
++
++        headers = {"User-Agent": "pastepwn (https://github.com/d-Rickyy-b/pastepwn)"}
+         if self.headers is not None:
+             headers.update(self.headers)
+ 
++        proxy = self._proxy_for_url(url)
++        if method == "GET":
++            url = self._get_url_for_get(url, data)
++            body = None
++        else:
++            body = self._encode_body(data, headers)
++
++        response_buffer = io.BytesIO()
++        curl = pycurl.Curl()
+         try:
+-            response = self.session.request(*args, headers=headers, proxies=self.proxies, data=data, timeout=timeout, **kwargs)
+-        except Timeout:
+-            url = kwargs.get("url")
+-            self.logger.warning("Timeout while requesting %s!", url)
+-            return ""
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.FOLLOWLOCATION, True)
++            curl.setopt(pycurl.WRITEFUNCTION, response_buffer.write)
++            curl.setopt(pycurl.HTTPHEADER, [f"{key}: {value}" for key, value in headers.items()])
++            curl.setopt(pycurl.TIMEOUT, timeout)
++            curl.setopt(pycurl.CONNECTTIMEOUT, timeout)
++            curl.setopt(pycurl.NOSIGNAL, 1)
++            curl.setopt(pycurl.USERAGENT, headers["User-Agent"])
++            curl.setopt(pycurl.ACCEPT_ENCODING, "")
++
++            ip_version = get_ip_version()
++            if ip_version == "4":
++                curl.setopt(pycurl.IPRESOLVE, pycurl.IPRESOLVE_V4)
++            elif ip_version == "6":
++                curl.setopt(pycurl.IPRESOLVE, pycurl.IPRESOLVE_V6)
++            else:
++                curl.setopt(pycurl.IPRESOLVE, pycurl.IPRESOLVE_WHATEVER)
++
++            if proxy:
++                curl.setopt(pycurl.PROXY, proxy)
++
++            if method == "POST":
++                curl.setopt(pycurl.POST, 1)
++            elif method in {"PUT", "DELETE"}:
++                curl.setopt(pycurl.CUSTOMREQUEST, method)
++            elif method == "GET":
++                curl.setopt(pycurl.HTTPGET, 1)
++            else:
++                curl.setopt(pycurl.CUSTOMREQUEST, method)
++
++            if body is not None:
++                curl.setopt(pycurl.POSTFIELDS, body)
++                curl.setopt(pycurl.POSTFIELDSIZE, len(body))
++
++            curl.perform()
++        except pycurl.error as exc:
++            errno = exc.args[0] if exc.args else None
++            if errno == pycurl.E_OPERATION_TIMEDOUT:
++                self.logger.warning("Timeout while requesting %s!", url)
++                return ""
++            raise
++        finally:
++            curl.close()
+ 
+-        return response.content.decode("utf-8")
++        content = response_buffer.getvalue()
++        return content.decode("utf-8")
+ 
+     def get(self, url, data=None, timeout=5):
+-        return self._request_wrapper(method="GET", url=url, data=data, timeout=timeout)
++        return self._request_wrapper(data, timeout, "GET", url)
+ 
+     def post(self, url, data=None, timeout=5):
+-        return self._request_wrapper(method="POST", url=url, data=data, timeout=timeout)
++        return self._request_wrapper(data, timeout, "POST", url)
+ 
+     def put(self, url, data=None, timeout=5):
+-        return self._request_wrapper(method="PUT", url=url, data=data, timeout=timeout)
++        return self._request_wrapper(data, timeout, "PUT", url)
+ 
+     def delete(self, url, data=None, timeout=5):
+-        return self._request_wrapper(method="DELETE", url=url, data=data, timeout=timeout)
++        return self._request_wrapper(data, timeout, "DELETE", url)

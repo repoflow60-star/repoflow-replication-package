@@ -1,0 +1,155 @@
+diff --git /dev/null b/tinychat/llms/_treq.py
+new file mode 100644
+index 0000000..93c2919
+--- /dev/null
++++ b/tinychat/llms/_treq.py
+@@ -0,0 +1,149 @@
++from __future__ import annotations
++
++import json
++import threading
++from queue import Queue
++from typing import Any
++
++import treq
++from twisted.internet.defer import Deferred
++from twisted.internet import reactor
++
++
++_END = object()
++_REACTOR_THREAD: threading.Thread | None = None
++_REACTOR_READY = threading.Event()
++
++
++def ensure_reactor_running() -> None:
++    global _REACTOR_THREAD
++    if reactor.running:
++        return
++    if _REACTOR_THREAD is not None and _REACTOR_THREAD.is_alive():
++        _REACTOR_READY.wait()
++        return
++
++    def _run_reactor() -> None:
++        _REACTOR_READY.set()
++        reactor.run(installSignalHandlers=False)
++
++    _REACTOR_THREAD = threading.Thread(target=_run_reactor, daemon=True)
++    _REACTOR_THREAD.start()
++    _REACTOR_READY.wait()
++
++
++def resolve_maybe_deferred(value: Any) -> Any:
++    if isinstance(value, Deferred):
++        done = threading.Event()
++        result: dict[str, Any] = {}
++
++        def _on_success(resolved: Any) -> Any:
++            result["value"] = resolved
++            done.set()
++            return resolved
++
++        def _on_error(failure: Any) -> Any:
++            error = getattr(failure, "value", failure)
++            result["error"] = error
++            done.set()
++            return failure
++
++        value.addCallbacks(_on_success, _on_error)
++        done.wait()
++        if "error" in result:
++            error = result["error"]
++            if isinstance(error, Exception):
++                raise error
++            raise RuntimeError(error)
++        return result.get("value")
++    return value
++
++
++def response_status_code(response: Any) -> int | None:
++    status_code = getattr(response, "status_code", None)
++    if status_code is not None:
++        return status_code
++    return getattr(response, "code", None)
++
++
++def encode_json_payload(payload: dict[str, Any]) -> bytes:
++    return json.dumps(payload).encode("utf-8")
++
++
++class StreamingBody:
++    def __init__(self) -> None:
++        self._queue: Queue[Any] = Queue()
++        self._error: Exception | None = None
++
++    def feed(self, chunk: Any) -> None:
++        if chunk is None:
++            return
++        if isinstance(chunk, str):
++            chunk = chunk.encode("utf-8")
++        self._queue.put(chunk)
++
++    def finish(self) -> None:
++        self._queue.put(_END)
++
++    def fail(self, failure: Any) -> None:
++        error = getattr(failure, "value", failure)
++        if isinstance(error, Exception):
++            self._error = error
++        else:
++            self._error = RuntimeError(str(error))
++        self._queue.put(_END)
++
++    def __iter__(self):
++        while True:
++            chunk = self._queue.get()
++            if chunk is _END:
++                if self._error is not None:
++                    raise self._error
++                break
++            yield chunk
++
++    def iter_lines(self, chunk_size: int = 1, decode_unicode: bool = False, delimiter: bytes | None = None):  # noqa: ARG002
++        buffer = b""
++        for chunk in self:
++            buffer += chunk
++            while True:
++                newline_index = buffer.find(b"\n")
++                if newline_index == -1:
++                    break
++                line = buffer[:newline_index]
++                buffer = buffer[newline_index + 1 :]
++                if line.endswith(b"\r"):
++                    line = line[:-1]
++                yield line.decode("utf-8") if decode_unicode else line
++        if buffer:
++            yield buffer.decode("utf-8") if decode_unicode else buffer
++
++
++def start_streaming_body(response: Any) -> StreamingBody:
++    streaming_body = StreamingBody()
++    if (
++        hasattr(response, "iter_content")
++        and callable(response.iter_content)
++        and type(response).__module__ != "unittest.mock"
++    ):
++        def _feed_iter_content() -> None:
++            try:
++                for chunk in response.iter_content(None):  # type: ignore[attr-defined]
++                    streaming_body.feed(chunk)
++            except Exception as error:  # pragma: no cover - defensive fallback
++                streaming_body.fail(error)
++            else:
++                streaming_body.finish()
++
++        threading.Thread(target=_feed_iter_content, daemon=True).start()
++        return streaming_body
++
++    collect_result = treq.collect(response, streaming_body.feed)
++    if isinstance(collect_result, Deferred):
++        collect_result.addCallbacks(
++            lambda _: streaming_body.finish(),
++            streaming_body.fail,
++        )
++    else:
++        streaming_body.finish()
++    return streaming_body

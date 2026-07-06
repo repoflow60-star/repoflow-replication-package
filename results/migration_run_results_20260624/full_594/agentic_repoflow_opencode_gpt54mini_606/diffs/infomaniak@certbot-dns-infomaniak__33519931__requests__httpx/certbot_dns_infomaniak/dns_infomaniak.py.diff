@@ -1,0 +1,199 @@
+--- a/certbot_dns_infomaniak/dns_infomaniak.py
++++ b/certbot_dns_infomaniak/dns_infomaniak.py
+@@ -5,9 +5,10 @@
+ """DNS Authenticator for Infomaniak"""
+ import json
+ import logging
++from urllib.parse import urlsplit
++
++import httpx
+ import idna
+-
+-import requests
+ 
+ from certbot import errors
+ from certbot.plugins import dns_common
+@@ -17,6 +18,77 @@
+     import os
+ 
+ logger = logging.getLogger(__name__)
++
++
++class _CompatClient(httpx.Client):
++    """httpx client with a small mount shim for request-mock tests."""
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self._mounted_adapters = {}
++
++    def mount(self, prefix, adapter):
++        self._mounted_adapters[prefix] = adapter
++
++    def request(self, method, url, **kwargs):
++        build_request_kwargs = {
++            key: kwargs[key]
++            for key in (
++                "content",
++                "data",
++                "files",
++                "json",
++                "params",
++                "headers",
++                "cookies",
++                "extensions",
++            )
++            if key in kwargs
++        }
++        request = self.build_request(method, url, **build_request_kwargs)
++        adapter = self._adapter_for_url(str(request.url))
++        if adapter is None:
++            return super().request(method, url, **kwargs)
++        return self._send_with_adapter(adapter, request)
++
++    def _adapter_for_url(self, url):
++        matches = [prefix for prefix in self._mounted_adapters if url.startswith(prefix)]
++        if not matches:
++            return None
++        return self._mounted_adapters[max(matches, key=len)]
++
++    def _send_with_adapter(self, adapter, request):
++        class _PreparedRequest:
++            def __init__(self, req):
++                self.method = req.method
++                self.url = str(req.url)
++                self.headers = dict(req.headers)
++                self.body = req.content
++                self.hooks = {}
++
++                parsed = urlsplit(self.url)
++                self.path_url = parsed.path or "/"
++                if parsed.query:
++                    self.path_url = "{}?{}".format(self.path_url, parsed.query)
++
++            def prepare_cookies(self, *args, **kwargs):
++                return None
++
++            def register_hook(self, *args, **kwargs):
++                return None
++
++        response = adapter.send(_PreparedRequest(request))
++        return httpx.Response(
++            response.status_code,
++            headers=dict(response.headers),
++            content=response.content,
++            request=httpx.Request(
++                request.method,
++                str(request.url),
++                headers=request.headers,
++                content=request.content,
++            ),
++        )
+ 
+ 
+ class Authenticator(dns_common.DNSAuthenticator):
+@@ -86,7 +158,7 @@
+         :param str token: oauth2 token to consume Infomaniak API
+         """
+         self.token = token
+-        self.session = requests.Session()
++        self.session = _CompatClient()
+         self.session.headers.update({"Authorization": "Bearer {token}".format(token=self.token)})
+ 
+     def _get_request(self, url, payload=None):
+@@ -97,20 +169,20 @@
+         """
+         url = self.baseUrl + url
+         logger.debug("GET %s", url)
+-        with self.session.get(url, params=payload) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            if result["error"]["code"] == "not_authorized":
+-                raise errors.PluginError("cannot authenticate")
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++        req = self.session.get(url, params=payload)
++        try:
++            result = req.json()
++        except json.decoder.JSONDecodeError as exc:
++            raise errors.PluginError("no JSON in API response") from exc
++        if result["result"] == "success":
++            return result["data"]
++        if result["error"]["code"] == "not_authorized":
++            raise errors.PluginError("cannot authenticate")
++        raise errors.PluginError(
++            "error in API request: {} / {}".format(
++                result["error"]["code"], result["error"]["description"]
++            )
++        )
+ 
+     def _post_request(self, url, payload):
+         """Performs a POST request
+@@ -122,18 +194,18 @@
+         headers = {"Content-Type": "application/json"}
+         json_data = json.dumps(payload)
+         logger.debug("POST %s", url)
+-        with self.session.post(url, data=json_data, headers=headers) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++        req = self.session.post(url, data=json_data, headers=headers)
++        try:
++            result = req.json()
++        except json.decoder.JSONDecodeError as exc:
++            raise errors.PluginError("no JSON in API response") from exc
++        if result["result"] == "success":
++            return result["data"]
++        raise errors.PluginError(
++            "error in API request: {} / {}".format(
++                result["error"]["code"], result["error"]["description"]
++            )
++        )
+ 
+     def _delete_request(self, url):
+         """Performs a POST request
+@@ -142,18 +214,18 @@
+         """
+         url = self.baseUrl + url
+         logger.debug("DELETE %s", url)
+-        with self.session.delete(url) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++        req = self.session.delete(url)
++        try:
++            result = req.json()
++        except json.decoder.JSONDecodeError as exc:
++            raise errors.PluginError("no JSON in API response") from exc
++        if result["result"] == "success":
++            return result["data"]
++        raise errors.PluginError(
++            "error in API request: {} / {}".format(
++                result["error"]["code"], result["error"]["description"]
++            )
++        )
+ 
+     def _get_records(self, domain, domain_id, record):
+         """Find record matching arguments

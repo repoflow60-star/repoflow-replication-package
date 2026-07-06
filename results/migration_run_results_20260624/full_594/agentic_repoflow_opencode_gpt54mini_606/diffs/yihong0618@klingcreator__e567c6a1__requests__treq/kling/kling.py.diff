@@ -1,0 +1,165 @@
+--- a/kling/kling.py
++++ b/kling/kling.py
+@@ -1,16 +1,18 @@
+ import argparse
++import json
+ import os
+ import time
+ import contextlib
+ from typing import Optional
+ from enum import Enum
+ from http.cookies import SimpleCookie
++from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+ 
+ from fake_useragent import UserAgent
+-import requests
+-from requests.utils import cookiejar_from_dict
++import treq
+ from rich import print
+ import threading
++from twisted.internet import defer, reactor, threads
+ 
+ browser_version = "edge101"
+ ua = UserAgent(browsers=["edge"])
+@@ -18,7 +20,113 @@
+ base_url_not_cn = "https://klingai.com/"
+ 
+ 
+-def call_for_daily_check(session: requests.Session, is_cn: bool) -> bool:
++_reactor_lock = threading.Lock()
++_reactor_started = False
++_reactor_ready = threading.Event()
++
++
++def _ensure_reactor_running() -> None:
++    global _reactor_started
++    if _reactor_started or reactor.running:
++        _reactor_started = True
++        return
++
++    with _reactor_lock:
++        if _reactor_started or reactor.running:
++            _reactor_started = True
++            return
++
++        def _run_reactor() -> None:
++            reactor.callWhenRunning(_reactor_ready.set)
++            reactor.run(installSignalHandlers=False)
++
++        threading.Thread(target=_run_reactor, daemon=True).start()
++        _reactor_ready.wait()
++        _reactor_started = True
++
++
++def _append_query_params(url: str, params) -> str:
++    if not params:
++        return url
++
++    split_url = urlsplit(url)
++    query = dict(parse_qsl(split_url.query, keep_blank_values=True))
++    query.update(params)
++    return urlunsplit(
++        (
++            split_url.scheme,
++            split_url.netloc,
++            split_url.path,
++            urlencode(query, doseq=True),
++            split_url.fragment,
++        )
++    )
++
++
++class TreqResponse:
++    def __init__(self, status_code: int, body: bytes) -> None:
++        self.status_code = status_code
++        self.content = body
++
++    @property
++    def ok(self) -> bool:
++        return 200 <= self.status_code < 400
++
++    @property
++    def text(self) -> str:
++        return self.content.decode("utf-8", errors="replace")
++
++    def json(self):
++        return json.loads(self.text)
++
++    def __str__(self) -> str:
++        return f"<TreqResponse [{self.status_code}]>"
++
++
++class TreqSession:
++    def __init__(self) -> None:
++        self.headers = {}
++        self.cookies = {}
++
++    @defer.inlineCallbacks
++    def _request_async(self, method: str, url: str, **kwargs):
++        response = yield treq.request(method, url, **kwargs)
++        body = yield treq.content(response)
++        defer.returnValue(TreqResponse(response.code, body))
++
++    def _request(self, method: str, url: str, **kwargs) -> TreqResponse:
++        _ensure_reactor_running()
++        headers = dict(self.headers)
++        extra_headers = kwargs.pop("headers", None)
++        json_body = kwargs.pop("json", None)
++        params = kwargs.pop("params", None)
++        if extra_headers:
++            headers.update(extra_headers)
++        if self.cookies:
++            cookie_header = "; ".join(
++                f"{key}={value}" for key, value in self.cookies.items()
++            )
++            if cookie_header:
++                headers.setdefault("Cookie", cookie_header)
++        if json_body is not None:
++            kwargs["data"] = json.dumps(json_body).encode("utf-8")
++            headers.setdefault("Content-Type", "application/json")
++        if params:
++            url = _append_query_params(url, params)
++        if headers:
++            kwargs["headers"] = headers
++        return threads.blockingCallFromThread(
++            reactor, self._request_async, method, url, **kwargs
++        )
++
++    def get(self, url: str, **kwargs) -> TreqResponse:
++        return self._request("GET", url, **kwargs)
++
++    def post(self, url: str, **kwargs) -> TreqResponse:
++        return self._request("POST", url, **kwargs)
++
++
++def call_for_daily_check(session, is_cn: bool) -> bool:
+     if is_cn:
+         r = session.get(f"{base_url}api/pay/reward?activity=login_bonus_daily")
+     else:
+@@ -40,7 +148,7 @@
+ 
+ class BaseGen:
+     def __init__(self, cookie: str) -> None:
+-        self.session: requests.Session = requests.Session()
++        self.session: TreqSession = TreqSession()
+         self.cookie = cookie
+         self.session.cookies, is_cn = self.parse_cookie_string(self.cookie)
+         self.session.headers["user-agent"] = ua.random
+@@ -72,16 +180,12 @@
+         cookie = SimpleCookie()
+         cookie.load(cookie_string)
+         cookies_dict = {}
+-        cookiejar = None
+         is_cn = False
+         for key, morsel in cookie.items():
+             if key.startswith("kuaishou"):
+                 is_cn = True
+             cookies_dict[key] = morsel.value
+-            cookiejar = cookiejar_from_dict(
+-                cookies_dict, cookiejar=None, overwrite=True
+-            )
+-        return cookiejar, is_cn
++        return cookies_dict, is_cn
+ 
+     def get_account_point(self) -> float:
+         bonus_req = self.session.get(self.daily_url)

@@ -1,0 +1,211 @@
+diff --git /dev/null b/aiohttp/__init__.py
+new file mode 100644
+index 0000000..e28e5f3
+--- /dev/null
++++ b/aiohttp/__init__.py
+@@ -0,0 +1,205 @@
++import asyncio
++import json
++import mimetypes
++import socket
++import uuid
++from dataclasses import dataclass
++from typing import Any, Dict, Iterable, List, Optional, Tuple
++from urllib import error as urllib_error
++from urllib import parse as urllib_parse
++from urllib import request as urllib_request
++
++
++class ClientError(Exception):
++    pass
++
++
++class ClientTimeout:
++    def __init__(self, total: Optional[float] = None) -> None:
++        self.total = total
++
++
++class FormData:
++    def __init__(self) -> None:
++        self.fields: List[Tuple[str, Any, Optional[str], Optional[str]]] = []
++
++    def add_field(
++            self,
++            name: str,
++            value: Any,
++            filename: Optional[str] = None,
++            content_type: Optional[str] = None
++    ) -> None:
++        self.fields.append((name, value, filename, content_type))
++
++
++@dataclass
++class _Response:
++    status: int
++    _text: str
++    headers: Dict[str, str]
++
++    async def text(self) -> str:
++        return self._text
++
++    async def __aenter__(self) -> "_Response":
++        return self
++
++    async def __aexit__(self, exc_type, exc, tb) -> bool:
++        return False
++
++
++class _RequestContext:
++    def __init__(self, response: _Response) -> None:
++        self._response = response
++
++    async def __aenter__(self) -> _Response:
++        return self._response
++
++    async def __aexit__(self, exc_type, exc, tb) -> bool:
++        return False
++
++
++class ClientSession:
++    def __init__(
++            self,
++            headers: Optional[Dict[str, str]] = None,
++            timeout: Optional[ClientTimeout] = None
++    ) -> None:
++        self.headers = dict(headers or {})
++        self.timeout = timeout
++
++    async def __aenter__(self) -> "ClientSession":
++        return self
++
++    async def __aexit__(self, exc_type, exc, tb) -> bool:
++        return False
++
++    def request(self, method: str, url: str, **kwargs: Any) -> _RequestContext:
++        response = self._perform_request(method, url, **kwargs)
++        return _RequestContext(response)
++
++    def _perform_request(self, method: str, url: str, **kwargs: Any) -> _Response:
++        request_headers = dict(self.headers)
++        extra_headers = kwargs.pop("headers", None)
++        if extra_headers:
++            request_headers.update(extra_headers)
++
++        timeout = kwargs.pop("timeout", None)
++        if isinstance(timeout, ClientTimeout):
++            timeout_value = timeout.total
++        elif timeout is not None:
++            timeout_value = timeout
++        elif self.timeout is not None:
++            timeout_value = self.timeout.total
++        else:
++            timeout_value = None
++
++        body, body_headers = self._build_body(kwargs)
++        request_headers.update(body_headers)
++
++        request = urllib_request.Request(
++            url=url,
++            data=body,
++            headers=request_headers,
++            method=method.upper()
++        )
++
++        try:
++            with urllib_request.urlopen(request, timeout=timeout_value) as response:
++                status = getattr(response, "status", response.getcode())
++                charset = response.headers.get_content_charset() or "utf-8"
++                text = response.read().decode(charset, errors="replace")
++                headers = dict(response.headers.items())
++        except urllib_error.HTTPError as error:
++            status = error.code
++            charset = error.headers.get_content_charset() or "utf-8"
++            text = error.read().decode(charset, errors="replace")
++            headers = dict(error.headers.items())
++        except (urllib_error.URLError, socket.timeout, TimeoutError) as error:
++            raise ClientError(str(error)) from error
++
++        return _Response(status=status, _text=text, headers=headers)
++
++    def _build_body(self, kwargs: Dict[str, Any]) -> Tuple[Optional[bytes], Dict[str, str]]:
++        json_body = kwargs.pop("json", None)
++        data_body = kwargs.pop("data", None)
++
++        if json_body is not None:
++            return (
++                json.dumps(json_body).encode("utf-8"),
++                {"Content-Type": "application/json"}
++            )
++
++        if isinstance(data_body, FormData):
++            return self._encode_form_data(data_body)
++
++        if isinstance(data_body, dict):
++            encoded = urllib_parse.urlencode(
++                [
++                    (key, self._normalize_value(value))
++                    for key, value in data_body.items()
++                ]
++            ).encode("utf-8")
++            return encoded, {
++                "Content-Type": "application/x-www-form-urlencoded"
++            }
++
++        if data_body is None:
++            return None, {}
++
++        if hasattr(data_body, "read"):
++            data_body = data_body.read()
++
++        if isinstance(data_body, str):
++            data_body = data_body.encode("utf-8")
++
++        if isinstance(data_body, bytearray):
++            data_body = bytes(data_body)
++
++        return data_body, {}
++
++    def _encode_form_data(self, form: FormData) -> Tuple[bytes, Dict[str, str]]:
++        boundary = uuid.uuid4().hex
++        chunks: List[bytes] = []
++
++        for name, value, filename, content_type in form.fields:
++            chunks.append(f"--{boundary}\r\n".encode("utf-8"))
++
++            disposition = f'Content-Disposition: form-data; name="{name}"'
++            if filename is not None:
++                disposition += f'; filename="{filename}"'
++            chunks.append(f"{disposition}\r\n".encode("utf-8"))
++
++            if content_type is not None:
++                chunks.append(
++                    f"Content-Type: {content_type}\r\n".encode("utf-8")
++                )
++
++            chunks.append(b"\r\n")
++            chunks.append(self._coerce_bytes(value))
++            chunks.append(b"\r\n")
++
++        chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
++
++        return b"".join(chunks), {
++            "Content-Type": f"multipart/form-data; boundary={boundary}"
++        }
++
++    @staticmethod
++    def _coerce_bytes(value: Any) -> bytes:
++        if hasattr(value, "read"):
++            value = value.read()
++        if isinstance(value, bytes):
++            return value
++        if isinstance(value, bytearray):
++            return bytes(value)
++        return str(value).encode("utf-8")
++
++    @staticmethod
++    def _normalize_value(value: Any) -> str:
++        if value is None:
++            return ""
++        if isinstance(value, bool):
++            return "true" if value else "false"
++        return str(value)

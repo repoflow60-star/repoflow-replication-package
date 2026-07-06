@@ -1,0 +1,141 @@
+diff --git a/census/core.py b/census/core.py
+index 5beeb4e..84a020b 100644
+--- a/census/core.py
++++ b/census/core.py
+@@ -1,15 +1,134 @@
+ import warnings
+ from functools import wraps, lru_cache
+ from importlib.metadata import version
++from threading import Event, Lock, Thread
+ 
+ __version__ = version('census')
+ 
+ ALL = '*'
+ 
++_reactor = None
++_reactor_error = None
++_reactor_ready = Event()
++_reactor_lock = Lock()
++_reactor_thread = None
++
++
++def _start_reactor_thread():
++    def run():
++        global _reactor
++        global _reactor_error
++        try:
++            from twisted.internet import reactor as twisted_reactor
++
++            _reactor = twisted_reactor
++            twisted_reactor.callWhenRunning(_reactor_ready.set)
++            twisted_reactor.run(installSignalHandlers=False)
++        except Exception as exc:
++            _reactor_error = exc
++            _reactor_ready.set()
++
++    thread = Thread(target=run, name='census-treq-reactor', daemon=True)
++    thread.start()
++    return thread
++
++
++def _get_reactor():
++    global _reactor_thread
++    if _reactor is not None:
++        return _reactor
++
++    with _reactor_lock:
++        if _reactor is None and _reactor_thread is None:
++            _reactor_thread = _start_reactor_thread()
++
++    _reactor_ready.wait()
++    if _reactor_error is not None:
++        raise _reactor_error
++    return _reactor
++
++
++def _call_on_reactor(func, *args, **kwargs):
++    from twisted.internet.threads import blockingCallFromThread
++
++    reactor = _get_reactor()
++    return blockingCallFromThread(reactor, func, *args, **kwargs)
++
++
++def _normalize_headers(headers):
++    if not headers:
++        return None
++
++    def to_text(value):
++        if isinstance(value, bytes):
++            return value.decode('latin-1')
++        return str(value)
++
++    normalized = {}
++    for key, value in headers.items():
++        if value is None:
++            continue
++
++        if isinstance(value, (list, tuple)):
++            values = value
++        else:
++            values = [value]
++
++        normalized[to_text(key)] = [to_text(item) for item in values]
++
++    return normalized
++
++
++class _BlockingResponse(object):
++    def __init__(self, response):
++        self._response = response
++
++    @property
++    def status_code(self):
++        return self._response.code
++
++    @property
++    def code(self):
++        return self._response.code
++
++    def json(self, **kwargs):
++        return _call_on_reactor(self._response.json, **kwargs)
++
++    @property
++    def text(self):
++        return _call_on_reactor(self._response.text)
++
++
++class _BlockingSession(object):
++    def __init__(self, *args, **kwargs):
++        self.headers = {}
++
++    def request(self, method, url, **kwargs):
++        import treq
++
++        headers = kwargs.pop('headers', None)
++        merged_headers = dict(self.headers)
++        if headers:
++            merged_headers.update(headers)
++
++        response = _call_on_reactor(
++            treq.request,
++            method,
++            url,
++            headers=_normalize_headers(merged_headers),
++            **kwargs
++        )
++        return _BlockingResponse(response)
++
++    def get(self, url, **kwargs):
++        return self.request('GET', url, **kwargs)
++
++    def close(self):
++        return None
++
+ 
+ def new_session(*args, **kwargs):
+-    import requests
+-    return requests.session(*args, **kwargs)
++    return _BlockingSession(*args, **kwargs)
+ 
+ 
+ class APIKeyError(Exception):

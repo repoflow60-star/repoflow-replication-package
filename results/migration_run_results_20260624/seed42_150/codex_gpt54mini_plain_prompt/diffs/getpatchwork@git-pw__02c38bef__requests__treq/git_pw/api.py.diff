@@ -1,0 +1,363 @@
+diff --git a/git_pw/api.py b/git_pw/api.py
+index fac6854..365083f 100644
+--- a/git_pw/api.py
++++ b/git_pw/api.py
+@@ -2,7 +2,9 @@
+ Simple wrappers around request methods.
+ """
+ 
++import asyncio
+ from functools import update_wrapper
++import json
+ import logging
+ import os.path
+ import re
+@@ -11,7 +13,13 @@ import tempfile
+ import typing as ty
+ 
+ import click
+-import requests
++from twisted.internet import asyncioreactor
++
++_ASYNCIO_LOOP = asyncio.new_event_loop()
++asyncio.set_event_loop(_ASYNCIO_LOOP)
++asyncioreactor.install(_ASYNCIO_LOOP)
++
++import treq
+ 
+ import git_pw
+ from git_pw import config
+@@ -22,30 +30,27 @@ LOG = logging.getLogger(__name__)
+ Filters = ty.List[ty.Tuple[str, str]]
+ 
+ 
+-class HTTPTokenAuth(requests.auth.AuthBase):
+-    """Attaches HTTP Token Authentication to the given Request object."""
++class HTTPError(Exception):
++    """Wrap an HTTP response that should be treated as a failure."""
+ 
+-    def __init__(self, token: str):
+-        self.token = token
++    def __init__(self, response, body: bytes):
++        super().__init__(response.code)
++        self.response = response
++        self.body = body
+ 
+-    def __call__(
+-        self,
+-        r: requests.PreparedRequest,
+-    ) -> requests.PreparedRequest:
+-        r.headers['Authorization'] = self._token_auth_str(self.token)
+-        return r
+ 
+-    @staticmethod
+-    def _token_auth_str(token: str) -> str:
+-        """Return a Token auth string."""
+-        return 'Token {}'.format(token.strip())
++def _run(value):
++    async def _await_value():
++        return await value
+ 
++    return _ASYNCIO_LOOP.run_until_complete(_await_value())
+ 
+-def _get_auth(optional: bool = False) -> ty.Optional[requests.auth.AuthBase]:
++
++def _get_auth(optional: bool = False) -> ty.Optional[ty.Tuple[str, str]]:
+     if CONF.token:
+-        return HTTPTokenAuth(CONF.token)
++        return None
+     elif CONF.username and CONF.password:
+-        return requests.auth.HTTPBasicAuth(CONF.username, CONF.password)
++        return (CONF.username, CONF.password)
+     elif not optional:
+         LOG.error('Authentication information missing')
+         LOG.error(
+@@ -57,9 +62,12 @@ def _get_auth(optional: bool = False) -> ty.Optional[requests.auth.AuthBase]:
+ 
+ 
+ def _get_headers() -> ty.Dict[str, str]:
+-    return {
++    headers = {
+         'User-Agent': 'git-pw ({})'.format(git_pw.__version__),
+     }
++    if CONF.token:
++        headers['Authorization'] = 'Token {}'.format(CONF.token.strip())
++    return headers
+ 
+ 
+ def _get_server() -> str:
+@@ -107,22 +115,24 @@ def _get_project() -> str:
+ 
+ def _handle_error(
+     operation: str,
+-    exc: requests.exceptions.RequestException,
++    response,
++    body: bytes,
+ ) -> None:
+-    if exc.response is not None and exc.response.content:
+-        # server errors should always be reported
+-        if exc.response.status_code in range(500, 512):  # 5xx Server Error
+-            LOG.error(
+-                'Server error. Please report this issue to '
+-                'https://github.com/getpatchwork/patchwork'
+-            )
+-            raise
++    if response.code in range(500, 512):  # 5xx Server Error
++        LOG.error(
++            'Server error. Please report this issue to '
++            'https://github.com/getpatchwork/patchwork'
++        )
++        raise HTTPError(response, body)
+ 
+-        # we make the assumption that all responses will be JSON encoded
+-        if exc.response.status_code == 404:
++    if body:
++        if response.code == 404:
+             LOG.error('Resource not found')
+         else:
+-            LOG.error(exc.response.json())
++            try:
++                LOG.error(json.loads(body.decode('utf-8')))
++            except (UnicodeDecodeError, ValueError):
++                LOG.error(body.decode('utf-8', 'replace'))
+     else:
+         LOG.error(
+             'Failed to %s resource. Is your configuration '
+@@ -131,33 +141,48 @@ def _handle_error(
+         LOG.error("Use the '--debug' flag for more information")
+ 
+     if CONF.debug:
+-        raise
+-    else:
+-        sys.exit(1)
++        raise HTTPError(response, body)
++    sys.exit(1)
++
++
++def _handle_request_failure(operation: str, exc: Exception) -> None:
++    LOG.error(
++        'Failed to %s resource. Is your configuration correct?' % operation
++    )
++    LOG.error("Use the '--debug' flag for more information")
++
++    if CONF.debug:
++        raise exc
++    sys.exit(1)
+ 
+ 
+ def _get(
+     url: str,
+     params: ty.Optional[Filters] = None,
+     stream: bool = False,
+-) -> requests.Response:
++) -> ty.Any:
+     """Make GET request and handle errors."""
+     LOG.debug('GET %s', url)
+ 
++    kwargs = {
++        'headers': _get_headers(),
++        'params': params,
++    }
++    auth = _get_auth(optional=True)
++    if auth is not None:
++        kwargs['auth'] = auth
++
+     try:
+-        # TODO(stephenfin): We only use a subset of the types possible for
+-        # 'params' (namely a list of tuples) but it doesn't seem possible to
+-        # indicate this
+-        rsp = requests.get(
+-            url,
+-            auth=_get_auth(optional=True),
+-            headers=_get_headers(),
+-            stream=stream,
+-            params=params,
+-        )  # type: ignore
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
+-        _handle_error('fetch', exc)
++        rsp = _run(treq.get(url, **kwargs))
++    except Exception as exc:
++        _handle_request_failure('fetch', exc)
++
++    if rsp.code >= 400:
++        try:
++            body = _run(rsp.content())
++        except Exception as exc:
++            _handle_request_failure('fetch', exc)
++        _handle_error('fetch', rsp, body)
+ 
+     LOG.debug('Got response')
+ 
+@@ -167,17 +192,29 @@ def _get(
+ def _post(
+     url: str,
+     data: ty.List[ty.Tuple[str, ty.Any]],
+-) -> requests.Response:
++) -> ty.Any:
+     """Make POST request and handle errors."""
+     LOG.debug('POST %s, data=%r', url, data)
+ 
++    kwargs = {
++        'headers': _get_headers(),
++        'data': data,
++    }
++    auth = _get_auth()
++    if auth is not None:
++        kwargs['auth'] = auth
++
+     try:
+-        rsp = requests.post(
+-            url, auth=_get_auth(), headers=_get_headers(), data=data
+-        )
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
+-        _handle_error('create', exc)
++        rsp = _run(treq.post(url, **kwargs))
++    except Exception as exc:
++        _handle_request_failure('create', exc)
++
++    if rsp.code >= 400:
++        try:
++            body = _run(rsp.content())
++        except Exception as exc:
++            _handle_request_failure('create', exc)
++        _handle_error('create', rsp, body)
+ 
+     LOG.debug('Got response')
+ 
+@@ -187,35 +224,57 @@ def _post(
+ def _patch(
+     url: str,
+     data: ty.List[ty.Tuple[str, ty.Any]],
+-) -> requests.Response:
++) -> ty.Any:
+     """Make PATCH request and handle errors."""
+     LOG.debug('PATCH %s, data=%r', url, data)
+ 
++    kwargs = {
++        'headers': _get_headers(),
++        'data': data,
++    }
++    auth = _get_auth()
++    if auth is not None:
++        kwargs['auth'] = auth
++
+     try:
+-        rsp = requests.patch(
+-            url,
+-            auth=_get_auth(),
+-            headers=_get_headers(),
+-            data=data,
+-        )
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
+-        _handle_error('update', exc)
++        rsp = _run(treq.patch(url, **kwargs))
++    except Exception as exc:
++        _handle_request_failure('update', exc)
++
++    if rsp.code >= 400:
++        try:
++            body = _run(rsp.content())
++        except Exception as exc:
++            _handle_request_failure('update', exc)
++        _handle_error('update', rsp, body)
+ 
+     LOG.debug('Got response')
+ 
+     return rsp
+ 
+ 
+-def _delete(url: str) -> requests.Response:
++def _delete(url: str) -> ty.Any:
+     """Make DELETE request and handle errors."""
+     LOG.debug('DELETE %s', url)
+ 
++    kwargs = {
++        'headers': _get_headers(),
++    }
++    auth = _get_auth()
++    if auth is not None:
++        kwargs['auth'] = auth
++
+     try:
+-        rsp = requests.delete(url, auth=_get_auth(), headers=_get_headers())
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
+-        _handle_error('delete', exc)
++        rsp = _run(treq.delete(url, **kwargs))
++    except Exception as exc:
++        _handle_request_failure('delete', exc)
++
++    if rsp.code >= 400:
++        try:
++            body = _run(rsp.content())
++        except Exception as exc:
++            _handle_request_failure('delete', exc)
++        _handle_error('delete', rsp, body)
+ 
+     LOG.debug('Got response')
+ 
+@@ -259,9 +318,12 @@ def download(
+     rsp = _get(url, params, stream=True)
+ 
+     # we don't catch anything here because we should break if these are missing
++    content_disposition = (
++        rsp.headers.getRawHeaders(b'content-disposition') or [b'']
++    )[0].decode('utf-8', 'replace')
+     header = re.search(
+         'filename=(.+)',
+-        rsp.headers.get('content-disposition') or '',
++        content_disposition,
+     )
+     if not header:
+         LOG.error('Filename was expected but was not provided in response')
+@@ -284,9 +346,8 @@ def download(
+         output_file = open(output_path, 'wb')
+ 
+     try:
+-        # we use iter_content because patches can be binary
+-        for block in rsp.iter_content(1024):
+-            output_file.write(block)
++        # We buffer the response body because patches can be binary.
++        output_file.write(_run(rsp.content()))
+     finally:
+         output_file.close()
+ 
+@@ -316,7 +377,7 @@ def index(resource_type: str, params: ty.Optional[Filters] = None) -> dict:
+     params = params or []
+     params.append(('project', _get_project()))
+ 
+-    return _get(url, params).json()
++    return _run(_get(url, params).json())
+ 
+ 
+ def detail(
+@@ -339,7 +400,7 @@ def detail(
+     # NOTE(stephenfin): All resources must have a trailing '/'
+     url = '/'.join([_get_server(), resource_type, str(resource_id), ''])
+ 
+-    return _get(url, params, stream=False).json()
++    return _run(_get(url, params, stream=False).json())
+ 
+ 
+ def create(
+@@ -360,7 +421,7 @@ def create(
+     # NOTE(stephenfin): All resources must have a trailing '/'
+     url = '/'.join([_get_server(), resource_type, ''])
+ 
+-    return _post(url, data).json()
++    return _run(_post(url, data).json())
+ 
+ 
+ def delete(resource_type: str, resource_id: ty.Union[str, int]) -> None:
+@@ -401,7 +462,7 @@ def update(
+     # NOTE(stephenfin): All resources must have a trailing '/'
+     url = '/'.join([_get_server(), resource_type, str(resource_id), ''])
+ 
+-    return _patch(url, data).json()
++    return _run(_patch(url, data).json())
+ 
+ 
+ def validate_minimum_version(

@@ -1,0 +1,290 @@
+--- a/hxl/input.py
++++ b/hxl/input.py
+@@ -33,7 +33,7 @@
+ 
+ import abc, collections, csv, datetime, dateutil.parser, hashlib, \
+     io, io_wrapper, json, jsonpath_ng.ext, logging, \
+-    os.path, re, requests, shutil, six, sys, \
++    os.path, pycurl, re, shutil, six, sys, \
+     tempfile, time, urllib.parse, xlrd3 as xlrd, zipfile
+ 
+ logger = logging.getLogger(__name__)
+@@ -164,6 +164,122 @@
+     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+     'application/vnd.ms-excel',
+ )
++
++
++class _HTTPHeaders(dict):
++    """Case-insensitive mapping for response headers."""
++
++    def __getitem__(self, key):
++        return super().__getitem__(key.lower())
++
++    def get(self, key, default=None):
++        return super().get(key.lower(), default)
++
++    def __setitem__(self, key, value):
++        super().__setitem__(key.lower(), value)
++
++
++class _HTTPResponse(object):
++    """Small response wrapper matching the subset of the old client API we use."""
++
++    def __init__(self, url, status_code, headers, content):
++        self.url = url
++        self.status_code = status_code
++        self.headers = headers
++        self.content = content
++
++    @property
++    def is_redirect(self):
++        return self.status_code in (301, 302, 303, 307, 308)
++
++    def json(self):
++        encoding = 'utf-8'
++        content_type = self.headers.get('content-type')
++        if content_type:
++            result = re.search(r'charset=([^;\s]+)', content_type, re.IGNORECASE)
++            if result:
++                encoding = result.group(1).strip('"').strip("'")
++        return json.loads(self.content.decode(encoding))
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise HXLIOException(
++                "HTTP error {} while retrieving {}".format(self.status_code, self.url),
++                url=self.url
++            )
++
++
++def _append_url_params(url, params):
++    """Append query params to a URL without disturbing existing parameters."""
++    if not params:
++        return url
++    separator = '&' if urllib.parse.urlsplit(url).query else '?'
++    return '{}{}{}'.format(url, separator, urllib.parse.urlencode(params, doseq=True))
++
++
++def _http_request(method, url, verify_ssl=True, timeout=None, headers=None, params=None, data=None, follow_redirects=True):
++    """Perform a small HTTP request using pycurl."""
++    content = io.BytesIO()
++    response_headers = _HTTPHeaders()
++    request_url = _append_url_params(url, params)
++    curl = pycurl.Curl()
++
++    def handle_header(header_line):
++        header_text = header_line.decode('iso-8859-1').strip()
++        if not header_text:
++            return len(header_line)
++        if header_text.startswith('HTTP/'):
++            response_headers.clear()
++            return len(header_line)
++        parts = header_text.split(':', 1)
++        if len(parts) == 2:
++            response_headers[parts[0].strip()] = parts[1].strip()
++        return len(header_line)
++
++    try:
++        curl.setopt(pycurl.URL, request_url)
++        curl.setopt(pycurl.WRITEDATA, content)
++        curl.setopt(pycurl.HEADERFUNCTION, handle_header)
++        curl.setopt(pycurl.ACCEPT_ENCODING, '')
++        curl.setopt(pycurl.FOLLOWLOCATION, 1 if follow_redirects else 0)
++        curl.setopt(pycurl.NOSIGNAL, 1)
++
++        if timeout is not None:
++            timeout = int(timeout)
++            curl.setopt(pycurl.CONNECTTIMEOUT, timeout)
++            curl.setopt(pycurl.TIMEOUT, timeout)
++
++        if not verify_ssl:
++            curl.setopt(pycurl.SSL_VERIFYPEER, 0)
++            curl.setopt(pycurl.SSL_VERIFYHOST, 0)
++
++        if headers:
++            curl.setopt(
++                pycurl.HTTPHEADER,
++                ['{}: {}'.format(name, value) for name, value in headers.items()]
++            )
++
++        method = method.upper()
++        if method == 'HEAD':
++            curl.setopt(pycurl.NOBODY, 1)
++            curl.setopt(pycurl.CUSTOMREQUEST, 'HEAD')
++        elif method == 'POST':
++            curl.setopt(pycurl.POST, 1)
++            curl.setopt(pycurl.POSTFIELDS, urllib.parse.urlencode(data or {}, doseq=True))
++        elif method != 'GET':
++            curl.setopt(pycurl.CUSTOMREQUEST, method)
++
++        curl.perform()
++        status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        response_url = curl.getinfo(pycurl.EFFECTIVE_URL) or request_url
++        return _HTTPResponse(response_url, status_code, response_headers, content.getvalue())
++    except pycurl.error as e:
++        message = e.args[1] if len(e.args) > 1 else str(e)
++        if e.args and e.args[0] == pycurl.E_OPERATION_TIMEDOUT:
++            raise HXLTimeoutException(url=url)
++        raise HXLIOException("Cannot open URL {} ({})".format(url, message), url=url)
++    finally:
++        curl.close()
+ 
+ 
+ ########################################################################
+@@ -621,10 +737,10 @@
+         try:
+             url = munge_url(url_or_filename, input_options)
+             logup("Trying to open remote resource", {"url": url_or_filename})
+-            response = requests.get(
++            response = _http_request(
++                'GET',
+                 url,
+-                stream=True,
+-                verify=input_options.verify_ssl,
++                verify_ssl=input_options.verify_ssl,
+                 timeout=input_options.timeout,
+                 headers=input_options.http_headers
+             )
+@@ -760,7 +876,7 @@
+             message (str): the error message
+             url (str): the URL that triggered the exception
+         """
+-        super().init__(message, url)
++        super().__init__(message, url)
+ 
+ 
+ class HXLTagsNotFoundException(HXLParseException):
+@@ -820,17 +936,16 @@
+ 
+ # Deprecated - will remove in future release
+ class RequestResponseIOWrapper(io.RawIOBase):
+-    """Wrapper for a Response object from the requests library.  Streaming
+-    in requests is a bit broken: for example, if you're streaming, the
+-    stream from the raw property doesn't unzip the payload.
++    """Wrapper for a response object from the HTTP client. Streaming
++    support is limited, so this adapter remains only for compatibility.
+     """
+ 
+     BUFFER_SIZE = 0x1000
+-    """Size of input chunk buffer from requests.raw.iter_content"""
++    """Size of input chunk buffer from the response iterator."""
+ 
+     def __init__(self, response):
+-        """Construct a wrapper around a requests response object
+-        @param response: the HTTP response from the requests library
++        """Construct a wrapper around an HTTP response object.
++        @param response: the HTTP response object
+         """
+         self.response = response
+         self.buffer = None
+@@ -838,7 +953,7 @@
+         self.iter = response.iter_content(self.BUFFER_SIZE) # iterator through the input
+ 
+     def read(self, size=-1):
+-        """Read raw byte input from the requests raw.iter_content iterator
++        """Read raw byte input from the response iterator.
+         The function will unzip zipped content.
+         @param size: the maximum number of bytes to read, or -1 for all available.
+         """
+@@ -1644,7 +1759,7 @@
+     """
+ 
+     #
+-    # Stage 1: unpack indirect links (requires extra HTTP requests)
++    # Stage 1: unpack indirect links (requires extra HTTP calls)
+     #
+ 
+     # Is it a CKAN resource? (Assumes the v.3 API for now)
+@@ -1657,7 +1772,14 @@
+     result = re.match(GOOGLE_DRIVE_URL, url)
+     if result:
+         logup("HEAD request for Google Drive URL", {"url": url})
+-        response = requests.head(url)
++        response = _http_request(
++            'HEAD',
++            url,
++            verify_ssl=input_options.verify_ssl,
++            timeout=input_options.timeout,
++            headers=input_options.http_headers,
++            follow_redirects=False
++        )
+         if response.is_redirect:
+             new_url = response.headers['Location']
+             logup("Google Drive redirect", {"url": url, "redirect": new_url})
+@@ -1752,7 +1874,13 @@
+         # CKAN resource URL
+         ckan_api_query = '{}/api/3/action/resource_show?id={}'.format(site_url, resource_id)
+         logup("Trying CKAN API call", {"url": ckan_api_query})
+-        ckan_api_result = requests.get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
++        ckan_api_result = _http_request(
++            'GET',
++            ckan_api_query,
++            verify_ssl=input_options.verify_ssl,
++            timeout=input_options.timeout,
++            headers=input_options.http_headers
++        ).json()
+         if ckan_api_result['success']:
+             url = ckan_api_result['result']['url']
+             logup("Found candidate URL for CKAN dataset", {"url": url})
+@@ -1775,7 +1903,13 @@
+     else:
+         # CKAN dataset (package) URL
+         ckan_api_query = '{}/api/3/action/package_show?id={}'.format(site_url, dataset_id)
+-        ckan_api_result = requests.get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
++        ckan_api_result = _http_request(
++            'GET',
++            ckan_api_query,
++            verify_ssl=input_options.verify_ssl,
++            timeout=input_options.timeout,
++            headers=input_options.http_headers
++        ).json()
+         if ckan_api_result['success']:
+             for resource in ckan_api_result['result']['resources']:
+                 url = resource['url']
+@@ -1825,9 +1959,11 @@
+         "q": "source:{}".format(asset_id)
+     }
+     logup("Trying Kobo dataset", {"url": asset_id})
+-    response = requests.get(
++    response = _http_request(
++        'GET',
+         "https://kobo.humanitarianresponse.info/exports/",
+-        verify=input_options.verify_ssl,
++        verify_ssl=input_options.verify_ssl,
++        timeout=input_options.timeout,
+         headers=input_options.http_headers,
+         params=params
+     )
+@@ -1861,10 +1997,12 @@
+         "hierarchy_in_labels": False,
+         "group_sep": ",",
+     }
+-    response = requests.post(
++    response = _http_request(
++        'POST',
+         "https://kobo.humanitarianresponse.info/exports/",
+-        verify=input_options.verify_ssl,
+-        headers=http_headers,
++        verify_ssl=input_options.verify_ssl,
++        timeout=input_options.timeout,
++        headers=input_options.http_headers,
+         data=params
+     )
+     logup("Generated Kobo export", {"asset_id": asset_id, "status": response.status_code})
+@@ -1881,10 +2019,12 @@
+     fail_counter = 0
+     while True:
+         logup("Getting info for Kobo export", {"url": info_url})
+-        response = requests.get(
++        response = _http_request(
++            'GET',
+             info_url,
+-            verify=input_options.verify_ssl,
+-            headers=http_headers
++            verify_ssl=input_options.verify_ssl,
++            timeout=input_options.timeout,
++            headers=input_options.http_headers
+         )
+         logup("Response for Kobo info", {"url": info_url, "status": response.status_code})
+ 

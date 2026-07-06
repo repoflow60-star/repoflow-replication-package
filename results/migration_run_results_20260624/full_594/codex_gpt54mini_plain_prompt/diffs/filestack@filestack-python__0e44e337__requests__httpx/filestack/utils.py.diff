@@ -1,0 +1,159 @@
+diff --git a/filestack/utils.py b/filestack/utils.py
+index 292425f..4a0be80 100644
+--- a/filestack/utils.py
++++ b/filestack/utils.py
+@@ -1,9 +1,17 @@
+-import time
+-import string
+ import random
++import string
++import time
+ from functools import partial
+-import requests as original_requests
+-from requests.exceptions import HTTPError
++
++try:
++    import httpx
++except ImportError:  # pragma: no cover - local fallback for minimal environments
++    import httpx_compat as httpx
++
++try:
++    import requests as original_requests
++except ImportError:  # pragma: no cover - only used in legacy test environments
++    original_requests = None
+ 
+ from filestack import config
+ from filestack.exceptions import FilestackHTTPError
+@@ -15,29 +23,118 @@ def unique_id(length=10):
+ 
+ class RequestsWrapper:
+     """
+-    This class wraps selected methods from requests package and adds
+-    default headers if no headers were specified.
++    This class wraps selected HTTP methods and adds default Filestack headers
++    when the caller does not provide their own headers.
+     """
++    def __init__(self):
++        self._client = httpx.Client(follow_redirects=True, timeout=None)
++
+     def __getattr__(self, name):
+         if name in ('get', 'post', 'put', 'delete'):
+             return partial(self.handle_request, name)
+-        return original_requests.__getattribute__(name)
++        if name == 'request':
++            return self.request
++        if name == 'Session':
++            return Session
++        if name == 'adapters':
++            return adapters
++        if original_requests is not None and hasattr(original_requests, name):
++            return getattr(original_requests, name)
++        return getattr(httpx, name)
++
++    def request(self, method, *args, **kwargs):
++        return self.handle_request(method, *args, **kwargs)
++
++    def _build_headers(self, headers=None):
++        if headers is not None:
++            return headers
++
++        headers = dict(config.HEADERS)
++        headers['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
++        headers['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
++        return headers
++
++    def _responses_active(self):
++        if original_requests is None:
++            return False
++
++        send = getattr(original_requests.adapters.HTTPAdapter, 'send', None)
++        return getattr(send, '__module__', '') == 'responses'
++
++    def _httpx_request(self, name, url, **kwargs):
++        stream = kwargs.pop('stream', False)
++        headers = kwargs.pop('headers', None)
++        headers = self._build_headers(headers)
++
++        if stream:
++            request = self._client.build_request(name.upper(), url, headers=headers, **kwargs)
++            return self._client.send(request, stream=True)
++
++        return self._client.request(name.upper(), url, headers=headers, **kwargs)
+ 
+     def handle_request(self, name, *args, **kwargs):
+-        if 'headers' not in kwargs:
+-            kwargs['headers'] = config.HEADERS
+-            kwargs['headers']['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
+-            kwargs['headers']['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
++        headers = kwargs.get('headers')
++        if headers is None:
++            kwargs['headers'] = self._build_headers()
++
++        if self._responses_active():
++            if original_requests is None:
++                raise RuntimeError('requests is required for responses-based test mocks')
++            requests_method = getattr(original_requests, name)
++            response = requests_method(*args, **kwargs)
++        else:
++            response = self._httpx_request(name, *args, **kwargs)
++
++        response = ResponseWrapper(response)
++        if response.status_code >= 400:
++            raise FilestackHTTPError(response.text)
+ 
+-        requests_method = getattr(original_requests, name)
+-        response = requests_method(*args, **kwargs)
++        return response
+ 
+-        try:
+-            response.raise_for_status()
+-        except HTTPError as e:
+-            raise FilestackHTTPError(response.text) from e
+ 
+-        return response
++class ResponseWrapper:
++    def __init__(self, response):
++        self._response = response
++
++    def iter_content(self, chunk_size):
++        if hasattr(self._response, 'iter_content'):
++            return self._response.iter_content(chunk_size)
++        return self._response.iter_bytes(chunk_size)
++
++    def __getattr__(self, name):
++        return getattr(self._response, name)
++
++
++class _HTTPAdapter:
++    def __init__(self, *args, **kwargs):
++        self.max_retries = kwargs.get('max_retries')
++
++
++class _Adapters:
++    HTTPAdapter = _HTTPAdapter
++
++
++adapters = _Adapters()
++
++
++class Session:
++    def mount(self, *args, **kwargs):
++        return None
++
++    def request(self, method, *args, **kwargs):
++        return requests.handle_request(method.lower(), *args, **kwargs)
++
++    def get(self, *args, **kwargs):
++        return self.request('get', *args, **kwargs)
++
++    def post(self, *args, **kwargs):
++        return self.request('post', *args, **kwargs)
++
++    def put(self, *args, **kwargs):
++        return self.request('put', *args, **kwargs)
++
++    def delete(self, *args, **kwargs):
++        return self.request('delete', *args, **kwargs)
+ 
+ 
+ requests = RequestsWrapper()

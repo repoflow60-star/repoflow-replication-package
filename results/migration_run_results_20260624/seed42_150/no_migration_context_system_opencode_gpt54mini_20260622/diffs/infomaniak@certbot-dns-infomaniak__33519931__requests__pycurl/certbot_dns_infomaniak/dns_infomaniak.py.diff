@@ -1,0 +1,172 @@
+--- a/certbot_dns_infomaniak/dns_infomaniak.py
++++ b/certbot_dns_infomaniak/dns_infomaniak.py
+@@ -3,11 +3,14 @@
+ # SPDX-FileCopyrightText: 2021      Romain Autran <romain.autran@2itea.ch>
+ # SPDX-License-Identifier: Apache-2.0
+ """DNS Authenticator for Infomaniak"""
++import io
+ import json
+ import logging
++from urllib.parse import urlencode
++
+ import idna
+ 
+-import requests
++import pycurl
+ 
+ from certbot import errors
+ from certbot.plugins import dns_common
+@@ -86,74 +89,69 @@
+         :param str token: oauth2 token to consume Infomaniak API
+         """
+         self.token = token
+-        self.session = requests.Session()
+-        self.session.headers.update({"Authorization": "Bearer {token}".format(token=self.token)})
++        self.auth_header = "Authorization: Bearer {token}".format(token=self.token)
++
++    def _request_json(self, method, url, payload=None):
++        """Perform an API request and return parsed JSON data."""
++        url = self.baseUrl + url
++        if method == "GET" and payload:
++            query = urlencode(payload, doseq=True)
++            url = "{url}{sep}{query}".format(
++                url=url, sep="&" if "?" in url else "?", query=query
++            )
++
++        logger.debug("%s %s", method, url)
++
++        response = io.BytesIO()
++        curl = pycurl.Curl()
++        headers = [self.auth_header]
++        if method == "POST":
++            headers.append("Content-Type: application/json")
++
++        try:
++            curl.setopt(pycurl.URL, url.encode("utf-8"))
++            curl.setopt(pycurl.NOSIGNAL, 1)
++            curl.setopt(pycurl.HTTPHEADER, headers)
++            curl.setopt(pycurl.WRITEFUNCTION, response.write)
++
++            if method == "POST":
++                curl.setopt(pycurl.POST, 1)
++                if payload is not None:
++                    body = json.dumps(payload).encode("utf-8")
++                    curl.setopt(pycurl.POSTFIELDS, body)
++                    curl.setopt(pycurl.POSTFIELDSIZE, len(body))
++            elif method == "DELETE":
++                curl.setopt(pycurl.CUSTOMREQUEST, "DELETE")
++
++            curl.perform()
++        except pycurl.error as exc:
++            raise errors.PluginError("API request failed") from exc
++        finally:
++            curl.close()
++
++        try:
++            result = json.loads(response.getvalue().decode("utf-8"))
++        except json.decoder.JSONDecodeError as exc:
++            raise errors.PluginError("no JSON in API response") from exc
++
++        if result["result"] == "success":
++            return result["data"]
++        if method == "GET" and result["error"]["code"] == "not_authorized":
++            raise errors.PluginError("cannot authenticate")
++        raise errors.PluginError(
++            "error in API request: {} / {}".format(
++                result["error"]["code"], result["error"]["description"]
++            )
++        )
+ 
+     def _get_request(self, url, payload=None):
+-        """Performs a GET request against API
+-
+-        :param str url: relative url
+-        :param dict payload : body of request
+-        """
+-        url = self.baseUrl + url
+-        logger.debug("GET %s", url)
+-        with self.session.get(url, params=payload) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            if result["error"]["code"] == "not_authorized":
+-                raise errors.PluginError("cannot authenticate")
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++        return self._request_json("GET", url, payload=payload)
+ 
+     def _post_request(self, url, payload):
+-        """Performs a POST request
+-
+-        :param str url: relative url
+-        :param dict payload : body of request
+-        """
+-        url = self.baseUrl + url
+-        headers = {"Content-Type": "application/json"}
+-        json_data = json.dumps(payload)
+-        logger.debug("POST %s", url)
+-        with self.session.post(url, data=json_data, headers=headers) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++        return self._request_json("POST", url, payload=payload)
+ 
+     def _delete_request(self, url):
+-        """Performs a POST request
+-
+-        :param str url: relative url
+-        """
+-        url = self.baseUrl + url
+-        logger.debug("DELETE %s", url)
+-        with self.session.delete(url) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++        return self._request_json("DELETE", url)
+ 
+     def _get_records(self, domain, domain_id, record):
+         """Find record matching arguments
+@@ -180,7 +178,10 @@
+                     and x["type"] == record["type"]
+                     and x["target"] == record["target"]
+                 ),
+-                self._get_request("/1/domain/{domain_id}/dns/record?search={fqdn}&filter[types][]={type}".format(domain_id=domain_id, fqdn=fqdn, type=record["type"])),
++                self._get_request(
++                    "/1/domain/{domain_id}/dns/record".format(domain_id=domain_id),
++                    payload={"search": fqdn, "filter[types][]": record["type"]},
++                ),
+             )
+         )
+ 
+@@ -193,7 +194,8 @@
+         """
+         while "." in domain:
+             result = self._get_request(
+-                "/1/product?service_name=domain&customer_name={domain}".format(domain=domain),
++                "/1/product",
++                payload={"service_name": "domain", "customer_name": domain},
+             )
+             if len(result) == 1:
+                 return (

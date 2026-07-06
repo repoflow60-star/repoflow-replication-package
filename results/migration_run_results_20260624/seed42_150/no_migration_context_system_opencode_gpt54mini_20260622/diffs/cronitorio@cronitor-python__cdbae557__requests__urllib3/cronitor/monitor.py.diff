@@ -1,0 +1,228 @@
+--- a/cronitor/monitor.py
++++ b/cronitor/monitor.py
+@@ -3,32 +3,144 @@
+ import logging
+ import json
+ import os
+-import requests
+ from yaml.loader import SafeLoader
+ 
+ 
+ import cronitor
++from urllib3 import PoolManager, make_headers
+ from urllib3.util.retry import Retry
+-from requests.adapters import HTTPAdapter
+ 
+ logger = logging.getLogger(__name__)
+ 
+-# https://stackoverflow.com/questions/49121365/implementing-retry-for-requests-in-python
+ def retry_session(retries, session=None, backoff_factor=0.3):
+-    session = session or requests.Session()
++    if session is not None:
++        return session
+     retry = Retry(
+         total=retries,
+         read=retries,
+         connect=retries,
+         backoff_factor=backoff_factor,
+     )
+-    adapter = HTTPAdapter(max_retries=retry)
+-    session.mount('http://', adapter)
+-    session.mount('https://', adapter)
+-    return session
++    return _RetrySession(retry)
++
++
++def _headers_with_auth(headers, api_key=None):
++    merged = dict(headers or {})
++    if api_key is not None:
++        merged.update(make_headers(basic_auth='%s:' % api_key))
++    return {k: v for k, v in merged.items() if v is not None}
++
++
++def _clean_fields(fields):
++    if isinstance(fields, dict):
++        return {k: v for k, v in fields.items() if v is not None}
++    return fields
++
++
++def _response_status(resp):
++    for attr in ('status_code', 'status'):
++        value = getattr(resp, attr, None)
++        if isinstance(value, int):
++            return value
++    return None
++
++
++def _response_text(resp):
++    data = getattr(resp, 'data', None)
++    if isinstance(data, (bytes, bytearray, memoryview)):
++        return bytes(data).decode('utf-8')
++    if isinstance(data, str):
++        return data
++
++    text = getattr(resp, 'text', None)
++    if text is not None:
++        return text
++
++    content = getattr(resp, 'content', None)
++    if content is not None:
++        return content.decode('utf-8') if isinstance(content, bytes) else content
++
++    return ''
++
++
++def _response_json(resp):
++    json_fn = getattr(resp, 'json', None)
++    if callable(json_fn):
++        return json_fn()
++    return json.loads(_response_text(resp))
+ 
+ JSON = 'json'
+ YAML = 'yaml'
++
++
++class _ResponseAdapter(object):
++    def __init__(self, response):
++        self._response = response
++
++    @property
++    def status_code(self):
++        value = getattr(self._response, 'status_code', None)
++        if isinstance(value, int):
++            return value
++        value = getattr(self._response, 'status', None)
++        return value if isinstance(value, int) else None
++
++    @property
++    def status(self):
++        value = getattr(self._response, 'status', None)
++        if isinstance(value, int):
++            return value
++        value = getattr(self._response, 'status_code', None)
++        return value if isinstance(value, int) else None
++
++    @property
++    def data(self):
++        return getattr(self._response, 'data', None)
++
++    @property
++    def text(self):
++        return _response_text(self._response)
++
++    def json(self):
++        return _response_json(self._response)
++
++    def __getattr__(self, name):
++        return getattr(self._response, name)
++
++
++class _RetrySession(object):
++    def __init__(self, retry):
++        self._pool = PoolManager(retries=retry)
++
++    def request(self, method, url, auth=None, headers=None, timeout=None, fields=None, params=None, body=None, **kwargs):
++        api_key = auth[0] if auth else None
++        if fields is None:
++            fields = params
++        if isinstance(body, str):
++            body = body.encode('utf-8')
++        if 'json' in kwargs and body is None:
++            body = json.dumps(kwargs['json']).encode('utf-8')
++            headers = dict(headers or {}, **{'Content-Type': 'application/json'})
++        response = self._pool.request(
++            method,
++            url,
++            headers=_headers_with_auth(headers, api_key),
++            timeout=timeout,
++            fields=_clean_fields(fields),
++            body=body,
++        )
++        return _ResponseAdapter(response)
++
++    def get(self, url, auth=None, headers=None, timeout=None, params=None, fields=None, **kwargs):
++        query = fields if fields is not None else params
++        return self.request('GET', url, auth=auth, headers=headers, timeout=timeout, fields=query, **kwargs)
++
++    def put(self, url, auth=None, data=None, headers=None, timeout=None, body=None, **kwargs):
++        payload = body if body is not None else data
++        return self.request('PUT', url, auth=auth, headers=headers, timeout=timeout, body=payload, **kwargs)
++
++    def delete(self, url, auth=None, headers=None, timeout=None, **kwargs):
++        return self.request('DELETE', url, auth=auth, headers=headers, timeout=timeout, **kwargs)
+ 
+ class Monitor(object):
+     _headers = {
+@@ -45,10 +157,10 @@
+                         auth=(api_key, ''),
+                         headers=dict(cls._headers, **{'Content-Type': 'application/yaml', 'Cronitor-Version': api_version}),
+                         timeout=timeout)
+-        if resp.status_code == 200:
+-            return resp.text
++        if _response_status(resp) == 200:
++            return _response_text(resp)
+         else:
+-            raise cronitor.APIError("Unexpected error %s" % resp.text)
++            raise cronitor.APIError("Unexpected error %s" % _response_text(resp))
+ 
+     @classmethod
+     def put(cls, monitors=None, **kwargs):
+@@ -105,15 +217,15 @@
+                         headers=dict(cls._headers, **{'Content-Type': content_type, 'Cronitor-Version': api_version}),
+                         timeout=timeout)
+ 
+-        if resp.status_code == 200:
++        if _response_status(resp) == 200:
+             if request_format == YAML:
+-                return yaml.load(resp.text, Loader=SafeLoader)
++                return yaml.load(_response_text(resp), Loader=SafeLoader)
+             else:
+-                return resp.json().get('monitors', [])
+-        elif resp.status_code == 400:
+-            raise cronitor.APIValidationError(resp.text)
++                return _response_json(resp).get('monitors', [])
++        elif _response_status(resp) == 400:
++            raise cronitor.APIValidationError(_response_text(resp))
+         else:
+-            raise cronitor.APIError("Unexpected error %s" % resp.text)
++            raise cronitor.APIError("Unexpected error %s" % _response_text(resp))
+ 
+     def __init__(self, key, api_key=None, api_version=None, env=None):
+         self.key = key
+@@ -135,15 +247,15 @@
+         self._data = Struct(**data)
+ 
+     def delete(self):
+-        resp = requests.delete(
++        resp = self._req.delete(
+                     self._monitor_api_url(self.key),
+                     auth=(self.api_key, ''),
+                     headers=self._headers,
+                     timeout=10)
+ 
+-        if resp.status_code == 204:
++        if _response_status(resp) == 204:
+             return True
+-        elif resp.status_code == 404:
++        elif _response_status(resp) == 404:
+             raise cronitor.MonitorNotFound("Monitor '%s' not found" % self.key)
+         else:
+             raise cronitor.APIError("An unexpected error occured when deleting '%s'" % self.key)
+@@ -172,14 +284,14 @@
+         if not self.api_key:
+             raise cronitor.AuthenticationError('No api_key detected. Set cronitor.api_key or initialize Monitor with kwarg.')
+ 
+-        resp = requests.get(self._monitor_api_url(self.key),
++        resp = self._req.get(self._monitor_api_url(self.key),
+                             timeout=10,
+                             auth=(self.api_key, ''),
+                             headers=dict(self._headers, **{'Content-Type': 'application/json', 'Cronitor-Version': self.api_verion}))
+ 
+-        if resp.status_code == 404:
++        if _response_status(resp) == 404:
+             raise cronitor.MonitorNotFound("Monitor '%s' not found" % self.key)
+-        return resp.json()
++        return _response_json(resp)
+ 
+     def _clean_params(self, params):
+         metrics = None

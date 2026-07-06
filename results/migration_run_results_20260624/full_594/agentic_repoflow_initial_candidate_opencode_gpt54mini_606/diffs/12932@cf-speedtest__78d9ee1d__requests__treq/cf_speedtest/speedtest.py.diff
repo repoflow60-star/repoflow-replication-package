@@ -1,0 +1,167 @@
+--- a/cf_speedtest/speedtest.py
++++ b/cf_speedtest/speedtest.py
+@@ -2,18 +2,152 @@
+ from __future__ import annotations
+ 
+ import argparse
++import asyncio
++from io import BytesIO
+ import math
+ import statistics
+ import time
+ from timeit import default_timer as timer
+ 
+-import requests
+-import urllib3
++import treq
++from twisted.internet import asyncioreactor
++from twisted.web.client import Agent
++from twisted.web.client import BrowserLikePolicyForHTTPS
++from twisted.web.client import FileBodyProducer
++from twisted.web.client import HTTPConnectionPool
++from twisted.web.client import ProxyAgent
++from twisted.web.client import WebClientContextFactory
++from twisted.web.http_headers import Headers
+ 
+ import cf_speedtest.locations as locations
+ import cf_speedtest.options as options
+ 
+-REQ_SESSION = requests.Session()
++_ASYNCIO_LOOP = asyncio.new_event_loop()
++asyncio.set_event_loop(_ASYNCIO_LOOP)
++try:
++    asyncioreactor.install(_ASYNCIO_LOOP)
++except Exception:
++    pass
++
++from twisted.internet import reactor
++
++
++class _CaseInsensitiveHeaders:
++    def __init__(self, raw_headers):
++        self._headers = {}
++        for name, values in raw_headers.getAllRawHeaders():
++            key = name.decode('latin-1').lower()
++            self._headers[key] = ', '.join(
++                value.decode('latin-1') for value in values
++            )
++
++    def __getitem__(self, key):
++        return self._headers[key.lower()]
++
++    def get(self, key, default=None):
++        return self._headers.get(key.lower(), default)
++
++
++class _TreqResponse:
++    def __init__(self, response, content: bytes):
++        self.code = response.code
++        self.headers = _CaseInsensitiveHeaders(response.headers)
++        self.content = content
++        self.text = content.decode('utf-8', errors='replace')
++
++    def raise_for_status(self):
++        if self.code >= 400:
++            raise RuntimeError(f'HTTP {self.code}')
++
++
++class _TreqSession:
++    def __init__(self):
++        self._agents = {}
++
++    def _proxy_uri(self, proxies):
++        if not proxies:
++            return None
++        return proxies.get('https') or proxies.get('http')
++
++    def _agent(self, verify_ssl, proxies):
++        key = (verify_ssl, self._proxy_uri(proxies))
++        if key not in self._agents:
++            pool = HTTPConnectionPool(reactor, persistent=True)
++            proxy_uri = key[1]
++            if proxy_uri:
++                self._agents[key] = ProxyAgent(
++                    reactor,
++                    proxy_uri.encode('utf-8'),
++                    pool=pool,
++                )
++            else:
++                context_factory = (
++                    BrowserLikePolicyForHTTPS()
++                    if verify_ssl else WebClientContextFactory()
++                )
++                self._agents[key] = Agent(
++                    reactor,
++                    contextFactory=context_factory,
++                    pool=pool,
++                )
++        return self._agents[key]
++
++    @staticmethod
++    def _build_headers(headers):
++        if not headers:
++            return None
++
++        raw_headers = Headers()
++        for name, value in headers.items():
++            values = value if isinstance(value, (list, tuple)) else [value]
++            raw_headers.addRawHeader(
++                name.encode('ascii'),
++                [str(item).encode('utf-8') for item in values],
++            )
++        return raw_headers
++
++    async def _request(
++        self,
++        method: str,
++        url: str,
++        *,
++        data=None,
++        headers=None,
++        verify_ssl=True,
++        proxies=None,
++    ):
++        body_producer = None
++        if data is not None:
++            if isinstance(data, (bytes, bytearray)):
++                body = bytes(data)
++            else:
++                body = str(data).encode('utf-8')
++            body_producer = FileBodyProducer(BytesIO(body))
++
++        response = await self._agent(verify_ssl, proxies).request(
++            method.encode('ascii'),
++            url.encode('utf-8'),
++            headers=self._build_headers(headers),
++            bodyProducer=body_producer,
++        )
++        content = await treq.content(response)
++        return _TreqResponse(response, content)
++
++    def get(self, url, verify=True, proxies=None):
++        return _ASYNCIO_LOOP.run_until_complete(
++            self._request('GET', url, verify_ssl=verify, proxies=proxies),
++        )
++
++    def post(self, url, data=None, headers=None, verify=True, proxies=None):
++        return _ASYNCIO_LOOP.run_until_complete(
++            self._request(
++                'POST', url, data=data, headers=headers,
++                verify_ssl=verify, proxies=proxies,
++            ),
++        )
++
++
++REQ_SESSION = _TreqSession()
+ 
+ CGI_ENDPOINT = 'https://speed.cloudflare.com/cdn-cgi/trace'
+ DOWNLOAD_ENDPOINT = 'https://speed.cloudflare.com/__down?measId=0&bytes={}'
+@@ -290,8 +424,6 @@
+ 
+ def main(argv=None) -> int:
+     global PROXY_DICT, VERIFY_SSL, OUTPUT_FILE
+-    # disable annoying warning when using verify=False in requests.get("x", verify=False)
+-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+ 
+     parser = argparse.ArgumentParser()
+     parser_with_args = options.add_run_options(parser)

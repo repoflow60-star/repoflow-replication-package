@@ -1,0 +1,227 @@
+--- a/cronitor/monitor.py
++++ b/cronitor/monitor.py
+@@ -3,29 +3,89 @@
+ import logging
+ import json
+ import os
+-import requests
+ from yaml.loader import SafeLoader
+ 
+ 
+ import cronitor
+-from urllib3.util.retry import Retry
+-from requests.adapters import HTTPAdapter
++from urllib3 import PoolManager
++from urllib3.util import Retry, make_headers
+ 
+ logger = logging.getLogger(__name__)
+ 
+-# https://stackoverflow.com/questions/49121365/implementing-retry-for-requests-in-python
++class _ResponseAdapter(object):
++    def __init__(self, response):
++        self._response = response
++        self.status_code = response.status
++        self.data = response.data
++        self.headers = response.headers
++        self.url = getattr(response, 'url', None)
++
++    @property
++    def text(self):
++        return self.data.decode()
++
++    @property
++    def ok(self):
++        return self.status_code < 400
++
++    @property
++    def status(self):
++        return self.status_code
++
++    def json(self):
++        return json.loads(self.text)
++
++    def __bool__(self):
++        return self.ok
++
++    def __getattr__(self, name):
++        return getattr(self._response, name)
++
++
++class _RetrySession(object):
++    def __init__(self, retries, backoff_factor=0.3):
++        retry = Retry(
++            total=retries,
++            read=retries,
++            connect=retries,
++            backoff_factor=backoff_factor,
++        )
++        self._pool = PoolManager(retries=retry)
++
++    def _translate_kwargs(self, kwargs):
++        request_kwargs = dict(kwargs)
++
++        params = request_kwargs.pop('params', None)
++        if params is not None and 'fields' not in request_kwargs:
++            request_kwargs['fields'] = params
++
++        data = request_kwargs.pop('data', None)
++        if data is not None and 'body' not in request_kwargs:
++            request_kwargs['body'] = data.encode() if isinstance(data, str) else data
++
++        auth = request_kwargs.pop('auth', None)
++        if auth:
++            headers = dict(request_kwargs.get('headers') or {})
++            headers.update(make_headers(basic_auth='{}:{}'.format(auth[0], auth[1])))
++            request_kwargs['headers'] = headers
++
++        return request_kwargs
++
++    def request(self, method, url, **kwargs):
++        return _ResponseAdapter(self._pool.request(method, url, **self._translate_kwargs(kwargs)))
++
++    def get(self, url, **kwargs):
++        return self.request('GET', url, **kwargs)
++
++    def put(self, url, **kwargs):
++        return self.request('PUT', url, **kwargs)
++
++    def delete(self, url, **kwargs):
++        return self.request('DELETE', url, **kwargs)
++
++
+ def retry_session(retries, session=None, backoff_factor=0.3):
+-    session = session or requests.Session()
+-    retry = Retry(
+-        total=retries,
+-        read=retries,
+-        connect=retries,
+-        backoff_factor=backoff_factor,
+-    )
+-    adapter = HTTPAdapter(max_retries=retry)
+-    session.mount('http://', adapter)
+-    session.mount('https://', adapter)
+-    return session
++    return session or _RetrySession(retries=retries, backoff_factor=backoff_factor)
+ 
+ JSON = 'json'
+ YAML = 'yaml'
+@@ -38,13 +98,24 @@
+     _req = retry_session(retries=3)
+ 
+     @classmethod
++    def _request_headers(cls, api_key=None, extra_headers=None):
++        headers = dict(cls._headers)
++        if api_key:
++            headers.update(make_headers(basic_auth='{}:'.format(api_key)))
++        if extra_headers:
++            headers.update({k: v for k, v in extra_headers.items() if v is not None})
++        return headers
++
++    @classmethod
+     def as_yaml(cls, api_key=None, api_version=None):
+         timeout = cronitor.timeout or 10
+         api_key = api_key or cronitor.api_key
+-        resp = cls._req.get('%s.yaml' % cls._monitor_api_url(),
+-                        auth=(api_key, ''),
+-                        headers=dict(cls._headers, **{'Content-Type': 'application/yaml', 'Cronitor-Version': api_version}),
+-                        timeout=timeout)
++        resp = cls._req.get(
++            '%s.yaml' % cls._monitor_api_url(),
++            auth=(api_key, ''),
++            headers=cls._request_headers(api_key, {'Content-Type': 'application/yaml', 'Cronitor-Version': api_version}),
++            timeout=timeout,
++        )
+         if resp.status_code == 200:
+             return resp.text
+         else:
+@@ -99,11 +170,13 @@
+             data = json.dumps(payload)
+             url = cls._monitor_api_url()
+ 
+-        resp = cls._req.put(url,
+-                        auth=(api_key, ''),
+-                        data=data,
+-                        headers=dict(cls._headers, **{'Content-Type': content_type, 'Cronitor-Version': api_version}),
+-                        timeout=timeout)
++        resp = cls._req.put(
++            url,
++            data=data,
++            auth=(api_key, ''),
++            headers=cls._request_headers(api_key, {'Content-Type': content_type, 'Cronitor-Version': api_version}),
++            timeout=timeout,
++        )
+ 
+         if resp.status_code == 200:
+             if request_format == YAML:
+@@ -135,11 +208,12 @@
+         self._data = Struct(**data)
+ 
+     def delete(self):
+-        resp = requests.delete(
+-                    self._monitor_api_url(self.key),
+-                    auth=(self.api_key, ''),
+-                    headers=self._headers,
+-                    timeout=10)
++        resp = self._req.delete(
++            self._monitor_api_url(self.key),
++            auth=(self.api_key, ''),
++            headers=self._request_headers(self.api_key),
++            timeout=10,
++        )
+ 
+         if resp.status_code == 204:
+             return True
+@@ -163,7 +237,12 @@
+             logger.error('No API key detected. Set cronitor.api_key or initialize Monitor with kwarg api_key.')
+             return
+ 
+-        return self._req.get(url='{}/pause/{}'.format(self._monitor_api_url(self.key), hours), auth=(self.api_key, ''), timeout=5, headers=self._headers)
++        return self._req.get(
++            '{}/pause/{}'.format(self._monitor_api_url(self.key), hours),
++            auth=(self.api_key, ''),
++            headers=self._request_headers(self.api_key),
++            timeout=5,
++        )
+ 
+     def unpause(self):
+         return self.pause(0)
+@@ -172,10 +251,12 @@
+         if not self.api_key:
+             raise cronitor.AuthenticationError('No api_key detected. Set cronitor.api_key or initialize Monitor with kwarg.')
+ 
+-        resp = requests.get(self._monitor_api_url(self.key),
+-                            timeout=10,
+-                            auth=(self.api_key, ''),
+-                            headers=dict(self._headers, **{'Content-Type': 'application/json', 'Cronitor-Version': self.api_verion}))
++        resp = self._req.get(
++            self._monitor_api_url(self.key),
++            auth=(self.api_key, ''),
++            headers=self._request_headers(self.api_key, {'Content-Type': 'application/json', 'Cronitor-Version': self.api_verion}),
++            timeout=10,
++        )
+ 
+         if resp.status_code == 404:
+             raise cronitor.MonitorNotFound("Monitor '%s' not found" % self.key)
+@@ -187,13 +268,15 @@
+             metrics = ['{}:{}'.format(k,v) for k,v in params['metrics'].items()]
+ 
+         return {
+-            'state': params.get('state', None),
+-            'message': params.get('message', None),
+-            'series': params.get('series', None),
+-            'host': params.get('host', os.getenv('COMPUTERNAME', None)),
+-            'metric': metrics,
+-            'stamp': time.time(),
+-            'env': self.env,
++            k: v for k, v in {
++                'state': params.get('state', None),
++                'message': params.get('message', None),
++                'series': params.get('series', None),
++                'host': params.get('host', os.getenv('COMPUTERNAME', None)),
++                'metric': metrics,
++                'stamp': time.time(),
++                'env': self.env,
++            }.items() if v is not None
+         }
+ 
+     def _ping_api_url(self):

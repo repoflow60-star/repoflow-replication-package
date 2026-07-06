@@ -1,0 +1,482 @@
+--- a/tdclient/api.py
++++ b/tdclient/api.py
+@@ -1,25 +1,24 @@
+ #!/usr/bin/env python
+ 
++import asyncio
+ import contextlib
+ import csv
+ import email.utils
+ import gzip
+-import http
+ import io
+ import json
+ import logging
+ import os
+ import socket
+ import ssl
+-import sys
+ import tempfile
++import threading
+ import time
+ import urllib.parse as urlparse
+ from array import array
+ 
++import aiohttp
+ import msgpack
+-import urllib3
+-import urllib3.util
+ 
+ from tdclient import errors, version
+ from tdclient.bulk_import_api import BulkImportAPI
+@@ -49,6 +48,247 @@
+ 
+ log = logging.getLogger(__name__)
+ 
++
++class _AiohttpResponse:
++    def __init__(self, loop, session, response):
++        self._loop = loop
++        self._session = session
++        self._response = response
++        self.status = response.status
++        self._headers = list(response.headers.items())
++        self._buffer = bytearray()
++        self._offset = 0
++        self._closed = False
++        self._eof = False
++
++    @property
++    def data(self):
++        self._ensure_all()
++        return bytes(self._buffer)
++
++    def _run(self, coro):
++        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
++        return future.result()
++
++    async def _read_more(self, size):
++        if self._eof:
++            return b""
++
++        chunk = await self._response.content.read(size)
++        if not chunk:
++            self._eof = True
++            return b""
++
++        self._buffer.extend(chunk)
++        return chunk
++
++    async def _read_all(self):
++        if not self._eof:
++            chunk = await self._response.read()
++            if chunk:
++                self._buffer.extend(chunk)
++            self._eof = True
++        return bytes(self._buffer)
++
++    def _ensure_all(self):
++        if self._closed or self._eof or self._loop.is_closed() or not self._loop.is_running():
++            return
++        self._run(self._read_all())
++
++    def read(self, size=-1):
++        if size is None or size < 0:
++            self._ensure_all()
++            chunk = bytes(self._buffer[self._offset :])
++            self._offset = len(self._buffer)
++            return chunk
++
++        target = self._offset + size
++        if self._loop.is_closed() or not self._loop.is_running():
++            end = min(target, len(self._buffer))
++            chunk = bytes(self._buffer[self._offset : end])
++            self._offset = end
++            return chunk
++
++        while len(self._buffer) < target and not self._eof:
++            self._run(self._read_more(target - len(self._buffer)))
++
++        end = min(target, len(self._buffer))
++        chunk = bytes(self._buffer[self._offset : end])
++        self._offset = end
++        return chunk
++
++    def stream(self, chunk_size):
++        while True:
++            chunk = self.read(chunk_size)
++            if not chunk:
++                break
++            yield chunk
++
++    def getheaders(self):
++        return self._headers
++
++    @property
++    def closed(self):
++        return self._closed or self._response.closed or self._loop.is_closed() or not self._loop.is_running()
++
++    def close(self):
++        if self._closed:
++            return None
++        if self._loop.is_closed() or not self._loop.is_running():
++            self._closed = True
++            with contextlib.suppress(Exception):
++                self._response.close()
++            self._offset = len(self._buffer)
++            self._eof = True
++            return None
++        self._run(self._aclose())
++        return None
++
++    async def _aclose(self):
++        if self._closed:
++            return None
++        self._closed = True
++        with contextlib.suppress(Exception):
++            self._response.close()
++        with contextlib.suppress(Exception):
++            await self._session.close()
++        self._offset = len(self._buffer)
++        self._eof = True
++        return None
++
++    def release(self):
++        return self.close()
++
++    def release_conn(self):
++        return self.close()
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc, tb):
++        self.close()
++
++
++class _AiohttpTransport:
++    def __init__(self, timeout=60, ssl_context=None, proxy=None, proxy_auth=None):
++        self._timeout = timeout
++        self._ssl_context = ssl_context
++        self._proxy = proxy
++        self._proxy_auth = proxy_auth
++        self._loop = asyncio.new_event_loop()
++        self._closed = False
++        self._lock = threading.RLock()
++        self._ready = threading.Event()
++        self._thread = threading.Thread(target=self._run_loop, daemon=True)
++        self._thread.start()
++        self._ready.wait()
++
++    def _run_loop(self):
++        asyncio.set_event_loop(self._loop)
++        self._ready.set()
++        self._loop.run_forever()
++
++    def _run(self, coro):
++        with self._lock:
++            if self._closed:
++                raise RuntimeError("transport is closed")
++            future = asyncio.run_coroutine_threadsafe(coro, self._loop)
++        return future.result()
++
++    async def _request(self, method, url, fields=None, body=None, headers=None, **kwargs):
++        request_kwargs = dict(kwargs)
++        request_kwargs.pop("decode_content", None)
++        request_kwargs.pop("preload_content", None)
++
++        ssl_context = request_kwargs.pop("ssl_context", None)
++        ca_certs = request_kwargs.pop("ca_certs", None)
++        cert_reqs = request_kwargs.pop("cert_reqs", None)
++        if ssl_context is None and (ca_certs is not None or cert_reqs is not None):
++            ssl_context = self._create_ssl_context(
++                {"ca_certs": ca_certs, "cert_reqs": cert_reqs}
++            )
++        if ssl_context is None:
++            ssl_context = self._ssl_context
++
++        if headers is not None:
++            request_kwargs["headers"] = headers
++        if self._proxy is not None:
++            request_kwargs["proxy"] = self._proxy
++        if self._proxy_auth is not None:
++            request_kwargs["proxy_auth"] = self._proxy_auth
++        if ssl_context is not None:
++            request_kwargs.setdefault("ssl", ssl_context)
++
++        timeout = request_kwargs.get("timeout", self._timeout)
++        if timeout is not None:
++            if isinstance(timeout, aiohttp.ClientTimeout):
++                request_kwargs["timeout"] = timeout
++            else:
++                request_kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout)
++
++        if isinstance(body, bytearray):
++            body = bytes(body)
++        elif isinstance(body, memoryview):
++            body = body.tobytes()
++        elif isinstance(body, array):
++            body = body.tobytes()
++        elif isinstance(body, str):
++            body = body.encode("utf-8")
++
++        if fields is not None:
++            if method in ("GET", "DELETE"):
++                request_kwargs["params"] = fields
++            else:
++                request_kwargs["data"] = fields
++        elif body is not None:
++            request_kwargs["data"] = body
++
++        session = aiohttp.ClientSession()
++        try:
++            response = await session.request(method, url, **request_kwargs)
++        except Exception:
++            await session.close()
++            raise
++
++        return _AiohttpResponse(self._loop, session, response)
++
++    def request(self, method, url, fields=None, body=None, headers=None, **kwargs):
++        return self._run(
++            self._request(
++                method,
++                url,
++                fields=fields,
++                body=body,
++                headers=headers,
++                **kwargs,
++            )
++        )
++
++    def urlopen(self, method, url, fields=None, body=None, headers=None, **kwargs):
++        return self.request(
++            method,
++            url,
++            fields=fields,
++            body=body,
++            headers=headers,
++            **kwargs,
++        )
++
++    def clear(self):
++        return None
++
++    def close(self):
++        with self._lock:
++            if self._closed:
++                return None
++            self._closed = True
++            loop = self._loop
++            thread = self._thread
++            loop.call_soon_threadsafe(loop.stop)
++        thread.join()
++        loop.close()
++        return None
++
+ APIError = errors.APIError
+ AuthError = errors.AuthError
+ ForbiddenError = errors.ForbiddenError
+@@ -118,18 +358,12 @@
+         else:
+             self._endpoint = self.DEFAULT_ENDPOINT
+ 
+-        pool_options = dict(kwargs)
+-        if "ca_certs" not in pool_options and certifi:
+-            pool_options["ca_certs"] = certifi.where()
+-
+-        if pool_options.get("ca_certs") is not None:
+-            pool_options["cert_reqs"] = ssl.CERT_REQUIRED
+-
+-        if "timeout" not in pool_options:
+-            pool_options["timeout"] = 60
+-
++        timeout = kwargs.get("timeout", 60)
++        ssl_context = self._create_ssl_context(kwargs)
+         self.http = self._init_http(
+-            http_proxy if http_proxy else os.getenv("HTTP_PROXY"), **pool_options
++            http_proxy if http_proxy else os.getenv("HTTP_PROXY"),
++            timeout=timeout,
++            ssl_context=ssl_context,
+         )
+         self._retry_post_requests = retry_post_requests
+         self._max_cumul_retry_delay = max_cumul_retry_delay
+@@ -143,24 +377,56 @@
+     def endpoint(self):
+         return self._endpoint
+ 
+-    def _init_http(self, http_proxy=None, **kwargs):
++    def _init_http(self, http_proxy=None, timeout=60, ssl_context=None):
+         if http_proxy is None:
+-            return urllib3.PoolManager(**kwargs)
+-        else:
+-            if http_proxy.startswith("http://"):
+-                return self._init_http_proxy(http_proxy, **kwargs)
+-            else:
+-                return self._init_http_proxy("http://%s" % (http_proxy,), **kwargs)
+-
+-    def _init_http_proxy(self, http_proxy, **kwargs):
+-        pool_options = dict(kwargs)
++            return _AiohttpTransport(timeout=timeout, ssl_context=ssl_context)
++        if http_proxy.startswith(("http://", "https://")):
++            return self._init_http_proxy(http_proxy, timeout, ssl_context)
++        return self._init_http_proxy("http://%s" % (http_proxy,), timeout, ssl_context)
++
++    def _init_http_proxy(self, http_proxy, timeout, ssl_context):
+         p = urlparse.urlparse(http_proxy)
+-        scheme = p.scheme
+         netloc = p.netloc
++        proxy_auth = None
+         if "@" in netloc:
+             auth, netloc = netloc.split("@", 2)
+-            pool_options["proxy_headers"] = urllib3.make_headers(proxy_basic_auth=auth)
+-        return urllib3.ProxyManager("%s://%s" % (scheme, netloc), **pool_options)
++            if ":" in auth:
++                username, password = auth.split(":", 1)
++            else:
++                username, password = auth, ""
++            proxy_auth = aiohttp.BasicAuth(
++                urlparse.unquote(username), urlparse.unquote(password)
++            )
++        proxy = urlparse.urlunparse(
++            urlparse.ParseResult(p.scheme, netloc, "", "", "", "")
++        )
++        return _AiohttpTransport(
++            timeout=timeout, ssl_context=ssl_context, proxy=proxy, proxy_auth=proxy_auth
++        )
++
++    def _create_ssl_context(self, kwargs):
++        ssl_context = kwargs.get("ssl_context")
++        if ssl_context is not None:
++            return ssl_context
++
++        ca_certs = kwargs.get("ca_certs")
++        cert_reqs = kwargs.get("cert_reqs")
++        if ca_certs is None and certifi:
++            ca_certs = certifi.where()
++
++        if ca_certs is None:
++            if cert_reqs == ssl.CERT_NONE:
++                context = ssl.create_default_context()
++                context.check_hostname = False
++                context.verify_mode = ssl.CERT_NONE
++                return context
++            return None
++
++        context = ssl.create_default_context(cafile=ca_certs)
++        if cert_reqs == ssl.CERT_NONE:
++            context.check_hostname = False
++            context.verify_mode = ssl.CERT_NONE
++        return context
+ 
+     def get(self, path, params=None, headers=None, **kwargs):
+         headers = {} if headers is None else dict(headers)
+@@ -203,14 +469,7 @@
+                         cumul_retry_delay,
+                         self._max_cumul_retry_delay,
+                     )
+-            except (
+-                urllib3.exceptions.TimeoutStateError,
+-                urllib3.exceptions.TimeoutError,
+-                urllib3.exceptions.PoolError,
+-                http.client.IncompleteRead,
+-                TimeoutError,
+-                socket.error,
+-            ):
++            except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError, socket.error):
+                 pass
+ 
+             if cumul_retry_delay <= self._max_cumul_retry_delay:
+@@ -297,12 +556,7 @@
+                         cumul_retry_delay,
+                         self._max_cumul_retry_delay,
+                     )
+-            except (
+-                urllib3.exceptions.TimeoutStateError,
+-                urllib3.exceptions.TimeoutError,
+-                urllib3.exceptions.PoolError,
+-                socket.error,
+-            ):
++            except (aiohttp.ClientError, asyncio.TimeoutError, socket.error):
+                 if not self._retry_post_requests:
+                     raise APIError("Retrying stopped by retry_post_requests == False")
+ 
+@@ -348,7 +602,7 @@
+         )
+ 
+         if hasattr(bytes_or_stream, "read"):
+-            # file-like must support `read` and `fileno` to work with `httplib`
++            # Preserve file-like streaming when possible.
+             fileno_supported = hasattr(bytes_or_stream, "fileno")
+             if fileno_supported:
+                 try:
+@@ -362,7 +616,7 @@
+                 stream = array("b", bytes_or_stream.read())
+ 
+         else:
+-            # send request body as an `array.array` since `httplib` requires the request body to be a unicode string
++            # Keep raw bytes-like bodies compatible with the transport layer.
+             stream = array("b", bytes_or_stream)
+ 
+         response = None
+@@ -379,12 +633,7 @@
+                 pass
+             else:
+                 raise APIError("Error %d: %s", response.status, response.data)
+-        except (
+-            urllib3.exceptions.TimeoutStateError,
+-            urllib3.exceptions.TimeoutError,
+-            urllib3.exceptions.PoolError,
+-            socket.error,
+-        ):
++        except (aiohttp.ClientError, asyncio.TimeoutError, socket.error):
+             raise APIError("Error: %s" % (repr(response)))
+ 
+         log.debug(
+@@ -435,12 +684,7 @@
+                         cumul_retry_delay,
+                         self._max_cumul_retry_delay,
+                     )
+-            except (
+-                urllib3.exceptions.TimeoutStateError,
+-                urllib3.exceptions.TimeoutError,
+-                urllib3.exceptions.PoolError,
+-                socket.error,
+-            ):
++            except (aiohttp.ClientError, asyncio.TimeoutError, socket.error):
+                 pass
+ 
+             if cumul_retry_delay <= self._max_cumul_retry_delay:
+@@ -497,18 +741,9 @@
+         return (url, _headers)
+ 
+     def send_request(self, method, url, fields=None, body=None, headers=None, **kwargs):
+-        if body is None:
+-            return self.http.request(
+-                method, url, fields=fields, headers=headers, **kwargs
+-            )
+-
+-        if urllib3.util.IS_PYOPENSSL and isinstance(body, bytearray):
+-            # workaround for https://github.com/pyca/pyopenssl/issues/621
+-            body = memoryview(body)
+-        if urllib3.util.IS_PYOPENSSL and isinstance(body, array):
+-            # workaround for https://github.com/pyca/pyopenssl/issues/621
+-            body = body.tobytes()
+-        return self.http.urlopen(method, url, body=body, headers=headers, **kwargs)
++        return self.http.request(
++            method, url, fields=fields, body=body, headers=headers, **kwargs
++        )
+ 
+     def raise_error(self, msg, res, body):
+         status_code = res.status
+@@ -539,9 +774,7 @@
+         return js
+ 
+     def close(self):
+-        # urllib3 doesn't allow to close all connections immediately.
+-        # all connections in pool will be closed eventually during gc.
+-        self.http.clear()
++        self.http.close()
+ 
+     def _prepare_file(self, file_like, fmt, **kwargs):
+         fp = tempfile.TemporaryFile()

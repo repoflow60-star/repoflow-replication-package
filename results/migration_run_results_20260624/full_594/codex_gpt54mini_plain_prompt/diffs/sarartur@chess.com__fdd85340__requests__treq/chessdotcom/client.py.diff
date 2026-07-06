@@ -1,0 +1,190 @@
+diff --git a/chessdotcom/client.py b/chessdotcom/client.py
+index 212e20f..f060438 100644
+--- a/chessdotcom/client.py
++++ b/chessdotcom/client.py
+@@ -2,14 +2,27 @@ import asyncio
+ import copy
+ import time
+ import warnings
++import threading
+ from functools import wraps
+ 
+-import requests
+ from aiohttp import ClientSession
+ 
+ from .errors import ChessDotComClientError
+ from .response_builder import DefaultResponseBuilder
+ 
++try:
++    import treq as requests
++    from twisted.internet import reactor
++    from twisted.internet.threads import blockingCallFromThread
++
++    _USING_TREQ = True
++except ImportError:  # pragma: no cover - local fallback when treq is unavailable
++    import requests
++
++    reactor = None
++    blockingCallFromThread = None
++    _USING_TREQ = False
++
+ 
+ class RateLimitHandler(object):
+     """
+@@ -48,7 +61,7 @@ class Client:
+     Client for Chess.com Public API. The client is only responsible for making calls.
+ 
+     :cvar request_config: Dictionary containing extra keyword arguments for
+-        requests to the API (headers, proxy, etc).
++        HTTP requests to the API (headers, proxy, etc).
+     :cvar aio: Determines if the functions behave asynchronously.
+     :cvar :rate_limit_handler: A RateLimitHandler object.
+         See :obj:`chessdotcom.client.RateLimitHandler`.
+@@ -59,6 +72,7 @@ class Client:
+     request_config = {"headers": {}}
+     rate_limit_handler = RateLimitHandler(tts=0, retries=1)
+     endpoints = []
++    _reactor_thread = None
+ 
+     @classmethod
+     def endpoint(cls, func):
+@@ -101,7 +115,102 @@ class Client:
+ 
+         return options
+ 
++    def _build_treq_request_options(self, resource):
++        options = self._build_request_options(resource)
++
++        treq_options = {
++            key: options[key]
++            for key in (
++                "headers",
++                "params",
++                "cookies",
++                "allow_redirects",
++                "browser_like_redirects",
++                "timeout",
++                "unbuffered",
++                "persistent",
++            )
++            if key in options
++        }
++
++        if "headers" not in treq_options:
++            treq_options["headers"] = {}
++
++        return treq_options
++
++    def _normalize_headers(self, headers):
++        if headers is None:
++            return {}
++
++        if hasattr(headers, "items"):
++            return dict(headers)
++
++        if hasattr(headers, "getAllRawHeaders"):
++            normalized = {}
++            for key, values in headers.getAllRawHeaders():
++                key = key.decode("latin-1") if isinstance(key, bytes) else key
++                normalized[key] = ", ".join(
++                    value.decode("latin-1") if isinstance(value, bytes) else value
++                    for value in values
++                )
++            return normalized
++
++        return headers
++
++    def _ensure_reactor_thread(self):
++        if reactor is None or blockingCallFromThread is None:
++            raise RuntimeError("treq is not available")
++
++        if reactor.running:
++            return
++
++        if self.__class__._reactor_thread is not None:
++            return
++
++        def run_reactor():
++            reactor.run(installSignalHandlers=False)
++
++        self.__class__._reactor_thread = threading.Thread(
++            target=run_reactor, name="chessdotcom-treq-reactor", daemon=True
++        )
++        self.__class__._reactor_thread.start()
++
++        while not reactor.running:
++            time.sleep(0.01)
++
++    def _do_treq_get_request(self, resource):
++        self._ensure_reactor_thread()
++
++        def _request():
++            def _build_result(response):
++                def _finalize(text):
++                    return (
++                        response.code,
++                        text,
++                        self._normalize_headers(response.headers),
++                    )
++
++                return response.text().addCallback(_finalize)
++
++            return requests.get(
++                resource.url, **self._build_treq_request_options(resource)
++            ).addCallback(_build_result)
++
++        return blockingCallFromThread(reactor, _request)
++
+     def _do_sync_get_request(self, resource):
++        if _USING_TREQ:
++            status_code, text, headers = self._do_treq_get_request(resource)
++            resource.times_requested += 1
++
++            if status_code != 200:
++                if self.rate_limit_handler.should_try_again(status_code, resource):
++                    return self._do_sync_get_request(resource)
++                raise ChessDotComClientError(
++                    status_code=status_code, response_text=text, headers=headers
++                )
++            return resource.response_builder.build(text)
++
+         r = requests.get(
+             url=resource.url, **self._build_request_options(resource), timeout=30
+         )
+@@ -111,7 +220,9 @@ class Client:
+             if self.rate_limit_handler.should_try_again(r.status_code, resource):
+                 return self._do_sync_get_request(resource)
+             raise ChessDotComClientError(
+-                status_code=r.status_code, response_text=r.text, headers=r.headers
++                status_code=r.status_code,
++                response_text=r.text,
++                headers=self._normalize_headers(r.headers),
+             )
+         return resource.response_builder.build(r.text)
+ 
+@@ -127,7 +238,9 @@ class Client:
+                     if self.rate_limit_handler.should_try_again(r.status, resource):
+                         return await self._do_async_get_request(resource)
+                     raise ChessDotComClientError(
+-                        status_code=r.status, response_text=text, headers=r.headers
++                        status_code=r.status,
++                        response_text=text,
++                        headers=self._normalize_headers(r.headers),
+                     )
+                 return resource.response_builder.build(text)
+ 
+@@ -137,12 +250,12 @@ class ChessDotComClient(Client):
+     Client for Chess.com Public API. The client can be initialized withe following options.
+ 
+     :ivar request_config: Dictionary containing extra keyword arguments
+-        for requests to the API (headers, proxy, etc).
++        for HTTP requests to the API (headers, proxy, etc).
+         This value will be set from Client if nothing is provided
+     :ivar aio: Determines if the functions behave asynchronously. Defaults to False
+     :ivar rate_limit_handler: A RateLimitHandler object.
+         See :obj:`chessdotcom.client.RateLimitHandler`.
+-    :ivar user_agent: A string that will be used as the User-Agent header in requests to the API.
++    :ivar user_agent: A string that will be used as the User-Agent header in HTTP requests to the API.
+         This value will override the value in request_config if provided.
+     """
+ 

@@ -1,0 +1,167 @@
+diff --git a/census/core.py b/census/core.py
+index 5beeb4e..dd4c863 100644
+--- a/census/core.py
++++ b/census/core.py
+@@ -1,6 +1,17 @@
++import json
++import re
+ import warnings
+ from functools import wraps, lru_cache
+ from importlib.metadata import version
++from io import BytesIO
++from urllib.error import HTTPError, URLError
++from urllib.parse import urlencode
++from urllib.request import Request, urlopen
++
++try:
++    import pycurl
++except ImportError:
++    pycurl = None
+ 
+ __version__ = version('census')
+ 
+@@ -8,8 +19,9 @@ ALL = '*'
+ 
+ 
+ def new_session(*args, **kwargs):
+-    import requests
+-    return requests.session(*args, **kwargs)
++    if pycurl is not None:
++        return PycurlSession(*args, **kwargs)
++    return UrllibSession(*args, **kwargs)
+ 
+ 
+ class APIKeyError(Exception):
+@@ -81,6 +93,132 @@ def merge(dicts):
+     return dict(item for d in dicts for item in d.items())
+ 
+ 
++_CHARSET_RE = re.compile(r'charset=([^\s;]+)', re.I)
++
++
++class _ResponseBase(object):
++
++    def __init__(self, status_code, content, headers=None, url=None):
++        self.status_code = status_code
++        self.content = content
++        self.headers = headers or {}
++        self.url = url
++
++    @property
++    def encoding(self):
++        content_type = self.headers.get('content-type', '')
++        match = _CHARSET_RE.search(content_type)
++        if match:
++            return match.group(1).strip('"\'')
++        return 'utf-8'
++
++    @property
++    def text(self):
++        if isinstance(self.content, bytes):
++            return self.content.decode(self.encoding, errors='replace')
++        return str(self.content)
++
++    def json(self):
++        return json.loads(self.text)
++
++
++class PycurlResponse(_ResponseBase):
++    pass
++
++
++class UrllibResponse(_ResponseBase):
++    pass
++
++
++class PycurlSession(object):
++
++    def __init__(self, *args, **kwargs):
++        if pycurl is None:
++            raise ImportError('pycurl is required to create a PycurlSession')
++        self.headers = {}
++
++    def close(self):
++        pass
++
++    def get(self, url, params=None, **kwargs):
++        if params:
++            query = urlencode(params, doseq=True)
++            separator = '&' if '?' in url else '?'
++            url = '{}{}{}'.format(url, separator, query)
++
++        body = BytesIO()
++        raw_headers = BytesIO()
++        curl = pycurl.Curl()
++
++        try:
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.FOLLOWLOCATION, True)
++            curl.setopt(pycurl.NOSIGNAL, 1)
++            curl.setopt(pycurl.ACCEPT_ENCODING, '')
++            curl.setopt(pycurl.WRITEFUNCTION, body.write)
++            curl.setopt(pycurl.HEADERFUNCTION, raw_headers.write)
++            if self.headers:
++                curl.setopt(
++                    pycurl.HTTPHEADER,
++                    ['{}: {}'.format(key, value) for key, value in self.headers.items()]
++                )
++            curl.perform()
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++            effective_url = curl.getinfo(pycurl.EFFECTIVE_URL)
++        finally:
++            curl.close()
++
++        headers = _parse_response_headers(raw_headers.getvalue())
++        return PycurlResponse(status_code, body.getvalue(), headers=headers, url=effective_url)
++
++
++class UrllibSession(object):
++
++    def __init__(self, *args, **kwargs):
++        self.headers = {}
++
++    def close(self):
++        pass
++
++    def get(self, url, params=None, **kwargs):
++        if params:
++            query = urlencode(params, doseq=True)
++            separator = '&' if '?' in url else '?'
++            url = '{}{}{}'.format(url, separator, query)
++
++        request = Request(url, headers=self.headers)
++
++        try:
++            with urlopen(request) as response:
++                content = response.read()
++                headers = {key.lower(): value for key, value in response.headers.items()}
++                return UrllibResponse(response.getcode(), content, headers=headers, url=response.geturl())
++        except HTTPError as exc:
++            content = exc.read()
++            headers = {key.lower(): value for key, value in exc.headers.items()}
++            return UrllibResponse(exc.code, content, headers=headers, url=exc.geturl())
++        except URLError as exc:
++            raise CensusException(str(exc))
++
++
++def _parse_response_headers(raw_headers):
++    if not raw_headers:
++        return {}
++
++    text = raw_headers.decode('iso-8859-1', errors='replace')
++    for block in reversed([chunk for chunk in text.split('\r\n\r\n') if chunk.strip()]):
++        lines = block.splitlines()
++        headers = {}
++        for line in lines[1:]:
++            if ':' not in line:
++                continue
++            key, value = line.split(':', 1)
++            headers[key.strip().lower()] = value.strip()
++        if headers:
++            return headers
++    return {}
++
++
+ class CensusException(Exception):
+     pass
+ 

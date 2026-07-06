@@ -1,0 +1,199 @@
+--- a/kling/kling.py
++++ b/kling/kling.py
+@@ -6,9 +6,8 @@
+ from enum import Enum
+ from http.cookies import SimpleCookie
+ 
++import httpx
+ from fake_useragent import UserAgent
+-import requests
+-from requests.utils import cookiejar_from_dict
+ from rich import print
+ import threading
+ 
+@@ -18,7 +17,12 @@
+ base_url_not_cn = "https://klingai.com/"
+ 
+ 
+-def call_for_daily_check(session: requests.Session, is_cn: bool) -> bool:
++def _json_dict(response: httpx.Response) -> dict:
++    data = response.json()
++    return data if isinstance(data, dict) else {}
++
++
++def call_for_daily_check(session: httpx.Client, is_cn: bool) -> bool:
+     if is_cn:
+         r = session.get(f"{base_url}api/pay/reward?activity=login_bonus_daily")
+     else:
+@@ -40,10 +44,12 @@
+ 
+ class BaseGen:
+     def __init__(self, cookie: str) -> None:
+-        self.session: requests.Session = requests.Session()
+         self.cookie = cookie
+-        self.session.cookies, is_cn = self.parse_cookie_string(self.cookie)
+-        self.session.headers["user-agent"] = ua.random
++        self.session_cookies, is_cn = self.parse_cookie_string(self.cookie)
++        self.session: httpx.Client = httpx.Client(
++            cookies=self.session_cookies,
++            headers={"user-agent": ua.random},
++        )
+         # check the daily login
+         call_for_daily_check(self.session, is_cn)
+         if is_cn:
+@@ -72,24 +78,22 @@
+         cookie = SimpleCookie()
+         cookie.load(cookie_string)
+         cookies_dict = {}
+-        cookiejar = None
++        cookiejar = httpx.Cookies()
+         is_cn = False
+         for key, morsel in cookie.items():
+             if key.startswith("kuaishou"):
+                 is_cn = True
+             cookies_dict[key] = morsel.value
+-            cookiejar = cookiejar_from_dict(
+-                cookies_dict, cookiejar=None, overwrite=True
+-            )
++            cookiejar = httpx.Cookies(cookies_dict)
+         return cookiejar, is_cn
+ 
+     def get_account_point(self) -> float:
+         bonus_req = self.session.get(self.daily_url)
+-        bonus_data = bonus_req.json()
++        bonus_data = _json_dict(bonus_req)
+         assert bonus_data.get("status") == 200
+ 
+         point_req = self.session.get(self.point_url)
+-        point_data = point_req.json()
++        point_data = _json_dict(point_req)
+         assert point_data.get("status") == 200
+ 
+         total_point = point_data["data"]["total"]
+@@ -106,14 +110,14 @@
+         file_name = image_path.split("/")[-1]
+         upload_url = self.apis_dict["image_upload_gettoken"] + file_name
+         token_req = self.session.get(upload_url)
+-        token_data = token_req.json()
++        token_data = _json_dict(token_req)
+ 
+         assert token_data.get("status") == 200
+ 
+         token = token_data["data"]["token"]
+         resume_url = self.apis_dict["image_upload_resume"] + token
+         resume_req = self.session.get(resume_url)
+-        resume_data = resume_req.json()
++        resume_data = _json_dict(resume_req)
+ 
+         assert resume_data.get("result") == 1
+         fragment_req = self.session.post(
+@@ -122,29 +126,31 @@
+             params=dict(upload_token=token, fragment_id=0),
+             headers={"Content-Type": "application/octet-stream"},
+         )
+-        fragment_data = fragment_req.json()
++        fragment_data = _json_dict(fragment_req)
+         assert fragment_data.get("result") == 1
+         complete_req = self.session.post(
+             self.apis_dict["image_upload_complete"],
+             params=dict(upload_token=token, fragment_count=1),
+         )
+-        complete_data = complete_req.json()
++        complete_data = _json_dict(complete_req)
+         assert complete_data.get("result") == 1
+         verify_url = self.apis_dict["image_upload_geturl"] + token
+         result_req = self.session.get(verify_url)
+-        result_data = result_req.json()
++        result_data = _json_dict(result_req)
+         assert result_data.get("status") == 200
+-        return result_data.get("data").get("url")
++        return (result_data.get("data") or {}).get("url")
+ 
+     def fetch_metadata(self, task_id: str) -> tuple[dict, TaskStatus]:
+         url = f"{self.base_url}api/task/status?taskId={task_id}"
+         response = self.session.get(url)
+-        data = response.json().get("data")
+-        assert data is not None
++        data = _json_dict(response).get("data")
++        if not isinstance(data, dict):
++            data = {}
+         # this is very interesting it use resolution to check if the image is ready
+-        if data.get("status") >= 90:
++        status = data.get("status")
++        if isinstance(status, int) and status >= 90:
+             return data, TaskStatus.COMPLETED
+-        elif data.get("status") in [9, 50]:
++        elif status in [9, 50]:
+             return data, TaskStatus.FAILED
+         else:
+             return data, TaskStatus.PENDING
+@@ -215,11 +221,14 @@
+         if not response.ok:
+             print(response.text)
+             raise Exception(f"Error response {str(response)}")
+-        response_body = response.json()
+-        if response_body.get("data").get("status") == 7:
+-            message = response_body.get("data").get("message")
++        response_body = _json_dict(response)
++        response_data = response_body.get("data")
++        if not isinstance(response_data, dict):
++            response_data = {}
++        if response_data.get("status") == 7:
++            message = response_data.get("message")
+             raise Exception(f"Request failed message {message}")
+-        request_id = response_body.get("data", {}).get("task", {}).get("id")
++        request_id = (response_data.get("task") or {}).get("id")
+ 
+         if not request_id:
+             raise Exception("Could not get request ID")
+@@ -240,13 +249,13 @@
+                 return []
+             else:
+                 result = []
+-                works = image_data.get("works", [])
++                works = image_data.get("works") or []
+                 if not works:
+                     print("No video found.")
+                     return []
+                 else:
+                     for work in works:
+-                        resource = work.get("resource", {}).get("resource")
++                        resource = (work.get("resource") or {}).get("resource")
+                         if resource:
+                             # sleep for 2s for waiting the video to be ready in kuaishou server
+                             time.sleep(2)
+@@ -485,11 +494,14 @@
+         if not response.ok:
+             print(response.text)
+             raise Exception(f"Error response {str(response)}")
+-        response_body = response.json()
+-        if response_body.get("data").get("status") == 7:
+-            message = response_body.get("data").get("message")
++        response_body = _json_dict(response)
++        response_data = response_body.get("data")
++        if not isinstance(response_data, dict):
++            response_data = {}
++        if response_data.get("status") == 7:
++            message = response_data.get("message")
+             raise Exception(f"Request failed message {message}")
+-        request_id = (response_body.get("data", {}).get("task") or {}).get("id")
++        request_id = (response_data.get("task") or {}).get("id")
+         if not request_id:
+             raise Exception("Could not get request ID")
+         start_wait = time.time()
+@@ -507,13 +519,13 @@
+                 return []
+             else:
+                 result = []
+-                works = image_data.get("works", [])
++                works = image_data.get("works") or []
+                 if not works:
+                     print("No images found.")
+                     return []
+                 else:
+                     for work in works:
+-                        resource = work.get("resource", {}).get("resource")
++                        resource = (work.get("resource") or {}).get("resource")
+                         if resource:
+                             # sleep for 2s for waiting the video to be ready in kuaishou server
+                             time.sleep(2)

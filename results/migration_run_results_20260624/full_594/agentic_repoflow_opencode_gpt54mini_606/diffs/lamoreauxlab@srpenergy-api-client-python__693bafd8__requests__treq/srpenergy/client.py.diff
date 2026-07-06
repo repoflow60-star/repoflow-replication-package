@@ -1,0 +1,162 @@
+--- a/srpenergy/client.py
++++ b/srpenergy/client.py
+@@ -5,13 +5,131 @@
+ """
+ 
+ from datetime import datetime, timedelta
++from http.cookies import SimpleCookie
+ import re
++import threading
++from types import SimpleNamespace
+ from urllib.parse import unquote
+ 
+ from dateutil.parser import parse
+-import requests
++import treq
++from twisted.internet import reactor
++from twisted.internet.threads import blockingCallFromThread
+ 
+ BASE_USAGE_URL = "https://myaccount.srpnet.com/myaccountapi/api/"
++_REACTOR_LOCK = threading.Lock()
++_REACTOR_READY = threading.Event()
++_REACTOR_THREAD = None
++
++
++def _run_reactor():
++    reactor.callWhenRunning(_REACTOR_READY.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor_running():
++    global _REACTOR_THREAD
++
++    if reactor.running:
++        return
++
++    with _REACTOR_LOCK:
++        if reactor.running:
++            return
++
++        if _REACTOR_THREAD is None or not _REACTOR_THREAD.is_alive():
++            _REACTOR_READY.clear()
++            _REACTOR_THREAD = threading.Thread(target=_run_reactor, daemon=True)
++            _REACTOR_THREAD.start()
++
++    _REACTOR_READY.wait()
++
++
++def _blocking_call(func, *args, **kwargs):
++    _ensure_reactor_running()
++    return blockingCallFromThread(reactor, func, *args, **kwargs)
++
++
++def _response_cookies(response):
++    cookies = {}
++
++    response_cookies = getattr(response, "cookies", None)
++    if response_cookies:
++        if hasattr(response_cookies, "items"):
++            for key, value in response_cookies.items():
++                cookies[str(key)] = str(value)
++        else:
++            for key in response_cookies:
++                cookies[str(key)] = str(response_cookies[key])
++
++    headers = getattr(response, "headers", None)
++    if headers is None:
++        return cookies
++
++    raw_headers = []
++    if hasattr(headers, "getAllRawHeaders"):
++        raw_headers = list(headers.getAllRawHeaders())
++    elif hasattr(headers, "getRawHeaders"):
++        raw_headers = [
++            (b"set-cookie", headers.getRawHeaders(b"set-cookie", []) or []),
++            (b"Set-Cookie", headers.getRawHeaders(b"Set-Cookie", []) or []),
++        ]
++
++    for header_name, header_values in raw_headers:
++        if isinstance(header_name, bytes):
++            header_name = header_name.decode("utf-8", "ignore")
++        if header_name.lower() != "set-cookie":
++            continue
++
++        for raw_cookie in header_values:
++            if isinstance(raw_cookie, bytes):
++                raw_cookie = raw_cookie.decode("utf-8")
++
++            parsed_cookie = SimpleCookie()
++            parsed_cookie.load(raw_cookie)
++            for morsel in parsed_cookie.values():
++                cookies[morsel.key] = morsel.value
++
++    return cookies
++
++
++def _cookie_value(cookies, cookie_name):
++    if hasattr(cookies, "items"):
++        cookie = cookies[cookie_name]
++    else:
++        cookie = SimpleCookie()
++        cookie.load(cookies)
++        cookie = cookie[cookie_name].value
++
++    return unquote(str(cookie))
++
++
++class _TreqResponse:
++    def __init__(self, response):
++        self._response = response
++        self.cookies = _response_cookies(response)
++
++    def json(self):
++        return _blocking_call(treq.json_content, self._response)
++
++
++class _RequestsSession:
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc, tb):
++        return False
++
++    def post(self, *args, **kwargs):
++        response = _blocking_call(treq.post, *args, **kwargs)
++        return _TreqResponse(response)
++
++    def get(self, *args, **kwargs):
++        response = _blocking_call(treq.get, *args, **kwargs)
++        return _TreqResponse(response)
++
++
++requests = SimpleNamespace(Session=_RequestsSession)
+ 
+ 
+ def get_pretty_date(date_part):
+@@ -188,7 +306,7 @@
+         """
+         try:
+ 
+-            with requests.Session() as session:
++            with _RequestsSession() as session:
+ 
+                 response = session.post(
+                     BASE_USAGE_URL + "/login/authorize",
+@@ -272,7 +390,7 @@
+             str_startdate = startdate.strftime("%m-%d-%Y")
+             str_enddate = enddate.strftime("%m-%d-%Y")
+ 
+-            with requests.Session() as session:
++            with _RequestsSession() as session:
+ 
+                 response = session.post(
+                     BASE_USAGE_URL + "login/authorize",
+@@ -280,7 +398,7 @@
+                 )
+ 
+                 response = session.get(BASE_USAGE_URL + "login/antiforgerytoken")
+-                xsrf_token = unquote(response.cookies["xsrf-token"])
++                xsrf_token = _cookie_value(response.cookies, "xsrf-token")
+ 
+                 response = session.get(
+                     BASE_USAGE_URL

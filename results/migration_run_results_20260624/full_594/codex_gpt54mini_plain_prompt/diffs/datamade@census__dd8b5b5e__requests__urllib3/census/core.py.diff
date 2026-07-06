@@ -1,0 +1,262 @@
+diff --git a/census/core.py b/census/core.py
+index 5beeb4e..bda9821 100644
+--- a/census/core.py
++++ b/census/core.py
+@@ -1,15 +1,130 @@
++import json
+ import warnings
+ from functools import wraps, lru_cache
+ from importlib.metadata import version
+ 
++import urllib3
++
+ __version__ = version('census')
+ 
+ ALL = '*'
+ 
+ 
++class _Urllib3Session(object):
++    def __init__(self, *args, **kwargs):
++        self._pool = urllib3.PoolManager(*args, **kwargs)
++        self.headers = dict(getattr(self._pool, 'headers', {}) or {})
++
++    def get(self, url, params=None, headers=None, **kwargs):
++        request_headers = dict(self.headers)
++        if headers:
++            request_headers.update(headers)
++
++        return self._pool.request(
++            'GET',
++            url,
++            fields=params,
++            headers=request_headers or None,
++            **kwargs
++        )
++
++    def close(self):
++        self._pool.clear()
++
++
++class _SessionAdapter(object):
++    def __init__(self, session):
++        self._session = session
++        self.headers = dict(getattr(session, 'headers', {}) or {})
++
++    def get(self, url, params=None, headers=None, **kwargs):
++        request_headers = dict(self.headers)
++        if headers:
++            request_headers.update(headers)
++
++        if hasattr(self._session, 'request'):
++            return self._session.request(
++                'GET',
++                url,
++                fields=params,
++                headers=request_headers or None,
++                **kwargs
++            )
++
++        if hasattr(self._session, 'get'):
++            return self._session.get(
++                url,
++                params=params,
++                headers=request_headers or None,
++                **kwargs
++            )
++
++        raise TypeError('session must provide a get or request method')
++
++    def close(self):
++        closer = getattr(self._session, 'close', None)
++        if callable(closer):
++            closer()
++            return
++
++        clearer = getattr(self._session, 'clear', None)
++        if callable(clearer):
++            clearer()
++
++
+ def new_session(*args, **kwargs):
+-    import requests
+-    return requests.session(*args, **kwargs)
++    return _Urllib3Session(*args, **kwargs)
++
++
++def _ensure_session(session):
++    if session is None:
++        return new_session()
++
++    if hasattr(session, 'get') and hasattr(session, 'headers'):
++        return session
++
++    return _SessionAdapter(session)
++
++
++def _response_status(response):
++    return getattr(response, 'status_code', getattr(response, 'status', None))
++
++
++def _response_text(response):
++    text = getattr(response, 'text', None)
++    if text is not None:
++        return text
++
++    data = getattr(response, 'data', None)
++    if data is None:
++        data = getattr(response, 'content', b'')
++
++    if isinstance(data, str):
++        return data
++
++    headers = getattr(response, 'headers', None)
++    encoding = None
++    if headers is not None:
++        encoding = getattr(headers, 'get_content_charset', lambda: None)()
++        if not encoding:
++            content_type = headers.get('Content-Type') or headers.get('content-type')
++            if content_type and 'charset=' in content_type:
++                encoding = content_type.split('charset=', 1)[1].split(';', 1)[0].strip()
++
++    return data.decode(encoding or 'utf-8', errors='replace')
++
++
++def _response_json(response):
++    json_method = getattr(response, 'json', None)
++    if callable(json_method):
++        return json_method()
++    return json.loads(_response_text(response))
++
++
++def _response_close(response):
++    closer = getattr(response, 'close', None)
++    if callable(closer):
++        closer()
+ 
+ 
+ class APIKeyError(Exception):
+@@ -97,7 +212,7 @@ class Client(object):
+ 
+     def __init__(self, key, year=None, session=None, retries=3):
+         self._key = key
+-        self.session = session or new_session()
++        self.session = _ensure_session(session)
+         if year:
+             self.default_year = year
+         self.retries = retries
+@@ -115,7 +230,7 @@ class Client(object):
+         resp = self.session.get(tables_url)
+ 
+         # Pass it out
+-        return resp.json()['groups']
++        return _response_json(resp)['groups']
+ 
+     @supported_years()
+     def fields(self, year=None, flat=False):
+@@ -127,7 +242,7 @@ class Client(object):
+         fields_url = self.definitions_url % (year, self.dataset)
+ 
+         resp = self.session.get(fields_url)
+-        obj = resp.json()
++        obj = _response_json(resp)
+ 
+         if flat:
+ 
+@@ -149,9 +264,9 @@ class Client(object):
+     def get(self, fields, geo, year=None, **kwargs):
+         """
+         The API only accepts up to 50 fields on each query.
+-        Chunk requests, and use the unique GEO_ID to match up the chunks
++        Chunk HTTP requests, and use the unique GEO_ID to match up the chunks
+         in case the responses are in different orders.
+-        GEO_ID is not reliably present in pre-2010 requests.
++        GEO_ID is not reliably present in pre-2010 responses.
+         """
+         sort_by_geoid = len(fields) > 49 and (not year or year > 2009)
+         all_results = (self.query(forty_nine_fields, geo, year, sort_by_geoid=sort_by_geoid, **kwargs)
+@@ -185,12 +300,13 @@ class Client(object):
+ 
+         resp = self.session.get(url, params=params)
+ 
+-        if resp.status_code == 200:
++        if _response_status(resp) == 200:
+             try:
+-                data = resp.json()
++                data = _response_json(resp)
+             except ValueError as ex:
+-                if '<title>Invalid Key</title>' in resp.text:
+-                    raise APIKeyError(' '.join(resp.text.splitlines()))
++                text = _response_text(resp)
++                if '<title>Invalid Key</title>' in text:
++                    raise APIKeyError(' '.join(text.splitlines()))
+                 else:
+                     raise ex
+ 
+@@ -207,11 +323,11 @@ class Client(object):
+                     results = sorted(results, key=lambda x: x.pop('GEO_ID'))
+             return results
+ 
+-        elif resp.status_code == 204:
++        elif _response_status(resp) == 204:
+             return []
+ 
+         else:
+-            raise CensusException(resp.text)
++            raise CensusException(_response_text(resp))
+ 
+     @lru_cache(maxsize=1024)
+     def _field_type(self, field, year):
+@@ -225,8 +341,8 @@ class Client(object):
+                  "float": float,
+                  "string": str}
+ 
+-        if resp.status_code == 200:
+-            predicate_type = resp.json().get("predicateType", "string")
++        if _response_status(resp) == 200:
++            predicate_type = _response_json(resp).get("predicateType", "string")
+             return types[predicate_type]
+         else:
+             return str
+@@ -582,25 +698,23 @@ class Census(object):
+ 
+     def __init__(self, key, year=None, session=None):
+ 
+-        if not session:
+-            session = new_session()
+-
+-        self.session = session
+-        self.session.headers.update({
+-            'User-Agent': ('python-census/{} '.format(__version__) +
+-                           'github.com/datamade/census')
+-        })
+-
+-        self._acs = ACS5Client(key, year, session)  # deprecated
+-        self.acs5 = ACS5Client(key, year, session)
+-        self.acs3 = ACS3Client(key, year, session)
+-        self.acs1 = ACS1Client(key, year, session)
+-        self.acs5st = ACS5StClient(key, year, session)
+-        self.acs5dp = ACS5DpClient(key, year, session)
+-        self.acs3dp = ACS3DpClient(key, year, session)
+-        self.acs1dp = ACS1DpClient(key, year, session)
+-        self.sf1 = SF1Client(key, year, session)
+-        self.pl = PLClient(key, year, session)
++        self.session = _ensure_session(session)
++        if hasattr(self.session, 'headers'):
++            self.session.headers.update({
++                'User-Agent': ('python-census/{} '.format(__version__) +
++                               'github.com/datamade/census')
++            })
++
++        self._acs = ACS5Client(key, year, self.session)  # deprecated
++        self.acs5 = ACS5Client(key, year, self.session)
++        self.acs3 = ACS3Client(key, year, self.session)
++        self.acs1 = ACS1Client(key, year, self.session)
++        self.acs5st = ACS5StClient(key, year, self.session)
++        self.acs5dp = ACS5DpClient(key, year, self.session)
++        self.acs3dp = ACS3DpClient(key, year, self.session)
++        self.acs1dp = ACS1DpClient(key, year, self.session)
++        self.sf1 = SF1Client(key, year, self.session)
++        self.pl = PLClient(key, year, self.session)
+ 
+     @property
+     def acs(self):

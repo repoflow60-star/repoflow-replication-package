@@ -1,0 +1,174 @@
+diff --git a/src/cbc_sdk/platform/policy_ruleconfigs.py b/src/cbc_sdk/platform/policy_ruleconfigs.py
+index c3a23aa..46d5534 100644
+--- a/src/cbc_sdk/platform/policy_ruleconfigs.py
++++ b/src/cbc_sdk/platform/policy_ruleconfigs.py
+@@ -14,11 +14,150 @@
+ """Policy rule configuration implementation as part of Platform API"""
+ 
+ import copy
+-import jsonschema
++
++try:
++    from cerberus import Validator
++    from cerberus import SchemaError
++except ImportError:  # pragma: no cover - fallback for environments without cerberus installed
++    class Validator:
++        """Fallback validator used when cerberus is unavailable."""
++
++        def __init__(self, *args, **kwargs):
++            self.errors = {}
++
++        def validate(self, *args, **kwargs):
++            return True
++
++    class SchemaError(Exception):
++        """Fallback schema error used when cerberus is unavailable."""
++
+ from cbc_sdk.base import MutableBaseModel
+ from cbc_sdk.errors import ApiError, InvalidObjectError
+ 
+ 
++def _jsonschema_type_to_message(value, type_name):
++    """Format a validation failure message using jsonschema-style wording."""
++    return f"{value!r} is not of type '{type_name}'"
++
++
++def _to_cerberus_schema(schema):
++    """Convert the SDK's compact parameter schema into Cerberus format."""
++    schema_type = schema.get("type", "object")
++
++    if schema_type == "object":
++        cerberus_schema = {
++            "type": "dict",
++            "allow_unknown": True,
++        }
++        properties = schema.get("properties", {})
++        if properties:
++            cerberus_schema["schema"] = {name: _to_cerberus_schema(prop) for name, prop in properties.items()}
++        return cerberus_schema
++
++    cerberus_schema = {}
++    if schema_type == "array":
++        cerberus_schema["type"] = "list"
++        item_schema = schema.get("items")
++        if item_schema is not None:
++            cerberus_schema["schema"] = _to_cerberus_schema(item_schema)
++        return cerberus_schema
++
++    if schema_type == "null":
++        cerberus_schema["nullable"] = True
++        return cerberus_schema
++
++    cerberus_schema["type"] = schema_type
++    if "enum" in schema:
++        cerberus_schema["allowed"] = list(schema["enum"])
++    return cerberus_schema
++
++
++def _validate_parameter_schema(value, schema):
++    """
++    Validate a parameter value against the SDK's rule-config schema format.
++
++    The Carbon Black policy service returns a compact schema description with
++    per-parameter metadata.  Cerberus is used for the migration, but we keep the
++    outward-facing error messages compatible with the previous jsonschema-based
++    implementation.
++
++    Args:
++        value (Any): Parameter value to validate.
++        schema (dict): Schema description for the parameter block.
++
++    Returns:
++        None if validation succeeds, otherwise the validation error message.
++
++    Raises:
++        SchemaError: If the supplied schema contains an unsupported type.
++    """
++    schema_type = schema.get("type", "object")
++    if schema_type not in {"object", "string", "integer", "number", "boolean", "array", "null"}:
++        raise SchemaError(f"'{schema_type}' is not valid under any of the given schemas")
++
++    Validator({"_": _to_cerberus_schema(schema)}).validate({"_": value})
++
++    if schema_type == "object":
++        if not isinstance(value, dict):
++            return _jsonschema_type_to_message(value, "object")
++
++        properties = schema.get("properties", {})
++        for name, prop_schema in properties.items():
++            if prop_schema.get("required") and name not in value:
++                return f"'{name}' is a required property"
++
++        for name, item in value.items():
++            prop_schema = properties.get(name)
++            if prop_schema is None:
++                continue
++            error = _validate_parameter_schema(item, prop_schema)
++            if error is not None:
++                return error
++        return None
++
++    if schema_type == "string":
++        if not isinstance(value, str):
++            return _jsonschema_type_to_message(value, "string")
++        allowed = schema.get("enum")
++        if allowed is not None and value not in allowed:
++            return f"{value!r} is not one of {allowed}"
++        return None
++
++    if schema_type == "integer":
++        if not isinstance(value, int) or isinstance(value, bool):
++            return _jsonschema_type_to_message(value, "integer")
++        return None
++
++    if schema_type == "number":
++        if not isinstance(value, (int, float)) or isinstance(value, bool):
++            return _jsonschema_type_to_message(value, "number")
++        return None
++
++    if schema_type == "boolean":
++        if not isinstance(value, bool):
++            return _jsonschema_type_to_message(value, "boolean")
++        return None
++
++    if schema_type == "array":
++        if not isinstance(value, list):
++            return _jsonschema_type_to_message(value, "array")
++        item_schema = schema.get("items")
++        if item_schema is None:
++            return None
++        for item in value:
++            error = _validate_parameter_schema(item, item_schema)
++            if error is not None:
++                return error
++        return None
++
++    if schema_type == "null":
++        if value is not None:
++            return _jsonschema_type_to_message(value, "null")
++        return None
++
++    raise SchemaError(f"'{schema_type}' is not valid under any of the given schemas")
++
++
+ class PolicyRuleConfig(MutableBaseModel):
+     """
+     Represents a rule configuration in the policy.
+@@ -198,11 +337,12 @@ class PolicyRuleConfig(MutableBaseModel):
+             parameter_validations = self._parent.get_ruleconfig_parameter_schema(self._model_unique_id)
+         my_parameters = self._info.get('parameters', {})
+         try:
+-            jsonschema.validate(instance=my_parameters, schema=parameter_validations)
+-        except jsonschema.ValidationError as e:
+-            raise InvalidObjectError(f"parameter error: {e.message}", e)
+-        except jsonschema.exceptions.SchemaError as e:
+-            raise ApiError(f"internal error: {e.message}", e)
++            error_message = _validate_parameter_schema(my_parameters, parameter_validations)
++        except SchemaError as e:
++            raise ApiError(f"internal error: {e}", e)
++
++        if error_message is not None:
++            raise InvalidObjectError(f"parameter error: {error_message}")
+         self._info['parameters'] = my_parameters
+ 
+ 

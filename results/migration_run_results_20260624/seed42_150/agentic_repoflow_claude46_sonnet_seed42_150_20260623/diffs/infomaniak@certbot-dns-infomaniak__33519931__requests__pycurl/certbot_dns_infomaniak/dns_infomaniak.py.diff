@@ -1,0 +1,145 @@
+--- a/certbot_dns_infomaniak/dns_infomaniak.py
++++ b/certbot_dns_infomaniak/dns_infomaniak.py
+@@ -3,11 +3,13 @@
+ # SPDX-FileCopyrightText: 2021      Romain Autran <romain.autran@2itea.ch>
+ # SPDX-License-Identifier: Apache-2.0
+ """DNS Authenticator for Infomaniak"""
++import io
+ import json
+ import logging
++import urllib.parse
+ import idna
+ 
+-import requests
++import pycurl
+ 
+ from certbot import errors
+ from certbot.plugins import dns_common
+@@ -17,6 +19,116 @@
+     import os
+ 
+ logger = logging.getLogger(__name__)
++
++
++class _PyCurlResponse:
++    """Minimal response object returned by _PyCurlSession."""
++
++    def __init__(self, body_bytes):
++        self._body = body_bytes
++
++    def json(self):
++        return json.loads(self._body.decode("utf-8"))
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *args):
++        pass
++
++
++class _PyCurlSession:
++    """A pycurl-backed HTTP session that supports adapter mounting for testability."""
++
++    def __init__(self):
++        self.headers = {}
++        self._adapters = {}
++
++    def mount(self, prefix, adapter):
++        """Register an adapter for a URL prefix (e.g. 'mock' -> requests_mock.Adapter)."""
++        self._adapters[prefix] = adapter
++
++    def _adapter_for(self, url):
++        """Return the longest-prefix matching adapter, or None."""
++        for prefix in sorted(self._adapters, key=len, reverse=True):
++            if url.startswith(prefix):
++                return self._adapters[prefix]
++        return None
++
++    def _pycurl_request(self, url, method, body=None, extra_headers=None):
++        """Perform an HTTP request via pycurl and return response bytes."""
++        buf = io.BytesIO()
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.WRITEDATA, buf)
++            # Convert headers dict to "Name: value" strings for pycurl
++            all_headers = ["{}: {}".format(k, v) for k, v in self.headers.items()]
++            if extra_headers:
++                all_headers.extend(extra_headers)
++            if all_headers:
++                curl.setopt(pycurl.HTTPHEADER, all_headers)
++            if method == "POST":
++                curl.setopt(pycurl.POST, 1)
++                curl.setopt(pycurl.POSTFIELDS, body)
++                if body is not None:
++                    curl.setopt(pycurl.POSTFIELDSIZE, len(body))
++            elif method == "DELETE":
++                curl.setopt(pycurl.CUSTOMREQUEST, "DELETE")
++            curl.perform()
++        finally:
++            curl.close()
++        return _PyCurlResponse(buf.getvalue())
++
++    def _adapter_request(self, adapter, method, url, params=None, data=None, headers=None):
++        """Delegate to a mounted adapter using a PreparedRequest-like object."""
++        full_url = url
++        if params:
++            sep = "&" if "?" in url else "?"
++            full_url = url + sep + urllib.parse.urlencode(params)
++
++        merged_headers = dict(self.headers)
++        if headers:
++            merged_headers.update(headers)
++
++        class _PreparedRequest:
++            pass
++
++        prepared = _PreparedRequest()
++        prepared.method = method.upper()
++        prepared.url = full_url
++        prepared.headers = merged_headers
++        prepared.body = data
++        prepared.path_url = full_url
++
++        response = adapter.send(prepared, timeout=30)
++        return response
++
++    def get(self, url, params=None, headers=None):
++        adapter = self._adapter_for(url)
++        if adapter is not None:
++            return self._adapter_request(adapter, "GET", url, params=params, headers=headers)
++        full_url = url
++        if params:
++            sep = "&" if "?" in url else "?"
++            full_url = url + sep + urllib.parse.urlencode(params)
++        return self._pycurl_request(full_url, "GET")
++
++    def post(self, url, data=None, headers=None):
++        adapter = self._adapter_for(url)
++        if adapter is not None:
++            return self._adapter_request(adapter, "POST", url, data=data, headers=headers)
++        body = data.encode("utf-8") if isinstance(data, str) else data
++        extra = []
++        if headers:
++            extra = ["{}: {}".format(k, v) for k, v in headers.items()]
++        return self._pycurl_request(url, "POST", body=body, extra_headers=extra or None)
++
++    def delete(self, url, headers=None):
++        adapter = self._adapter_for(url)
++        if adapter is not None:
++            return self._adapter_request(adapter, "DELETE", url, headers=headers)
++        return self._pycurl_request(url, "DELETE")
+ 
+ 
+ class Authenticator(dns_common.DNSAuthenticator):
+@@ -86,8 +198,8 @@
+         :param str token: oauth2 token to consume Infomaniak API
+         """
+         self.token = token
+-        self.session = requests.Session()
+-        self.session.headers.update({"Authorization": "Bearer {token}".format(token=self.token)})
++        self.session = _PyCurlSession()
++        self.session.headers["Authorization"] = "Bearer {token}".format(token=self.token)
+ 
+     def _get_request(self, url, payload=None):
+         """Performs a GET request against API

@@ -1,0 +1,253 @@
+diff --git /dev/null b/hxl/http.py
+new file mode 100644
+index 0000000..9d344a5
+--- /dev/null
++++ b/hxl/http.py
+@@ -0,0 +1,247 @@
++"""Minimal HTTP client abstraction for HXL.
++
++The code prefers ``pycurl`` when available, but falls back to ``urllib``
++in environments where ``pycurl`` is not installed. The rest of the codebase
++uses the small request/response surface defined here.
++"""
++
++import io
++import json
++import logging
++import ssl
++import urllib.error
++import urllib.parse
++import urllib.request
++
++try:
++    import pycurl
++except ImportError:  # pragma: no cover - exercised only when pycurl is absent
++    pycurl = None
++
++logger = logging.getLogger(__name__)
++
++
++class CaseInsensitiveHeaders(dict):
++    """Very small case-insensitive mapping for HTTP headers."""
++
++    def __init__(self, *args, **kwargs):
++        super().__init__()
++        self.update(*args, **kwargs)
++
++    @staticmethod
++    def _key(key):
++        return key.lower() if isinstance(key, str) else key
++
++    def __setitem__(self, key, value):
++        super().__setitem__(self._key(key), value)
++
++    def __getitem__(self, key):
++        return super().__getitem__(self._key(key))
++
++    def get(self, key, default=None):
++        return super().get(self._key(key), default)
++
++    def __contains__(self, key):
++        return super().__contains__(self._key(key))
++
++    def update(self, *args, **kwargs):
++        for key, value in dict(*args, **kwargs).items():
++            super().__setitem__(self._key(key), value)
++
++
++class HTTPError(Exception):
++    """HTTP error raised by ``raise_for_status``."""
++
++    def __init__(self, message, response=None):
++        super().__init__(message)
++        self.response = response
++
++
++class Response:
++    """Small response object mirroring the bits of requests we use."""
++
++    def __init__(self, url, status_code, headers, content):
++        self.url = url
++        self.status_code = status_code
++        self.headers = CaseInsensitiveHeaders(headers or {})
++        self.content = content or b""
++
++    @property
++    def is_redirect(self):
++        return self.status_code in (301, 302, 303, 307, 308)
++
++    def json(self):
++        encoding = self._encoding_from_headers() or "utf-8"
++        return json.loads(self.content.decode(encoding, errors="replace"))
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise HTTPError("HTTP {}".format(self.status_code), response=self)
++
++    def close(self):
++        return None
++
++    def _encoding_from_headers(self):
++        content_type = self.headers.get("content-type")
++        if not content_type:
++            return None
++        for part in content_type.split(";")[1:]:
++            part = part.strip()
++            if part.lower().startswith("charset="):
++                return part.split("=", 1)[1].strip()
++        return None
++
++
++class _HTTPClient:
++    def get(self, url, stream=False, verify=True, timeout=None, headers=None, params=None):
++        return self.request("GET", url, verify=verify, timeout=timeout, headers=headers, params=params)
++
++    def head(self, url, verify=True, timeout=None, headers=None):
++        return self.request("HEAD", url, verify=verify, timeout=timeout, headers=headers, follow_redirects=False)
++
++    def post(self, url, verify=True, timeout=None, headers=None, data=None):
++        return self.request("POST", url, verify=verify, timeout=timeout, headers=headers, data=data)
++
++    def request(self, method, url, verify=True, timeout=None, headers=None, params=None, data=None, follow_redirects=True):
++        if pycurl is not None:
++            return self._request_pycurl(method, url, verify, timeout, headers, params, data, follow_redirects)
++        return self._request_urllib(method, url, verify, timeout, headers, params, data, follow_redirects)
++
++    def _prepare_url(self, url, params):
++        if not params:
++            return url
++        query = urllib.parse.urlencode(params, doseq=True)
++        parts = list(urllib.parse.urlsplit(url))
++        if parts[3]:
++            parts[3] = parts[3] + "&" + query
++        else:
++            parts[3] = query
++        return urllib.parse.urlunsplit(parts)
++
++    def _prepare_headers(self, headers):
++        if not headers:
++            return []
++        if isinstance(headers, dict):
++            items = headers.items()
++        else:
++            items = headers
++        return ["{}: {}".format(key, value) for key, value in items]
++
++    def _normalize_headers(self, headers):
++        normalized = CaseInsensitiveHeaders()
++        if headers:
++            if hasattr(headers, "items"):
++                iterable = headers.items()
++            else:
++                iterable = headers
++            for key, value in iterable:
++                normalized[key] = value
++        return normalized
++
++    def _request_pycurl(self, method, url, verify, timeout, headers, params, data, follow_redirects):
++        query_url = self._prepare_url(url, params)
++        body = io.BytesIO()
++        header_state = {"status": 0, "headers": CaseInsensitiveHeaders()}
++
++        def header_callback(line):
++            text = line.decode("iso-8859-1")
++            if text.startswith("HTTP/"):
++                parts = text.split(None, 2)
++                if len(parts) >= 2:
++                    try:
++                        header_state["status"] = int(parts[1])
++                    except ValueError:
++                        header_state["status"] = 0
++                header_state["headers"] = CaseInsensitiveHeaders()
++            elif ":" in text:
++                key, value = text.split(":", 1)
++                header_state["headers"][key.strip()] = value.strip()
++            return len(line)
++
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, query_url.encode("utf-8"))
++            curl.setopt(pycurl.HEADERFUNCTION, header_callback)
++            curl.setopt(pycurl.WRITEFUNCTION, body.write)
++            curl.setopt(pycurl.FOLLOWLOCATION, 1 if follow_redirects else 0)
++            curl.setopt(pycurl.MAXREDIRS, 10)
++            curl.setopt(pycurl.ACCEPT_ENCODING, "")
++            curl.setopt(pycurl.SSL_VERIFYPEER, 1 if verify else 0)
++            curl.setopt(pycurl.SSL_VERIFYHOST, 2 if verify else 0)
++            if timeout is not None:
++                curl.setopt(pycurl.TIMEOUT, timeout)
++                curl.setopt(pycurl.CONNECTTIMEOUT, timeout)
++            if headers:
++                curl.setopt(pycurl.HTTPHEADER, self._prepare_headers(headers))
++            if method == "HEAD":
++                curl.setopt(pycurl.NOBODY, 1)
++            elif method == "POST":
++                curl.setopt(pycurl.POST, 1)
++                if data is not None:
++                    if isinstance(data, (dict, list, tuple)):
++                        data = urllib.parse.urlencode(data, doseq=True)
++                    if isinstance(data, str):
++                        data = data.encode("utf-8")
++                    curl.setopt(pycurl.POSTFIELDS, data)
++                if headers is None or not any(str(h).lower().startswith("content-type:") for h in self._prepare_headers(headers)):
++                    curl.setopt(pycurl.HTTPHEADER, self._prepare_headers(headers or {}) + ["Content-Type: application/x-www-form-urlencoded"])
++            else:
++                curl.setopt(pycurl.HTTPGET, 1)
++            curl.perform()
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++            final_url = curl.getinfo(pycurl.EFFECTIVE_URL)
++        finally:
++            curl.close()
++
++        return Response(final_url, status_code, self._normalize_headers(header_state["headers"]), body.getvalue())
++
++    def _request_urllib(self, method, url, verify, timeout, headers, params, data, follow_redirects):
++        query_url = self._prepare_url(url, params)
++        request_headers = {}
++        if headers:
++            request_headers.update(dict(headers))
++
++        if method == "POST":
++            if data is not None:
++                if isinstance(data, (dict, list, tuple)):
++                    data = urllib.parse.urlencode(data, doseq=True)
++                if isinstance(data, str):
++                    data = data.encode("utf-8")
++            else:
++                data = b""
++            request_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
++        else:
++            data = None
++
++        req = urllib.request.Request(query_url, data=data, headers=request_headers, method=method)
++        context = None
++        if query_url.startswith("https://") and not verify:
++            context = ssl._create_unverified_context()
++
++        handlers = []
++        if not follow_redirects:
++            class NoRedirect(urllib.request.HTTPRedirectHandler):
++                def redirect_request(self, req, fp, code, msg, headers, newurl):
++                    return None
++
++            handlers.append(NoRedirect())
++
++        if context is not None:
++            handlers.append(urllib.request.HTTPSHandler(context=context))
++
++        opener = urllib.request.build_opener(*handlers) if handlers else urllib.request.build_opener()
++        try:
++            response = opener.open(req, timeout=timeout)
++            content = response.read()
++            status = getattr(response, "status", None) or response.getcode() or 200
++            headers_map = self._normalize_headers(response.headers.items())
++            final_url = response.geturl()
++        except urllib.error.HTTPError as e:
++            content = e.read()
++            status = e.code
++            headers_map = self._normalize_headers(e.headers.items() if e.headers else {})
++            final_url = e.geturl() if hasattr(e, "geturl") else query_url
++        return Response(final_url, status, headers_map, content)
++
++
++requests = _HTTPClient()

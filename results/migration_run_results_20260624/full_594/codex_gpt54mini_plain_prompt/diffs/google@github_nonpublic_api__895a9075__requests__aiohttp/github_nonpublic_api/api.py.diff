@@ -1,0 +1,388 @@
+diff --git a/github_nonpublic_api/api.py b/github_nonpublic_api/api.py
+index be69954..745dc26 100644
+--- a/github_nonpublic_api/api.py
++++ b/github_nonpublic_api/api.py
+@@ -14,32 +14,67 @@
+ 
+ """An API to do things that aren't in the official public GitHub REST API."""
+ 
+-import os.path
++from __future__ import annotations
++
++import asyncio
+ import functools
+-from enum import Enum
++import os.path
+ import re
++from dataclasses import dataclass, field
++from enum import Enum
++from typing import Any, Optional
+ from urllib.parse import urljoin
+ 
++import aiohttp
+ import html5lib
+ import pyotp
+-import requests
+ from absl import logging
+ from configobj import ConfigObj
+-from typing import Optional
++
++
++def _response_text(response: Any) -> str:
++    text = getattr(response, "text", None)
++    if isinstance(text, str):
++        return text
++
++    content = getattr(response, "content", b"")
++    if isinstance(content, bytes):
++        return content.decode("utf-8", errors="replace")
++
++    return str(content)
++
++
++def _response_content(response: Any) -> bytes:
++    content = getattr(response, "content", None)
++    if isinstance(content, bytes):
++        return content
++
++    text = getattr(response, "text", None)
++    if isinstance(text, str):
++        return text.encode("utf-8")
++
++    return b""
++
++
++def _response_history(response: Any) -> list[Any]:
++    history = getattr(response, "history", [])
++    if history is None:
++        return []
++    return list(history)
+ 
+ 
+ def _get_and_submit_form(
+-    session, url: str, data_callback=None, form_matcher=lambda form: True
++    session: Any, url: str, data_callback=None, form_matcher=lambda form: True
+ ):
+     logging.info("Fetching URL %s", url)
+     response = session.get(url)
+     response.raise_for_status()
+ 
+-    logging.info("Fetching URL %s", response.url)
+-    for redirect_response in response.history:
+-        logging.info("Redirected from: %s", redirect_response.url)
++    logging.info("Fetching URL %s", getattr(response, "url", url))
++    for redirect_response in _response_history(response):
++        logging.info("Redirected from: %s", getattr(redirect_response, "url", ""))
+ 
+-    doc = html5lib.parse(response.text, namespaceHTMLElements=False)
++    doc = html5lib.parse(_response_text(response), namespaceHTMLElements=False)
+     forms = doc.findall(".//form")
+ 
+     submit_form = None
+@@ -51,7 +86,6 @@ def _get_and_submit_form(
+         raise ValueError("Unable to find form")
+ 
+     action_url = submit_form.attrib["action"]
+-    # Look at all the inputs under the given form.
+     inputs = submit_form.findall(".//input")
+ 
+     data = dict()
+@@ -60,7 +94,6 @@ def _get_and_submit_form(
+         if value and "name" in form_input.attrib:
+             data[form_input.attrib["name"]] = value
+ 
+-    # Have the caller provide additional data
+     if data_callback:
+         data_callback(data)
+ 
+@@ -74,23 +107,87 @@ def _get_and_submit_form(
+     return response
+ 
+ 
+-def _get_url_with_session(session, url: str):
++def _get_url_with_session(session: Any, url: str):
+     logging.info("Fetching URL %s", url)
+     response = session.get(url)
+     response.raise_for_status()
+     return response
+ 
+ 
++@dataclass
++class _Redirect:
++    url: str
++
++
++@dataclass
++class _CookieStore:
++    cookies: dict[str, str] = field(default_factory=dict)
++
++    def clear(self):
++        self.cookies.clear()
++
++    def update_from_cookie_jar(self, cookie_jar):
++        for name, morsel in cookie_jar.items():
++            self.cookies[name] = morsel.value
++
++
++@dataclass
++class _AiohttpResponse:
++    url: str
++    text: str
++    content: bytes
++    history: list[_Redirect]
++    status: int
++    reason: str
++
++    def raise_for_status(self):
++        if self.status >= 400:
++            raise RuntimeError(
++                f"HTTP {self.status} {self.reason} while fetching {self.url}"
++            )
++
++
++class _AiohttpSession:
++    def __init__(self):
++        self.cookies = _CookieStore()
++
++    def get(self, url: str, **kwargs):
++        return asyncio.run(self._request("GET", url, **kwargs))
++
++    def post(self, url: str, **kwargs):
++        return asyncio.run(self._request("POST", url, **kwargs))
++
++    async def _request(self, method: str, url: str, **kwargs):
++        cookie_jar = aiohttp.CookieJar()
++        if self.cookies.cookies:
++            cookie_jar.update_cookies(self.cookies.cookies)
++
++        async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
++            async with session.request(method, url, **kwargs) as response:
++                content = await response.read()
++                text = content.decode(response.charset or "utf-8", errors="replace")
++                self.cookies.update_from_cookie_jar(
++                    session.cookie_jar.filter_cookies(response.url)
++                )
++                return _AiohttpResponse(
++                    url=str(response.url),
++                    text=text,
++                    content=content,
++                    history=[_Redirect(url=str(item.url)) for item in response.history],
++                    status=response.status,
++                    reason=response.reason,
++                )
++
++
+ def create_login_session(
+     username: str,
+     password: str,
+     tfa_callback,
+-    session: Optional[requests.Session] = None,
+-) -> requests.Session:
+-    """Create a requests.Session object with logged in GitHub cookies for the user."""
+-    session = session or requests.Session()
++    session: Optional[Any] = None,
++):
++    """Create a session object with logged in GitHub cookies for the user."""
++    session = session or _AiohttpSession()
+ 
+-    # Clear cookies before re-authentication
+     session.cookies.clear()
+ 
+     def _login_callback(data):
+@@ -129,8 +226,6 @@ _UPDATE_GHAS_SETTINGS_URL = (
+ )
+ 
+ 
+-
+-
+ class OrganizationUsage(Enum):
+     """Organization Usage for Organization Creation."""
+ 
+@@ -139,7 +234,7 @@ class OrganizationUsage(Enum):
+ 
+ 
+ class Api(object):
+-    """API Endpoing for doing non-public things to GitHub.
++    """API Endpoint for doing non-public things to GitHub.
+ 
+     Ideally these would all exist as REST API endpoints, but instead we get
+     to pretend to be a real user.
+@@ -150,7 +245,7 @@ class Api(object):
+         username: str,
+         password: str,
+         tfa_callback=None,
+-        session: Optional[requests.Session] = None,
++        session: Optional[Any] = None,
+     ):
+         self._session = session or create_login_session(
+             username=username,
+@@ -159,7 +254,7 @@ class Api(object):
+             session=session,
+         )
+ 
+-    def request_usage(self, enterprise_name: str, days: int = 30) -> requests.Response:
++    def request_usage(self, enterprise_name: str, days: int = 30):
+         """Requests a GitHub usage report.
+ 
+         Github will send an email link when the report is available.
+@@ -169,7 +264,7 @@ class Api(object):
+             data["days"] = days
+ 
+         action = f"/enterprises/{enterprise_name}/settings/metered_exports"
+-        url = url = _REQUEST_USAGE_URL.format(enterprise_name=enterprise_name)
++        url = _REQUEST_USAGE_URL.format(enterprise_name=enterprise_name)
+         return _get_and_submit_form(
+             session=self._session,
+             url=url,
+@@ -183,7 +278,7 @@ class Api(object):
+         contact_email: str,
+         org_usage: OrganizationUsage,
+         business_name: Optional[str] = None,
+-    ) -> requests.Response:
++    ):
+         """Create the specified GitHub organization.
+ 
+         Right now, only creates free tier organizations.
+@@ -205,9 +300,7 @@ class Api(object):
+             form_matcher=lambda f: f.attrib.get("id") == "org-new-form",
+         )
+ 
+-    def install_application_in_organization(
+-        self, app_name: str, org_id: int
+-    ) -> requests.Response:
++    def install_application_in_organization(self, app_name: str, org_id: int):
+         """Installs the specified app on the given organization."""
+         url = _INSTALL_APP_URL.format(app_name=app_name, org_id=org_id)
+ 
+@@ -221,10 +314,8 @@ class Api(object):
+             form_matcher=lambda form: app_name in form.attrib.get("action"),
+         )
+ 
+-    def toggle_app_suspended(
+-        self, org_name: str, app_install_id: int
+-    ) -> requests.Response:
+-        """Set this applicaiton install to be suspended or not."""
++    def toggle_app_suspended(self, org_name: str, app_install_id: int):
++        """Set this application install to be suspended or not."""
+         url = _APP_SUSPEND_URL.format(org_name=org_name, app_install_id=app_install_id)
+ 
+         return _get_and_submit_form(
+@@ -233,37 +324,37 @@ class Api(object):
+             form_matcher=lambda f: "suspended" in f.attrib.get("action"),
+         )
+ 
+-    def download_usage_report(
+-        self, enterprise_name: str, report_id: int
+-    ) -> requests.Response:
+-        """Download a usage report based on an id recieved in an email"""
++    def download_usage_report(self, enterprise_name: str, report_id: int):
++        """Download a usage report based on an id received in an email."""
+         url = _USAGE_REPORT_URL.format(
+             enterprise_name=enterprise_name, report_id=report_id
+         )
+         return _get_url_with_session(session=self._session, url=url)
+ 
+-    def request_dormant_users_report(self, enterprise_name: str) -> requests.Response:
++    def request_dormant_users_report(self, enterprise_name: str):
+         """Requests a GitHub dormant users report.
+ 
+         Github will send an email link when the report is available.
+         """
+ 
+         action = f"/enterprises/{enterprise_name}/settings/dormant-users/exports"
+-        url = url = _REQUEST_DORMANTUSERS_URL.format(enterprise_name=enterprise_name)
++        url = _REQUEST_DORMANTUSERS_URL.format(enterprise_name=enterprise_name)
+         return _get_and_submit_form(
+             session=self._session,
+             url=url,
+             form_matcher=lambda form: form.attrib.get("action") == action,
+         )
+ 
+-    def download_dormant_users_report(self, enterprise_name: str) -> requests.Response:
+-        """Download a usage report based on an id received in an email"""
++    def download_dormant_users_report(self, enterprise_name: str):
++        """Download a usage report based on an id received in an email."""
+         url = _REQUEST_DORMANTUSERS_URL.format(enterprise_name=enterprise_name)
+         page = _get_url_with_session(session=self._session, url=url)
+-        link = re.search(
+-            r"https://github.com/enterprises/alphabet/settings/dormant-users/exports/[0-9A-Fa-f]{8}\\-[0-9A-Fa-f]{4}\\-[0-9A-Fa-f]{4}\\-[0-9A-Fa-f]{4}\\-[0-9A-Fa-f]{12}",
+-            page.content,
++        pattern = (
++            rf"https://github\.com/enterprises/{re.escape(enterprise_name)}/settings/"
++            r"dormant-users/exports/[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-"
++            r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+         )
++        link = re.search(pattern, _response_text(page))
+         if link is None:
+             raise ValueError("Unable to find dormant users report link in content.")
+         return _get_url_with_session(session=self._session, url=link.group(0))
+@@ -272,8 +363,8 @@ class Api(object):
+         self,
+         org_name: str,
+         app_install_id: str,
+-    ) -> requests.Response:
+-        """Approve a request for updated permissions for a GitHub app installation in an org"""
++    ):
++        """Approve a request for updated permissions for a GitHub app installation in an org."""
+ 
+         return _get_and_submit_form(
+             session=self._session,
+@@ -293,30 +384,39 @@ class Api(object):
+     ):
+         def _form_matcher(doc, name):
+             return doc.findall(".//input[@name='%s']" % name)
+-        
++
+         if code_scanning_autofix is not None:
++
+             def _data_callback(data):
+-                data['code_scanning_autofix'] = 'enabled' if code_scanning_autofix else 'disabled'
++                data["code_scanning_autofix"] = (
++                    "enabled" if code_scanning_autofix else "disabled"
++                )
++
+             _get_and_submit_form(
+                 session=self._session,
+-                url=_UPDATE_GHAS_SETTINGS_URL.format(
+-                    org_name=org_name,
+-                ),
+-                form_matcher=functools.partial(_form_matcher, name='code_scanning_autofix'),
+-                data_callback=_data_callback
++                url=_UPDATE_GHAS_SETTINGS_URL.format(org_name=org_name),
++                form_matcher=functools.partial(_form_matcher, name="code_scanning_autofix"),
++                data_callback=_data_callback,
+             )
+         if code_scanning_autofix_third_party_tools is not None:
++
+             def _data_callback(data):
+-                data['code_scanning_autofix_third_party_tools'] = 'enabled' if code_scanning_autofix_third_party_tools else 'disabled'
++                data["code_scanning_autofix_third_party_tools"] = (
++                    "enabled"
++                    if code_scanning_autofix_third_party_tools
++                    else "disabled"
++                )
++
+             _get_and_submit_form(
+                 session=self._session,
+-                url=_UPDATE_GHAS_SETTINGS_URL.format(
+-                    org_name=org_name,
++                url=_UPDATE_GHAS_SETTINGS_URL.format(org_name=org_name),
++                form_matcher=functools.partial(
++                    _form_matcher, name="code_scanning_autofix_third_party_tools"
+                 ),
+-                form_matcher=functools.partial(_form_matcher, name='code_scanning_autofix_third_party_tools'),
+-                data_callback=_data_callback
++                data_callback=_data_callback,
+             )
+ 
++
+ if __name__ == "__main__":
+     config = ConfigObj(os.path.expanduser("~/github.ini"), _inspec=True)
+ 
+@@ -324,4 +424,4 @@ if __name__ == "__main__":
+         username=config["username"],
+         password=config["password"],
+         tfa_callback=lambda: pyotp.TOTP(config["otp_seed"]).now(),
+-    )
+\ No newline at end of file
++    )

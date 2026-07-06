@@ -1,0 +1,119 @@
+--- a/ldnlib/base.py
++++ b/ldnlib/base.py
+@@ -1,5 +1,15 @@
++import base64
++import json
++import re
++from collections.abc import Mapping
++
++import urllib3
++
+ from rdflib import Graph, URIRef
+-import requests
++
++
++_HTTP = urllib3.PoolManager()
++_LINK_RE = re.compile(r'<([^>]+)>\s*;\s*rel=\"?([^\";,]+)\"?')
+ 
+ 
+ class BaseLDN(object):
+@@ -14,18 +24,91 @@
+     def __init__(self, **kwargs):
+         self.accept_headers = kwargs.get('accept_headers', self.ACCEPT_HEADERS)
+ 
++    def _basic_auth_header(self, auth):
++        username, password = auth
++        token = base64.b64encode(
++            f'{username}:{password}'.encode('utf-8')
++        ).decode('ascii')
++        return f'Basic {token}'
++
++    def _response_status(self, response):
++        status = getattr(response, 'status_code', None)
++        if not isinstance(status, int):
++            status = getattr(response, 'status', None)
++        return status if isinstance(status, int) else None
++
++    def _response_headers(self, response):
++        headers = getattr(response, 'headers', None)
++        return headers if isinstance(headers, Mapping) else {}
++
++    def _response_text(self, response):
++        text = getattr(response, 'text', None)
++        if isinstance(text, str):
++            return text
++
++        data = getattr(response, 'data', None)
++        if isinstance(data, str):
++            return data
++        if not isinstance(data, (bytes, bytearray)):
++            data = b''
++
++        content_type = self._response_headers(response).get('content-type', '')
++        charset = 'utf-8'
++        for part in content_type.split(';')[1:]:
++            part = part.strip()
++            if part.lower().startswith('charset='):
++                charset = part.split('=', 1)[1].strip().strip('"')
++                break
++        return data.decode(charset, errors='replace')
++
++    def _response_json(self, response):
++        json_method = getattr(response, 'json', None)
++        if callable(json_method):
++            result = json_method()
++            if isinstance(result, (dict, list, str, int, float, bool)) or result is None:
++                return result
++        return json.loads(self._response_text(response))
++
++    def _response_links(self, response):
++        links = getattr(response, 'links', None)
++        if isinstance(links, Mapping):
++            return links
++
++        header = self._response_headers(response).get('link', '')
++        parsed = {}
++        for match in _LINK_RE.finditer(header):
++            parsed[match.group(2)] = {'url': match.group(1)}
++        return parsed
++
++    def _request(self, method, target, **kwargs):
++        headers = dict(kwargs.pop('headers', {}) or {})
++        auth = kwargs.pop('auth', None)
++        if auth is not None:
++            headers['authorization'] = self._basic_auth_header(auth)
++
++        body = kwargs.pop('data', None)
++        allow_redirects = kwargs.pop('allow_redirects', True)
++
++        return _HTTP.request(
++            method,
++            target,
++            headers=headers,
++            body=body,
++            redirect=allow_redirects,
++            **kwargs,
++        )
++
+     def __discover_head(self, target, **kwargs):
+-        r = requests.head(target, **kwargs)
+-        r.raise_for_status()
+-        if self.LDP_INBOX in r.links:
+-            return r.links[self.LDP_INBOX].get('url')
++        r = self._request('HEAD', target, **kwargs)
++        links = self._response_links(r)
++        if self.LDP_INBOX in links:
++            return links[self.LDP_INBOX].get('url')
+ 
+     def __discover_get(self, target, **kwargs):
+-        r = requests.get(target, **kwargs)
+-        r.raise_for_status()
++        r = self._request('GET', target, **kwargs)
+         # TODO -- check for HTML
+-        g = Graph().parse(data=r.text, format=self.content_type_to_mime_type(
+-            r.headers['content-type']))
++        g = Graph().parse(data=self._response_text(r), format=self.content_type_to_mime_type(
++            self._response_headers(r)['content-type']))
+ 
+         for (subject, inbox) in g[:URIRef(self.LDP_INBOX)]:
+             return str(inbox)

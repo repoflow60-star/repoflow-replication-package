@@ -1,0 +1,215 @@
+--- a/srpenergy/client.py
++++ b/srpenergy/client.py
+@@ -4,14 +4,145 @@
+ 
+ """
+ 
++import json
+ from datetime import datetime, timedelta
+ import re
++from types import SimpleNamespace
++from http.cookies import SimpleCookie
+ from urllib.parse import unquote
++from urllib.parse import urlencode
+ 
+ from dateutil.parser import parse
+-import requests
++import urllib3
+ 
+ BASE_USAGE_URL = "https://myaccount.srpnet.com/myaccountapi/api/"
++
++
++class Session:
++    """Minimal session-compatible wrapper backed by urllib3."""
++
++    def __init__(self):
++        self._pool = urllib3.PoolManager()
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc_value, traceback):
++        self.close()
++        return False
++
++    def close(self):
++        clear = getattr(self._pool, "clear", None)
++        if callable(clear):
++            clear()
++
++    def request(self, method, url, data=None, headers=None, **kwargs):
++        body = kwargs.pop("body", None)
++        if body is None and data is not None:
++            body = urlencode(data) if isinstance(data, dict) else data
++
++        request_headers = dict(headers or {})
++        if body is not None and data is not None and not request_headers:
++            request_headers["Content-Type"] = "application/x-www-form-urlencoded"
++
++        request_kwargs = dict(kwargs)
++        if request_headers:
++            request_kwargs["headers"] = request_headers
++        if body is not None:
++            request_kwargs["body"] = body
++
++        return self._pool.request(method, url, **request_kwargs)
++
++    def get(self, url, headers=None, **kwargs):
++        return self.request("GET", url, headers=headers, **kwargs)
++
++    def post(self, url, data=None, headers=None, **kwargs):
++        return self.request("POST", url, data=data, headers=headers, **kwargs)
++
++
++requests = SimpleNamespace(Session=Session)
++
++
++def _response_json(response):
++    """Return a response payload as JSON for urllib3 or mocked responses."""
++    json_method = getattr(response, "json", None)
++    if callable(json_method):
++        return json_method()
++
++    data = getattr(response, "data", None)
++    if isinstance(data, bytes):
++        data = data.decode("utf-8")
++
++    return json.loads(data)
++
++
++def _response_attr(response, name):
++    """Return an instance attribute without creating mock child attributes."""
++    try:
++        return object.__getattribute__(response, name)
++    except AttributeError:
++        return None
++
++
++def _response_set_cookie_headers(response):
++    """Return any Set-Cookie headers from a response."""
++    headers = _response_attr(response, "headers")
++    if headers is None:
++        return []
++
++    getlist = getattr(headers, "getlist", None)
++    if callable(getlist):
++        return list(getlist("set-cookie"))
++
++    if hasattr(headers, "get"):
++        header_value = headers.get("set-cookie") or headers.get("Set-Cookie")
++        if header_value is None:
++            return []
++        if isinstance(header_value, (list, tuple)):
++            return list(header_value)
++        return [header_value]
++
++    return []
++
++
++def _cookie_header(response, existing=None):
++    """Build a merged Cookie header from response cookies."""
++    cookie = SimpleCookie()
++    if existing:
++        cookie.load(existing)
++
++    for header in _response_set_cookie_headers(response):
++        cookie.load(header)
++
++    response_cookies = _response_attr(response, "cookies")
++    if response_cookies is not None and hasattr(response_cookies, "items"):
++        for name, value in response_cookies.items():
++            cookie[name] = getattr(value, "value", value)
++
++    if not cookie:
++        return None
++
++    return "; ".join(f"{morsel.key}={morsel.value}" for morsel in cookie.values())
++
++
++def _cookie_value(response, name):
++    """Return the value of a cookie set on a response."""
++    cookie = SimpleCookie()
++    for header in _response_set_cookie_headers(response):
++        cookie.load(header)
++
++    response_cookies = _response_attr(response, "cookies")
++    if response_cookies is not None:
++        cookie_get = getattr(response_cookies, "get", None)
++        if callable(cookie_get):
++            cookie_value = cookie_get(name)
++            if cookie_value is not None:
++                return cookie_value
++
++    if name not in cookie:
++        return None
++
++    return cookie[name].value
+ 
+ 
+ def get_pretty_date(date_part):
+@@ -187,14 +318,13 @@
+ 
+         """
+         try:
+-
+-            with requests.Session() as session:
++            with Session() as session:
+ 
+                 response = session.post(
+                     BASE_USAGE_URL + "/login/authorize",
+                     data={"username": self.username, "password": self.password},
+                 )
+-                data = response.json()
++                data = _response_json(response)
+ 
+                 valid = data["message"] == "Log in successful."
+ 
+@@ -272,15 +402,32 @@
+             str_startdate = startdate.strftime("%m-%d-%Y")
+             str_enddate = enddate.strftime("%m-%d-%Y")
+ 
+-            with requests.Session() as session:
++            with Session() as session:
+ 
+                 response = session.post(
+                     BASE_USAGE_URL + "login/authorize",
+                     data={"username": self.username, "password": self.password},
+                 )
+ 
+-                response = session.get(BASE_USAGE_URL + "login/antiforgerytoken")
+-                xsrf_token = unquote(response.cookies["xsrf-token"])
++                cookie_header = _cookie_header(response)
++
++                headers = None
++                if cookie_header:
++                    headers = {"Cookie": cookie_header}
++
++                if headers is None:
++                    response = session.get(BASE_USAGE_URL + "login/antiforgerytoken")
++                else:
++                    response = session.get(
++                        BASE_USAGE_URL + "login/antiforgerytoken", headers=headers
++                    )
++
++                cookie_header = _cookie_header(response, cookie_header)
++                xsrf_token = unquote(_cookie_value(response, "xsrf-token"))
++
++                headers = {"x-xsrf-token": xsrf_token}
++                if cookie_header:
++                    headers["Cookie"] = cookie_header
+ 
+                 response = session.get(
+                     BASE_USAGE_URL
+@@ -290,10 +437,10 @@
+                     + str_startdate
+                     + "&endDate="
+                     + str_enddate,
+-                    headers={"x-xsrf-token": xsrf_token},
++                    headers=headers,
+                 )
+ 
+-                data = response.json()
++                data = _response_json(response)
+                 hourly_usage_list = data["hourlyUsageList"]
+ 
+                 usage = []

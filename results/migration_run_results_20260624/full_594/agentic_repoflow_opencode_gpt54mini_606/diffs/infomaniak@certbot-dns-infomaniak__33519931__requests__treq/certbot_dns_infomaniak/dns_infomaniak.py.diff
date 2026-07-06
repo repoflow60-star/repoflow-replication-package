@@ -1,0 +1,171 @@
+--- a/certbot_dns_infomaniak/dns_infomaniak.py
++++ b/certbot_dns_infomaniak/dns_infomaniak.py
+@@ -5,18 +5,156 @@
+ """DNS Authenticator for Infomaniak"""
+ import json
+ import logging
++import threading
++from urllib.parse import urlsplit
++
+ import idna
+ 
+-import requests
++import treq
+ 
+ from certbot import errors
+ from certbot.plugins import dns_common
++from twisted.internet import defer, reactor, threads
+ try:
+     import certbot.compat.os as os
+ except ImportError:
+     import os
+ 
+ logger = logging.getLogger(__name__)
++_reactor_lock = threading.Lock()
++_reactor_thread = None
++_reactor_ready = threading.Event()
++
++
++def _run_reactor():
++    reactor.callWhenRunning(_reactor_ready.set)
++    reactor.run(installSignalHandlers=False)
++
++
++class _ResponseWrapper:
++
++    def __init__(self, body):
++        self._body = body
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc, tb):
++        return False
++
++    def json(self):
++        try:
++            return json.loads(self._body.decode("utf-8"))
++        except (UnicodeDecodeError, json.decoder.JSONDecodeError) as exc:
++            raise errors.PluginError("no JSON in API response") from exc
++
++
++class _PreparedRequest:
++
++    def __init__(self, method, url, headers=None, body=None):
++        self.method = method.upper()
++        self.url = url
++        self._request = self
++        self.headers = headers or {}
++        self.body = body
++        parsed = urlsplit(url)
++        self.scheme = parsed.scheme
++        self.hostname = parsed.hostname
++        self.netloc = parsed.netloc
++        self.path_url = parsed.path + ("?" + parsed.query if parsed.query else "")
++        self.qs = parsed.query
++        self.params = {}
++        self.hooks = {}
++        self.body_position = None
++
++    def copy(self):
++        return _PreparedRequest(self.method, self.url, dict(self.headers), self.body)
++
++    def register_hook(self, event, hook):
++        self.hooks.setdefault(event, []).append(hook)
++
++    def deregister_hook(self, event, hook):
++        hooks = self.hooks.get(event)
++        if hooks and hook in hooks:
++            hooks.remove(hook)
++
++    def prepare_cookies(self, cookies):  # pragma: no cover - compatibility shim
++        return None
++
++
++class _Session:
++
++    def __init__(self, headers):
++        self.headers = headers
++        self._mounts = []
++
++    def mount(self, prefix, adapter):
++        self._mounts.append((prefix, adapter))
++
++    def get(self, url, params=None, headers=None):
++        return self._request("get", url, params=params, headers=headers)
++
++    def post(self, url, data=None, headers=None):
++        return self._request("post", url, data=data, headers=headers)
++
++    def delete(self, url, headers=None):
++        return self._request("delete", url, headers=headers)
++
++    def _request(self, method, url, **kwargs):
++        request_kwargs = dict(kwargs)
++        request_kwargs["headers"] = self._merged_headers(kwargs.get("headers"))
++        adapter = self._adapter_for(url)
++        if adapter is not None:
++            request = _PreparedRequest(
++                method,
++                url,
++                headers=request_kwargs["headers"],
++                body=request_kwargs.get("data"),
++            )
++            return adapter.send(request)
++        return self._request_via_treq(method, url, request_kwargs)
++
++    def _adapter_for(self, url):
++        scheme = urlsplit(url).scheme
++        for prefix, adapter in reversed(self._mounts):
++            if prefix == scheme:
++                return adapter
++        return None
++
++    def _merged_headers(self, headers):
++        request_headers = dict(self.headers)
++        if headers:
++            request_headers.update(headers)
++        return request_headers
++
++    def _request_via_treq(self, method, url, kwargs):
++        self._ensure_reactor()
++        return threads.blockingCallFromThread(
++            reactor,
++            self._request_in_reactor,
++            method,
++            url,
++            kwargs,
++        )
++
++    def _ensure_reactor(self):
++        global _reactor_thread
++        if reactor.running:
++            return
++        with _reactor_lock:
++            if reactor.running:
++                return
++            if _reactor_thread is None or not _reactor_thread.is_alive():
++                _reactor_thread = threading.Thread(target=_run_reactor, daemon=True)
++                _reactor_thread.start()
++        _reactor_ready.wait()
++
++    @defer.inlineCallbacks
++    def _request_in_reactor(self, method, url, kwargs):
++        request = getattr(treq, method)(url, **kwargs)
++        response = yield request
++        body = yield treq.content(response)
++        defer.returnValue(_ResponseWrapper(body))
+ 
+ 
+ class Authenticator(dns_common.DNSAuthenticator):
+@@ -86,8 +224,8 @@
+         :param str token: oauth2 token to consume Infomaniak API
+         """
+         self.token = token
+-        self.session = requests.Session()
+-        self.session.headers.update({"Authorization": "Bearer {token}".format(token=self.token)})
++        self.headers = {"Authorization": "Bearer {token}".format(token=self.token)}
++        self.session = _Session(self.headers)
+ 
+     def _get_request(self, url, payload=None):
+         """Performs a GET request against API

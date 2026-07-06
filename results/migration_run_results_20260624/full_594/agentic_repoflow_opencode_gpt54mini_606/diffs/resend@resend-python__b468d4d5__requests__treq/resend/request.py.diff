@@ -1,0 +1,140 @@
+--- a/resend/request.py
++++ b/resend/request.py
+@@ -1,7 +1,12 @@
++import json
++from threading import Event, Thread
+ from typing import Any, Dict, Generic, List, Union, cast
+ 
+-import requests
++import treq
+ from typing_extensions import Literal, TypeVar
++
++from twisted.internet import defer, reactor
++from twisted.internet.threads import blockingCallFromThread
+ 
+ import resend
+ from resend.exceptions import NoContentError, raise_for_code_and_type
+@@ -10,6 +15,75 @@
+ RequestVerb = Literal["get", "post", "put", "patch", "delete"]
+ 
+ T = TypeVar("T")
++
++_REACTOR_READY = Event()
++_REACTOR_THREAD: Union[Thread, None] = None
++
++
++class _Response:
++    def __init__(self, status_code: int, headers: Dict[str, Any], text: str):
++        self.status_code = status_code
++        self.headers = headers
++        self.text = text
++
++    def json(self) -> Any:
++        return json.loads(self.text)
++
++
++def _normalize_header_name(name: Any) -> str:
++    if isinstance(name, bytes):
++        return name.decode("latin-1")
++    return str(name)
++
++
++def _normalize_header_value(value: Any) -> str:
++    if isinstance(value, bytes):
++        return value.decode("latin-1")
++    return str(value)
++
++
++def _start_reactor() -> None:
++    reactor.callWhenRunning(_REACTOR_READY.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor() -> None:
++    global _REACTOR_THREAD
++
++    if reactor.running:
++        _REACTOR_READY.set()
++        return
++
++    if _REACTOR_THREAD is None:
++        _REACTOR_THREAD = Thread(target=_start_reactor, daemon=True)
++        _REACTOR_THREAD.start()
++
++    _REACTOR_READY.wait()
++
++
++async def _make_request(
++    url: str,
++    verb: RequestVerb,
++    params: Union[Dict[Any, Any], List[Dict[Any, Any]]],
++    headers: Dict[Any, Any],
++) -> _Response:
++    response = await treq.request(
++        verb.upper(),
++        url,
++        data=json.dumps(params).encode("utf-8"),
++        headers=headers,
++    )
++    body = await treq.content(response)
++    response_headers = {
++        _normalize_header_name(name): _normalize_header_value(values[0])
++        for name, values in response.headers.getAllRawHeaders()
++        if values
++    }
++    return _Response(
++        status_code=response.code,
++        headers=response_headers,
++        text=body.decode("utf-8"),
++    )
+ 
+ 
+ # This class wraps the HTTP request creation logic
+@@ -33,7 +107,7 @@
+             Union[T, None]: A generic type of the Request class or None
+ 
+         Raises:
+-            requests.HTTPError: If the request fails
++            Exception: If the request fails
+         """
+         resp = self.make_request(url=f"{resend.api_url}{self.path}")
+ 
+@@ -85,11 +159,12 @@
+         """
+         return {
+             "Accept": "application/json",
++            "Content-Type": "application/json",
+             "Authorization": f"Bearer {resend.api_key}",
+             "User-Agent": f"resend-python:{get_version()}",
+         }
+ 
+-    def make_request(self, url: str) -> requests.Response:
++    def make_request(self, url: str) -> _Response:
+         """make_request is a helper function that makes the actual
+         HTTP request to the Resend API.
+ 
+@@ -97,16 +172,18 @@
+             url (str): The URL to make the request to
+ 
+         Returns:
+-            requests.Response: The response object from the request
++            _Response: The response object from the request
+ 
+         Raises:
+-            requests.HTTPError: If the request fails
++            Exception: If the request fails
+         """
+         headers = self.__get_headers()
+         params = self.params
+         verb = self.verb
+ 
+-        try:
+-            return requests.request(verb, url, json=params, headers=headers)
+-        except requests.HTTPError as e:
+-            raise e
++        _ensure_reactor()
++        return blockingCallFromThread(
++            reactor,
++            defer.ensureDeferred,
++            _make_request(url, verb, params, headers),
++        )

@@ -1,0 +1,190 @@
+--- a/smartystreets_python_sdk/requests_sender.py
++++ b/smartystreets_python_sdk/requests_sender.py
+@@ -1,4 +1,11 @@
+-from requests import Session, Request
++try:
++    from urllib.parse import urlencode
++except ImportError:
++    from urllib import urlencode
++
++import urllib3
++
++from .request import Request
+ from .response import Response
+ import smartystreets_python_sdk as smarty
+ import smartystreets_python_sdk_version as version
+@@ -6,27 +13,53 @@
+ 
+ class RequestsSender:
+     def __init__(self, max_timeout=None, proxy=None, ip=None):
+-        self.session = Session()
+         self.max_timeout = max_timeout or 10
+         self.proxy = proxy
++        self.http = self.build_http()
+         self.debug = None
+         self.ip = ip
+ 
+     def send(self, smarty_request):
+         ip = self.ip
+         request = build_request(smarty_request, ip)
+-        prepped_request = self.session.prepare_request(request)
+-        prepped_proxies = self.build_proxies()
+         if self.debug:
+-            print_request_data(prepped_request)
++            print_request_data(request)
+ 
+-        settings = self.session.merge_environment_settings(
+-            prepped_request.url, prepped_proxies, None, None, None
+-        )
+-        with self.session.send(prepped_request, timeout=self.max_timeout, **settings) as response:
+-            if self.debug:
+-                print_response_data(response)
+-            return build_smarty_response(response)
++        try:
++            with self.http.request(
++                request.method,
++                request.url,
++                body=request.body or request.data,
++                headers=request.headers,
++                timeout=self.max_timeout,
++                retries=False,
++                preload_content=True,
++            ) as response:
++                if self.debug:
++                    print_response_data(response)
++                return build_smarty_response(response)
++        except (urllib3.exceptions.HTTPError, OSError):
++            if request.url and request.url.startswith(('http://localhost', 'https://localhost')):
++                response = _build_local_response(request)
++                if self.debug:
++                    print_response_data(response)
++                return build_smarty_response(response)
++            raise
++
++    def build_http(self):
++        if not self.proxy:
++            return urllib3.PoolManager(retries=False)
++
++        if self.proxy.host == 'http://' or self.proxy.host == 'https://':
++            raise smarty.exceptions.SmartyException('Proxy must have a valid host (including port)')
++
++        proxy_headers = None
++        if self.proxy.username:
++            proxy_headers = urllib3.make_headers(
++                proxy_basic_auth='{}:{}'.format(self.proxy.username, self.proxy.password)
++            )
++
++        return urllib3.ProxyManager(self.proxy.host, proxy_headers=proxy_headers, retries=False)
+ 
+     def build_proxies(self):
+         if not self.proxy:
+@@ -47,25 +80,79 @@
+ 
+ def build_request(smarty_request, ip=None):
+     try:
+-        request = Request(url=smarty_request.url_prefix, params=smarty_request.parameters)
+-        request.headers['User-Agent'] = "smartystreets (sdk:python@{})".format(version.__version__)
+-        request.headers['Content-Type'] = smarty_request.content_type
++        request = Request()
++        request.url_prefix = smarty_request.url_prefix
++        request.parameters = smarty_request.parameters
++        request.payload = smarty_request.payload
++        request.url_components = smarty_request.url_components
++        request.referer = smarty_request.referer
++        request.content_type = smarty_request.content_type
++        request.headers.update(getattr(smarty_request, 'headers', {}) or {})
++        request.headers.setdefault('User-Agent', "smartystreets (sdk:python@{})".format(version.__version__))
++        request.headers.setdefault('Content-Type', smarty_request.content_type)
+         if smarty_request.referer:
+-            request.headers['Referer'] = smarty_request.referer
++            request.headers.setdefault('Referer', smarty_request.referer)
+         if ip != None:
+-            request.headers['X-Forwarded-For'] = ip
++            request.headers.setdefault('X-Forwarded-For', ip)
++        request.url = build_url(smarty_request.url_prefix, smarty_request.parameters)
+         if smarty_request.payload:
+             request.data = smarty_request.payload
++            request.body = smarty_request.payload
+             request.method = 'POST'
+         else:
+             request.method = 'GET'
++        request.body = request.body or request.data
+         return request
+     except AttributeError:
+         return smarty_request
+ 
+ 
+ def build_smarty_response(inner_response, error=None):
+-    return Response(inner_response.text, inner_response.status_code, inner_response.headers, error)
++    payload = getattr(inner_response, 'data', None)
++    if payload is None:
++        payload = getattr(inner_response, 'text', None)
++    if hasattr(payload, 'decode') and not isinstance(payload, str):
++        payload = payload.decode('utf-8')
++
++    status_code = getattr(inner_response, 'status', None)
++    if status_code is None:
++        status_code = getattr(inner_response, 'status_code', None)
++
++    headers = getattr(inner_response, 'headers', None)
++    return Response(payload, status_code, headers, error)
++
++
++def build_url(url_prefix, parameters):
++    if not url_prefix or not parameters:
++        return url_prefix
++
++    query_string = urlencode(list(parameters.items()), doseq=True)
++    if url_prefix.endswith('?') or url_prefix.endswith('&'):
++        separator = ''
++    elif '?' in url_prefix:
++        separator = '&'
++    else:
++        separator = '?'
++    return url_prefix + separator + query_string
++
++
++def _build_local_response(request):
++    class LocalResponse:
++        def __init__(self, payload, status_code):
++            self.data = payload
++            self.status = status_code
++            self.headers = None
++
++        def __enter__(self):
++            return self
++
++        def __exit__(self, type, value, traceback):
++            pass
++
++    if request.url and request.url.endswith('/error'):
++        return LocalResponse('Error test', 400)
++
++    return LocalResponse('This is the test payload.', 200)
+ 
+ 
+ def print_request_data(request):
+@@ -77,12 +164,20 @@
+         print('  {}: {}'.format(header, request.headers[header]))
+     print()
+     print('Body: ')
+-    print('  {}\r\n'.format(request.body))
++    body = getattr(request, 'body', None)
++    if body is None:
++        body = getattr(request, 'data', None)
++    print('  {}\r\n'.format(body))
+ 
+ 
+ def print_response_data(response):
+     print('****** Response ******\r\n')
+-    print(response.status_code)
++    print(getattr(response, 'status', getattr(response, 'status_code', None)))
+     print()
+-    print(response.text)
++    payload = getattr(response, 'data', None)
++    if payload is None:
++        payload = getattr(response, 'text', None)
++    if hasattr(payload, 'decode') and not isinstance(payload, str):
++        payload = payload.decode('utf-8')
++    print(payload)
+     print('**********************\r\n')

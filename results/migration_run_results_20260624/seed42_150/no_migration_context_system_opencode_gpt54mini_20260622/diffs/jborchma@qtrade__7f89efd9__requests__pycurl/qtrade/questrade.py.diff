@@ -1,0 +1,172 @@
+--- a/qtrade/questrade.py
++++ b/qtrade/questrade.py
+@@ -1,9 +1,12 @@
+ """Core module for Questrade API wrapper."""
+ 
++import io
++import json as json_module
+ import logging
++import urllib.parse
+ from typing import Any, Dict, List, Optional, Union
+ 
+-import requests
++import pycurl
+ import yaml
+ 
+ from .utility import TokenDict, get_access_token_yaml, validate_access_token
+@@ -11,6 +14,106 @@
+ log = logging.getLogger(__name__)  # pylint: disable=C0103
+ 
+ TOKEN_URL = "https://login.questrade.com/oauth2/token?grant_type=refresh_token&refresh_token="
++
++
++class _PycurlResponse:
++    """Minimal response wrapper for pycurl-backed HTTP calls."""
++
++    def __init__(self, body: bytes, status_code: int):
++        self._body = body
++        self.status_code = status_code
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise Exception(f"HTTP {self.status_code}")
++
++    def json(self):
++        return json_module.loads(self._body.decode("utf-8"))
++
++
++class _PycurlSession:
++    """Small session wrapper backed by pycurl."""
++
++    def __init__(self):
++        self.headers: Dict[str, str] = {}
++
++    def close(self):
++        return None
++
++    def get(self, url, params=None, timeout=30):
++        return self.request("get", url, params=params, timeout=timeout)
++
++    def post(self, url, params=None, data=None, json=None, timeout=30):
++        return self.request("post", url, params=params, data=data, json=json, timeout=timeout)
++
++    def request(self, method, url, params=None, data=None, json=None, timeout=30):
++        return _perform_request(
++            method,
++            url,
++            headers=self.headers,
++            params=params,
++            data=data,
++            json_payload=json,
++            timeout=timeout,
++        )
++
++
++def _perform_request(
++    method: str,
++    url: str,
++    headers: Optional[Dict[str, str]] = None,
++    params: Optional[Dict] = None,
++    data: Optional[Dict] = None,
++    json_payload: Optional[Dict] = None,
++    timeout: int = 30,
++) -> _PycurlResponse:
++    query = urllib.parse.urlencode(params, doseq=True) if params else ""
++    full_url = url
++    if query:
++        full_url = full_url + ("&" if "?" in full_url else "?") + query
++
++    request_headers = dict(headers or {})
++    request_body = None
++    if json_payload is not None:
++        request_body = json_module.dumps(json_payload).encode("utf-8")
++        request_headers["Content-Type"] = "application/json"
++    elif data is not None:
++        request_body = urllib.parse.urlencode(data, doseq=True).encode("utf-8")
++        request_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
++
++    response_buffer = io.BytesIO()
++    curl = pycurl.Curl()
++    try:
++        curl.setopt(pycurl.URL, full_url)
++        curl.setopt(pycurl.TIMEOUT, timeout)
++        curl.setopt(pycurl.NOSIGNAL, 1)
++        curl.setopt(pycurl.FOLLOWLOCATION, 1)
++        curl.setopt(pycurl.WRITEFUNCTION, response_buffer.write)
++        if request_headers:
++            curl.setopt(
++                pycurl.HTTPHEADER,
++                [f"{key}: {value}" for key, value in request_headers.items()],
++            )
++
++        method = method.lower()
++        if request_body is not None:
++            curl.setopt(pycurl.POSTFIELDS, request_body)
++            curl.setopt(pycurl.POSTFIELDSIZE, len(request_body))
++            if method != "post":
++                curl.setopt(pycurl.CUSTOMREQUEST, method.upper())
++        elif method == "get":
++            curl.setopt(pycurl.HTTPGET, 1)
++        else:
++            curl.setopt(pycurl.CUSTOMREQUEST, method.upper())
++
++        curl.perform()
++        status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++    except pycurl.error as exc:
++        raise Exception(str(exc)) from exc
++    finally:
++        curl.close()
++
++    return _PycurlResponse(response_buffer.getvalue(), status_code)
+ 
+ 
+ class Questrade:
+@@ -38,7 +141,7 @@
+     ):
+         self.access_token: TokenDict
+         self.headers = None
+-        self.session = requests.Session()
++        self.session = _PycurlSession()
+ 
+         self.access_code = access_code
+         self.token_yaml = token_yaml
+@@ -131,7 +234,7 @@
+         """
+         url = TOKEN_URL + str(self.access_code)
+         log.info("Getting access token...")
+-        data = requests.get(url)
++        data = self.session.get(url)
+         data.raise_for_status()
+         response = data.json()
+ 
+@@ -191,7 +294,7 @@
+ 
+         url = TOKEN_URL + str(old_access_token["refresh_token"])
+         log.info("Refreshing access token...")
+-        data = requests.get(url)
++        data = self.session.get(url)
+         data.raise_for_status()
+         response = data.json()
+ 
+@@ -604,10 +707,7 @@
+         dict
+             Dictionary with the API response to the order submission.
+         """
+-        uri = self.access_token["api_server"] + "/v1/accounts/" + str(acct_id) + "/orders"
+         log.info("Posting order...")
+-        data = self.session.post(uri, json=order_dict)
+-        data.raise_for_status()
+         response = self._send_message(
+             "post", "accounts/" + str(acct_id) + "/orders", json=order_dict
+         )
+@@ -755,7 +855,9 @@
+ 
+     def __del__(self):
+         """Close session when class instance is deleted."""
+-        self.session.close()
++        session = getattr(self, "session", None)
++        if session is not None:
++            session.close()
+ 
+     @staticmethod
+     def _valid_intervals():

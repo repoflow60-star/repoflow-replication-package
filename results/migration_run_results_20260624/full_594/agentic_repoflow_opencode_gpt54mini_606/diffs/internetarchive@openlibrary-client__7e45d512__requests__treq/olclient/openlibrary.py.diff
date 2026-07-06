@@ -1,0 +1,292 @@
+--- a/olclient/openlibrary.py
++++ b/olclient/openlibrary.py
+@@ -2,18 +2,21 @@
+ 
+ 
+ import json
+-from typing import List, Dict, Optional, Any
+-
+-import jsonschema
+ import logging
+ import os
+ import re
+-from urllib.parse import urlencode
++import threading
++from http.cookiejar import Cookie, CookieJar
++from http.cookies import SimpleCookie
++from typing import List, Dict, Optional, Any
++from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+ from urllib.request import pathname2url
+ 
+ import backoff
+-import requests
+-from requests import Response
++import jsonschema
++import treq
++from twisted.internet import reactor, threads
++from urllib3.filepost import encode_multipart_formdata
+ 
+ from olclient import common
+ from olclient.config import Config
+@@ -21,6 +24,210 @@
+ from olclient.utils import merge_unique_lists
+ 
+ logger = logging.getLogger('openlibrary')
++
++
++class OpenLibraryRequestError(Exception):
++    def __init__(self, message, response=None):
++        super().__init__(message)
++        self.response = response
++
++
++class _CookieJar(CookieJar):
++    def __len__(self):
++        return sum(1 for _ in self)
++
++
++_REACTOR_STARTED = threading.Event()
++_REACTOR_THREAD = None
++
++
++def _run_reactor():
++    reactor.callWhenRunning(_REACTOR_STARTED.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor_running():
++    global _REACTOR_THREAD
++    if reactor.running:
++        return
++    if _REACTOR_THREAD is None or not _REACTOR_THREAD.is_alive():
++        _REACTOR_STARTED.clear()
++        _REACTOR_THREAD = threading.Thread(target=_run_reactor, daemon=True)
++        _REACTOR_THREAD.start()
++        _REACTOR_STARTED.wait()
++
++
++def _merge_query_params(url, params):
++    if not params:
++        return url
++    parts = list(urlsplit(url))
++    current = dict(parse_qsl(parts[3], keep_blank_values=True))
++    current.update(params)
++    parts[3] = urlencode(current, doseq=True)
++    return urlunsplit(parts)
++
++
++class _TreqResponse:
++    def __init__(self, session, response, url):
++        self._session = session
++        self._response = response
++        self.url = url
++        self.code = response.code
++        self.status_code = response.code
++        self.headers = response.headers
++        self._body = None
++
++    def _load_body(self):
++        if self._body is None:
++            self._body = self._session._call_in_reactor(treq.content, self._response)
++        return self._body
++
++    def json(self):
++        return json.loads(self._load_body().decode('utf-8'))
++
++    def raise_for_status(self):
++        if self.code >= 400:
++            raise OpenLibraryRequestError(f'HTTP {self.code} for {self.url}', response=self)
++
++
++class _TreqSession:
++    REDIRECT_CODES = {301, 302, 303, 307, 308}
++
++    def __init__(self):
++        self.cookies = _CookieJar()
++
++    def _call_in_reactor(self, func, *args, **kwargs):
++        _ensure_reactor_running()
++        try:
++            return threads.blockingCallFromThread(reactor, func, *args, **kwargs)
++        except OpenLibraryRequestError:
++            raise
++        except Exception as exc:
++            raise OpenLibraryRequestError(str(exc)) from exc
++
++    def _store_cookies(self, response, url):
++        cookie_headers = response.headers.getRawHeaders('Set-Cookie', [])
++        if not cookie_headers:
++            return
++        parsed_url = urlsplit(url)
++        domain = parsed_url.hostname or ''
++        for cookie_header in cookie_headers:
++            if isinstance(cookie_header, bytes):
++                cookie_header = cookie_header.decode('utf-8')
++            simple = SimpleCookie()
++            simple.load(cookie_header)
++            for name, morsel in simple.items():
++                self.cookies.set_cookie(
++                    Cookie(
++                        version=0,
++                        name=name,
++                        value=morsel.value,
++                        port=None,
++                        port_specified=False,
++                        domain=domain,
++                        domain_specified=bool(domain),
++                        domain_initial_dot=domain.startswith('.'),
++                        path=morsel['path'] or '/',
++                        path_specified=True,
++                        secure=bool(morsel['secure']),
++                        expires=None,
++                        discard=True,
++                        comment=None,
++                        comment_url=None,
++                        rest={},
++                        rfc2109=False,
++                    )
++                )
++
++    def _prepare_request(self, url, data=None, json_data=None, headers=None, files=None, params=None):
++        request_headers = dict(headers or {})
++        request_url = _merge_query_params(url, params)
++
++        if json_data is not None:
++            request_headers.setdefault('Content-Type', 'application/json')
++            data = json.dumps(json_data)
++
++        if files is not None:
++            fields = []
++            if isinstance(data, dict):
++                fields.extend(data.items())
++            elif data is not None:
++                fields.append(('data', data))
++            fields.extend(files.items())
++            body, content_type = encode_multipart_formdata(fields)
++            request_headers.setdefault('Content-Type', content_type)
++            data = body
++        elif isinstance(data, dict):
++            request_headers.setdefault('Content-Type', 'application/x-www-form-urlencoded')
++            data = urlencode(data, doseq=True)
++
++        if isinstance(data, str):
++            data = data.encode('utf-8')
++
++        return request_url, data, request_headers
++
++    def _request_once(self, method, url, data=None, json=None, headers=None, files=None, params=None, **kwargs):
++        request_url, request_data, request_headers = self._prepare_request(
++            url,
++            data=data,
++            json_data=json,
++            headers=headers,
++            files=files,
++            params=params,
++        )
++
++        def _submit():
++            return treq.request(
++                method,
++                request_url,
++                headers=request_headers or None,
++                data=request_data,
++                cookies=self.cookies,
++                **kwargs,
++            )
++
++        response = self._call_in_reactor(_submit)
++        wrapped = _TreqResponse(self, response, request_url)
++        self._store_cookies(response, request_url)
++        return wrapped
++
++    def _follow_redirects(self, method, response, **kwargs):
++        current_method = method
++        current_response = response
++        current_kwargs = dict(kwargs)
++
++        for _ in range(10):
++            if current_response.code not in self.REDIRECT_CODES:
++                return current_response
++            location = current_response.headers.getRawHeaders('Location', [None])[0]
++            if not location:
++                return current_response
++            if isinstance(location, bytes):
++                location = location.decode('utf-8')
++            next_url = urljoin(current_response.url, location)
++            if current_response.code in (301, 302, 303) and current_method.upper() not in ('GET', 'HEAD'):
++                current_method = 'GET'
++                current_kwargs = {
++                    'headers': current_kwargs.get('headers'),
++                    'params': current_kwargs.get('params'),
++                }
++            current_response = self._request_once(current_method, next_url, **current_kwargs)
++        return current_response
++
++    def request(self, method, url, allow_redirects=True, **kwargs):
++        response = self._request_once(method, url, **kwargs)
++        if allow_redirects:
++            response = self._follow_redirects(method, response, **kwargs)
++        return response
++
++    def get(self, url, **kwargs):
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, data=None, **kwargs):
++        return self.request('POST', url, data=data, **kwargs)
++
++    def put(self, url, data=None, **kwargs):
++        return self.request('PUT', url, data=data, **kwargs)
+ 
+ 
+ class OpenLibrary:
+@@ -51,9 +258,10 @@
+     VALID_IDS = ['isbn_10', 'isbn_13', 'lccn', 'ocaid']
+     BACKOFF_KWARGS = {
+         'wait_gen': backoff.expo,
+-        'exception': requests.exceptions.RequestException,
+-        'giveup': lambda e: hasattr(e.response, 'status_code')
+-        and 400 <= e.response.status_code < 500,
++        'exception': OpenLibraryRequestError,
++        'giveup': lambda e: hasattr(e, 'response')
++        and getattr(e.response, 'status_code', getattr(e.response, 'code', 0))
++        and 400 <= getattr(e.response, 'status_code', getattr(e.response, 'code', 0)) < 500,
+         'max_tries': 5,
+     }
+ 
+@@ -62,16 +270,14 @@
+     WORKS_PAGINATION_OFFSET = 0
+ 
+     def __init__(self, credentials=None, base_url='https://openlibrary.org'):
+-        self.session = requests.Session()
++        self.session = _TreqSession()
+         self.base_url = base_url
+         credentials = credentials or Config().get_config().get('s3', None)
+         if credentials:
+             self.login(credentials)
+ 
+     def login(self, credentials):
+-        """Login to Open Library with given credentials, ensures the requests
+-        session has valid cookies for future requests.
+-        """
++        """Login to Open Library with given credentials and keep session cookies."""
+ 
+         if 'username' in credentials._asdict():
+             headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+@@ -119,7 +325,7 @@
+         url = self._generate_url_from_olid(olid)
+         return self.session.put(url, data=data)
+ 
+-    def save_many(self, docs, comment) -> Response:
++    def save_many(self, docs, comment) -> Any:
+         """
+         Uses the Open Library save_many API endpoint to
+         write any number or combination of documents (Edition, Work, or Author)
+@@ -135,7 +341,7 @@
+             f'{self.base_url}/api/save_many', json.dumps(doc_json), headers=headers
+         )
+ 
+-    def delete_many(self, ol_ids: List[str], comment: str) -> Response:
++    def delete_many(self, ol_ids: List[str], comment: str) -> Any:
+         return self.save_many(
+             [self.Delete(ol_id) for ol_id in ol_ids],
+             comment=comment

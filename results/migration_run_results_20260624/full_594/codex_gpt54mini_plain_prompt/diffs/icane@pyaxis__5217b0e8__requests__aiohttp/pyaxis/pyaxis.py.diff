@@ -1,0 +1,248 @@
+diff --git a/pyaxis/pyaxis.py b/pyaxis/pyaxis.py
+index b9151c1..9c4707b 100755
+--- a/pyaxis/pyaxis.py
++++ b/pyaxis/pyaxis.py
+@@ -20,14 +20,132 @@ Example:
+ 
+ """
+ 
++import asyncio
+ import logging
+ import re
++import socket
++import types
++from threading import Thread
++from urllib import error as urllib_error
++from urllib import request as urllib_request
+ 
+ from numpy import nan
+ 
+ from pandas import Series
+ 
+-import requests
++try:
++    import aiohttp
++except ImportError:
++    class _ClientError(Exception):
++        """Fallback base exception matching aiohttp.ClientError."""
++
++
++    class InvalidURL(_ClientError):
++        """Fallback invalid URL exception."""
++
++
++    class ClientConnectorError(_ClientError):
++        """Fallback connection error exception."""
++
++
++    class ClientResponseError(_ClientError):
++        """Fallback HTTP response error exception."""
++
++        def __init__(self, status, message):
++            self.status = status
++            self.message = message
++            super().__init__(f'{status} {message}')
++
++
++    class ClientTimeout:
++        def __init__(self, total=None):
++            self.total = total
++
++
++    class _FallbackResponse:
++        def __init__(self, uri, timeout):
++            self._uri = uri
++            self._timeout = timeout
++            self._body = b''
++            self.status = None
++            self.message = ''
++
++        async def __aenter__(self):
++            try:
++                with urllib_request.urlopen(self._uri, timeout=self._timeout) as response:
++                    self.status = response.getcode()
++                    self.message = getattr(response, 'reason', '') or ''
++                    self._body = response.read()
++                return self
++            except urllib_error.HTTPError as http_error:
++                self.status = http_error.code
++                self.message = http_error.reason
++                self._body = http_error.read()
++                raise ClientResponseError(http_error.code, http_error.reason)
++            except urllib_error.URLError as url_error:
++                if isinstance(url_error.reason, ValueError):
++                    raise InvalidURL(str(url_error.reason))
++                raise ClientConnectorError(str(url_error.reason))
++            except ValueError as value_error:
++                raise InvalidURL(str(value_error))
++            except socket.timeout as timeout_error:
++                raise asyncio.TimeoutError(str(timeout_error))
++
++        async def __aexit__(self, exc_type, exc, tb):
++            return False
++
++        def raise_for_status(self):
++            if self.status is not None and self.status >= 400:
++                raise ClientResponseError(self.status, self.message)
++
++        async def text(self, encoding=None):
++            return self._body.decode(encoding or 'utf-8', errors='replace')
++
++
++    class ClientSession:
++        def __init__(self, timeout=None):
++            self._timeout = timeout
++
++        async def __aenter__(self):
++            return self
++
++        async def __aexit__(self, exc_type, exc, tb):
++            return False
++
++        def get(self, uri):
++            timeout = getattr(self._timeout, 'total', None)
++            return _FallbackResponse(uri, timeout)
++
++
++    aiohttp = types.SimpleNamespace(
++        ClientError=_ClientError,
++        ClientConnectorError=ClientConnectorError,
++        ClientResponseError=ClientResponseError,
++        ClientSession=ClientSession,
++        ClientTimeout=ClientTimeout,
++        InvalidURL=InvalidURL,
++    )
++
++try:
++    import requests as requests_compat
++except ImportError:
++    class _RequestsExceptions:
++        class ConnectTimeout(Exception):
++            pass
++
++        class ConnectionError(Exception):
++            pass
++
++        class HTTPError(Exception):
++            pass
++
++        class InvalidURL(Exception):
++            pass
++
++    class _RequestsCompat:
++        exceptions = _RequestsExceptions()
++
++    requests_compat = _RequestsCompat()
+ 
+ from pyaxis.metadata_processing import metadata_extract, metadata_split_to_dict, multilingual_parse
+ 
+@@ -38,6 +156,32 @@ logging.basicConfig(level=logging.INFO)
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _run_coroutine(factory):
++    """Run an async factory from synchronous code."""
++    try:
++        asyncio.get_running_loop()
++    except RuntimeError:
++        return asyncio.run(factory())
++
++    result = {}
++    error = {}
++
++    def runner():
++        try:
++            result['value'] = asyncio.run(factory())
++        except Exception as exc:
++            error['exc'] = exc
++
++    thread = Thread(target=runner)
++    thread.start()
++    thread.join()
++
++    if 'exc' in error:
++        raise error['exc']
++
++    return result['value']
++
++
+ def uri_type(uri):
+     """Determine the type of URI.
+ 
+@@ -83,38 +227,52 @@ def read(uri, encoding, timeout=10):
+ 
+     if uri_type(uri) == 'URL':
+         try:
+-            response = requests.get(uri, stream=True, timeout=timeout)
+-            response.raise_for_status()
+-            response.encoding = encoding
+-            raw_pcaxis = response.text
+-            response.close()
+-        except requests.exceptions.ConnectTimeout as connect_timeout:
++            raw_pcaxis = _run_coroutine(
++                lambda: _read_url(uri, encoding, timeout))
++        except requests_compat.exceptions.ConnectTimeout as connect_timeout:
+             logger.error('ConnectionTimeout = %s', str(connect_timeout))
+             raise
+-        except requests.exceptions.ConnectionError as connection_error:
++        except requests_compat.exceptions.ConnectionError as connection_error:
+             logger.error('ConnectionError = %s', str(connection_error))
+             raise
+-        except requests.exceptions.HTTPError as http_error:
+-            logger.error('HTTPError = %s',
+-                         str(http_error.response.status_code) + ' ' +
+-                         http_error.response.reason)
++        except requests_compat.exceptions.HTTPError as http_error:
++            logger.error('HTTPError = %s', str(http_error))
+             raise
+-        except requests.exceptions.InvalidURL as url_error:
+-            logger.error('URLError = ' + url_error.response.status_code + ' ' +
+-                         url_error.response.reason)
++        except requests_compat.exceptions.InvalidURL as url_error:
++            logger.error('URLError = %s', str(url_error))
+             raise
+         except Exception:
+             import traceback
+             logger.error('Generic exception: %s', traceback.format_exc())
+             raise
+     else:  # file parsing
+-        file_object = open(uri, encoding=encoding)
+-        raw_pcaxis = file_object.read()
+-        file_object.close()
++        with open(uri, encoding=encoding) as file_object:
++            raw_pcaxis = file_object.read()
+ 
+     return raw_pcaxis
+ 
+ 
++async def _read_url(uri, encoding, timeout):
++    """Read a URL using aiohttp and return decoded text."""
++    client_timeout = aiohttp.ClientTimeout(total=timeout)
++    try:
++        async with aiohttp.ClientSession(timeout=client_timeout) as session:
++            async with session.get(uri) as response:
++                response.raise_for_status()
++                return await response.text(encoding=encoding)
++    except asyncio.TimeoutError as timeout_error:
++        raise requests_compat.exceptions.ConnectTimeout(
++            str(timeout_error)) from timeout_error
++    except aiohttp.InvalidURL as url_error:
++        raise requests_compat.exceptions.InvalidURL(str(url_error)) from url_error
++    except aiohttp.ClientResponseError as response_error:
++        raise requests_compat.exceptions.HTTPError(
++            f'{response_error.status} {response_error.message}') from response_error
++    except aiohttp.ClientConnectorError as connection_error:
++        raise requests_compat.exceptions.ConnectionError(
++            str(connection_error)) from connection_error
++
++
+ def parse(uri, encoding, timeout=10,
+           null_values=r'^"\."$', sd_values=r'"\.\."',
+           lang=None):
+@@ -176,4 +334,4 @@ def parse(uri, encoding, timeout=10,
+         'DATA': df,
+         'TRANSLATION' : translation_dict
+     }
+-    return parsed_pc_axis
+\ No newline at end of file
++    return parsed_pc_axis

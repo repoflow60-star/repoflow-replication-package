@@ -1,0 +1,130 @@
+--- a/segment/analytics/request.py
++++ b/segment/analytics/request.py
+@@ -3,14 +3,105 @@
+ from gzip import GzipFile
+ import logging
+ import json
++import threading
++import time
+ from dateutil.tz import tzutc
+-from requests.auth import HTTPBasicAuth
+-from requests import sessions
++import treq
++from twisted.internet import reactor
++from twisted.internet.defer import CancelledError, Deferred, TimeoutError as DeferredTimeoutError
++from twisted.internet.threads import blockingCallFromThread
++from twisted.web._newclient import ResponseNeverReceived
+ 
+ from segment.analytics.version import VERSION
+ from segment.analytics.utils import remove_trailing_slash
+ 
+-_session = sessions.Session()
++_session = treq
++_reactor_thread = None
++_reactor_lock = threading.Lock()
++
++
++class _HeaderMap(object):
++    def __init__(self, raw_headers):
++        self._headers = {}
++        if not raw_headers:
++            return
++
++        for key, values in raw_headers:
++            if not values:
++                continue
++            value = values[0]
++            if isinstance(key, bytes):
++                key = key.decode('latin-1')
++            if isinstance(value, bytes):
++                value = value.decode('latin-1')
++            self._headers[key.lower()] = value
++
++    def get(self, key, default=None):
++        return self._headers.get(key.lower(), default)
++
++
++class _Response(object):
++    def __init__(self, response, body):
++        self.status_code = response.code
++        self.reason = getattr(response, 'phrase', '') or ''
++        if isinstance(self.reason, bytes):
++            self.reason = self.reason.decode('latin-1')
++        self.headers = _HeaderMap(response.headers.getAllRawHeaders())
++        self._body = body or b''
++
++    @property
++    def text(self):
++        return self._body.decode('utf-8', errors='replace')
++
++    def json(self):
++        return json.loads(self._body.decode('utf-8'))
++
++
++def _ensure_reactor_running():
++    global _reactor_thread
++
++    if reactor.running:
++        return
++
++    with _reactor_lock:
++        if reactor.running:
++            return
++        if _reactor_thread and _reactor_thread.is_alive():
++            return
++
++        _reactor_thread = threading.Thread(
++            target=reactor.run,
++            kwargs={'installSignalHandlers': False},
++            daemon=True,
++        )
++        _reactor_thread.start()
++        while _reactor_thread.is_alive() and not reactor.running:
++            time.sleep(0.01)
++
++
++def _request(method, url, data=None, headers=None, timeout=None, proxies=None):
++    _ensure_reactor_running()
++
++    def _call():
++        result = _session.post(url, data=data, headers=headers)
++        if timeout is not None and isinstance(result, Deferred):
++            result.addTimeout(timeout, reactor)
++        if isinstance(result, Deferred):
++            def _with_body(response):
++                body = treq.content(response)
++                if isinstance(body, Deferred):
++                    body.addCallback(lambda content: _Response(response, content))
++                    return body
++                return _Response(response, body)
++
++            result.addCallback(_with_body)
++            return result
++        return result
++
++    try:
++        return blockingCallFromThread(reactor, _call)
++    except (CancelledError, DeferredTimeoutError, ResponseNeverReceived) as e:
++        raise TimeoutError(str(e))
+ 
+ 
+ def post(write_key, host=None, gzip=False, timeout=15, proxies=None, oauth_manager=None, **kwargs):
+@@ -42,17 +133,9 @@
+             gz.write(data.encode('utf-8'))
+         data = buf.getvalue()
+ 
+-    kwargs = {
+-        "data": data,
+-        "headers": headers,
+-        "timeout": 15,
+-    }
+-
+-    if proxies:
+-        kwargs['proxies'] = proxies
+     res = None
+     try:
+-        res = _session.post(url, data=data, headers=headers, timeout=timeout)
++        res = _request('POST', url, data=data, headers=headers, timeout=timeout, proxies=proxies)
+     except Exception as e:
+         log.error(e)
+         raise e

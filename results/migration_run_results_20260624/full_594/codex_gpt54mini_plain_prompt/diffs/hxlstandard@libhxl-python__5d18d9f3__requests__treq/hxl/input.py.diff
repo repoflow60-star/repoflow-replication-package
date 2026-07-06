@@ -1,0 +1,369 @@
+diff --git a/hxl/input.py b/hxl/input.py
+index 19af971..b1394ad 100644
+--- a/hxl/input.py
++++ b/hxl/input.py
+@@ -33,9 +33,29 @@ from hxl.util import logup
+ 
+ import abc, collections, csv, datetime, dateutil.parser, hashlib, \
+     io, io_wrapper, json, jsonpath_ng.ext, logging, \
+-    os.path, re, requests, shutil, six, sys, \
++    os.path, re, shutil, six, sys, \
+     tempfile, time, urllib.parse, xlrd3 as xlrd, zipfile
+ 
++try:
++    import asyncio
++    from twisted.internet import asyncioreactor
++    _HTTP_LOOP = asyncio.new_event_loop()
++    asyncio.set_event_loop(_HTTP_LOOP)
++    try:
++        asyncioreactor.install(_HTTP_LOOP)
++    except Exception:
++        _HTTP_LOOP = None
++        treq = None
++    import treq
++except Exception:
++    treq = None
++    _HTTP_LOOP = None
++
++try:
++    import requests as _requests
++except Exception:
++    _requests = None
++
+ logger = logging.getLogger(__name__)
+ 
+ __all__ = (
+@@ -166,6 +186,149 @@ CSV_MIME_TYPES = (
+ )
+ 
+ 
++########################################################################
++# Internal HTTP helpers
++########################################################################
++
++
++class _CaseInsensitiveHeaders(dict):
++    """Minimal case-insensitive header mapping."""
++
++    def __setitem__(self, key, value):
++        super().__setitem__(str(key).lower(), value)
++
++    def __getitem__(self, key):
++        return super().__getitem__(str(key).lower())
++
++    def get(self, key, default=None):
++        return super().get(str(key).lower(), default)
++
++
++class _HTTPResponse:
++    """Lightweight response wrapper shared by the HTTP helpers."""
++
++    def __init__(self, url, status_code, headers=None, content=b""):
++        self.url = url
++        self.status_code = status_code
++        self.headers = _CaseInsensitiveHeaders(headers or {})
++        self.content = content or b""
++
++    @property
++    def is_redirect(self):
++        return 300 <= self.status_code < 400 and self.headers.get("location") is not None
++
++    def json(self):
++        return json.loads(self.content.decode("utf-8"))
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise HXLIOException(
++                "HTTP {} for {}".format(self.status_code, self.url),
++                url=self.url,
++            )
++
++
++def _normalize_header_name(name):
++    if isinstance(name, bytes):
++        return name.decode("latin1")
++    return str(name)
++
++
++def _normalize_header_value(value):
++    if isinstance(value, bytes):
++        return value.decode("latin1")
++    return str(value)
++
++
++def _headers_from_treq(raw_headers):
++    headers = _CaseInsensitiveHeaders()
++    if hasattr(raw_headers, "getAllRawHeaders"):
++        for key, values in raw_headers.getAllRawHeaders():
++            headers[_normalize_header_name(key)] = ", ".join(
++                _normalize_header_value(value) for value in values
++            )
++    else:
++        for key, value in dict(raw_headers).items():
++            headers[_normalize_header_name(key)] = _normalize_header_value(value)
++    return headers
++
++
++def _join_url_params(url, params):
++    if not params:
++        return url
++    parsed = urllib.parse.urlsplit(url)
++    query = urllib.parse.urlencode(params, doseq=True)
++    if parsed.query:
++        query = parsed.query + "&" + query
++    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, parsed.fragment))
++
++
++def _encode_request_data(data):
++    if data is None:
++        return None
++    if isinstance(data, (bytes, bytearray)):
++        return bytes(data)
++    if isinstance(data, str):
++        return data.encode("utf-8")
++    return urllib.parse.urlencode(data, doseq=True).encode("utf-8")
++
++
++async def _request_with_treq(method, url, verify_ssl=True, timeout=None, headers=None, params=None, data=None):
++    request_url = _join_url_params(url, params)
++    request_kwargs = {}
++    if headers:
++        request_kwargs["headers"] = headers
++    if timeout is not None:
++        request_kwargs["timeout"] = timeout
++    request_data = _encode_request_data(data)
++    if request_data is not None:
++        request_kwargs["data"] = request_data
++    response = await treq.request(method, request_url, **request_kwargs)
++    body = b""
++    if method.upper() != "HEAD":
++        body = await treq.content(response)
++    return _HTTPResponse(
++        request_url,
++        getattr(response, "code", getattr(response, "status", None)),
++        _headers_from_treq(response.headers),
++        body,
++    )
++
++
++def _request(method, url, verify_ssl=True, timeout=None, headers=None, params=None, data=None):
++    if treq is not None and _HTTP_LOOP is not None and verify_ssl is not False:
++        return _HTTP_LOOP.run_until_complete(
++            _request_with_treq(
++                method,
++                url,
++                verify_ssl=verify_ssl,
++                timeout=timeout,
++                headers=headers,
++                params=params,
++                data=data,
++            )
++        )
++
++    if _requests is None:
++        raise HXLIOException("No HTTP client available")
++
++    request_url = _join_url_params(url, params)
++    response = _requests.request(
++        method,
++        request_url,
++        stream=(method.upper() != "HEAD"),
++        verify=verify_ssl,
++        timeout=timeout,
++        headers=headers,
++        data=data,
++    )
++    return _HTTPResponse(request_url, response.status_code, response.headers, response.content)
++
++
++def _get_json(url, verify_ssl=True, timeout=None, headers=None, params=None, data=None):
++    return _request("GET", url, verify_ssl=verify_ssl, timeout=timeout, headers=headers, params=params, data=data).json()
++
++
+ ########################################################################
+ # Exported functions
+ ########################################################################
+@@ -621,10 +784,10 @@ def open_url_or_file(url_or_filename, input_options):
+         try:
+             url = munge_url(url_or_filename, input_options)
+             logup("Trying to open remote resource", {"url": url_or_filename})
+-            response = requests.get(
++            response = _request(
++                "GET",
+                 url,
+-                stream=True,
+-                verify=input_options.verify_ssl,
++                verify_ssl=input_options.verify_ssl,
+                 timeout=input_options.timeout,
+                 headers=input_options.http_headers
+             )
+@@ -653,7 +816,6 @@ def open_url_or_file(url_or_filename, input_options):
+             except:
+                 content_length = None
+ 
+-        # return (RequestResponseIOWrapper(response), mime_type, file_ext, encoding, content_length, fileno,)
+         return (io.BytesIO(response.content), mime_type, file_ext, encoding, content_length, fileno,)
+ 
+     elif input_options.allow_local:
+@@ -817,82 +979,6 @@ class InputOptions:
+         self.scan_ckan_resources = scan_ckan_resources
+ 
+ 
+-# Deprecated - will remove in future release
+-class RequestResponseIOWrapper(io.RawIOBase):
+-    """Wrapper for a Response object from the requests library.  Streaming
+-    in requests is a bit broken: for example, if you're streaming, the
+-    stream from the raw property doesn't unzip the payload.
+-    """
+-
+-    BUFFER_SIZE = 0x1000
+-    """Size of input chunk buffer from requests.raw.iter_content"""
+-
+-    def __init__(self, response):
+-        """Construct a wrapper around a requests response object
+-        @param response: the HTTP response from the requests library
+-        """
+-        self.response = response
+-        self.buffer = None
+-        self.buffer_pos = -1
+-        self.iter = response.iter_content(self.BUFFER_SIZE) # iterator through the input
+-
+-    def read(self, size=-1):
+-        """Read raw byte input from the requests raw.iter_content iterator
+-        The function will unzip zipped content.
+-        @param size: the maximum number of bytes to read, or -1 for all available.
+-        """
+-        result = bytearray()
+-
+-        if size == -1:
+-            # Read all of the content at once
+-            for chunk in self.iter:
+-                result += chunk
+-            self.buffer = None
+-        else:
+-            # Read from chunks until we have enough content
+-            while size > 0:
+-                if not self.buffer:
+-                    try:
+-                        self.buffer = next(self.iter)
+-                    except StopIteration:
+-                         # stop if we've run out of input
+-                        break
+-                    self.buffer_pos = 0
+-                avail = min(len(self.buffer)-self.buffer_pos, size) #actually read
+-                result += self.buffer[self.buffer_pos:self.buffer_pos+avail]
+-                size -= avail
+-                self.buffer_pos += avail
+-                if self.buffer_pos >= len(self.buffer):
+-                    self.buffer = None
+-
+-        return bytes(result) # FIXME - how can we avoid a copy?
+-
+-    def readinto(self, b):
+-        """Read content into a buffer of some kind.
+-        This is not very efficient right now -- too much copying.
+-        @param b: the buffer to read into (will read up to its length)
+-        """
+-        result = self.read(len(b))[:len(b)]
+-        size = len(result)
+-        b[:size] = result[:size]
+-        return size
+-
+-    def readable(self):
+-        """Flag whether the content is readable."""
+-        try:
+-            return self.response.raw.readable()
+-        except:
+-            return True
+-
+-    @property
+-    def content_type(self):
+-        return self.response.headers.get('Content-type')
+-
+-    def close(self):
+-        """Close the streaming response."""
+-        return self.response.close()
+-
+-
+ class AbstractInput(object):
+     """Abstract base class for input classes.
+ 
+@@ -1641,7 +1727,7 @@ def munge_url(url, input_options):
+     """
+ 
+     #
+-    # Stage 1: unpack indirect links (requires extra HTTP requests)
++    # Stage 1: unpack indirect links (requires extra HTTP fetches)
+     #
+ 
+     # Is it a CKAN resource? (Assumes the v.3 API for now)
+@@ -1654,7 +1740,7 @@ def munge_url(url, input_options):
+     result = re.match(GOOGLE_DRIVE_URL, url)
+     if result:
+         logup("HEAD request for Google Drive URL", {"url": url})
+-        response = requests.head(url)
++        response = _request("HEAD", url)
+         if response.is_redirect:
+             new_url = response.headers['Location']
+             logup("Google Drive redirect", {"url": url, "redirect": new_url})
+@@ -1749,7 +1835,7 @@ def _get_ckan_urls(site_url, dataset_id, resource_id, input_options):
+         # CKAN resource URL
+         ckan_api_query = '{}/api/3/action/resource_show?id={}'.format(site_url, resource_id)
+         logup("Trying CKAN API call", {"url": ckan_api_query})
+-        ckan_api_result = requests.get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
++        ckan_api_result = _get_json(ckan_api_query, verify_ssl=input_options.verify_ssl, headers=input_options.http_headers)
+         if ckan_api_result['success']:
+             url = ckan_api_result['result']['url']
+             logup("Found candidate URL for CKAN dataset", {"url": url})
+@@ -1772,7 +1858,7 @@ def _get_ckan_urls(site_url, dataset_id, resource_id, input_options):
+     else:
+         # CKAN dataset (package) URL
+         ckan_api_query = '{}/api/3/action/package_show?id={}'.format(site_url, dataset_id)
+-        ckan_api_result = requests.get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
++        ckan_api_result = _get_json(ckan_api_query, verify_ssl=input_options.verify_ssl, headers=input_options.http_headers)
+         if ckan_api_result['success']:
+             for resource in ckan_api_result['result']['resources']:
+                 url = resource['url']
+@@ -1822,9 +1908,10 @@ def _get_kobo_url(asset_id, url, input_options, max_export_age_seconds=14400):
+         "q": "source:{}".format(asset_id)
+     }
+     logup("Trying Kobo dataset", {"url": asset_id})
+-    response = requests.get(
++    response = _request(
++        "GET",
+         "https://kobo.humanitarianresponse.info/exports/",
+-        verify=input_options.verify_ssl,
++        verify_ssl=input_options.verify_ssl,
+         headers=input_options.http_headers,
+         params=params
+     )
+@@ -1858,10 +1945,11 @@ def _get_kobo_url(asset_id, url, input_options, max_export_age_seconds=14400):
+         "hierarchy_in_labels": False,
+         "group_sep": ",",
+     }
+-    response = requests.post(
++    response = _request(
++        "POST",
+         "https://kobo.humanitarianresponse.info/exports/",
+-        verify=input_options.verify_ssl,
+-        headers=http_headers,
++        verify_ssl=input_options.verify_ssl,
++        headers=input_options.http_headers,
+         data=params
+     )
+     logup("Generated Kobo export", {"asset_id": asset_id, "status": response.status_code})
+@@ -1878,10 +1966,11 @@ def _get_kobo_url(asset_id, url, input_options, max_export_age_seconds=14400):
+     fail_counter = 0
+     while True:
+         logup("Getting info for Kobo export", {"url": info_url})
+-        response = requests.get(
++        response = _request(
++            "GET",
+             info_url,
+-            verify=input_options.verify_ssl,
+-            headers=http_headers
++            verify_ssl=input_options.verify_ssl,
++            headers=input_options.http_headers
+         )
+         logup("Response for Kobo info", {"url": info_url, "status": response.status_code})
+ 

@@ -1,0 +1,230 @@
+--- a/kling/kling.py
++++ b/kling/kling.py
+@@ -1,14 +1,16 @@
+ import argparse
++import json as json_module
+ import os
+ import time
+ import contextlib
+ from typing import Optional
+ from enum import Enum
+ from http.cookies import SimpleCookie
++from io import BytesIO
++from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+ 
+ from fake_useragent import UserAgent
+-import requests
+-from requests.utils import cookiejar_from_dict
++import pycurl
+ from rich import print
+ import threading
+ 
+@@ -18,7 +20,131 @@
+ base_url_not_cn = "https://klingai.com/"
+ 
+ 
+-def call_for_daily_check(session: requests.Session, is_cn: bool) -> bool:
++class Response:
++    def __init__(self, status_code: int, body: bytes, headers: Optional[dict] = None) -> None:
++        self.status_code = status_code
++        self.content = body
++        self.text = body.decode("utf-8", errors="replace")
++        self.headers = headers or {}
++
++    @property
++    def ok(self) -> bool:
++        return 200 <= self.status_code < 400
++
++    def json(self):
++        return json_module.loads(self.text)
++
++    def __str__(self) -> str:
++        return f"<Response [{self.status_code}]>"
++
++
++class Session:
++    def __init__(self) -> None:
++        self.headers = {}
++        self.cookies = {}
++
++    def _cookie_header(self) -> str:
++        return "; ".join(f"{key}={value}" for key, value in self.cookies.items())
++
++    @staticmethod
++    def _merge_params(url: str, params) -> str:
++        if not params:
++            return url
++        parsed = urlsplit(url)
++        query_items = list(parse_qsl(parsed.query, keep_blank_values=True))
++        if hasattr(params, "items"):
++            query_items.extend((str(key), str(value)) for key, value in params.items())
++        else:
++            query_items.extend((str(key), str(value)) for key, value in params)
++        return urlunsplit(
++            (
++                parsed.scheme,
++                parsed.netloc,
++                parsed.path,
++                urlencode(query_items, doseq=True),
++                parsed.fragment,
++            )
++        )
++
++    def _request(self, method: str, url: str, params=None, data=None, json=None, headers=None) -> Response:
++        final_url = self._merge_params(url, params)
++        request_headers = [f"{key}: {value}" for key, value in self.headers.items()]
++        if headers:
++            request_headers.extend(f"{key}: {value}" for key, value in headers.items())
++        cookie_header = self._cookie_header()
++        if cookie_header:
++            request_headers.append(f"Cookie: {cookie_header}")
++
++        body = None
++        if json is not None:
++            body = json_module.dumps(json).encode("utf-8")
++            if not any(header.lower().startswith("content-type:") for header in request_headers):
++                request_headers.append("Content-Type: application/json")
++        elif data is not None:
++            body = data.encode("utf-8") if isinstance(data, str) else data
++
++        buffer = BytesIO()
++        response_headers = {}
++
++        def capture_header(line):
++            text = line.decode("iso-8859-1").strip()
++            if not text or text.startswith("HTTP/"):
++                return len(line)
++            if ":" in text:
++                key, value = text.split(":", 1)
++                key = key.strip().lower()
++                value = value.strip()
++                response_headers[key] = value
++                if key == "set-cookie":
++                    cookie = SimpleCookie()
++                    cookie.load(value)
++                    for name, morsel in cookie.items():
++                        self.cookies[name] = morsel.value
++            return len(line)
++
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, final_url)
++            curl.setopt(pycurl.FOLLOWLOCATION, 1)
++            curl.setopt(pycurl.NOSIGNAL, 1)
++            curl.setopt(pycurl.WRITEFUNCTION, buffer.write)
++            curl.setopt(pycurl.HEADERFUNCTION, capture_header)
++            if request_headers:
++                curl.setopt(pycurl.HTTPHEADER, request_headers)
++            if method == "POST":
++                curl.setopt(pycurl.POST, 1)
++                if body is None:
++                    body = b""
++                curl.setopt(pycurl.POSTFIELDS, body)
++                curl.setopt(pycurl.POSTFIELDSIZE, len(body))
++            elif method == "GET":
++                curl.setopt(pycurl.HTTPGET, 1)
++            else:
++                curl.setopt(pycurl.CUSTOMREQUEST, method)
++                if body is not None:
++                    curl.setopt(pycurl.POSTFIELDS, body)
++                    curl.setopt(pycurl.POSTFIELDSIZE, len(body))
++            curl.perform()
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        finally:
++            curl.close()
++
++        return Response(status_code, buffer.getvalue(), response_headers)
++
++    def get(self, url: str, params=None, headers=None) -> Response:
++        return self._request("GET", url, params=params, headers=headers)
++
++    def post(self, url: str, params=None, data=None, json=None, headers=None) -> Response:
++        return self._request("POST", url, params=params, data=data, json=json, headers=headers)
++
++    def request(self, method: str, url: str, **kwargs) -> Response:
++        return self._request(method.upper(), url, **kwargs)
++
++    def close(self) -> None:
++        return None
++
++
++def call_for_daily_check(session: Session, is_cn: bool) -> bool:
+     if is_cn:
+         r = session.get(f"{base_url}api/pay/reward?activity=login_bonus_daily")
+     else:
+@@ -39,8 +165,8 @@
+ 
+ 
+ class BaseGen:
+-    def __init__(self, cookie: str) -> None:
+-        self.session: requests.Session = requests.Session()
++    def __init__(self, cookie: str, session: Optional[Session] = None) -> None:
++        self.session: Session = session or Session()
+         self.cookie = cookie
+         self.session.cookies, is_cn = self.parse_cookie_string(self.cookie)
+         self.session.headers["user-agent"] = ua.random
+@@ -72,16 +198,12 @@
+         cookie = SimpleCookie()
+         cookie.load(cookie_string)
+         cookies_dict = {}
+-        cookiejar = None
+         is_cn = False
+         for key, morsel in cookie.items():
+             if key.startswith("kuaishou"):
+                 is_cn = True
+             cookies_dict[key] = morsel.value
+-            cookiejar = cookiejar_from_dict(
+-                cookies_dict, cookiejar=None, overwrite=True
+-            )
+-        return cookiejar, is_cn
++        return cookies_dict, is_cn
+ 
+     def get_account_point(self) -> float:
+         bonus_req = self.session.get(self.daily_url)
+@@ -139,12 +261,13 @@
+     def fetch_metadata(self, task_id: str) -> tuple[dict, TaskStatus]:
+         url = f"{self.base_url}api/task/status?taskId={task_id}"
+         response = self.session.get(url)
+-        data = response.json().get("data")
++        data = response.json().get("data") or {}
+         assert data is not None
+         # this is very interesting it use resolution to check if the image is ready
+-        if data.get("status") >= 90:
++        status = data.get("status") or 0
++        if status >= 90:
+             return data, TaskStatus.COMPLETED
+-        elif data.get("status") in [9, 50]:
++        elif status in [9, 50]:
+             return data, TaskStatus.FAILED
+         else:
+             return data, TaskStatus.PENDING
+@@ -216,10 +339,11 @@
+             print(response.text)
+             raise Exception(f"Error response {str(response)}")
+         response_body = response.json()
+-        if response_body.get("data").get("status") == 7:
+-            message = response_body.get("data").get("message")
++        response_data = response_body.get("data") or {}
++        if response_data.get("status") == 7:
++            message = response_data.get("message")
+             raise Exception(f"Request failed message {message}")
+-        request_id = response_body.get("data", {}).get("task", {}).get("id")
++        request_id = (response_data.get("task") or {}).get("id")
+ 
+         if not request_id:
+             raise Exception("Could not get request ID")
+@@ -486,10 +610,11 @@
+             print(response.text)
+             raise Exception(f"Error response {str(response)}")
+         response_body = response.json()
+-        if response_body.get("data").get("status") == 7:
+-            message = response_body.get("data").get("message")
++        response_data = response_body.get("data") or {}
++        if response_data.get("status") == 7:
++            message = response_data.get("message")
+             raise Exception(f"Request failed message {message}")
+-        request_id = (response_body.get("data", {}).get("task") or {}).get("id")
++        request_id = (response_data.get("task") or {}).get("id")
+         if not request_id:
+             raise Exception("Could not get request ID")
+         start_wait = time.time()

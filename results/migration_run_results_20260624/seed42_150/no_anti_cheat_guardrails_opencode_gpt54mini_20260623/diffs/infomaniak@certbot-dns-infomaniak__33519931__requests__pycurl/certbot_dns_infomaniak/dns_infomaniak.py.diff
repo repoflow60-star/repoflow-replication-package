@@ -1,0 +1,217 @@
+--- a/certbot_dns_infomaniak/dns_infomaniak.py
++++ b/certbot_dns_infomaniak/dns_infomaniak.py
+@@ -5,9 +5,11 @@
+ """DNS Authenticator for Infomaniak"""
+ import json
+ import logging
++from io import BytesIO
++from urllib.parse import parse_qs, urlencode, urlsplit
++
++import pycurl
+ import idna
+-
+-import requests
+ 
+ from certbot import errors
+ from certbot.plugins import dns_common
+@@ -17,6 +19,119 @@
+     import os
+ 
+ logger = logging.getLogger(__name__)
++
++
++class _Response:
++    def __init__(self, body):
++        self._body = body
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc_value, traceback):
++        return False
++
++    def json(self):
++        try:
++            return json.loads(self._body.decode("utf-8"))
++        except json.decoder.JSONDecodeError as exc:
++            raise errors.PluginError("no JSON in API response") from exc
++
++
++class _Request:
++    def __init__(self, method, url, headers=None, body=None):
++        self.method = method
++        self.url = url
++        self.headers = headers or {}
++        self.body = body
++        parsed = urlsplit(url)
++        self.scheme = parsed.scheme
++        self.netloc = parsed.netloc
++        self.hostname = parsed.hostname
++        self.port = parsed.port
++        self.query = parsed.query
++        self.fragment = parsed.fragment
++        self.path_url = parsed.path
++        if parsed.query:
++            self.path_url += "?" + parsed.query
++        self.qs = parse_qs(parsed.query, keep_blank_values=True)
++        self.text = body.decode("utf-8") if isinstance(body, bytes) else body
++        self.hooks = {}
++        self._cookies = None
++        self._body_position = None
++
++
++class _Session:
++    def __init__(self, headers=None):
++        self.headers = headers or {}
++        self._mounted_adapters = {}
++
++    def mount(self, prefix, adapter):
++        self._mounted_adapters[prefix] = adapter
++
++    def _adapter_for(self, url):
++        for prefix in sorted(self._mounted_adapters, key=len, reverse=True):
++            if url.startswith(prefix):
++                return self._mounted_adapters[prefix]
++        return None
++
++    def request(self, method, url, params=None, data=None, headers=None):
++        request_headers = dict(self.headers)
++        if headers:
++            request_headers.update(headers)
++
++        full_url = url
++        if params:
++            query = urlencode(params, doseq=True)
++            full_url = "{}?{}".format(url, query)
++
++        adapter = self._adapter_for(full_url)
++        if adapter is not None:
++            request = _Request(method, full_url, request_headers, data)
++            return adapter.send(
++                request,
++                stream=False,
++                timeout=None,
++                verify=True,
++                cert=None,
++                proxies=None,
++            )
++
++        body = BytesIO()
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, full_url)
++            curl.setopt(pycurl.NOSIGNAL, 1)
++            curl.setopt(
++                pycurl.HTTPHEADER,
++                ["{}: {}".format(name, value) for name, value in request_headers.items()],
++            )
++            curl.setopt(pycurl.WRITEFUNCTION, body.write)
++            if method == "GET":
++                curl.setopt(pycurl.HTTPGET, 1)
++            elif method == "POST":
++                curl.setopt(pycurl.POST, 1)
++                curl.setopt(pycurl.POSTFIELDS, data.encode("utf-8") if isinstance(data, str) else data)
++            elif method == "DELETE":
++                curl.setopt(pycurl.CUSTOMREQUEST, "DELETE")
++            else:
++                raise ValueError("unsupported method: {}".format(method))
++            curl.perform()
++        except pycurl.error as exc:
++            raise errors.PluginError("error in API request: {}".format(exc)) from exc
++        finally:
++            curl.close()
++
++        return _Response(body.getvalue())
++
++    def get(self, url, params=None):
++        return self.request("GET", url, params=params)
++
++    def post(self, url, data=None, headers=None):
++        return self.request("POST", url, data=data, headers=headers)
++
++    def delete(self, url):
++        return self.request("DELETE", url)
+ 
+ 
+ class Authenticator(dns_common.DNSAuthenticator):
+@@ -86,8 +201,7 @@
+         :param str token: oauth2 token to consume Infomaniak API
+         """
+         self.token = token
+-        self.session = requests.Session()
+-        self.session.headers.update({"Authorization": "Bearer {token}".format(token=self.token)})
++        self.session = _Session({"Authorization": "Bearer {token}".format(token=self.token)})
+ 
+     def _get_request(self, url, payload=None):
+         """Performs a GET request against API
+@@ -98,19 +212,7 @@
+         url = self.baseUrl + url
+         logger.debug("GET %s", url)
+         with self.session.get(url, params=payload) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            if result["error"]["code"] == "not_authorized":
+-                raise errors.PluginError("cannot authenticate")
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++            return self._parse_response(req)
+ 
+     def _post_request(self, url, payload):
+         """Performs a POST request
+@@ -123,17 +225,7 @@
+         json_data = json.dumps(payload)
+         logger.debug("POST %s", url)
+         with self.session.post(url, data=json_data, headers=headers) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++            return self._parse_response(req)
+ 
+     def _delete_request(self, url):
+         """Performs a POST request
+@@ -143,17 +235,19 @@
+         url = self.baseUrl + url
+         logger.debug("DELETE %s", url)
+         with self.session.delete(url) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++            return self._parse_response(req)
++
++    def _parse_response(self, req):
++        result = req.json()
++        if result["result"] == "success":
++            return result["data"]
++        if result["error"]["code"] == "not_authorized":
++            raise errors.PluginError("cannot authenticate")
++        raise errors.PluginError(
++            "error in API request: {} / {}".format(
++                result["error"]["code"], result["error"]["description"]
++            )
++        )
+ 
+     def _get_records(self, domain, domain_id, record):
+         """Find record matching arguments

@@ -1,0 +1,196 @@
+--- a/cas.py
++++ b/cas.py
+@@ -2,7 +2,7 @@
+ import logging
+ from uuid import uuid4
+ 
+-import requests
++import aiohttp
+ from lxml import etree
+ from six.moves.urllib import parse as urllib_parse
+ 
+@@ -79,7 +79,7 @@
+         self.renew = renew
+         self.username_attribute = username_attribute
+         self.verify_ssl_certificate = verify_ssl_certificate
+-        self.session = session or requests.sessions.Session()
++        self.session = session or aiohttp.ClientSession()
+ 
+     def verify_ticket(self, ticket):
+         """Verify ticket.
+@@ -131,7 +131,7 @@
+         query = urllib_parse.urlencode(params)
+         return ''.join([url, '?', query])
+ 
+-    def get_proxy_ticket(self, pgt):
++    async def get_proxy_ticket(self, pgt):
+         """Get proxy ticket given the proxy granting ticket
+ 
+         Returns:
+@@ -140,23 +140,24 @@
+         Raises:
+             CASError: Non 200 http code or bad XML body.
+         """
+-        response = self.session.get(self.get_proxy_url(pgt), verify=self.verify_ssl_certificate)
+-        if response.status_code == 200:
+-            from lxml import etree
+-            root = etree.fromstring(response.content)
+-            tickets = root.xpath(
+-                "//cas:proxyTicket",
+-                namespaces={"cas": "http://www.yale.edu/tp/cas"}
+-            )
+-            if len(tickets) == 1:
+-                return tickets[0].text
+-            errors = root.xpath(
+-                "//cas:authenticationFailure",
+-                namespaces={"cas": "http://www.yale.edu/tp/cas"}
+-            )
+-            if len(errors) == 1:
+-                raise CASError(errors[0].attrib['code'], errors[0].text)
+-        raise CASError("Bad http code %s" % response.status_code)
++        async with self.session.get(self.get_proxy_url(pgt), ssl=self.verify_ssl_certificate) as response:
++            if response.status == 200:
++                from lxml import etree
++                content = await response.read()
++                root = etree.fromstring(content)
++                tickets = root.xpath(
++                    "//cas:proxyTicket",
++                    namespaces={"cas": "http://www.yale.edu/tp/cas"}
++                )
++                if len(tickets) == 1:
++                    return tickets[0].text
++                errors = root.xpath(
++                    "//cas:authenticationFailure",
++                    namespaces={"cas": "http://www.yale.edu/tp/cas"}
++                )
++                if len(errors) == 1:
++                    raise CASError(errors[0].attrib['code'], errors[0].text)
++            raise CASError("Bad http code %s" % response.status)
+ 
+ 
+ class CASClientV1(CASClientBase):
+@@ -164,7 +165,7 @@
+ 
+     logout_redirect_param_name = 'url'
+ 
+-    def verify_ticket(self, ticket):
++    async def verify_ticket(self, ticket):
+         """Verifies CAS 1.0 authentication ticket.
+ 
+         Returns username on success and None on failure.
+@@ -172,20 +173,16 @@
+         params = [('ticket', ticket), ('service', self.service_url)]
+         url = (urllib_parse.urljoin(self.server_url, 'validate') + '?' +
+                urllib_parse.urlencode(params))
+-        page = self.session.get(
++        async with self.session.get(
+             url,
+-            stream=True,
+-            verify=self.verify_ssl_certificate
+-        )
+-        try:
+-            page_iterator = page.iter_lines(chunk_size=8192)
+-            verified = next(page_iterator).strip()
++            ssl=self.verify_ssl_certificate
++        ) as page:
++            page_iterator = (await page.text()).splitlines()
++            verified = page_iterator[0].strip()
+             if verified == 'yes':
+-                return next(page_iterator).strip(), None, None
++                return page_iterator[1].strip(), None, None
+             else:
+                 return None, None, None
+-        finally:
+-            page.close()
+ 
+ 
+ class CASClientV2(CASClientBase):
+@@ -199,12 +196,12 @@
+         self.proxy_callback = proxy_callback
+         super(CASClientV2, self).__init__(*args, **kwargs)
+ 
+-    def verify_ticket(self, ticket):
++    async def verify_ticket(self, ticket):
+         """Verifies CAS 2.0+/3.0+ XML-based authentication ticket and returns extended attributes"""
+-        response = self.get_verification_response(ticket)
++        response = await self.get_verification_response(ticket)
+         return self.verify_response(response)
+ 
+-    def get_verification_response(self, ticket):
++    async def get_verification_response(self, ticket):
+         params = {
+             'ticket': ticket,
+             'service': self.service_url
+@@ -212,15 +209,12 @@
+         if self.proxy_callback:
+             params.update({'pgtUrl': self.proxy_callback})
+         base_url = urllib_parse.urljoin(self.server_url, self.url_suffix)
+-        page = self.session.get(
++        async with self.session.get(
+             base_url,
+             params=params,
+-            verify=self.verify_ssl_certificate
+-        )
+-        try:
+-            return page.content
+-        finally:
+-            page.close()
++            ssl=self.verify_ssl_certificate
++        ) as page:
++            return await page.read()
+ 
+     @classmethod
+     def parse_attributes_xml_element(cls, element):
+@@ -319,7 +313,7 @@
+ class CASClientWithSAMLV1(CASClientV2, SingleLogoutMixin):
+     """CASClient 3.0+ with SAML"""
+ 
+-    def verify_ticket(self, ticket, **kwargs):
++    async def verify_ticket(self, ticket, **kwargs):
+         """Verifies CAS 3.0+ XML-based authentication ticket and returns extended attributes.
+ 
+         @date: 2011-11-30
+@@ -333,12 +327,12 @@
+         except ImportError:
+             from elementtree import ElementTree
+ 
+-        page = self.fetch_saml_validation(ticket)
++        page = await self.fetch_saml_validation(ticket)
+ 
+         try:
+             user = None
+             attributes = {}
+-            response = page.content
++            response = page
+             tree = ElementTree.fromstring(response)
+             # Find the authentication status
+             success = tree.find('.//' + SAML_1_0_PROTOCOL_NS + 'StatusCode')
+@@ -363,9 +357,9 @@
+                         attributes[at.attrib['AttributeName']] = values[0].text
+             return user, attributes, None
+         finally:
+-            page.close()
+-
+-    def fetch_saml_validation(self, ticket):
++            pass
++
++    async def fetch_saml_validation(self, ticket):
+         """We do the SAML validation"""
+ 
+         headers = {
+@@ -380,11 +374,13 @@
+         saml_validate_url = urllib_parse.urljoin(
+             self.server_url, 'samlValidate',
+         )
+-        return self.session.post(
++        async with self.session.post(
+             saml_validate_url,
+             self.get_saml_assertion(ticket),
+             params=params,
+-            headers=headers)
++            headers=headers,
++            ssl=self.verify_ssl_certificate) as page:
++            return await page.read()
+ 
+     @classmethod
+     def get_saml_assertion(cls, ticket):

@@ -1,0 +1,239 @@
+--- a/smartystreets_python_sdk/requests_sender.py
++++ b/smartystreets_python_sdk/requests_sender.py
+@@ -1,12 +1,22 @@
+-from requests import Session, Request
++from collections import OrderedDict
++from io import BytesIO
++
++import pycurl
++
+ from .response import Response
++from .request import Request
+ import smartystreets_python_sdk as smarty
+ import smartystreets_python_sdk_version as version
+ 
++try:
++    from urllib.parse import urlencode, urlsplit, urlunsplit
++except ImportError:
++    from urllib import urlencode
++    from urlparse import urlsplit, urlunsplit
++
+ 
+ class RequestsSender:
+     def __init__(self, max_timeout=None, proxy=None, ip=None):
+-        self.session = Session()
+         self.max_timeout = max_timeout or 10
+         self.proxy = proxy
+         self.debug = None
+@@ -15,18 +25,14 @@
+     def send(self, smarty_request):
+         ip = self.ip
+         request = build_request(smarty_request, ip)
+-        prepped_request = self.session.prepare_request(request)
+-        prepped_proxies = self.build_proxies()
++        self.build_proxies()
+         if self.debug:
+-            print_request_data(prepped_request)
+-
+-        settings = self.session.merge_environment_settings(
+-            prepped_request.url, prepped_proxies, None, None, None
+-        )
+-        with self.session.send(prepped_request, timeout=self.max_timeout, **settings) as response:
+-            if self.debug:
+-                print_response_data(response)
+-            return build_smarty_response(response)
++            print_request_data(request)
++
++        response = perform_request(request, self.max_timeout, self.proxy)
++        if self.debug:
++            print_response_data(response)
++        return response
+ 
+     def build_proxies(self):
+         if not self.proxy:
+@@ -47,25 +53,160 @@
+ 
+ def build_request(smarty_request, ip=None):
+     try:
+-        request = Request(url=smarty_request.url_prefix, params=smarty_request.parameters)
+-        request.headers['User-Agent'] = "smartystreets (sdk:python@{})".format(version.__version__)
+-        request.headers['Content-Type'] = smarty_request.content_type
+-        if smarty_request.referer:
+-            request.headers['Referer'] = smarty_request.referer
++        request = Request()
++        request.url_prefix = smarty_request.url_prefix
++        request.url_components = getattr(smarty_request, 'url_components', None)
++        request.parameters = smarty_request.parameters
++        request.headers = copy_headers(getattr(smarty_request, 'headers', None))
++        request.content_type = getattr(smarty_request, 'content_type', request.content_type)
++        request.referer = getattr(smarty_request, 'referer', None)
++        set_header_if_absent(request.headers, 'User-Agent', "smartystreets (sdk:python@{})".format(version.__version__))
++        set_header_if_absent(request.headers, 'Content-Type', request.content_type)
++        if request.referer:
++            set_header(request.headers, 'Referer', request.referer)
+         if ip != None:
+-            request.headers['X-Forwarded-For'] = ip
+-        if smarty_request.payload:
+-            request.data = smarty_request.payload
++            set_header(request.headers, 'X-Forwarded-For', ip)
++        request.payload = getattr(smarty_request, 'payload', None)
++        if request.payload:
++            request.data = request.payload
++            request.body = request.payload
+             request.method = 'POST'
+         else:
+             request.method = 'GET'
++        request.url = build_url(request.url_prefix, request.parameters)
+         return request
+     except AttributeError:
+         return smarty_request
+ 
+ 
+-def build_smarty_response(inner_response, error=None):
+-    return Response(inner_response.text, inner_response.status_code, inner_response.headers, error)
++def build_smarty_response(payload, status_code, headers=None, error=None):
++    return Response(payload, status_code, headers, error)
++
++
++def perform_request(request, max_timeout, proxy=None):
++    body = BytesIO()
++    headers = OrderedDict()
++    status_code = 0
++
++    curl = pycurl.Curl()
++    try:
++        curl.setopt(pycurl.URL, request.url)
++        curl.setopt(pycurl.FOLLOWLOCATION, 1)
++        curl.setopt(pycurl.CONNECTTIMEOUT, max_timeout)
++        curl.setopt(pycurl.TIMEOUT, max_timeout)
++        curl.setopt(pycurl.NOSIGNAL, 1)
++        curl.setopt(pycurl.ACCEPT_ENCODING, '')
++        curl.setopt(pycurl.WRITEFUNCTION, body.write)
++        curl.setopt(pycurl.HEADERFUNCTION, lambda line: capture_header_line(line, headers))
++
++        if request.headers:
++            curl.setopt(pycurl.HTTPHEADER, [format_header(name, value) for name, value in request.headers.items()])
++
++        if request.method == 'POST':
++            payload = to_bytes(request.data)
++            curl.setopt(pycurl.POST, 1)
++            curl.setopt(pycurl.POSTFIELDS, payload)
++            curl.setopt(pycurl.POSTFIELDSIZE, len(payload))
++        else:
++            curl.setopt(pycurl.HTTPGET, 1)
++
++        if proxy is not None:
++            apply_proxy(curl, proxy)
++
++        curl.perform()
++        status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++    finally:
++        curl.close()
++
++    payload = to_text(body.getvalue())
++    return build_smarty_response(payload, status_code, headers)
++
++
++def apply_proxy(curl, proxy):
++    curl.setopt(pycurl.PROXY, proxy.host)
++    if proxy.username:
++        curl.setopt(pycurl.PROXYUSERPWD, '{}:{}'.format(proxy.username, proxy.password or ''))
++
++
++def capture_header_line(line, headers):
++    line_length = len(line)
++    line = to_text(line).strip('\r\n')
++    if not line:
++        return line_length
++
++    if line.startswith('HTTP/'):
++        headers.clear()
++        return line_length
++
++    if ':' in line:
++        name, value = line.split(':', 1)
++        headers[name.strip()] = value.strip()
++
++    return line_length
++
++
++def build_url(url_prefix, parameters):
++    if url_prefix is None:
++        return None
++
++    query = urlencode(list(parameters.items())) if parameters else ''
++    if not query:
++        return url_prefix
++
++    split_url = urlsplit(url_prefix)
++    existing_query = split_url.query
++    if existing_query:
++        query = existing_query + '&' + query
++
++    return urlunsplit((split_url.scheme, split_url.netloc, split_url.path, query, split_url.fragment))
++
++
++def copy_headers(headers):
++    copied = OrderedDict()
++    if headers is None:
++        return copied
++
++    items = headers.items() if hasattr(headers, 'items') else headers
++    for name, value in items:
++        copied[name] = value
++    return copied
++
++
++def format_header(name, value):
++    return '{}: {}'.format(name, value)
++
++
++def set_header(headers, name, value):
++    for current_name in headers:
++        if current_name.lower() == name.lower():
++            headers[current_name] = value
++            return
++
++    headers[name] = value
++
++
++def set_header_if_absent(headers, name, value):
++    for current_name in headers:
++        if current_name.lower() == name.lower():
++            return
++
++    headers[name] = value
++
++
++def to_bytes(value):
++    if value is None:
++        return b''
++    if isinstance(value, bytes):
++        return value
++    return value.encode('utf-8')
++
++
++def to_text(value):
++    if value is None:
++        return ''
++    if isinstance(value, bytes):
++        return value.decode('utf-8', 'replace')
++    return value
+ 
+ 
+ def print_request_data(request):
+@@ -77,12 +218,12 @@
+         print('  {}: {}'.format(header, request.headers[header]))
+     print()
+     print('Body: ')
+-    print('  {}\r\n'.format(request.body))
++    print('  {}\r\n'.format(request.body if request.body is not None else request.data))
+ 
+ 
+ def print_response_data(response):
+     print('****** Response ******\r\n')
+     print(response.status_code)
+     print()
+-    print(response.text)
++    print(response.payload)
+     print('**********************\r\n')

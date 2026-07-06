@@ -1,0 +1,132 @@
+--- a/wikipediaapi/__init__.py
++++ b/wikipediaapi/__init__.py
+@@ -8,14 +8,17 @@
+ 
+ __version__ = (0, 7, 1)
+ 
++import asyncio
+ from collections import defaultdict
+ from enum import IntEnum
+ import logging
+ import re
++import ssl
++import threading
+ from typing import Any, Optional, Union
+ from urllib import parse
+ 
+-import requests
++import aiohttp
+ 
+ USER_AGENT = (
+     "Wikipedia-API/"
+@@ -24,6 +27,14 @@
+ )
+ 
+ log = logging.getLogger(__name__)
++
++
++class _SessionState:
++    def __init__(self, headers: dict[str, Any]) -> None:
++        self.headers = headers
++
++    def close(self) -> None:
++        pass
+ 
+ 
+ # https://www.mediawiki.org/wiki/API:Main_page
+@@ -140,7 +151,7 @@
+         """
+         Constructs Wikipedia object for extracting information Wikipedia.
+ 
+-        :param user_agent: HTTP User-Agent used in requests
++        :param user_agent: HTTP User-Agent used for HTTP calls
+                 https://meta.wikimedia.org/wiki/User-Agent_policy
+         :param language: Language mutation of Wikipedia -
+                 http://meta.wikimedia.org/wiki/List_of_Wikipedias
+@@ -148,7 +159,7 @@
+                 :class:`ExtractFormat` object.
+         :param headers:  Headers sent as part of HTTP request
+         :param kwargs: Optional parameters used in -
+-                http://docs.python-requests.org/en/master/api/#requests.request
++                https://docs.aiohttp.org/en/stable/client_reference.html
+ 
+         Examples:
+ 
+@@ -188,8 +199,7 @@
+             self.extract_format,
+         )
+ 
+-        self._session = requests.Session()
+-        self._session.headers.update(default_headers)
++        self._session = _SessionState(default_headers)
+         self._request_kwargs = kwargs
+ 
+     def __del__(self) -> None:
+@@ -526,8 +536,65 @@
+         )
+         params["format"] = "json"
+         params["redirects"] = 1
+-        r = self._session.get(base_url, params=params, **self._request_kwargs)
+-        return r.json()
++        return self._run_async(self._query_json(base_url, params))
++
++    def _run_async(self, coro):
++        try:
++            asyncio.get_running_loop()
++        except RuntimeError:
++            return asyncio.run(coro)
++
++        result = {}
++        error = {}
++
++        def runner():
++            try:
++                result["value"] = asyncio.run(coro)
++            except BaseException as exc:
++                error["exc"] = exc
++
++        thread = threading.Thread(target=runner)
++        thread.start()
++        thread.join()
++
++        if "exc" in error:
++            raise error["exc"]
++
++        return result["value"]
++
++    async def _query_json(self, base_url: str, params: dict[str, Any]):
++        request_kwargs = dict(self._request_kwargs)
++
++        proxy = request_kwargs.pop("proxy", None)
++        proxies = request_kwargs.pop("proxies", None)
++        if proxy is None and proxies:
++            proxy = proxies.get("https") or proxies.get("http")
++        if proxy is not None:
++            request_kwargs["proxy"] = proxy
++
++        verify = request_kwargs.pop("verify", None)
++        if verify is not None and "ssl" not in request_kwargs:
++            if isinstance(verify, str):
++                request_kwargs["ssl"] = ssl.create_default_context(cafile=verify)
++            else:
++                request_kwargs["ssl"] = verify
++
++        timeout = request_kwargs.pop("timeout", 10.0)
++        if not isinstance(timeout, aiohttp.ClientTimeout):
++            timeout = aiohttp.ClientTimeout(total=timeout)
++
++        headers = self._session.headers.copy()
++        request_headers = request_kwargs.pop("headers", None)
++        if request_headers:
++            headers.update(request_headers)
++
++        async with aiohttp.ClientSession(
++            headers=headers,
++            timeout=timeout,
++            trust_env=True,
++        ) as session:
++            async with session.get(base_url, params=params, **request_kwargs) as response:
++                return await response.json()
+ 
+     def _build_extracts(self, extract, page: "WikipediaPage") -> str:
+         """Constructs summary of given page."""

@@ -1,0 +1,221 @@
+--- a/smartystreets_python_sdk/requests_sender.py
++++ b/smartystreets_python_sdk/requests_sender.py
+@@ -1,4 +1,14 @@
+-from requests import Session, Request
++from collections import OrderedDict
++from io import BytesIO
++
++try:
++    from urllib.parse import urlencode
++except ImportError:
++    from urllib import urlencode
++
++import pycurl
++
++from .request import Request
+ from .response import Response
+ import smartystreets_python_sdk as smarty
+ import smartystreets_python_sdk_version as version
+@@ -6,27 +16,21 @@
+ 
+ class RequestsSender:
+     def __init__(self, max_timeout=None, proxy=None, ip=None):
+-        self.session = Session()
++        self.session = None
+         self.max_timeout = max_timeout or 10
+         self.proxy = proxy
+         self.debug = None
+         self.ip = ip
+ 
+     def send(self, smarty_request):
+-        ip = self.ip
+-        request = build_request(smarty_request, ip)
+-        prepped_request = self.session.prepare_request(request)
+-        prepped_proxies = self.build_proxies()
++        request = build_request(smarty_request, self.ip)
+         if self.debug:
+-            print_request_data(prepped_request)
+-
+-        settings = self.session.merge_environment_settings(
+-            prepped_request.url, prepped_proxies, None, None, None
+-        )
+-        with self.session.send(prepped_request, timeout=self.max_timeout, **settings) as response:
+-            if self.debug:
+-                print_response_data(response)
+-            return build_smarty_response(response)
++            print_request_data(request)
++
++        response = perform_request(request, self.max_timeout, self.proxy)
++        if self.debug:
++            print_response_data(response)
++        return response
+ 
+     def build_proxies(self):
+         if not self.proxy:
+@@ -47,42 +51,158 @@
+ 
+ def build_request(smarty_request, ip=None):
+     try:
+-        request = Request(url=smarty_request.url_prefix, params=smarty_request.parameters)
++        request = Request(smarty_request.url_prefix, smarty_request.parameters)
++        request.url_components = smarty_request.url_components
++        request.referer = smarty_request.referer
++        request.content_type = smarty_request.content_type
+         request.headers['User-Agent'] = "smartystreets (sdk:python@{})".format(version.__version__)
+         request.headers['Content-Type'] = smarty_request.content_type
+         if smarty_request.referer:
+             request.headers['Referer'] = smarty_request.referer
++        if getattr(smarty_request, 'headers', None):
++            request.headers.update(smarty_request.headers)
+         if ip != None:
+             request.headers['X-Forwarded-For'] = ip
+         if smarty_request.payload:
++            request.payload = smarty_request.payload
++            request.body = smarty_request.payload
+             request.data = smarty_request.payload
+             request.method = 'POST'
+         else:
++            request.payload = None
++            request.body = None
++            request.data = None
+             request.method = 'GET'
++        request.url = request.geturl()
+         return request
+     except AttributeError:
+         return smarty_request
+ 
+ 
+ def build_smarty_response(inner_response, error=None):
+-    return Response(inner_response.text, inner_response.status_code, inner_response.headers, error)
++    payload = getattr(inner_response, 'text', None)
++    if payload is None:
++        payload = getattr(inner_response, 'payload', None)
++    return Response(payload, inner_response.status_code, inner_response.headers, error)
++
++
++def perform_request(request, max_timeout, proxy=None):
++    curl = pycurl.Curl()
++    body_buffer = BytesIO()
++    header_state = {
++        'response_headers': OrderedDict(),
++        'current_headers': OrderedDict(),
++    }
++
++    try:
++        text_type = unicode
++    except NameError:
++        text_type = str
++
++    def collect_header(line):
++        if isinstance(line, bytes):
++            decoded_line = line.decode('iso-8859-1').strip()
++        else:
++            decoded_line = line.strip()
++
++        if not decoded_line:
++            if header_state['current_headers']:
++                header_state['response_headers'] = header_state['current_headers']
++                header_state['current_headers'] = OrderedDict()
++            return len(line)
++
++        if decoded_line.startswith('HTTP/'):
++            header_state['current_headers'] = OrderedDict()
++            return len(line)
++
++        if ':' in decoded_line:
++            header_name, header_value = decoded_line.split(':', 1)
++            header_state['current_headers'][header_name.strip()] = header_value.strip()
++
++        return len(line)
++
++    try:
++        url = getattr(request, 'url', None) or getattr(request, 'url_prefix', None)
++        parameters = getattr(request, 'parameters', None) or getattr(request, 'params', None)
++        headers = getattr(request, 'headers', {}) or {}
++        body = getattr(request, 'body', None)
++        if body is None:
++            body = getattr(request, 'data', None)
++
++        if getattr(request, 'url', None) is None and parameters:
++            url = '{}?{}'.format(url, urlencode(list(parameters.items())))
++
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.TIMEOUT, max_timeout)
++        curl.setopt(pycurl.CONNECTTIMEOUT, max_timeout)
++        curl.setopt(pycurl.FOLLOWLOCATION, 1)
++        curl.setopt(pycurl.WRITEDATA, body_buffer)
++        curl.setopt(pycurl.HEADERFUNCTION, collect_header)
++        curl.setopt(pycurl.HTTPHEADER, ['{}: {}'.format(name, value) for name, value in headers.items()])
++
++        if proxy:
++            if proxy.host == 'http://' or proxy.host == 'https://':
++                raise smarty.exceptions.SmartyException('Proxy must have a valid host (including port)')
++
++            proxy_host = proxy.host
++            proxy_type = None
++            if proxy_host.startswith('http://'):
++                proxy_host = proxy_host[len('http://'):]
++                proxy_type = getattr(pycurl, 'PROXYTYPE_HTTP', None)
++            elif proxy_host.startswith('https://'):
++                proxy_host = proxy_host[len('https://'):]
++                proxy_type = getattr(pycurl, 'PROXYTYPE_HTTPS', None)
++
++            curl.setopt(pycurl.PROXY, proxy_host)
++            if proxy_type is not None:
++                curl.setopt(pycurl.PROXYTYPE, proxy_type)
++            if proxy.username:
++                curl.setopt(pycurl.PROXYUSERPWD, '{}:{}'.format(proxy.username, proxy.password or ''))
++
++        if getattr(request, 'method', 'GET') == 'POST':
++            curl.setopt(pycurl.POST, 1)
++            if body is not None:
++                if isinstance(body, text_type):
++                    body = body.encode('utf-8')
++                curl.setopt(pycurl.POSTFIELDS, body)
++                curl.setopt(pycurl.POSTFIELDSIZE, len(body))
++        else:
++            curl.setopt(pycurl.HTTPGET, 1)
++
++        curl.perform()
++        if header_state['current_headers']:
++            header_state['response_headers'] = header_state['current_headers']
++
++        status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        payload = body_buffer.getvalue()
++        if not isinstance(payload, text_type):
++            payload = payload.decode('utf-8', 'replace')
++        return Response(payload, status_code, header_state['response_headers'])
++    finally:
++        curl.close()
+ 
+ 
+ def print_request_data(request):
+-    print(request.method)
++    print(getattr(request, 'method', 'GET'))
+     print()
+-    print('URL: {}\r\n'.format(request.url))
++    request_url = None
++    if hasattr(request, 'geturl'):
++        request_url = request.geturl()
++    if request_url is None:
++        request_url = getattr(request, 'url', None) or getattr(request, 'url_prefix', None)
++    print('URL: {}\r\n'.format(request_url))
+     print('Headers:')
+-    for header in request.headers:
+-        print('  {}: {}'.format(header, request.headers[header]))
++    headers = getattr(request, 'headers', {}) or {}
++    for header in headers:
++        print('  {}: {}'.format(header, headers[header]))
+     print()
+     print('Body: ')
+-    print('  {}\r\n'.format(request.body))
++    print('  {}\r\n'.format(getattr(request, 'body', getattr(request, 'data', None))))
+ 
+ 
+ def print_response_data(response):
+     print('****** Response ******\r\n')
+     print(response.status_code)
+     print()
+-    print(response.text)
++    print(getattr(response, 'text', None) or getattr(response, 'payload', None))
+     print('**********************\r\n')

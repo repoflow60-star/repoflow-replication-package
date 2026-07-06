@@ -1,0 +1,222 @@
+diff --git /dev/null b/aiohttp/__init__.py
+new file mode 100644
+index 0000000..4f874d1
+--- /dev/null
++++ b/aiohttp/__init__.py
+@@ -0,0 +1,216 @@
++"""Lightweight aiohttp-compatible transport used by the client.
++
++This project only needs a small subset of aiohttp's client API.  The
++implementation below keeps the public surface area required by the repo while
++backing requests with the Python standard library.
++"""
++
++from __future__ import annotations
++
++import json
++import uuid
++from dataclasses import dataclass
++from http import cookiejar
++from typing import Any, Dict, Iterable, Mapping, Optional
++from urllib import error as urllib_error
++from urllib import parse as urllib_parse
++from urllib import request as urllib_request
++
++
++class ClientError(Exception):
++    """Base transport error."""
++
++
++class HTTPError(ClientError):
++    """Raised when a response reports a non-success status."""
++
++    def __init__(self, message: str, *, response=None):
++        super().__init__(message)
++        self.response = response
++
++
++class ClientResponseError(HTTPError):
++    """Alias kept for compatibility with aiohttp-style call sites."""
++
++
++@dataclass
++class ClientResponse:
++    status: int
++    url: str
++    body: bytes
++    headers: Mapping[str, str]
++    reason: str = ""
++
++    def __post_init__(self):
++        self.status_code = self.status
++
++    def json(self):
++        return json.loads(self.text())
++
++    def text(self, encoding: str = "utf-8"):
++        return self.body.decode(encoding)
++
++    def raise_for_status(self):
++        if 400 <= self.status < 600:
++            raise HTTPError(
++                f"{self.status} response for {self.url}",
++                response=self,
++            )
++
++
++class ClientSession:
++    def __init__(self, cookie_jar: Optional[cookiejar.CookieJar] = None):
++        self._cookie_jar = cookie_jar or cookiejar.CookieJar()
++
++    @property
++    def cookies(self):
++        return {
++            cookie.name: cookie.value
++            for cookie in self._cookie_jar
++        }
++
++    def close(self):
++        return None
++
++    def get(self, url, *, params=None, headers=None):
++        return self.request("GET", url, params=params, headers=headers)
++
++    def post(self, url, data=None, *, json=None, headers=None, params=None, files=None):
++        return self.request(
++            "POST",
++            url,
++            data=data,
++            json=json,
++            headers=headers,
++            params=params,
++            files=files,
++        )
++
++    def put(self, url, data=None, *, json=None, headers=None, params=None, files=None):
++        return self.request(
++            "PUT",
++            url,
++            data=data,
++            json=json,
++            headers=headers,
++            params=params,
++            files=files,
++        )
++
++    def request(self, method, url, *, params=None, data=None, json=None, headers=None, files=None):
++        full_url = self._build_url(url, params)
++        body, request_headers = self._prepare_body(data=data, json=json, files=files)
++        if headers:
++            request_headers.update(headers)
++
++        request = urllib_request.Request(
++            full_url,
++            data=body,
++            headers=request_headers,
++            method=method.upper(),
++        )
++        opener = urllib_request.build_opener(
++            urllib_request.HTTPCookieProcessor(self._cookie_jar)
++        )
++
++        try:
++            with opener.open(request) as response:
++                return self._build_response(response, full_url)
++        except urllib_error.HTTPError as exc:
++            return self._build_response(exc, full_url)
++        except urllib_error.URLError as exc:
++            raise ClientError(str(exc)) from exc
++
++    def _build_url(self, url, params):
++        if not params:
++            return url
++        if isinstance(params, str):
++            query = params
++        else:
++            query = urllib_parse.urlencode(params, doseq=True)
++        separator = "&" if "?" in url else "?"
++        return f"{url}{separator}{query}"
++
++    def _prepare_body(self, *, data=None, json=None, files=None):
++        headers: Dict[str, str] = {}
++        if files:
++            return self._encode_multipart(files), headers
++        if json is not None:
++            headers["Content-Type"] = "application/json"
++            return json_encode(json), headers
++        if data is None:
++            return None, headers
++        if isinstance(data, bytes):
++            return data, headers
++        if isinstance(data, str):
++            return data.encode("utf-8"), headers
++        if isinstance(data, Mapping):
++            headers["Content-Type"] = "application/x-www-form-urlencoded"
++            return urllib_parse.urlencode(data, doseq=True).encode("utf-8"), headers
++        return bytes(data), headers
++
++    def _encode_multipart(self, files: Mapping[str, Any]):
++        boundary = f"----aiohttp-{uuid.uuid4().hex}"
++        body = bytearray()
++        for field_name, value in files.items():
++            body.extend(f"--{boundary}\r\n".encode("utf-8"))
++            filename = None
++            content_type = "application/octet-stream"
++            content = value
++
++            if isinstance(value, tuple):
++                if len(value) == 3:
++                    filename, content, content_type = value
++                elif len(value) == 2:
++                    filename, content = value
++                else:
++                    raise TypeError("multipart file tuples must have 2 or 3 items")
++
++            if filename is not None:
++                body.extend(
++                    (
++                        f'Content-Disposition: form-data; name="{field_name}"; '
++                        f'filename="{filename}"\r\n'
++                    ).encode("utf-8")
++                )
++                body.extend(f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"))
++                if isinstance(content, str):
++                    content = content.encode("utf-8")
++                body.extend(content)
++                body.extend(b"\r\n")
++            else:
++                body.extend(
++                    (
++                        f'Content-Disposition: form-data; name="{field_name}"\r\n\r\n'
++                    ).encode("utf-8")
++                )
++                if isinstance(content, bytes):
++                    body.extend(content)
++                else:
++                    body.extend(str(content).encode("utf-8"))
++                body.extend(b"\r\n")
++
++        body.extend(f"--{boundary}--\r\n".encode("utf-8"))
++        return bytes(body)
++
++    def _build_response(self, response, url):
++        headers = dict(response.headers.items())
++        body = response.read()
++        reason = getattr(response, "reason", "")
++        status = getattr(response, "status", getattr(response, "code", 0))
++        return ClientResponse(status=status, url=url, body=body, headers=headers, reason=reason)
++
++
++def json_encode(value):
++    return json.dumps(value).encode("utf-8")
++
++
++class _Exceptions:
++    RequestException = ClientError
++    ClientError = ClientError
++    HTTPError = HTTPError
++    ClientResponseError = ClientResponseError
++
++
++exceptions = _Exceptions()
++

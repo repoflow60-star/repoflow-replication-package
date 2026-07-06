@@ -1,0 +1,169 @@
+diff --git a/jsonfmt/jsonfmt.py b/jsonfmt/jsonfmt.py
+index c029570..64d2934 100755
+--- a/jsonfmt/jsonfmt.py
++++ b/jsonfmt/jsonfmt.py
+@@ -3,18 +3,20 @@
+ 
+ import io
+ import json
++import math
+ import os
++import re
+ import sys
+ from argparse import ArgumentParser
+ from functools import partial
+ from pydoc import pager
+ from shutil import get_terminal_size
+ from tempfile import NamedTemporaryFile, _TemporaryFileWrapper
++from datetime import date, datetime, time
+ from typing import IO, Any, Callable, List, Optional, Tuple, Union
+ from unittest.mock import patch
+ 
+ import pyperclip
+-import toml
+ import yaml
+ from jmespath import compile as parse_jmespath
+ from jmespath.exceptions import JMESPathError
+@@ -26,11 +28,17 @@ from pygments import highlight
+ from pygments.formatters import TerminalFormatter
+ from pygments.lexers import JsonLexer, TOMLLexer, XmlLexer, YamlLexer
+ 
++try:
++    import tomli
++except ImportError:  # pragma: no cover
++    import tomllib as tomli
++
+ from . import __version__, utils, xml2py
+ from .diff import compare
+ 
+ QueryPath = Union[JMESPath, JSONPath]
+ TEMP_CLIPBOARD = io.StringIO()
++_TOML_BARE_KEY_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+ 
+ 
+ class FormatError(Exception):
+@@ -84,7 +92,7 @@ def parse_to_pyobj(text: str, qpath: Optional[QueryPath]) -> Tuple[Any, str]:
+     # parse json, toml or yaml to python object
+     loads_methods: list[tuple[str, Callable]] = [
+         ('json', json.loads),
+-        ('toml', toml.loads),
++        ('toml', tomli.loads),
+         ('xml', xml2py.loads),
+         ('yaml', partial(yaml.load, Loader=yaml.Loader)),
+     ]
+@@ -162,6 +170,103 @@ def get_overview(py_obj: Any) -> Any:
+         return clip(py_obj)
+ 
+ 
++def _toml_filter_none(py_obj: Any) -> Any:
++    '''remove None values so TOML output stays valid'''
++    if isinstance(py_obj, dict):
++        return {key: _toml_filter_none(value)
++                for key, value in py_obj.items()
++                if value is not None}
++    elif isinstance(py_obj, list):
++        return [_toml_filter_none(item) for item in py_obj if item is not None]
++    else:
++        return py_obj
++
++
++def _toml_format_key(key: Any) -> str:
++    '''format TOML keys with quotes when needed'''
++    key_text = str(key)
++    if _TOML_BARE_KEY_RE.match(key_text):
++        return key_text
++    return json.dumps(key_text, ensure_ascii=False)
++
++
++def _toml_format_path(path: List[Any]) -> str:
++    return '.'.join(_toml_format_key(part) for part in path)
++
++
++def _toml_format_scalar(value: Any) -> str:
++    '''format TOML scalar or array values'''
++    if isinstance(value, bool):
++        return 'true' if value else 'false'
++    if isinstance(value, int):
++        return str(value)
++    if isinstance(value, float):
++        if not math.isfinite(value):
++            raise FormatError('the pyobj must not contain NaN or Infinity for toml')
++        return repr(value)
++    if isinstance(value, str):
++        return json.dumps(value, ensure_ascii=False)
++    if isinstance(value, datetime):
++        return value.isoformat()
++    if isinstance(value, date):
++        return value.isoformat()
++    if isinstance(value, time):
++        return value.isoformat()
++    if isinstance(value, list):
++        return '[' + ', '.join(_toml_format_scalar(item) for item in value) + ']'
++
++    raise FormatError(f'unsupported TOML value type: {type(value).__name__}')
++
++
++def _toml_dump_table(py_obj: dict, path: List[Any], lines: List[str]) -> None:
++    '''serialize a TOML table recursively'''
++    scalar_items: list[tuple[Any, Any]] = []
++    table_items: list[tuple[Any, dict]] = []
++    array_table_items: list[tuple[Any, list[dict]]] = []
++
++    for key, value in py_obj.items():
++        if isinstance(value, dict):
++            table_items.append((key, value))
++        elif isinstance(value, list) and value and all(isinstance(item, dict) for item in value):
++            array_table_items.append((key, value))
++        else:
++            scalar_items.append((key, value))
++
++    for key, value in scalar_items:
++        lines.append(f'{_toml_format_key(key)} = {_toml_format_scalar(value)}')
++
++    for key, value in table_items:
++        if lines and lines[-1] != '':
++            lines.append('')
++        table_path = path + [key]
++        lines.append(f'[{_toml_format_path(table_path)}]')
++        _toml_dump_table(value, table_path, lines)
++
++    for key, value in array_table_items:
++        table_path = path + [key]
++        for item in value:
++            if lines and lines[-1] != '':
++                lines.append('')
++            lines.append(f'[[{_toml_format_path(table_path)}]]')
++            _toml_dump_table(item, table_path, lines)
++
++
++def dumps_toml(py_obj: Any) -> str:
++    '''serialize python objects to TOML'''
++    if not isinstance(py_obj, dict):
++        msg = 'the pyobj must be a Mapping when format to toml'
++        raise FormatError(msg)
++
++    filtered = _toml_filter_none(py_obj)
++    if not isinstance(filtered, dict):
++        msg = 'the pyobj must be a Mapping when format to toml'
++        raise FormatError(msg)
++
++    lines: list[str] = []
++    _toml_dump_table(filtered, [], lines)
++    return '\n'.join(lines)
++
++
+ def format_to_text(py_obj: Any, fmt: str, *,
+                    compact: bool, escape: bool,
+                    indent: str, sort_keys: bool) -> str:
+@@ -174,10 +279,7 @@ def format_to_text(py_obj: Any, fmt: str, *,
+             result = json.dumps(py_obj, ensure_ascii=escape, sort_keys=sort_keys,
+                                 indent='\t' if indent == 't' else int(indent))
+     elif fmt == 'toml':
+-        if not isinstance(py_obj, dict):
+-            msg = 'the pyobj must be a Mapping when format to toml'
+-            raise FormatError(msg)
+-        result = toml.dumps(utils.sort_dict(py_obj) if sort_keys else py_obj)
++        result = dumps_toml(utils.sort_dict(py_obj) if sort_keys else py_obj)
+     elif fmt == 'xml':
+         result = xml2py.dumps(py_obj, indent, compact, sort_keys)
+     elif fmt == 'yaml':

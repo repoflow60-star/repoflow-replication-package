@@ -1,0 +1,170 @@
+diff --git a/maproulette/api/maproulette_server.py b/maproulette/api/maproulette_server.py
+index b8e4974..b93a0f8 100644
+--- a/maproulette/api/maproulette_server.py
++++ b/maproulette/api/maproulette_server.py
+@@ -1,11 +1,162 @@
+-"""This module contains the basic methods that handle API calls to the MapRoulette API. It uses the requests library to
+-accomplish this."""
++"""This module contains the basic methods that handle API calls to the MapRoulette API."""
+ 
+-import requests
+ import json
+ import time
++from types import SimpleNamespace
++
+ from .errors import HttpError, InvalidJsonError, ConnectionUnavailableError, UnauthorizedError, NotFoundError
+ 
++try:
++    import treq
++    from twisted.internet import reactor
++    from twisted.internet.error import TimeoutError as TwistedTimeoutError
++    from twisted.internet.threads import blockingCallFromThread
++except ImportError:
++    import requests
++else:
++    import threading
++
++    class _TreqHTTPError(Exception):
++        def __init__(self, message=None, response=None):
++            super().__init__(message)
++            self.response = response
++
++
++    class _TreqConnectionError(Exception):
++        pass
++
++
++    class _TreqTimeout(Exception):
++        pass
++
++
++    class _TreqResponseAdapter:
++        def __init__(self, status_code, body):
++            self.status_code = status_code
++            if isinstance(body, bytes):
++                self.text = body.decode('utf-8', errors='replace')
++            else:
++                self.text = str(body)
++
++        @property
++        def ok(self):
++            return 200 <= self.status_code < 400
++
++        def json(self):
++            return json.loads(self.text)
++
++        def raise_for_status(self):
++            if self.ok:
++                return None
++            error = _TreqHTTPError(response=self)
++            error.response = self
++            raise error
++
++
++    _reactor_lock = threading.Lock()
++    _reactor_thread = None
++
++    def _ensure_reactor_running():
++        global _reactor_thread
++        with _reactor_lock:
++            if reactor.running:
++                return
++            if _reactor_thread is None or not _reactor_thread.is_alive():
++                _reactor_thread = threading.Thread(
++                    target=lambda: reactor.run(installSignalHandlers=False),
++                    daemon=True
++                )
++                _reactor_thread.start()
++        for _ in range(500):
++            if reactor.running:
++                return
++            time.sleep(0.01)
++        raise RuntimeError("Timed out waiting for the Twisted reactor to start")
++
++
++    def _blocking_call(callable_, *args, **kwargs):
++        _ensure_reactor_running()
++        return blockingCallFromThread(reactor, callable_, *args, **kwargs)
++
++
++    def _treq_response_to_adapter(response):
++        def _wrap(body):
++            return _TreqResponseAdapter(response.code, body)
++
++        return treq.content(response).addCallback(_wrap)
++
++
++    class _TreqSession:
++        def __init__(self):
++            self.headers = {}
++            self.verify = True
++            self.cert = None
++
++        def _request(self, method, url, params=None, json=None, files=None):
++            def _do_request():
++                headers = {k: v for (k, v) in self.headers.items() if v is not None}
++                kwargs = {}
++                if headers:
++                    kwargs['headers'] = headers
++                if params is not None:
++                    kwargs['params'] = params
++                if json is not None:
++                    kwargs['json'] = json
++                if files is not None:
++                    kwargs['files'] = files
++                return treq.request(method, url, **kwargs).addCallback(_treq_response_to_adapter)
++
++            try:
++                return _blocking_call(_do_request)
++            except TwistedTimeoutError as exc:
++                raise requests.Timeout(str(exc)) from None
++            except Exception as exc:
++                raise requests.ConnectionError(str(exc)) from None
++
++        def get(self, url, params=None):
++            return self._request('GET', url, params=params)
++
++        def post(self, url, params=None, json=None):
++            return self._request('POST', url, params=params, json=json)
++
++        def put(self, url, params=None, json=None, files=None):
++            return self._request('PUT', url, params=params, json=json, files=files)
++
++        def delete(self, url, params=None):
++            return self._request('DELETE', url, params=params)
++
++
++    def _top_level_request(method, url, headers=None, verify=True, cert=None, params=None, json=None, files=None):
++        session = _TreqSession()
++        session.headers = headers or {}
++        session.verify = verify
++        session.cert = cert
++        return session._request(method, url, params=params, json=json, files=files)
++
++
++    requests = SimpleNamespace(
++        Session=_TreqSession,
++        get=lambda url, headers=None, verify=True, cert=None, params=None: _top_level_request(
++            'GET', url, headers=headers, verify=verify, cert=cert, params=params
++        ),
++        post=lambda url, headers=None, verify=True, cert=None, params=None, json=None: _top_level_request(
++            'POST', url, headers=headers, verify=verify, cert=cert, params=params, json=json
++        ),
++        put=lambda url, headers=None, verify=True, cert=None, params=None, json=None, files=None: _top_level_request(
++            'PUT', url, headers=headers, verify=verify, cert=cert, params=params, json=json, files=files
++        ),
++        delete=lambda url, headers=None, verify=True, cert=None, params=None: _top_level_request(
++            'DELETE', url, headers=headers, verify=verify, cert=cert, params=params
++        ),
++        exceptions=SimpleNamespace(
++            HTTPError=_TreqHTTPError,
++            ConnectionError=_TreqConnectionError,
++            Timeout=_TreqTimeout
++        ),
++        ConnectionError=_TreqConnectionError,
++        Timeout=_TreqTimeout
++    )
++
+ 
+ class MapRouletteServer:
+     """Class that holds the basic requests that can be made to the MapRoulette API."""

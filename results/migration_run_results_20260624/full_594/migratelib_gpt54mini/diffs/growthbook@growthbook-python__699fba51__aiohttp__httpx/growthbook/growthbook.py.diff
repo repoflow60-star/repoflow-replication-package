@@ -1,0 +1,369 @@
+--- a/growthbook/growthbook.py
++++ b/growthbook/growthbook.py
+@@ -23,10 +23,10 @@
+ from urllib.parse import urlparse, parse_qs
+
+ from base64 import b64decode
+
+ from time import time
+
+-import aiohttp
+
++import httpx
+
+ import asyncio
+
+ 
+
+-from aiohttp.client_exceptions import ClientConnectorError, ClientResponseError, ClientPayloadError
+
++from httpx import ConnectError, HTTPStatusError, ReadError, TimeoutException
+
+ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+ from cryptography.hazmat.primitives import padding
+
+ from urllib3 import PoolManager
+
+@@ -871,25 +871,25 @@
+ 
+
+     async def _init_session(self):
+
+         url = self._get_sse_url(self.api_host, self.client_key)
+
+-        
+
++
+
+         while self.is_running:
+
+             try:
+
+-                async with aiohttp.ClientSession(headers=self.headers) as session:
+
++                async with httpx.AsyncClient(headers=self.headers, timeout=None) as session:
+
+                     self._sse_session = session
+
+ 
+
+-                    async with session.get(url) as response:
+
++                    async with session.stream("GET", url) as response:
+
+                         response.raise_for_status()
+
+                         await self._process_response(response)
+
+-            except ClientResponseError as e:
+
+-                logger.error(f"Streaming error, closing connection: {e.status} {e.message}")
+
++            except HTTPStatusError as e:
+
++                logger.error(f"Streaming error, closing connection: {e.response.status_code} {e}")
+
+                 self.is_running = False
+
+                 break
+
+-            except (ClientConnectorError, ClientPayloadError) as e:
+
++            except (ConnectError, ReadError) as e:
+
+                 logger.error(f"Streaming error: {e}")
+
+                 if not self.is_running:
+
+                     break
+
+                 await self._wait_for_reconnect()
+
+-            except TimeoutError:
+
++            except TimeoutException:
+
+                 logger.warning(f"Streaming connection timed out after {self.timeout} seconds.")
+
+                 await self._wait_for_reconnect()
+
+             except asyncio.CancelledError:
+
+@@ -900,8 +900,8 @@
+ 
+
+     async def _process_response(self, response):
+
+         event_data = {}
+
+-        async for line in response.content:
+
+-            decoded_line = line.decode('utf-8').strip()
+
++        async for decoded_line in response.aiter_lines():
+
++            decoded_line = decoded_line.strip()
+
+             if decoded_line.startswith("event:"):
+
+                 event_data['type'] = decoded_line[len("event:"):].strip()
+
+             elif decoded_line.startswith("data:"):
+
+@@ -920,12 +920,12 @@
+ 
+
+     async def _close_session(self):
+
+         if self._sse_session:
+
+-            await self._sse_session.close()
+
++            await self._sse_session.aclose()
+
+             logger.debug("Streaming session closed.")
+
+ 
+
+     def _run_sse_channel(self):
+
+         self._loop = asyncio.new_event_loop()
+
+-        
+
++
+
+         try:
+
+             self._loop.run_until_complete(self._init_session())
+
+         except asyncio.CancelledError:
+
+@@ -936,7 +936,7 @@
+ 
+
+     async def _stop_session(self):
+
+         if self._sse_session:
+
+-            await self._sse_session.close()
+
++            await self._sse_session.aclose()
+
+ 
+
+         if self._loop and self._loop.is_running():
+
+             tasks = [task for task in asyncio.all_tasks(self._loop) if not task.done()]
+
+@@ -976,7 +976,7 @@
+                 logger.debug("Fetched features from API, stored in cache")
+
+                 return res
+
+         return cached
+
+-    
+
++
+
+     async def load_features_async(
+
+         self, api_host: str, client_key: str, decryption_key: str = "", ttl: int = 60
+
+     ) -> Optional[Dict]:
+
+@@ -995,7 +995,7 @@
+     def _get(self, url: str):
+
+         self.http = self.http or PoolManager()
+
+         return self.http.request("GET", url)
+
+-    
+
++
+
+     def _fetch_and_decode(self, api_host: str, client_key: str) -> Optional[Dict]:
+
+         try:
+
+             r = self._get(self._get_features_url(api_host, client_key))
+
+@@ -1009,24 +1009,24 @@
+         except Exception:
+
+             logger.warning("Failed to decode feature JSON from GrowthBook API")
+
+             return None
+
+-        
+
++
+
+     async def _fetch_and_decode_async(self, api_host: str, client_key: str) -> Optional[Dict]:
+
+         try:
+
+             url = self._get_features_url(api_host, client_key)
+
+-            async with aiohttp.ClientSession() as session:
+
+-                async with session.get(url) as response:
+
+-                    if response.status >= 400:
+
+-                        logger.warning("Failed to fetch features, received status code %d", response.status)
+
+-                        return None
+
+-                    decoded = await response.json()
+
+-                    return decoded
+
+-        except aiohttp.ClientError as e:
+
++            async with httpx.AsyncClient() as session:
+
++                response = await session.get(url)
+
++                if response.status_code >= 400:
+
++                    logger.warning("Failed to fetch features, received status code %d", response.status_code)
+
++                    return None
+
++                decoded = response.json()
+
++                return decoded
+
++        except httpx.HTTPError as e:
+
+             logger.warning(f"HTTP request failed: {e}")
+
+             return None
+
+         except Exception as e:
+
+             logger.warning("Failed to decode feature JSON from GrowthBook API: %s", e)
+
+             return None
+
+-        
+
++
+
+     def decrypt_response(self, data, decryption_key: str):
+
+         if "encryptedFeatures" in data:
+
+             if not decryption_key:
+
+@@ -1042,7 +1042,7 @@
+                 return None
+
+         elif "features" not in data:
+
+             logger.warning("GrowthBook API response missing features")
+
+-        
+
++
+
+         if "encryptedSavedGroups" in data:
+
+             if not decryption_key:
+
+                 raise ValueError("Must specify decryption_key")
+
+@@ -1055,7 +1055,7 @@
+                 logger.warning(
+
+                     "Failed to decrypt saved groups from GrowthBook API response"
+
+                 )
+
+-            
+
++
+
+         return data
+
+ 
+
+     # Fetch features from the GrowthBook API
+
+@@ -1069,7 +1069,7 @@
+         data = self.decrypt_response(decoded, decryption_key)
+
+ 
+
+         return data
+
+-        
+
++
+
+     async def _fetch_features_async(
+
+         self, api_host: str, client_key: str, decryption_key: str = ""
+
+     ) -> Optional[Dict]:
+
+@@ -1193,7 +1193,7 @@
+         decoded = json.loads(features)
+
+         if not decoded:
+
+             return None
+
+-        
+
++
+
+         data = feature_repo.decrypt_response(decoded, self._decryption_key)
+
+ 
+
+         if data is not None:
+
+@@ -1202,7 +1202,7 @@
+             if "savedGroups" in data:
+
+                 self._saved_groups = data["savedGroups"]
+
+             feature_repo.save_in_cache(self._client_key, features, self._cache_ttl)
+
+-            
+
++
+
+     def _dispatch_sse_event(self, event_data):
+
+         event_type = event_data['type']
+
+         data = event_data['data']
+
+@@ -1215,9 +1215,9 @@
+     def startAutoRefresh(self):
+
+         if not self._client_key:
+
+             raise ValueError("Must specify `client_key` to start features streaming")
+
+-       
+
++
+
+         feature_repo.startAutoRefresh(
+
+-            api_host=self._api_host, 
+
++            api_host=self._api_host,
+
+             client_key=self._client_key,
+
+             cb=self._dispatch_sse_event
+
+         )

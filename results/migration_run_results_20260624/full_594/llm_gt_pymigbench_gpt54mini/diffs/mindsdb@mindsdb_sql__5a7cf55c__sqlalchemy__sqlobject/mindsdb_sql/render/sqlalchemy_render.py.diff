@@ -1,0 +1,746 @@
+--- a/mindsdb_sql/render/sqlalchemy_render.py
++++ b/mindsdb_sql/render/sqlalchemy_render.py
+@@ -1,21 +1,17 @@
+ import re
+ import datetime as dt
+ 
+-import sqlalchemy as sa
+-from sqlalchemy.exc import SQLAlchemyError
+-from sqlalchemy.ext.compiler import compiles
+-from sqlalchemy.orm import aliased
+-from sqlalchemy.dialects import mysql, postgresql, sqlite, mssql, oracle
+-from sqlalchemy.schema import CreateTable, DropTable
+-from sqlalchemy.sql import ColumnElement
+-from sqlalchemy.sql import functions as sa_fnc
++import sqlobject as so
++from sqlobject.sqlbuilder import SQL, Select, Insert, Update, Delete, AND, OR, IN, NOT, LIKE, SQLConstant, SQLExpression, SQLRaw
++from sqlobject.dberrors import SQLObjectIntegrityError
++from sqlobject.sqlbuilder import sqlrepr
+ 
+ from mindsdb_sql.parser import ast
+ 
+ 
+ sa_type_names = [
+-    key for key, val in sa.types.__dict__.items() if hasattr(val, '__module__')
+-    and val.__module__ in ('sqlalchemy.sql.sqltypes', 'sqlalchemy.sql.type_api')
++    key for key, val in so.__dict__.items() if hasattr(val, '__module__')
++    and val.__module__ in ('sqlobject.sqlbuilder', 'sqlobject')
+ ]
+ 
+ 
+@@ -23,57 +19,43 @@
+     ...
+ 
+ 
+-# https://github.com/sqlalchemy/sqlalchemy/discussions/9483?sort=old#discussioncomment-5312979
+-class INTERVAL(ColumnElement):
++class INTERVAL(SQLExpression):
+     def __init__(self, info):
+         self.info = info
+-        self.type = sa.Interval()
+-
+-@compiles(INTERVAL)
+-def _compile_interval(element, compiler, **kw):
+-    items = element.info.split(' ', maxsplit=1)
+-    # quote first element
+-    items[0] = f"'{items[0]}'"
+-    return "INTERVAL " + " ".join(items)
++
++    def __sqlrepr__(self, db):
++        items = self.info.split(' ', maxsplit=1)
++        items[0] = f"'{items[0]}'"
++        return "INTERVAL " + " ".join(items)
+ 
+ 
+ class SqlalchemyRender:
+ 
+     def __init__(self, dialect_name):
+         dialects = {
+-            'mysql': mysql,
+-            'postgresql': postgresql,
+-            'postgres': postgresql,
+-            'sqlite': sqlite,
+-            'mssql': mssql,
+-            'oracle': oracle,
+-            'Snowflake': oracle,
++            'mysql': 'mysql',
++            'postgresql': 'postgresql',
++            'postgres': 'postgresql',
++            'sqlite': 'sqlite',
++            'mssql': 'mssql',
++            'oracle': 'oracle',
++            'Snowflake': 'oracle',
+         }
+ 
+         if isinstance(dialect_name, str):
+-            dialect = dialects[dialect_name].dialect
++            dialect = dialects[dialect_name]
+         else:
+             dialect = dialect_name
+ 
+-        # remove double percent signs
+-        # https://docs.sqlalchemy.org/en/14/faq/sqlexpressions.html#why-are-percent-signs-being-doubled-up-when-stringifying-sql-statements
+-        self.dialect = dialect(paramstyle="named")
+-
+-        if dialect_name == 'mssql':
+-            # update version to MS_2008_VERSION for supports_multivalues_insert
+-            self.dialect.server_version_info = (10,)
+-            self.dialect._setup_version_attributes()
+-        elif dialect_name == 'mysql':
+-            # update version for support float cast
+-            self.dialect.server_version_info = (8, 0, 17)
++        self.dialect = dialect
+ 
+         self.types_map = {}
+         for type_name in sa_type_names:
+-            self.types_map[type_name.upper()] = getattr(sa.types, type_name)
++            self.types_map[type_name.upper()] = getattr(so, type_name)
+         self.types_map['BOOL'] = self.types_map['BOOLEAN']
+ 
+     def to_column(self, parts):
+-        # because sqlalchemy doesn't allow columns consist from parts therefore we do it manually
++        # because sqlobject doesn't allow columns consist from parts therefore we do it manually
+ 
+         parts2 = []
+ 
+@@ -81,10 +63,10 @@
+             if isinstance(i, ast.Star):
+                 p = '*'
+             else:
+-                p = str(sa.column(i).compile(dialect=self.dialect))
++                p = str(SQL(i))
+             parts2.append(p)
+ 
+-        return sa.column('.'.join(parts2), is_literal=True)
++        return SQL('.'.join(parts2))
+ 
+     def get_alias(self, alias):
+         if alias is None or len(alias.parts) == 0:
+@@ -105,11 +87,11 @@
+             t = ast.Constant(t)
+ 
+         if isinstance(t, ast.Star):
+-            col = sa.text('*')
++            col = SQLRaw('*')
+         elif isinstance(t, ast.Last):
+             col = self.to_column(['last'])
+         elif isinstance(t, ast.Constant):
+-            col = sa.literal(t.value)
++            col = SQLConstant(t.value)
+             if t.alias:
+                 alias = self.get_alias(t.alias)
+             else:
+@@ -117,62 +99,62 @@
+                     alias = 'NULL'
+                 else:
+                     alias = str(t.value)
+-            col = col.label(alias)
++            col = SQLRaw(f"{sqlrepr(alias)}")
+         elif isinstance(t, ast.Identifier):
+             # sql functions
+             col = None
+             if len(t.parts) == 1:
+                 name = t.parts[0].upper()
+                 if name == 'CURRENT_DATE':
+-                    col = sa_fnc.current_date()
++                    col = SQLRaw('CURRENT_DATE')
+                 elif name == 'CURRENT_TIME':
+-                    col = sa_fnc.current_time()
++                    col = SQLRaw('CURRENT_TIME')
+                 elif name == 'CURRENT_TIMESTAMP':
+-                    col = sa_fnc.current_timestamp()
++                    col = SQLRaw('CURRENT_TIMESTAMP')
+                 elif name == 'CURRENT_USER':
+-                    col = sa_fnc.current_user()
++                    col = SQLRaw('CURRENT_USER')
+             if col is None:
+                 col = self.to_column(t.parts)
+             if t.alias:
+-                col = col.label(self.get_alias(t.alias))
++                col = SQLRaw(f"{sqlrepr(self.get_alias(t.alias))}")
+         elif isinstance(t, ast.Select):
+             sub_stmt = self.prepare_select(t)
+-            col = sub_stmt.scalar_subquery()
++            col = SQLRaw(f"({sub_stmt})")
+             if t.alias:
+                 alias = self.get_alias(t.alias)
+-                col = col.label(alias)
++                col = SQLRaw(f"({sub_stmt}) AS {sqlrepr(alias)}")
+         elif isinstance(t, ast.Function):
+             fnc = self.to_function(t)
+             if t.alias:
+                 alias = self.get_alias(t.alias)
+             else:
+                 alias = str(t.op)
+-            col = fnc.label(alias)
++            col = SQLRaw(f"{fnc} AS {sqlrepr(alias)}")
+         elif isinstance(t, ast.BinaryOperation):
+             methods = {
+-                "+": "__add__",
+-                "-": "__sub__",
+-                "/": "__truediv__",
+-                "*": "__mul__",
+-                "%": "__mod__",
+-                "=": "__eq__",
+-                "!=": "__ne__",
+-                "<>": "__ne__",
+-                ">": "__gt__",
+-                "<": "__lt__",
+-                ">=": "__ge__",
+-                "<=": "__le__",
+-                "is": "is_",
+-                "is not": "is_not",
+-                "like": "like",
+-                "not like": "notlike",
+-                "in": "in_",
+-                "not in": "notin_",
+-                "||": "concat",
++                "+": "+",
++                "-": "-",
++                "/": "/",
++                "*": "*",
++                "%": "%",
++                "=": "=",
++                "!=": "!=",
++                "<>": "!=",
++                ">": ">",
++                "<": "<",
++                ">=": ">=",
++                "<=": "<=",
++                "is": "IS",
++                "is not": "IS NOT",
++                "like": "LIKE",
++                "not like": "NOT LIKE",
++                "in": "IN",
++                "not in": "NOT IN",
++                "||": "||",
+             }
+             functions = {
+-                "and": sa.and_,
+-                "or": sa.or_,
++                "and": AND,
++                "or": OR,
+             }
+ 
+             arg0 = self.to_expression(t.args[0])
+@@ -180,49 +162,47 @@
+ 
+             op = t.op.lower()
+             if op in ('in', 'not in'):
+-                if isinstance(arg1, sa.sql.selectable.ColumnClause):
++                if isinstance(arg1, SQLExpression):
+                     raise NotImplementedError(f'Required list argument for: {op}')
+ 
+             method = methods.get(op)
+             if method is not None:
+-                sa_op = getattr(arg0, method)
+-
+-                col = sa_op(arg1)
++                col = SQLRaw(f"({arg0} {method} {arg1})")
+             elif t.op.lower() in functions:
+                 func = functions[t.op.lower()]
+                 col = func(arg0, arg1)
+             else:
+-                col = arg0.op(t.op)(arg1)
++                col = SQLRaw(f"({arg0} {t.op} {arg1})")
+ 
+             if t.alias:
+                 alias = self.get_alias(t.alias)
+-                col = col.label(alias)
++                col = SQLRaw(f"{col} AS {sqlrepr(alias)}")
+ 
+         elif isinstance(t, ast.UnaryOperation):
+             # not or munus
+             opmap = {
+-                "NOT": "__invert__",
+-                "-": "__neg__",
++                "NOT": "NOT",
++                "-": "-",
+             }
+             arg = self.to_expression(t.args[0])
+ 
+             method = opmap[t.op.upper()]
+-            col = getattr(arg, method)()
++            col = SQLRaw(f"({method} {arg})")
+             if t.alias:
+                 alias = self.get_alias(t.alias)
+-                col = col.label(alias)
++                col = SQLRaw(f"{col} AS {sqlrepr(alias)}")
+ 
+         elif isinstance(t, ast.BetweenOperation):
+             col0 = self.to_expression(t.args[0])
+             lim_down = self.to_expression(t.args[1])
+             lim_up = self.to_expression(t.args[2])
+ 
+-            col = sa.between(col0, lim_down, lim_up)
++            col = SQLRaw(f"({col0} BETWEEN {lim_down} AND {lim_up})")
+         elif isinstance(t, ast.Interval):
+             col = INTERVAL(t.args[0])
+             if t.alias:
+                 alias = self.get_alias(t.alias)
+-                col = col.label(alias)
++                col = SQLRaw(f"{col} AS {sqlrepr(alias)}")
+ 
+         elif isinstance(t, ast.WindowFunction):
+             func = self.to_expression(t.function)
+@@ -240,29 +220,25 @@
+                 for f in t.order_by:
+                     col0 = self.to_expression(f.field)
+                     if f.direction == 'DESC':
+-                        col0 = col0.desc()
++                        col0 = SQLRaw(f"{col0} DESC")
+                     order_by.append(col0)
+ 
+-            col = sa.over(
+-                func,
+-                partition_by=partition,
+-                order_by=order_by
+-            )
+-
+-            if t.alias:
+-                col = col.label(self.get_alias(t.alias))
++            col = SQLRaw(str(func))
++
++            if t.alias:
++                col = SQLRaw(f"{col} AS {sqlrepr(self.get_alias(t.alias))}")
+         elif isinstance(t, ast.TypeCast):
+             arg = self.to_expression(t.arg)
+             type = self.get_type(t.type_name)
+             if t.precision is not None:
+                 type = type(*t.precision)
+-            col = sa.cast(arg, type)
++            col = SQLRaw(f"CAST({arg} AS {type})")
+ 
+             if t.alias:
+                 alias = self.get_alias(t.alias)
+-                col = col.label(alias)
++                col = SQLRaw(f"{col} AS {sqlrepr(alias)}")
+         elif isinstance(t, ast.Parameter):
+-            col = sa.column(t.value, is_literal=True)
++            col = SQLRaw(t.value)
+             if t.alias: raise Exception()
+         elif isinstance(t, ast.Tuple):
+             col = [
+@@ -270,15 +246,15 @@
+                 for i in t.items
+             ]
+         elif isinstance(t, ast.Variable):
+-            col = sa.column(t.to_string(), is_literal=True)
++            col = SQLRaw(t.to_string())
+         elif isinstance(t, ast.Latest):
+-            col = sa.column(t.to_string(), is_literal=True)
++            col = SQLRaw(t.to_string())
+         elif isinstance(t, ast.Exists):
+             sub_stmt = self.prepare_select(t.query)
+-            col = sub_stmt.exists()
++            col = SQLRaw(f"EXISTS ({sub_stmt})")
+         elif isinstance(t, ast.NotExists):
+             sub_stmt = self.prepare_select(t.query)
+-            col = ~sub_stmt.exists()
++            col = SQLRaw(f"NOT EXISTS ({sub_stmt})")
+         elif isinstance(t, ast.Case):
+             col = self.prepare_case(t)
+         else:
+@@ -301,10 +277,14 @@
+         if t.arg is not None:
+             value = self.to_expression(t.arg)
+ 
+-        return sa.case(*conditions, else_=default, value=value)
++        return SQLRaw('CASE ' + ' '.join(
++            ['WHEN %s THEN %s' % (c, r) for c, r in conditions] +
++            (['ELSE %s' % default] if default is not None else []) +
++            (['END'] if value is None else ['END'])
++        ))
+ 
+     def to_function(self, t):
+-        op = getattr(sa.func, t.op)
++        op = getattr(so.sqlbuilder, t.op)
+         if t.from_arg is not None:
+             arg = t.args[0].to_string()
+             from_arg = self.to_expression(t.from_arg)
+@@ -317,14 +297,14 @@
+             ]
+             if t.distinct:
+                 # set first argument to distinct
+-                args[0] = args[0].distinct()
++                args[0] = SQLRaw(f"DISTINCT {args[0]}")
+             fnc = op(*args)
+         return fnc
+ 
+     def get_type(self, typename):
+         # TODO how to get type
+         if not isinstance(typename, str):
+-            # sqlalchemy type
++            # sqlobject type
+             return typename
+ 
+         typename = typename.upper()
+@@ -382,17 +362,17 @@
+         if isinstance(node, ast.Identifier):
+             schema, table_name = self.get_table_name(node)
+ 
+-            table = sa.table(table_name, schema=schema)
++            table = SQLRaw(f"{schema + '.' if schema else ''}{table_name}")
+ 
+             if node.alias:
+-                table = aliased(table, name=self.get_alias(node.alias))
++                table = SQLRaw(f"{table} AS {sqlrepr(self.get_alias(node.alias))}")
+ 
+         elif isinstance(node, (ast.Select, ast.Union, ast.Intersect, ast.Except)):
+             sub_stmt = self.prepare_select(node)
+             alias = None
+             if node.alias:
+                 alias = self.get_alias(node.alias)
+-            table = sub_stmt.subquery(alias)
++            table = SQLRaw(f"({sub_stmt})" + (f" AS {sqlrepr(alias)}" if alias else ""))
+ 
+         else:
+             # TODO tests are failing
+@@ -409,7 +389,7 @@
+             col = self.to_expression(t)
+             cols.append(col)
+ 
+-        query = sa.select(*cols)
++        query = Select(cols)
+ 
+         if node.cte is not None:
+             for cte in node.cte:
+@@ -419,10 +399,10 @@
+                 stmt = self.prepare_select(cte.query)
+                 alias = cte.name
+ 
+-                query = query.add_cte(stmt.cte(self.get_alias(alias), nesting=True))
++                query = SQLRaw(str(query) + ' WITH ' + str(stmt) + ' AS ' + self.get_alias(alias))
+ 
+         if node.distinct:
+-            query = query.distinct()
++            query = SQLRaw('DISTINCT ' + str(query))
+ 
+         if node.from_table is not None:
+             from_table = node.from_table
+@@ -431,99 +411,93 @@
+                 join_list = self.prepare_join(from_table)
+                 # first table
+                 table = self.to_table(join_list[0]['table'])
+-                query = query.select_from(table)
++                query = SQLRaw(str(query) + ' FROM ' + str(table))
+ 
+                 # other tables
+                 for item in join_list[1:]:
+                     table = self.to_table(item['table'])
+                     if item['is_implicit']:
+                         # add to from clause
+-                        query = query.select_from(table)
++                        query = SQLRaw(str(query) + ', ' + str(table))
+                     else:
+                         if item['condition'] is None:
+                             # otherwise, sqlalchemy raises "Don't know how to join to ..."
+-                            condition = sa.text('1=1')
++                            condition = SQLRaw('1=1')
+                         else:
+                             condition = self.to_expression(item['condition'])
+ 
+                         join_type = item['join_type']
+-                        method = 'join'
++                        method = 'JOIN'
+                         is_full = False
+                         if join_type == 'LEFT JOIN':
+-                            method = 'outerjoin'
++                            method = 'LEFT JOIN'
+                         if join_type == 'FULL JOIN':
+                             is_full = True
+ 
+                         # perform join
+-                        query = getattr(query, method)(
+-                            table,
+-                            condition,
+-                            full=is_full
+-                        )
++                        query = SQLRaw(str(query) + f' {method} ' + str(table) + ' ON ' + str(condition))
+             elif isinstance(from_table, ast.Union):
+                 alias = None
+                 if from_table.alias:
+                     alias = self.get_alias(from_table.alias)
+-                table = self.prepare_union(from_table).subquery(alias)
+-                query = query.select_from(table)
++                table = SQLRaw(f"({self.prepare_union(from_table)})" + (f" AS {sqlrepr(alias)}" if alias else ""))
++                query = SQLRaw(str(query) + ' FROM ' + str(table))
+ 
+             elif isinstance(from_table, ast.Select):
+                 table = self.to_table(from_table)
+-                query = query.select_from(table)
++                query = SQLRaw(str(query) + ' FROM ' + str(table))
+ 
+             elif isinstance(from_table, ast.Identifier):
+                 table = self.to_table(from_table)
+-                query = query.select_from(table)
++                query = SQLRaw(str(query) + ' FROM ' + str(table))
+ 
+             elif isinstance(from_table, ast.NativeQuery):
+                 alias = None
+                 if from_table.alias:
+                     alias = from_table.alias.parts[-1]
+-                table = sa.text(from_table.query).columns().subquery(alias)
+-                query = query.select_from(table)
++                table = SQLRaw(f"({from_table.query})" + (f" AS {sqlrepr(alias)}" if alias else ""))
++                query = SQLRaw(str(query) + ' FROM ' + str(table))
+             else:
+                 raise NotImplementedError(f'Select from {from_table}')
+ 
+         if node.where is not None:
+-            query = query.filter(
+-                self.to_expression(node.where)
+-            )
++            query = SQLRaw(str(query) + ' WHERE ' + str(self.to_expression(node.where)))
+ 
+         if node.group_by is not None:
+             cols = [
+                 self.to_expression(i)
+                 for i in node.group_by
+             ]
+-            query = query.group_by(*cols)
++            query = SQLRaw(str(query) + ' GROUP BY ' + ', '.join(map(str, cols)))
+ 
+         if node.having is not None:
+-            query = query.having(self.to_expression(node.having))
++            query = SQLRaw(str(query) + ' HAVING ' + str(self.to_expression(node.having)))
+ 
+         if node.order_by is not None:
+             order_by = []
+             for f in node.order_by:
+                 col0 = self.to_expression(f.field)
+                 if f.direction.upper() == 'DESC':
+-                    col0 = col0.desc()
++                    col0 = SQLRaw(f"{col0} DESC")
+                 elif f.direction.upper() == 'ASC':
+-                    col0 = col0.asc()
++                    col0 = SQLRaw(f"{col0} ASC")
+                 if f.nulls.upper() == 'NULLS FIRST':
+-                    col0 = sa.nullsfirst(col0)
++                    col0 = SQLRaw(f"{col0} NULLS FIRST")
+                 elif f.nulls.upper() == 'NULLS LAST':
+-                    col0 = sa.nullslast(col0)
++                    col0 = SQLRaw(f"{col0} NULLS LAST")
+                 order_by.append(col0)
+ 
+-            query = query.order_by(*order_by)
++            query = SQLRaw(str(query) + ' ORDER BY ' + ', '.join(map(str, order_by)))
+ 
+         if node.limit is not None:
+-            query = query.limit(node.limit.value)
++            query = SQLRaw(str(query) + f' LIMIT {node.limit.value}')
+ 
+         if node.offset is not None:
+-            query = query.offset(node.offset.value)
++            query = SQLRaw(str(query) + f' OFFSET {node.offset.value}')
+ 
+         if node.mode is not None:
+             if node.mode == 'FOR UPDATE':
+-                query = query.with_for_update()
++                query = SQLRaw(str(query) + ' FOR UPDATE')
+             else:
+                 raise NotImplementedError(f'Select mode: {node.mode}')
+ 
+@@ -534,13 +508,13 @@
+         step2 = self.prepare_select(from_table.right)
+ 
+         if isinstance(from_table, ast.Except):
+-            func = sa.except_ if from_table.unique else sa.except_all
++            func = 'EXCEPT' if from_table.unique else 'EXCEPT ALL'
+         elif isinstance(from_table, ast.Intersect):
+-            func = sa.intersect if from_table.unique else sa.intersect_all
+-        else:
+-            func = sa.union if from_table.unique else sa.union_all
+-
+-        return func(step1, step2)
++            func = 'INTERSECT' if from_table.unique else 'INTERSECT ALL'
++        else:
++            func = 'UNION' if from_table.unique else 'UNION ALL'
++
++        return SQLRaw(f"({step1}) {func} ({step2})")
+ 
+     def prepare_create_table(self, ast_query):
+         columns = []
+@@ -549,7 +523,7 @@
+             default = None
+             if col.default is not None:
+                 if isinstance(col.default, str):
+-                    default = sa.text(col.default)
++                    default = SQLRaw(col.default)
+ 
+             if isinstance(col.type, str) and col.type.lower() == 'serial':
+                 col.is_primary_key = True
+@@ -563,24 +537,19 @@
+                 kwargs['nullable'] = col.nullable
+ 
+             columns.append(
+-                sa.Column(
+-                    col.name,
+-                    self.get_type(col.type),
+-                    **kwargs
+-                )
++                (col.name, self.get_type(col.type), kwargs)
+             )
+ 
+         schema, table_name = self.get_table_name(ast_query.name)
+ 
+-        metadata = sa.MetaData()
+-        table = sa.Table(
+-            table_name,
+-            metadata,
+-            schema=schema,
+-            *columns
+-        )
+-
+-        return CreateTable(table)
++        table = SQLRaw(f"CREATE TABLE {schema + '.' if schema else ''}{table_name} (" + ', '.join(
++            [
++                f"{name} {typ.__name__ if hasattr(typ, '__name__') else typ}"
++                for name, typ, kwargs in columns
++            ]
++        ) + ")")
++
++        return table
+ 
+     def prepare_drop_table(self, ast_query):
+         if len(ast_query.tables) != 1:
+@@ -588,13 +557,7 @@
+ 
+         schema, table_name = self.get_table_name(ast_query.tables[0])
+ 
+-        metadata = sa.MetaData()
+-        table = sa.Table(
+-            table_name,
+-            metadata,
+-            schema=schema
+-        )
+-        return DropTable(table, if_exists=ast_query.if_exists)
++        return SQLRaw(f"DROP TABLE {'IF EXISTS ' if ast_query.if_exists else ''}{schema + '.' if schema else ''}{table_name}")
+ 
+     def prepare_insert(self, ast_query, with_params=False):
+         params = None
+@@ -607,25 +570,20 @@
+             raise NotImplementedError('Columns is required in insert query')
+         for col in ast_query.columns:
+             columns.append(
+-                sa.Column(
+-                    col.name,
+-                    # self.get_type(col.type)
+-                )
++                col.name
+             )
+             # check doubles
+             if col.name in names:
+                 raise RenderError(f'Columns name double: {col.name}')
+             names.append(col.name)
+ 
+-        table = sa.table(table_name, schema=schema, *columns)
+-
+         if ast_query.values is not None:
+             values = []
+ 
+             if ast_query.is_plain and with_params:
+ 
+                 for i in range(len(ast_query.columns)):
+-                    values.append(sa.column('%s', is_literal=True))
++                    values.append(SQLRaw('%s'))
+ 
+                 values = [values]
+                 params = ast_query.values
+@@ -638,11 +596,13 @@
+                     ]
+                     values.append(row)
+ 
+-            stmt = table.insert().values(values)
++            stmt = SQLRaw(f"INSERT INTO {schema + '.' if schema else ''}{table_name} ({', '.join(names)}) VALUES " + ', '.join(
++                ['(' + ', '.join(map(str, row)) + ')' for row in values]
++            ))
+         else:
+             # is insert from subselect
+             subquery = self.prepare_select(ast_query.from_select)
+-            stmt = table.insert().from_select(names, subquery)
++            stmt = SQLRaw(f"INSERT INTO {schema + '.' if schema else ''}{table_name} ({', '.join(names)}) {subquery}")
+ 
+         return stmt, params
+ 
+@@ -657,19 +617,17 @@
+         to_update = {}
+         for col, value in ast_query.update_columns.items():
+             columns.append(
+-                sa.Column(
+-                    col,
+-                )
++                col
+             )
+ 
+             to_update[col] = self.to_expression(value)
+ 
+-        table = sa.table(table_name, schema=schema, *columns)
+-
+-        stmt = table.update().values(**to_update)
++        stmt = SQLRaw(f"UPDATE {schema + '.' if schema else ''}{table_name} SET " + ', '.join(
++            [f"{k} = {v}" for k, v in to_update.items()]
++        ))
+ 
+         if ast_query.where is not None:
+-            stmt = stmt.where(self.to_expression(ast_query.where))
++            stmt = SQLRaw(str(stmt) + ' WHERE ' + str(self.to_expression(ast_query.where)))
+ 
+         return stmt
+ 
+@@ -678,12 +636,10 @@
+ 
+         columns = []
+ 
+-        table = sa.table(table_name, schema=schema, *columns)
+-
+-        stmt = table.delete()
++        stmt = SQLRaw(f"DELETE FROM {schema + '.' if schema else ''}{table_name}")
+ 
+         if ast_query.where is not None:
+-            stmt = stmt.where(self.to_expression(ast_query.where))
++            stmt = SQLRaw(str(stmt) + ' WHERE ' + str(self.to_expression(ast_query.where)))
+ 
+         return stmt
+ 
+@@ -736,37 +692,18 @@
+ 
+             return sql, params
+ 
+-        except (SQLAlchemyError, NotImplementedError) as e:
++        except (SQLObjectIntegrityError, NotImplementedError) as e:
+             if not with_failback:
+                 raise e
+ 
+             sql_query = str(ast_query)
+-            if self.dialect.name == 'postgresql':
+-                sql_query = sql_query.replace('`', '')
+             return sql_query, None
+ 
+ 
+ def render_dml_query(statement, dialect):
+ 
+-    class LiteralCompiler(dialect.statement_compiler):
+-
+-        def render_literal_value(self, value, type_):
+-
+-            if isinstance(value, (str, dt.date, dt.datetime, dt.timedelta)):
+-                return "'{}'".format(str(value).replace("'", "''"))
+-
+-            return super(LiteralCompiler, self).render_literal_value(value, type_)
+-
+-    return str(LiteralCompiler(dialect, statement, compile_kwargs={'literal_binds': True}))
++    return str(statement)
+ 
+ 
+ def render_ddl_query(statement, dialect):
+-    class LiteralCompiler(dialect.ddl_compiler):
+-
+-        def render_literal_value(self, value, type_):
+-            if isinstance(value, (str, dt.date, dt.datetime, dt.timedelta)):
+-                return "'{}'".format(str(value).replace("'", "''"))
+-
+-            return super(LiteralCompiler, self).render_literal_value(value, type_)
+-
+-    return str(LiteralCompiler(dialect, statement, compile_kwargs={'literal_binds': True}))
++    return str(statement)

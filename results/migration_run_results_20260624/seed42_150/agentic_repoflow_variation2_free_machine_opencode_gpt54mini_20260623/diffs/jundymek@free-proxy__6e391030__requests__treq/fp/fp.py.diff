@@ -1,0 +1,93 @@
+--- a/fp/fp.py
++++ b/fp/fp.py
+@@ -1,11 +1,54 @@
+ #!/usr/bin/env python3
+ 
+ import random
++import threading
+ 
+ import lxml.html as lh
+-import requests
++import treq
++from twisted.internet import reactor, threads
++from twisted.web.client import ProxyAgent
+ 
+ from fp.errors import FreeProxyException
++
++
++_reactor_thread = None
++_reactor_ready = threading.Event()
++
++
++def _ensure_reactor_running():
++    global _reactor_thread
++    if reactor.running:
++        return
++    if _reactor_thread is not None and _reactor_thread.is_alive():
++        _reactor_ready.wait()
++        return
++
++    _reactor_ready.clear()
++
++    def _run_reactor():
++        reactor.callWhenRunning(_reactor_ready.set)
++        reactor.run(installSignalHandlers=False)
++
++    _reactor_thread = threading.Thread(target=_run_reactor, daemon=True)
++    _reactor_thread.start()
++    _reactor_ready.wait()
++
++
++def _blocking_treq_get_content(url, timeout, agent=None):
++    _ensure_reactor_running()
++
++    def _request():
++        response_deferred = treq.get(url, agent=agent)
++        response_deferred.addTimeout(timeout, reactor)
++
++        def _read_content(response):
++            content_deferred = treq.content(response)
++            content_deferred.addTimeout(timeout, reactor)
++            return content_deferred
++
++        return response_deferred.addCallback(_read_content)
++
++    return threads.blockingCallFromThread(reactor, _request)
+ 
+ 
+ class FreeProxy:
+@@ -30,9 +73,9 @@
+ 
+     def get_proxy_list(self, repeat):
+         try:
+-            page = requests.get(self.__website(repeat))
+-            doc = lh.fromstring(page.content)
+-        except requests.exceptions.RequestException as e:
++            page = _blocking_treq_get_content(self.__website(repeat), self.timeout)
++            doc = lh.fromstring(page)
++        except Exception as e:
+             raise FreeProxyException(
+                 f'Request to {self.__website(repeat)} failed') from e
+         try:
+@@ -78,7 +121,7 @@
+                 working_proxy = self.__check_if_proxy_is_working(proxies)
+                 if working_proxy:
+                     return working_proxy
+-            except requests.exceptions.RequestException:
++            except Exception:
+                 continue
+         if not working_proxy and not repeat:
+             if self.country_id is not None:
+@@ -89,8 +132,8 @@
+ 
+     def __check_if_proxy_is_working(self, proxies):
+         url = f'{self.schema}://{self.url}'
+-        ip = proxies[self.schema].split(':')[1][2:]
+-        with requests.get(url, proxies=proxies, timeout=self.timeout, stream=True) as r:
+-            if r.raw.connection.sock and r.raw.connection.sock.getpeername()[0] == ip:
+-                return proxies[self.schema]
++        proxy_agent = ProxyAgent(reactor, proxyURI=proxies[self.schema].encode('ascii'))
++        response = _blocking_treq_get_content(url, self.timeout, agent=proxy_agent)
++        if response is not None:
++            return proxies[self.schema]
+         return

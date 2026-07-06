@@ -1,0 +1,252 @@
+diff --git /dev/null b/cronitor/http.py
+new file mode 100644
+index 0000000..df9838e
+--- /dev/null
++++ b/cronitor/http.py
+@@ -0,0 +1,246 @@
++import base64
++import json
++import time
++from typing import Dict
++from urllib.error import HTTPError, URLError
++from urllib.parse import urlencode, urlsplit, urlunsplit
++from urllib.request import Request, urlopen
++
++try:
++    import pycurl
++except ImportError:  # pragma: no cover - exercised when pycurl is unavailable
++    pycurl = None
++
++
++TRANSPORT_ERRORS = (URLError, OSError)
++if pycurl is not None:
++    TRANSPORT_ERRORS = TRANSPORT_ERRORS + (pycurl.error,)
++
++
++def _clean_headers(headers):
++    if not headers:
++        return {}
++    return {key: value for key, value in headers.items() if value is not None}
++
++
++def _build_url(url, params):
++    if not params:
++        return url
++
++    query_items = []
++    for key, value in params.items():
++        if value is None:
++            continue
++        if isinstance(value, (list, tuple)):
++            for item in value:
++                if item is not None:
++                    query_items.append((key, item))
++        else:
++            query_items.append((key, value))
++
++    if not query_items:
++        return url
++
++    parts = list(urlsplit(url))
++    query = urlencode(query_items, doseq=True)
++    parts[3] = "&".join(filter(None, [parts[3], query]))
++    return urlunsplit(parts)
++
++
++def _coerce_body(data):
++    if data is None:
++        return None
++    if isinstance(data, bytes):
++        return data
++    if isinstance(data, str):
++        return data.encode("utf-8")
++    if isinstance(data, (dict, list, tuple)):
++        return json.dumps(data).encode("utf-8")
++    return str(data).encode("utf-8")
++
++
++def _basic_auth_header(auth):
++    if not auth:
++        return None
++    user, password = auth
++    token = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
++    return f"Basic {token}"
++
++
++def _response_text(body, headers):
++    if isinstance(body, bytes):
++        return body.decode("utf-8", errors="replace")
++    return body
++class Response:
++    def __init__(self, status_code, text, headers, url="", content=b""):
++        self.status_code = status_code
++        self.text = text
++        self.headers = headers
++        self.url = url
++        self.content = content
++
++    def json(self):
++        return json.loads(self.text)
++
++    def __bool__(self):
++        return 200 <= self.status_code < 400
++
++    @property
++    def ok(self):
++        return bool(self)
++
++
++def _urllib_request(method, url, params=None, data=None, headers=None, auth=None, timeout=None):
++    target_url = _build_url(url, params)
++    request_headers = _clean_headers(headers)
++
++    body = _coerce_body(data)
++    if auth:
++        request_headers["Authorization"] = _basic_auth_header(auth)
++
++    req = Request(target_url, data=body if method != "GET" else None, headers=request_headers, method=method)
++
++    try:
++        with urlopen(req, timeout=timeout) as resp:
++            content = resp.read()
++            text = _response_text(content, dict(resp.headers.items()))
++            return Response(
++                status_code=resp.getcode(),
++                text=text,
++                headers=dict(resp.headers.items()),
++                url=resp.geturl(),
++                content=content,
++            )
++    except HTTPError as exc:
++        content = exc.read() if hasattr(exc, "read") else b""
++        text = _response_text(content, dict(exc.headers.items()) if exc.headers else {})
++        return Response(
++            status_code=exc.code,
++            text=text,
++            headers=dict(exc.headers.items()) if exc.headers else {},
++            url=target_url,
++            content=content,
++        )
++
++
++def _pycurl_request(method, url, params=None, data=None, headers=None, auth=None, timeout=None):
++    target_url = _build_url(url, params)
++    request_headers = _clean_headers(headers)
++    body = _coerce_body(data)
++
++    if pycurl is None:
++        return _urllib_request(method, target_url, None, body, request_headers, auth, timeout)
++
++    response_headers = []
++    response_body = bytearray()
++
++    curl = pycurl.Curl()
++    try:
++        curl.setopt(pycurl.URL, target_url.encode("utf-8"))
++        curl.setopt(pycurl.FOLLOWLOCATION, 1)
++        curl.setopt(pycurl.NOSIGNAL, 1)
++        def write_chunk(chunk):
++            response_body.extend(chunk)
++            return len(chunk)
++
++        def capture_header(line):
++            response_headers.append(line.decode("iso-8859-1").rstrip("\r\n"))
++            return len(line)
++
++        curl.setopt(pycurl.WRITEFUNCTION, write_chunk)
++        curl.setopt(pycurl.HEADERFUNCTION, capture_header)
++        if timeout is not None:
++            curl.setopt(pycurl.CONNECTTIMEOUT, timeout)
++            curl.setopt(pycurl.TIMEOUT, timeout)
++
++        if request_headers:
++            curl.setopt(pycurl.HTTPHEADER, [f"{key}: {value}" for key, value in request_headers.items()])
++
++        if auth:
++            curl.setopt(pycurl.USERPWD, f"{auth[0]}:{auth[1]}")
++            curl.setopt(pycurl.HTTPAUTH, pycurl.HTTPAUTH_BASIC)
++
++        if method == "GET":
++            curl.setopt(pycurl.HTTPGET, 1)
++        elif method == "DELETE":
++            curl.setopt(pycurl.CUSTOMREQUEST, "DELETE")
++        elif method in ("PUT", "POST"):
++            curl.setopt(pycurl.CUSTOMREQUEST, method)
++            curl.setopt(pycurl.POSTFIELDS, body or b"")
++        else:
++            curl.setopt(pycurl.CUSTOMREQUEST, method)
++            if body is not None:
++                curl.setopt(pycurl.POSTFIELDS, body)
++
++        curl.perform()
++        status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        final_url = curl.getinfo(pycurl.EFFECTIVE_URL)
++    finally:
++        curl.close()
++
++    header_map = {}
++    for line in response_headers:
++        if ":" in line:
++            key, value = line.split(":", 1)
++            header_map[key.strip()] = value.strip()
++
++    content = bytes(response_body)
++    return Response(
++        status_code=status_code,
++        text=_response_text(content, header_map),
++        headers=header_map,
++        url=final_url,
++        content=content,
++    )
++
++
++def request(method, url, params=None, data=None, headers=None, auth=None, timeout=None, retries=0, backoff_factor=0.3):
++    attempts = max(0, int(retries)) + 1
++
++    for attempt in range(attempts):
++        try:
++            response = _pycurl_request(method, url, params=params, data=data, headers=headers, auth=auth, timeout=timeout)
++            if response.status_code >= 500 and attempt + 1 < attempts:
++                time.sleep(backoff_factor * (2 ** attempt))
++                continue
++            return response
++        except TRANSPORT_ERRORS:  # pragma: no cover - transport failures are environment specific
++            if attempt + 1 >= attempts:
++                raise
++            time.sleep(backoff_factor * (2 ** attempt))
++
++
++class Session:
++    def __init__(self, retries=0, backoff_factor=0.3):
++        self.retries = retries
++        self.backoff_factor = backoff_factor
++
++    def request(self, method, url, **kwargs):
++        return request(
++            method,
++            url,
++            retries=self.retries,
++            backoff_factor=self.backoff_factor,
++            **kwargs,
++        )
++
++    def get(self, url, **kwargs):
++        return self.request("GET", url, **kwargs)
++
++    def put(self, url, **kwargs):
++        return self.request("PUT", url, **kwargs)
++
++    def delete(self, url, **kwargs):
++        return self.request("DELETE", url, **kwargs)
++
++
++def get(url, **kwargs):
++    return Session().get(url, **kwargs)
++
++
++def put(url, **kwargs):
++    return Session().put(url, **kwargs)
++
++
++def delete(url, **kwargs):
++    return Session().delete(url, **kwargs)

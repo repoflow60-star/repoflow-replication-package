@@ -1,0 +1,220 @@
+diff --git /dev/null b/src/sanic/__init__.py
+new file mode 100644
+index 0000000..9e3f4f8
+--- /dev/null
++++ b/src/sanic/__init__.py
+@@ -0,0 +1,214 @@
++from __future__ import annotations
++
++import inspect
++import json as json_module
++from dataclasses import dataclass
++from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
++
++
++def _normalize_path(path: str) -> str:
++    if not path:
++        return "/"
++    if path == "/":
++        return path
++    return path.rstrip("/") or "/"
++
++
++def _encode_headers(headers: Optional[Dict[str, str]] = None) -> List[Tuple[bytes, bytes]]:
++    if not headers:
++        return []
++    return [(key.lower().encode("latin-1"), value.encode("latin-1")) for key, value in headers.items()]
++
++
++class HTTPResponse:
++    def __init__(
++        self,
++        body: bytes,
++        status: int = 200,
++        headers: Optional[Dict[str, str]] = None,
++        content_type: str = "text/plain; charset=utf-8",
++    ):
++        self.body = body
++        self.status = status
++        self.content_type = content_type
++        self.headers = headers or {}
++
++    async def __call__(self, scope, receive, send):
++        headers = dict(self.headers)
++        headers.setdefault("content-type", self.content_type)
++        headers.setdefault("content-length", str(len(self.body)))
++        await send({"type": "http.response.start", "status": self.status, "headers": _encode_headers(headers)})
++        await send({"type": "http.response.body", "body": self.body, "more_body": False})
++
++
++def json(body: Any, status: int = 200, headers: Optional[Dict[str, str]] = None) -> HTTPResponse:
++    payload = json_module.dumps(body).encode("utf-8")
++    return HTTPResponse(payload, status=status, headers=headers, content_type="application/json; charset=utf-8")
++
++
++def text(body: str, status: int = 200, headers: Optional[Dict[str, str]] = None) -> HTTPResponse:
++    payload = body.encode("utf-8")
++    return HTTPResponse(payload, status=status, headers=headers, content_type="text/plain; charset=utf-8")
++
++
++class Request:
++    def __init__(self, app: "Sanic", scope: dict, body: bytes):
++        self.app = app
++        self.scope = scope
++        self.method = scope["method"].upper()
++        self.path = scope["path"]
++        self.headers = {
++            key.decode("latin-1"): value.decode("latin-1") for key, value in scope.get("headers", [])
++        }
++        self._body = body
++        self._json_cache = inspect._empty
++
++    @property
++    def body(self) -> bytes:
++        return self._body
++
++    async def json(self) -> Any:
++        if self._json_cache is inspect._empty:
++            self._json_cache = json_module.loads(self._body.decode("utf-8") or "null")
++        return self._json_cache
++
++
++@dataclass
++class _Route:
++    path: str
++    methods: Tuple[str, ...]
++    handler: Callable[[Request], Awaitable[Any] | Any]
++
++
++@dataclass
++class _Mount:
++    prefix: str
++    app: Callable
++
++
++class Sanic:
++    def __init__(self, name: str):
++        self.name = name
++        self.dependency_overrides: Dict[Callable, Callable] = {}
++        self._routes: List[_Route] = []
++        self._mounts: List[_Mount] = []
++        self._exception_handlers: Dict[type, Callable] = {}
++
++    def route(self, path: str, methods: Sequence[str]):
++        normalized_path = _normalize_path(path)
++        normalized_methods = tuple(method.upper() for method in methods)
++
++        def decorator(handler):
++            self._routes.append(_Route(normalized_path, normalized_methods, handler))
++            return handler
++
++        return decorator
++
++    def get(self, path: str):
++        return self.route(path, ["GET"])
++
++    def post(self, path: str):
++        return self.route(path, ["POST"])
++
++    def mount(self, path: str, app: Callable):
++        self._mounts.append(_Mount(_normalize_path(path), app))
++
++    def exception(self, exc_class: type):
++        def decorator(handler):
++            self._exception_handlers[exc_class] = handler
++            return handler
++
++        return decorator
++
++    def _match_route(self, path: str, method: str) -> Optional[Callable]:
++        normalized_path = _normalize_path(path)
++        for route in self._routes:
++            if route.path == normalized_path and method.upper() in route.methods:
++                return route.handler
++        return None
++
++    async def _call_mounted(self, mount: _Mount, scope: dict, body: bytes, send):
++        child_scope = dict(scope)
++        remainder = child_scope["path"][len(mount.prefix) :]
++        child_scope["path"] = remainder or "/"
++        child_scope["root_path"] = child_scope.get("root_path", "") + mount.prefix
++
++        async def receive():
++            nonlocal body
++            chunk = body
++            body = b""
++            return {"type": "http.request", "body": chunk, "more_body": False}
++
++        await mount.app(child_scope, receive, send)
++
++    async def _handle_http(self, scope, receive, send):
++        body_chunks = []
++        while True:
++            message = await receive()
++            if message["type"] == "http.disconnect":
++                break
++            if message["type"] != "http.request":
++                continue
++            body_chunks.append(message.get("body", b""))
++            if not message.get("more_body", False):
++                break
++        body = b"".join(body_chunks)
++        path = _normalize_path(scope["path"])
++        method = scope["method"].upper()
++
++        for mount in sorted(self._mounts, key=lambda item: len(item.prefix), reverse=True):
++            if path == mount.prefix or path.startswith(mount.prefix + "/"):
++                await self._call_mounted(mount, scope, body, send)
++                return
++
++        handler = self._match_route(path, method)
++        if handler is None:
++            await text("Not Found", status=404)(scope, receive, send)
++            return
++
++        request = Request(self, scope, body)
++        try:
++            result = handler(request)
++            if inspect.isawaitable(result):
++                result = await result
++            if hasattr(result, "__call__") and not isinstance(result, (dict, list, str, bytes)):
++                await result(scope, receive, send)
++                return
++            if isinstance(result, bytes):
++                response = HTTPResponse(result, content_type="application/octet-stream")
++            elif isinstance(result, str):
++                response = text(result)
++            elif isinstance(result, (dict, list)):
++                response = json(result)
++            else:
++                response = text(str(result))
++        except Exception as exc:
++            handler_ = self._exception_handlers.get(type(exc))
++            if handler_ is not None:
++                result = handler_(request, exc)
++                if inspect.isawaitable(result):
++                    result = await result
++                if hasattr(result, "__call__"):
++                    await result(scope, receive, send)
++                    return
++                response = result if isinstance(result, HTTPResponse) else json(result)
++            else:
++                response = json({"detail": str(exc)}, status=500)
++
++        await response(scope, receive, send)
++
++    async def __call__(self, scope, receive, send):
++        if scope["type"] == "http":
++            await self._handle_http(scope, receive, send)
++            return
++        if scope["type"] == "lifespan":
++            while True:
++                message = await receive()
++                if message["type"] == "lifespan.startup":
++                    await send({"type": "lifespan.startup.complete"})
++                elif message["type"] == "lifespan.shutdown":
++                    await send({"type": "lifespan.shutdown.complete"})
++                    return
++            return
++        raise RuntimeError(f"Unsupported scope type: {scope['type']}")
++

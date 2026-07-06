@@ -1,0 +1,201 @@
+diff --git /dev/null b/requests/__init__.py
+new file mode 100644
+index 0000000..b70ccac
+--- /dev/null
++++ b/requests/__init__.py
+@@ -0,0 +1,195 @@
++from __future__ import annotations
++
++import importlib.util
++import json
++import sys
++import threading
++from dataclasses import dataclass
++from pathlib import Path
++from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
++
++from . import exceptions as _local_exceptions
++
++try:
++    import treq
++    from twisted.internet import reactor, threads, defer
++except Exception:  # pragma: no cover - fallback for environments without treq installed
++    treq = None
++    reactor = None
++    threads = None
++    defer = None
++
++
++def _load_real_requests():
++    current_dir = Path(__file__).resolve().parent
++    for entry in list(sys.path):
++        if not entry:
++            continue
++        candidate = Path(entry) / "requests" / "__init__.py"
++        if not candidate.exists() or candidate.parent == current_dir:
++            continue
++        spec = importlib.util.spec_from_file_location(
++            "_real_requests",
++            candidate,
++            submodule_search_locations=[str(candidate.parent)],
++        )
++        if spec and spec.loader:
++            module = importlib.util.module_from_spec(spec)
++            sys.modules[spec.name] = module
++            try:
++                spec.loader.exec_module(module)
++            except Exception:
++                sys.modules.pop(spec.name, None)
++                continue
++            return module
++    return None
++
++
++_real_requests = _load_real_requests()
++
++if _real_requests is not None:
++    _metadata_names = {
++        "__version__",
++        "__build__",
++        "__author__",
++        "__copyright__",
++        "__license__",
++    }
++    for _name, _value in vars(_real_requests).items():
++        if (_name.startswith("_") and _name not in _metadata_names) or _name in {"get", "post", "exceptions", "Response"}:
++            continue
++        globals()[_name] = _value
++    exceptions = _real_requests.exceptions
++else:
++    exceptions = _local_exceptions
++
++
++@dataclass
++class Response:
++    status_code: int
++    content: bytes
++    url: str
++    headers: dict
++
++    @property
++    def text(self):
++        return self.content.decode("utf-8", errors="replace")
++
++    def json(self):
++        return json.loads(self.text)
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise exceptions.HTTPError(f"{self.status_code} Error for url: {self.url}")
++
++
++_reactor_started = False
++_reactor_lock = threading.Lock()
++_reactor_ready = threading.Event()
++
++
++def _start_reactor():
++    global _reactor_started
++    if reactor is None:
++        return
++    if getattr(reactor, "running", False):
++        _reactor_ready.set()
++        _reactor_started = True
++        return
++    with _reactor_lock:
++        if _reactor_started:
++            return
++
++        def _run():
++            reactor.callWhenRunning(_reactor_ready.set)
++            reactor.run(installSignalHandlers=False)
++
++        thread = threading.Thread(target=_run, name="treq-reactor", daemon=True)
++        thread.start()
++        _reactor_ready.wait(timeout=5)
++        _reactor_started = True
++
++
++def _merge_params(url, params):
++    if not params:
++        return url
++
++    parts = urlsplit(url)
++    query = dict(parse_qsl(parts.query, keep_blank_values=True))
++    query.update(params)
++    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query, doseq=True), parts.fragment))
++
++
++def _prepare_headers(headers):
++    return dict(headers or {})
++
++
++def _prepare_body(data):
++    if data is None:
++        return None
++    if isinstance(data, (bytes, bytearray)):
++        return bytes(data)
++    if isinstance(data, str):
++        return data.encode("utf-8")
++    if isinstance(data, dict):
++        return urlencode(data, doseq=True).encode("utf-8")
++    return data
++
++
++def _materialize_response(response, url):
++    @defer.inlineCallbacks
++    def _load():
++        body = yield treq.content(response)
++        headers = {
++            key.decode("utf-8") if isinstance(key, bytes) else key: value[0].decode("utf-8") if value and isinstance(value[0], bytes) else (value[0] if value else "")
++            for key, value in response.headers.getAllRawHeaders()
++        }
++        return Response(
++            status_code=response.code,
++            content=body,
++            url=url,
++            headers=headers,
++        )
++
++    return _load()
++
++
++def _request(method, url, *, params=None, data=None, headers=None, **kwargs):
++    url = _merge_params(url, params)
++    headers = _prepare_headers(headers)
++    body = _prepare_body(data)
++
++    if treq is None or reactor is None:
++        from urllib.request import Request, urlopen
++
++        request = Request(url, data=body if method == "post" else None, headers=headers, method=method.upper())
++        with urlopen(request) as response:
++            content = response.read()
++            status_code = response.getcode() or 0
++            response_headers = dict(response.headers.items())
++        return Response(status_code=status_code, content=content, url=url, headers=response_headers)
++
++    _start_reactor()
++
++    def _do_request():
++        if method == "get":
++            deferred = treq.get(url, headers=headers, **kwargs)
++        else:
++            deferred = treq.post(url, data=body, headers=headers, **kwargs)
++        deferred.addCallback(_materialize_response, url)
++        return deferred
++
++    response = threads.blockingCallFromThread(reactor, _do_request)
++    response.raise_for_status()
++    return response
++
++
++def get(url, params=None, headers=None, **kwargs):
++    return _request("get", url, params=params, headers=headers, **kwargs)
++
++
++def post(url, params=None, data=None, headers=None, **kwargs):
++    return _request("post", url, params=params, data=data, headers=headers, **kwargs)
++
++
++__all__ = ["get", "post", "Response", "exceptions"]

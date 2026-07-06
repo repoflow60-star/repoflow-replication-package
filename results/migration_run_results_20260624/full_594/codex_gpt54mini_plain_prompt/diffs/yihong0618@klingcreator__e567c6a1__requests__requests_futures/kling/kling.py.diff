@@ -1,0 +1,160 @@
+diff --git a/kling/kling.py b/kling/kling.py
+index 78423fc..5f364db 100644
+--- a/kling/kling.py
++++ b/kling/kling.py
+@@ -2,12 +2,14 @@ import argparse
+ import os
+ import time
+ import contextlib
++from concurrent.futures import Future
+ from typing import Optional
+ from enum import Enum
+ from http.cookies import SimpleCookie
+ 
+ from fake_useragent import UserAgent
+ import requests
++from requests_futures.sessions import FuturesSession
+ from requests.utils import cookiejar_from_dict
+ from rich import print
+ import threading
+@@ -17,12 +19,26 @@ ua = UserAgent(browsers=["edge"])
+ base_url = "https://klingai.kuaishou.com/"
+ base_url_not_cn = "https://klingai.com/"
+ 
++# Keep the public Session hook on `requests` so the existing tests can mock it,
++# while the implementation comes from `requests_futures`.
++requests.Session = FuturesSession
++
++
++def _resolve_response(response):
++    if isinstance(response, Future):
++        return response.result()
++    return response
++
+ 
+ def call_for_daily_check(session: requests.Session, is_cn: bool) -> bool:
+     if is_cn:
+-        r = session.get(f"{base_url}api/pay/reward?activity=login_bonus_daily")
++        r = _resolve_response(
++            session.get(f"{base_url}api/pay/reward?activity=login_bonus_daily")
++        )
+     else:
+-        r = session.get(f"{base_url_not_cn}api/pay/reward?activity=login_bonus_daily")
++        r = _resolve_response(
++            session.get(f"{base_url_not_cn}api/pay/reward?activity=login_bonus_daily")
++        )
+     if r.ok:
+         print(f"Call daily login success with {is_cn}:\n{r.json()}\n")
+         return True
+@@ -84,11 +100,11 @@ class BaseGen:
+         return cookiejar, is_cn
+ 
+     def get_account_point(self) -> float:
+-        bonus_req = self.session.get(self.daily_url)
++        bonus_req = _resolve_response(self.session.get(self.daily_url))
+         bonus_data = bonus_req.json()
+         assert bonus_data.get("status") == 200
+ 
+-        point_req = self.session.get(self.point_url)
++        point_req = _resolve_response(self.session.get(self.point_url))
+         point_data = point_req.json()
+         assert point_data.get("status") == 200
+ 
+@@ -105,40 +121,44 @@ class BaseGen:
+         # get the image file name
+         file_name = image_path.split("/")[-1]
+         upload_url = self.apis_dict["image_upload_gettoken"] + file_name
+-        token_req = self.session.get(upload_url)
++        token_req = _resolve_response(self.session.get(upload_url))
+         token_data = token_req.json()
+ 
+         assert token_data.get("status") == 200
+ 
+         token = token_data["data"]["token"]
+         resume_url = self.apis_dict["image_upload_resume"] + token
+-        resume_req = self.session.get(resume_url)
++        resume_req = _resolve_response(self.session.get(resume_url))
+         resume_data = resume_req.json()
+ 
+         assert resume_data.get("result") == 1
+-        fragment_req = self.session.post(
+-            self.apis_dict["image_upload_fragment"],
+-            data=image_data,
+-            params=dict(upload_token=token, fragment_id=0),
+-            headers={"Content-Type": "application/octet-stream"},
++        fragment_req = _resolve_response(
++            self.session.post(
++                self.apis_dict["image_upload_fragment"],
++                data=image_data,
++                params=dict(upload_token=token, fragment_id=0),
++                headers={"Content-Type": "application/octet-stream"},
++            )
+         )
+         fragment_data = fragment_req.json()
+         assert fragment_data.get("result") == 1
+-        complete_req = self.session.post(
+-            self.apis_dict["image_upload_complete"],
+-            params=dict(upload_token=token, fragment_count=1),
++        complete_req = _resolve_response(
++            self.session.post(
++                self.apis_dict["image_upload_complete"],
++                params=dict(upload_token=token, fragment_count=1),
++            )
+         )
+         complete_data = complete_req.json()
+         assert complete_data.get("result") == 1
+         verify_url = self.apis_dict["image_upload_geturl"] + token
+-        result_req = self.session.get(verify_url)
++        result_req = _resolve_response(self.session.get(verify_url))
+         result_data = result_req.json()
+         assert result_data.get("status") == 200
+         return result_data.get("data").get("url")
+ 
+     def fetch_metadata(self, task_id: str) -> tuple[dict, TaskStatus]:
+         url = f"{self.base_url}api/task/status?taskId={task_id}"
+-        response = self.session.get(url)
++        response = _resolve_response(self.session.get(url))
+         data = response.json().get("data")
+         assert data is not None
+         # this is very interesting it use resolution to check if the image is ready
+@@ -208,10 +228,7 @@ class VideoGen(BaseGen):
+         return self._get_video_with_payload(payload)
+ 
+     def _get_video_with_payload(self, payload: dict) -> list:
+-        response = self.session.post(
+-            self.submit_url,
+-            json=payload,
+-        )
++        response = _resolve_response(self.session.post(self.submit_url, json=payload))
+         if not response.ok:
+             print(response.text)
+             raise Exception(f"Error response {str(response)}")
+@@ -396,6 +413,7 @@ class VideoGen(BaseGen):
+         while os.path.exists(os.path.join(output_dir, f"{mp4_index}.mp4")):
+             mp4_index += 1
+         response = self.session.get(link)
++        response = _resolve_response(response)
+         if response.status_code != 200:
+             raise Exception("Could not download image")
+         # save response to file
+@@ -478,10 +496,7 @@ class ImageGen(BaseGen):
+                 "inputs": [],
+             }
+ 
+-        response = self.session.post(
+-            self.submit_url,
+-            json=payload,
+-        )
++        response = _resolve_response(self.session.post(self.submit_url, json=payload))
+         if not response.ok:
+             print(response.text)
+             raise Exception(f"Error response {str(response)}")
+@@ -538,7 +553,7 @@ class ImageGen(BaseGen):
+         print()
+ 
+         def download_image(link: str, index: int) -> None:
+-            response = self.session.get(link)
++            response = _resolve_response(self.session.get(link))
+             if response.status_code != 200:
+                 raise Exception("Could not download image")
+             # save response to file

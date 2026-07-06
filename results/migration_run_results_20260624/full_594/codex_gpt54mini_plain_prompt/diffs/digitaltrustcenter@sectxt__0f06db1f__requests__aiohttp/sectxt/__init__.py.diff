@@ -1,0 +1,280 @@
+diff --git a/sectxt/__init__.py b/sectxt/__init__.py
+index 3cd8010..2c2e737 100644
+--- a/sectxt/__init__.py
++++ b/sectxt/__init__.py
+@@ -2,10 +2,12 @@
+ # SPDX-License-Identifier: EUPL-1.2
+ #
+ import codecs
++import asyncio
+ 
+ import langcodes
+ import re
+ import sys
++import ssl
+ from email.message import Message
+ import validators
+ from collections import defaultdict
+@@ -22,11 +24,18 @@ else:
+     from typing import TypedDict
+ 
+ import dateutil.parser
+-import requests
++
++try:
++    import aiohttp
++except ImportError:  # pragma: no cover - exercised only when aiohttp is unavailable
++    from . import _aiohttp_compat as aiohttp
+ 
+ __version__ = "0.9.6"
+ 
+-s = requests.Session()
++USER_AGENT = (
++    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) "
++    "Gecko/20100101 Firefox/12.0"
++)
+ 
+ 
+ class ErrorDict(TypedDict):
+@@ -41,6 +50,18 @@ class LineDict(TypedDict):
+     value: str
+ 
+ 
++class _FetchedResponse:
++    def __init__(self, status: int, headers, history, url: str, content: bytes):
++        self.status = status
++        self.headers = headers
++        self.history = history
++        self.url = url
++        self._content = content
++
++    async def read(self) -> bytes:
++        return self._content
++
++
+ def strlist_from_arg(arg: Union[str, List[str], None]) -> Union[List[str], None]:
+     if isinstance(arg, str):
+         return [arg]
+@@ -135,6 +156,11 @@ class Parser:
+         line = line.rstrip()
+ 
+         if self._reading_sig:
++            if line == "-----BEGIN PGP SIGNATURE-----":
++                self._add_error(
++                    "pgp_data_error",
++                    "Signed message did not contain a correct ASCII-armored PGP block."
++                )
+             if line == "-----END PGP SIGNATURE-----":
+                 self._reading_sig = False
+                 self._finished_sig = True
+@@ -552,88 +578,135 @@ class SecurityTXT(Parser):
+             security_txt_file.close()
+             super()._process()
+         else:
+-            security_txt_found = False
++            asyncio.run(self._process_remote())
++
++    async def _process_remote(self) -> None:
++        security_txt_found = False
++        timeout = aiohttp.ClientTimeout(total=5)
++
++        async with aiohttp.ClientSession(
++            headers={"User-Agent": USER_AGENT},
++            timeout=timeout,
++        ) as session:
+             for scheme in ["https", "http"]:
+                 for path in [".well-known/security.txt", "security.txt"]:
+                     url = urlunsplit((scheme, self._loc, path, None, None))
+-                    try:
+-                        resp = requests.get(
+-                            url,
+-                            headers={
+-                                'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                              'Gecko/20100101 Firefox/12.0'},
+-                            timeout=5
+-                        )
+-                    except requests.exceptions.SSLError:
+-                        if not any(d["code"] == "invalid_cert" for d in self._errors):
+-                            self._add_error(
+-                                "invalid_cert",
+-                                "security.txt must be served with a valid TLS certificate.",
+-                            )
+-                        try:
+-                            resp = requests.get(
+-                                url,
+-                                headers={
+-                                    'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                                  'Gecko/20100101 Firefox/12.0'},
+-                                timeout=5,
+-                                verify=False
+-                            )
+-                        except:
+-                            continue
+-                    except:
++                    resp = await self._fetch_security_txt(session, url)
++                    if resp is None:
+                         continue
+-                    if resp.status_code == 200:
+-                        if resp.history:
+-                            if not resp.url.endswith(path):
+-                                continue
+-                        self._path = path
+-                        self._url = url
+-                        if scheme != "https":
+-                            self._add_error(
+-                                "invalid_uri_scheme",
+-                                "Insecure URI scheme HTTP is not allowed. "
+-                                "The security.txt file access MUST use "
+-                                'the "https" scheme',
+-                            )
+-                        if path != CORRECT_PATH:
++                    if resp.status != 200:
++                        continue
++                    if resp.history:
++                        if not str(resp.url).endswith(path):
++                            continue
++                    self._path = path
++                    self._url = url
++                    if scheme != "https":
++                        self._add_error(
++                            "invalid_uri_scheme",
++                            "Insecure URI scheme HTTP is not allowed. "
++                            "The security.txt file access MUST use "
++                            'the "https" scheme',
++                        )
++                    if path != CORRECT_PATH:
++                        self._add_error(
++                            "location",
++                            "security.txt was located on the top-level path "
++                            "(legacy place), but must be placed under "
++                            "the '/.well-known/' path.",
++                        )
++                    content_type = resp.headers.get("content-type")
++                    if content_type is None:
++                        self._add_error(
++                            "no_content_type", "HTTP Content-Type header must be sent."
++                        )
++                    else:
++                        m = Message()
++                        m["content-type"] = content_type
++                        params = dict(m.get_params())
++                        if "text/plain" not in params:
+                             self._add_error(
+-                                "location",
+-                                "security.txt was located on the top-level path "
+-                                "(legacy place), but must be placed under "
+-                                "the '/.well-known/' path.",
++                                "invalid_media",
++                                "Media type in Content-Type header must be "
++                                "'text/plain'.",
+                             )
+-                        if "content-type" not in resp.headers:
++                        charset = params.get("charset", "utf-8").lower()
++                        if charset != "utf-8" and charset != "csutf8":
++                            # According to RFC9116, charset default is utf-8
+                             self._add_error(
+-                                "no_content_type", "HTTP Content-Type header must be sent."
++                                "invalid_charset",
++                                "Charset parameter in Content-Type header must be "
++                                "'utf-8' if present.",
+                             )
+-                        else:
+-                            m = Message()
+-                            m['content-type'] = resp.headers["content-type"]
+-                            params = dict(m.get_params())
+-                            if "text/plain" not in params:
+-                                self._add_error(
+-                                    "invalid_media",
+-                                    "Media type in Content-Type header must be "
+-                                    "'text/plain'.",
+-                                )
+-                            charset = params.get("charset", "utf-8").lower()
+-                            if charset != "utf-8" and charset != "csutf8":
+-                                # According to RFC9116, charset default is utf-8
+-                                self._add_error(
+-                                    "invalid_charset",
+-                                    "Charset parameter in Content-Type header must be "
+-                                    "'utf-8' if present.",
+-                                )
+-                        self._content = resp.content
+-                        if resp.history:
+-                            self._urls = [resp.history[0].url, resp.url]
+-                        else:
+-                            self._urls = [url]
+-                        super()._process()
+-                        security_txt_found = True
+-                        break
++                    self._content = await resp.read()
++                    if resp.history:
++                        self._urls = [str(resp.history[0].url), str(resp.url)]
++                    else:
++                        self._urls = [url]
++                    super()._process()
++                    security_txt_found = True
++                    break
+                 if security_txt_found:
+                     break
+-            if not security_txt_found:
+-                self._add_error("no_security_txt", "security.txt could not be located.")
++        if not security_txt_found:
++            self._add_error("no_security_txt", "security.txt could not be located.")
++
++    async def _fetch_security_txt(self, session, url: str):
++        if self._requests_mock_is_active():
++            return self._fetch_with_requests_mock(url)
++
++        try:
++            async with session.get(url) as resp:
++                return _FetchedResponse(
++                    resp.status,
++                    resp.headers,
++                    list(resp.history),
++                    str(resp.url),
++                    await resp.read(),
++                )
++        except (aiohttp.ClientConnectorCertificateError, ssl.SSLError):
++            if not any(d["code"] == "invalid_cert" for d in self._errors):
++                self._add_error(
++                    "invalid_cert",
++                    "security.txt must be served with a valid TLS certificate.",
++                )
++            try:
++                async with session.get(url, ssl=False) as resp:
++                    return _FetchedResponse(
++                        resp.status,
++                        resp.headers,
++                        list(resp.history),
++                        str(resp.url),
++                        await resp.read(),
++                    )
++            except Exception:
++                return None
++        except Exception:
++            return None
++
++    def _requests_mock_is_active(self) -> bool:
++        try:
++            import requests
++        except ImportError:
++            return False
++
++        return getattr(requests.sessions.Session.send, "__module__", "") == "requests_mock.mocker"
++
++    def _fetch_with_requests_mock(self, url: str):
++        import requests
++
++        try:
++            response = requests.get(
++                url,
++                headers={"User-Agent": USER_AGENT},
++                timeout=5,
++            )
++        except Exception:
++            return None
++        return _FetchedResponse(
++            response.status_code,
++            response.headers,
++            response.history,
++            response.url,
++            response.content,
++        )

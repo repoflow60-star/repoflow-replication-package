@@ -1,0 +1,204 @@
+--- a/whatsapp_api_client_python/API.py
++++ b/whatsapp_api_client_python/API.py
+@@ -1,9 +1,9 @@
++import asyncio
+ import json
+ import logging
+-from typing import Any, NoReturn, Optional
+-
+-from requests import Response, Session
+-from requests.adapters import HTTPAdapter, Retry
++from typing import Any, Optional
++
++import aiohttp
+ 
+ from .response import Response as GreenAPIResponse
+ from .tools import (
+@@ -49,7 +49,6 @@
+         self.idInstance = idInstance
+         self.apiTokenInstance = apiTokenInstance
+ 
+-        self.session = Session()
+         self.__prepare_session()
+ 
+         self.account = account.Account(self)
+@@ -73,20 +72,73 @@
+             payload: Optional[dict] = None,
+             files: Optional[dict] = None
+     ) -> GreenAPIResponse:
++        return asyncio.run(
++            self.__request(
++                method,
++                url,
++                payload,
++                files,
++                timeout=self.media_timeout if files else self.host_timeout
++            )
++        )
++
++    async def __request(
++            self,
++            method: str,
++            url: str,
++            payload: Optional[dict] = None,
++            files: Optional[dict] = None,
++            timeout: Optional[float] = None,
++            **arguments: Any
++    ) -> GreenAPIResponse:
+         url = url.replace("{{host}}", self.host)
+         url = url.replace("{{media}}", self.media)
+         url = url.replace("{{idInstance}}", self.idInstance)
+         url = url.replace("{{apiTokenInstance}}", self.apiTokenInstance)
+ 
+         try:
+-            if not files:
+-                response = self.session.request(
+-                    method=method, url=url, json=payload, timeout=self.host_timeout
+-                )
+-            else:
+-                response = self.session.request(
+-                    method=method, url=url, data=payload, files=files, timeout=self.media_timeout
+-                )
++            async with aiohttp.ClientSession(headers=self.session_headers) as session:
++                for attempt in range(4):
++                    request_arguments = dict(arguments)
++                    timeout_argument = request_arguments.pop("timeout", None)
++                    request_arguments["headers"] = self.__prepare_headers(
++                        request_arguments.pop("headers", None)
++                    )
++
++                    if files:
++                        request_arguments["data"] = self.__prepare_form_data(
++                            payload, files
++                        )
++                        if timeout_argument is None:
++                            timeout_argument = timeout if timeout is not None else self.media_timeout
++                    else:
++                        if payload is not None and "json" not in request_arguments and "data" not in request_arguments:
++                            request_arguments["json"] = payload
++
++                        if timeout_argument is None:
++                            timeout_argument = timeout if timeout is not None else self.host_timeout
++
++                    if timeout_argument is not None:
++                        request_arguments["timeout"] = self.__prepare_timeout(
++                            timeout_argument
++                        )
++
++                    async with session.request(
++                            method=method,
++                            url=url,
++                            **request_arguments
++                    ) as response:
++                        text = await response.text()
++
++                        if response.status == 429 and attempt < 3:
++                            await asyncio.sleep(1.0 * (2 ** attempt))
++                            continue
++
++                        self.__handle_response(response.status, text)
++
++                        return GreenAPIResponse(response.status, text)
++        except GreenAPIError:
++            raise
+         except Exception as error:
+             error_message = f"Request was failed with error: {error}."
+ 
+@@ -96,35 +148,18 @@
+ 
+             return GreenAPIResponse(None, error_message)
+ 
+-        self.__handle_response(response)
+-
+-        return GreenAPIResponse(response.status_code, response.text)
+-
+     def raw_request(self, **arguments: Any) -> GreenAPIResponse:
+-        try:
+-            response = self.session.request(**arguments)
+-        except Exception as error:
+-            error_message = f"Request was failed with error: {error}."
+-
+-            if self.raise_errors:
+-                raise GreenAPIError(error_message)
+-            self.logger.log(logging.CRITICAL, error_message)
+-
+-            return GreenAPIResponse(None, error_message)
+-
+-        self.__handle_response(response)
+-
+-        return GreenAPIResponse(response.status_code, response.text)
+-
+-    def __handle_response(self, response: Response) -> Optional[NoReturn]:
+-        status_code = response.status_code
++        method = arguments.pop("method")
++        url = arguments.pop("url")
++
++        return asyncio.run(self.__request(method, url, **arguments))
++
++    def __handle_response(self, status_code: int, text: str) -> None:
+         if status_code != 200 or self.debug_mode:
+             try:
+-                data = json.dumps(
+-                    json.loads(response.text), ensure_ascii=False, indent=4
+-                )
++                data = json.dumps(json.loads(text), ensure_ascii=False, indent=4)
+             except json.JSONDecodeError:
+-                data = response.text
++                data = text
+ 
+             if status_code != 200:
+                 error_message = (
+@@ -159,17 +194,42 @@
+             self.logger.setLevel(logging.DEBUG)
+ 
+     def __prepare_session(self) -> None:
+-        self.session.headers["Connection"] = "close"
+-
+-        retry = Retry(
+-            total=3,
+-            backoff_factor=1.0,
+-            allowed_methods=None,
+-            status_forcelist=[429]
+-        )
+-
+-        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
++        self.session_headers = {"Connection": "close"}
++
++    @staticmethod
++    def __prepare_headers(headers: Optional[dict]) -> dict:
++        prepared_headers = {"Connection": "close"}
++
++        if headers:
++            prepared_headers.update(headers)
++
++        return prepared_headers
++
++    @staticmethod
++    def __prepare_timeout(timeout: Any) -> aiohttp.ClientTimeout:
++        if isinstance(timeout, aiohttp.ClientTimeout):
++            return timeout
++
++        return aiohttp.ClientTimeout(total=timeout)
++
++    @staticmethod
++    def __prepare_form_data(payload: Optional[dict], files: dict) -> aiohttp.FormData:
++        form_data = aiohttp.FormData()
++
++        if payload:
++            for key, value in payload.items():
++                form_data.add_field(str(key), str(value))
++
++        for field_name, file_payload in files.items():
++            file_name, file_object, content_type = file_payload
++            form_data.add_field(
++                field_name,
++                file_object,
++                filename=file_name,
++                content_type=content_type or "application/octet-stream"
++            )
++
++        return form_data
+ 
+ 
+ class GreenAPI(GreenApi):

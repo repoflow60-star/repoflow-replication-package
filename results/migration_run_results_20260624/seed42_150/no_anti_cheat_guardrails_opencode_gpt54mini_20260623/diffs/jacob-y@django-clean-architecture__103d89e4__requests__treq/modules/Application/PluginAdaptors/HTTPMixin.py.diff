@@ -1,0 +1,108 @@
+--- a/modules/Application/PluginAdaptors/HTTPMixin.py
++++ b/modules/Application/PluginAdaptors/HTTPMixin.py
+@@ -1,12 +1,21 @@
+-import requests
+-from requests.exceptions import RequestException
++import json
+ from abc import ABC, abstractmethod
++from threading import Event, Lock, Thread
++from urllib.parse import urlencode
++
++import treq
++from twisted.internet import reactor
++from twisted.internet.threads import blockingCallFromThread
+ 
+ 
+ class HTTPMixin(ABC):
+     """
+     Very basic code used to make HTTP requests.
+     """
++
++    _reactor_ready = Event()
++    _reactor_started = False
++    _reactor_lock = Lock()
+ 
+     def send(self) -> dict:
+         match self._method():
+@@ -18,26 +27,69 @@
+                 raise Exception(f'Unsupported HTTP method {self._method()}')
+ 
+     def _get(self) -> dict:
+-        return self._process_response(requests.get(self._endpoint(), headers=self._headers(), auth=self._auth()))
++        return self._process_response(
++            lambda: treq.get(self._endpoint(), headers=self._headers(), auth=self._auth()),
++            self._endpoint(),
++        )
+ 
+     def _post(self) -> dict:
++        headers = dict(self._headers())
+         if self._is_form_encoded():
+-            headers = self._headers()
+             headers['Content-Type'] = 'application/x-www-form-urlencoded'
+-            return self._process_response(
+-                requests.post(self._endpoint(), data=self._data(), headers=self._headers(), auth=self._auth()))
++            data = urlencode(self._data()).encode('utf-8')
++        else:
++            headers['Content-Type'] = 'application/json'
++            data = json.dumps(self._data()).encode('utf-8')
+         return self._process_response(
+-            requests.post(self._endpoint(), json=self._data(), headers=self._headers(), auth=self._auth()))
++            lambda: treq.post(self._endpoint(), data=data, headers=headers, auth=self._auth()),
++            self._endpoint(),
++        )
+ 
+     @staticmethod
+-    def _process_response(response: requests.Response) -> dict:
++    def _process_response(request_call, endpoint: str) -> dict:
+         try:
+-            if 200 <= response.status_code < 500:
+-                return response.json()
+-            else:
+-                raise Exception(f"HTTP {response.status_code} error while calling {response.url}")
+-        except RequestException:
+-            raise Exception(f"Connection failed while calling {response.url}")
++            response = HTTPMixin._wait(request_call)
++        except Exception as exc:
++            raise Exception(f"Connection failed while calling {endpoint}") from exc
++
++        code = getattr(response, 'code', getattr(response, 'status_code', None))
++        if code is None:
++            raise Exception(f"Connection failed while calling {endpoint}")
++
++        if 200 <= code < 500:
++            try:
++                return HTTPMixin._response_json(response)
++            except Exception as exc:
++                raise Exception(f"Connection failed while calling {endpoint}") from exc
++
++        raise Exception(f"HTTP {code} error while calling {endpoint}")
++
++    @staticmethod
++    def _response_json(response) -> dict:
++        return HTTPMixin._wait(lambda: treq.json_content(response))
++
++    @staticmethod
++    def _wait(callable_):
++        HTTPMixin._ensure_reactor()
++        return blockingCallFromThread(reactor, callable_)
++
++    @staticmethod
++    def _ensure_reactor() -> None:
++        if reactor.running:
++            HTTPMixin._reactor_ready.set()
++            return
++
++        with HTTPMixin._reactor_lock:
++            if not HTTPMixin._reactor_started:
++
++                def _run_reactor():
++                    reactor.callWhenRunning(HTTPMixin._reactor_ready.set)
++                    reactor.run(installSignalHandlers=False)
++
++                Thread(target=_run_reactor, daemon=True).start()
++                HTTPMixin._reactor_started = True
++
++        HTTPMixin._reactor_ready.wait()
+ 
+     @abstractmethod
+     def _method(self) -> str:

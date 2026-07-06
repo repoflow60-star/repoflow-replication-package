@@ -1,0 +1,236 @@
+--- a/sectxt/__init__.py
++++ b/sectxt/__init__.py
+@@ -2,6 +2,7 @@
+ # SPDX-License-Identifier: EUPL-1.2
+ #
+ import codecs
++import threading
+ 
+ import langcodes
+ import re
+@@ -22,11 +23,184 @@
+     from typing import TypedDict
+ 
+ import dateutil.parser
+-import requests
+ 
+ __version__ = "0.9.6"
+ 
+-s = requests.Session()
++_REACTOR_THREAD_STARTED = threading.Event()
++_REACTOR_THREAD_LOCK = threading.Lock()
++_REACTOR_THREAD_ERROR = None
++_TREQ = None
++_REACTOR = None
++_BLOCKING_CALL_FROM_THREAD = None
++
++
++def _load_treq_runtime():
++    global _TREQ, _REACTOR, _BLOCKING_CALL_FROM_THREAD
++    if _TREQ is None:
++        import treq as _treq
++        from twisted.internet import reactor as _reactor
++        from twisted.internet.threads import blockingCallFromThread as _blockingCallFromThread
++
++        _TREQ = _treq
++        _REACTOR = _reactor
++        _BLOCKING_CALL_FROM_THREAD = _blockingCallFromThread
++    return _TREQ, _REACTOR, _BLOCKING_CALL_FROM_THREAD
++
++
++def _ensure_reactor_thread() -> None:
++    _, reactor, _ = _load_treq_runtime()
++    if reactor.running:
++        _REACTOR_THREAD_STARTED.set()
++        return
++    with _REACTOR_THREAD_LOCK:
++        if reactor.running:
++            _REACTOR_THREAD_STARTED.set()
++            return
++        if not _REACTOR_THREAD_STARTED.is_set():
++
++            def _run_reactor() -> None:
++                global _REACTOR_THREAD_ERROR
++                try:
++                    reactor.callWhenRunning(_REACTOR_THREAD_STARTED.set)
++                    reactor.run(installSignalHandlers=False)
++                except Exception as exc:
++                    _REACTOR_THREAD_ERROR = exc
++                    _REACTOR_THREAD_STARTED.set()
++
++            threading.Thread(target=_run_reactor, daemon=True).start()
++    _REACTOR_THREAD_STARTED.wait()
++    if _REACTOR_THREAD_ERROR is not None:
++        raise RuntimeError("treq reactor failed to start") from _REACTOR_THREAD_ERROR
++
++
++def _call_treq(func, *args, **kwargs):
++    _, reactor, blockingCallFromThread = _load_treq_runtime()
++    _ensure_reactor_thread()
++    return blockingCallFromThread(reactor, func, *args, **kwargs)
++
++
++def _normalize_headers(headers) -> dict:
++    normalized = {}
++    if headers is None:
++        return normalized
++    if hasattr(headers, "getAllRawHeaders"):
++        for name, values in headers.getAllRawHeaders() or []:
++            if not values:
++                continue
++            header_name = name.decode("latin-1") if isinstance(name, bytes) else str(name)
++            header_value = values[0]
++            normalized[header_name.lower()] = (
++                header_value.decode("latin-1") if isinstance(header_value, bytes) else str(header_value)
++            )
++        return normalized
++    for name, value in headers.items():
++        header_name = name.decode("latin-1") if isinstance(name, bytes) else str(name)
++        if isinstance(value, (list, tuple)):
++            value = value[0] if value else ""
++        normalized[header_name.lower()] = value.decode("latin-1") if isinstance(value, bytes) else str(value)
++    return normalized
++
++
++def _response_url(response, fallback_url: str) -> str:
++    url = getattr(response, "url", None)
++    if url:
++        return url
++    request = getattr(response, "request", None)
++    if request is not None:
++        request_url = getattr(request, "absoluteURI", None)
++        if request_url:
++            return request_url.decode("ascii") if isinstance(request_url, bytes) else str(request_url)
++        request_uri = getattr(request, "uri", None)
++        if request_uri:
++            return request_uri.decode("ascii") if isinstance(request_uri, bytes) else str(request_uri)
++    return fallback_url
++
++
++def _response_history(response):
++    history = getattr(response, "history", None)
++    if history is not None:
++        return [_HistoryEntry(item) for item in history]
++    previous = getattr(response, "previous_response", None)
++    if previous is None:
++        previous = getattr(response, "previousResponse", None)
++    if previous is None:
++        return []
++    chain = []
++    while previous is not None:
++        chain.insert(0, _HistoryEntry(previous))
++        previous = getattr(previous, "previous_response", None)
++        if previous is None:
++            previous = getattr(previous, "previousResponse", None)
++    return chain
++
++
++def _is_ssl_error(exc: Exception) -> bool:
++    name = exc.__class__.__name__.lower()
++    module = exc.__class__.__module__.lower()
++    message = str(exc).lower()
++    return (
++        "ssl" in name
++        or "ssl" in module
++        or "cert" in name
++        or "cert" in module
++        or "certificate" in message
++        or "ssl" in message
++    )
++
++
++def _build_agent(verify: bool):
++    _, reactor, _ = _load_treq_runtime()
++    from twisted.web.client import Agent, BrowserLikePolicyForHTTPS
++
++    if verify:
++        return Agent(reactor, contextFactory=BrowserLikePolicyForHTTPS())
++
++    class _InsecurePolicyForHTTPS:
++        def creatorForNetloc(self, hostname, port):
++            from twisted.internet import ssl
++
++            return ssl.ClientContextFactory()
++
++    return Agent(reactor, contextFactory=_InsecurePolicyForHTTPS())
++
++
++class _FetchedResponse:
++    def __init__(self, response, content: bytes, fallback_url: str):
++        self._response = response
++        self.status_code = getattr(response, "status_code", getattr(response, "code", None))
++        self.history = _response_history(response)
++        self.url = _response_url(response, fallback_url)
++        self.headers = _normalize_headers(getattr(response, "headers", None))
++        self.content = content
++
++    def __getattr__(self, name):
++        return getattr(self._response, name)
++
++
++class _HistoryEntry:
++    def __init__(self, response):
++        self._response = response
++        self.url = _response_url(response, "")
++
++    def __getattr__(self, name):
++        return getattr(self._response, name)
++
++
++def _fetch_url(url: str, verify: bool = True) -> _FetchedResponse:
++    treq, _, _ = _load_treq_runtime()
++    from twisted.web.http_headers import Headers
++
++    headers = {
++        "User-Agent": (
++            "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) "
++            "Gecko/20100101 Firefox/12.0"
++        )
++    }
++    agent = _build_agent(verify)
++    request_headers = Headers({b"User-Agent": [headers["User-Agent"].encode("ascii")]})
++    response = _call_treq(agent.request, b"GET", url.encode("ascii"), request_headers)
++    content = _call_treq(treq.content, response)
++    return _FetchedResponse(response, content, url)
+ 
+ 
+ class ErrorDict(TypedDict):
+@@ -557,32 +731,19 @@
+                 for path in [".well-known/security.txt", "security.txt"]:
+                     url = urlunsplit((scheme, self._loc, path, None, None))
+                     try:
+-                        resp = requests.get(
+-                            url,
+-                            headers={
+-                                'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                              'Gecko/20100101 Firefox/12.0'},
+-                            timeout=5
+-                        )
+-                    except requests.exceptions.SSLError:
++                        resp = _fetch_url(url)
++                    except Exception as exc:
++                        if not _is_ssl_error(exc):
++                            continue
+                         if not any(d["code"] == "invalid_cert" for d in self._errors):
+                             self._add_error(
+                                 "invalid_cert",
+                                 "security.txt must be served with a valid TLS certificate.",
+                             )
+                         try:
+-                            resp = requests.get(
+-                                url,
+-                                headers={
+-                                    'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                                  'Gecko/20100101 Firefox/12.0'},
+-                                timeout=5,
+-                                verify=False
+-                            )
+-                        except:
++                            resp = _fetch_url(url, verify=False)
++                        except Exception:
+                             continue
+-                    except:
+-                        continue
+                     if resp.status_code == 200:
+                         if resp.history:
+                             if not resp.url.endswith(path):

@@ -1,0 +1,550 @@
+--- a/git_pw/api.py
++++ b/git_pw/api.py
+@@ -11,7 +11,9 @@
+ import typing as ty
+
+ 
+
+ import click
+
+-import requests
+
++import treq
+
++from twisted.internet import defer
+
++from twisted.web import http
+
+ 
+
+ import git_pw
+
+ from git_pw import config
+
+@@ -22,7 +24,7 @@
+ Filters = ty.List[ty.Tuple[str, str]]
+
+ 
+
+ 
+
+-class HTTPTokenAuth(requests.auth.AuthBase):
+
++class HTTPTokenAuth:
+
+     """Attaches HTTP Token Authentication to the given Request object."""
+
+ 
+
+     def __init__(self, token: str):
+
+@@ -30,8 +32,8 @@
+ 
+
+     def __call__(
+
+         self,
+
+-        r: requests.PreparedRequest,
+
+-    ) -> requests.PreparedRequest:
+
++        r,
+
++    ):
+
+         r.headers['Authorization'] = self._token_auth_str(self.token)
+
+         return r
+
+ 
+
+@@ -41,11 +43,11 @@
+         return 'Token {}'.format(token.strip())
+
+ 
+
+ 
+
+-def _get_auth(optional: bool = False) -> ty.Optional[requests.auth.AuthBase]:
+
++def _get_auth(optional: bool = False) -> ty.Optional[ty.Callable]:
+
+     if CONF.token:
+
+         return HTTPTokenAuth(CONF.token)
+
+     elif CONF.username and CONF.password:
+
+-        return requests.auth.HTTPBasicAuth(CONF.username, CONF.password)
+
++        return (CONF.username, CONF.password)
+
+     elif not optional:
+
+         LOG.error('Authentication information missing')
+
+         LOG.error(
+
+@@ -107,11 +109,11 @@
+ 
+
+ def _handle_error(
+
+     operation: str,
+
+-    exc: requests.exceptions.RequestException,
+
++    exc,
+
+ ) -> None:
+
+-    if exc.response is not None and exc.response.content:
+
+-        # server errors should always be reported
+
+-        if exc.response.status_code in range(500, 512):  # 5xx Server Error
+
++    if hasattr(exc, 'response') and exc.response is not None:
+
++        response = exc.response
+
++        if response.code in range(500, 512):  # 5xx Server Error
+
+             LOG.error(
+
+                 'Server error. Please report this issue to '
+
+                 'https://github.com/getpatchwork/patchwork'
+
+@@ -119,10 +121,10 @@
+             raise
+
+ 
+
+         # we make the assumption that all responses will be JSON encoded
+
+-        if exc.response.status_code == 404:
+
++        if response.code == 404:
+
+             LOG.error('Resource not found')
+
+         else:
+
+-            LOG.error(exc.response.json())
+
++            LOG.error(response.json())
+
+     else:
+
+         LOG.error(
+
+             'Failed to %s resource. Is your configuration '
+
+@@ -136,11 +138,12 @@
+         sys.exit(1)
+
+ 
+
+ 
+
++@defer.inlineCallbacks
+
+ def _get(
+
+     url: str,
+
+     params: ty.Optional[Filters] = None,
+
+     stream: bool = False,
+
+-) -> requests.Response:
+
++):
+
+     """Make GET request and handle errors."""
+
+     LOG.debug('GET %s', url)
+
+ 
+
+@@ -148,15 +151,15 @@
+         # TODO(stephenfin): We only use a subset of the types possible for
+
+         # 'params' (namely a list of tuples) but it doesn't seem possible to
+
+         # indicate this
+
+-        rsp = requests.get(
+
++        rsp = yield treq.get(
+
+             url,
+
+             auth=_get_auth(optional=True),
+
+             headers=_get_headers(),
+
+-            stream=stream,
+
+             params=params,
+
+         )  # type: ignore
+
+-        rsp.raise_for_status()
+
+-    except requests.exceptions.RequestException as exc:
+
++        if rsp.code >= 400:
+
++            raise treq.HTTPError(rsp)
+
++    except Exception as exc:
+
+         _handle_error('fetch', exc)
+
+ 
+
+     LOG.debug('Got response')
+
+@@ -164,19 +167,21 @@
+     return rsp
+
+ 
+
+ 
+
++@defer.inlineCallbacks
+
+ def _post(
+
+     url: str,
+
+     data: ty.List[ty.Tuple[str, ty.Any]],
+
+-) -> requests.Response:
+
++):
+
+     """Make POST request and handle errors."""
+
+     LOG.debug('POST %s, data=%r', url, data)
+
+ 
+
+     try:
+
+-        rsp = requests.post(
+
++        rsp = yield treq.post(
+
+             url, auth=_get_auth(), headers=_get_headers(), data=data
+
+         )
+
+-        rsp.raise_for_status()
+
+-    except requests.exceptions.RequestException as exc:
+
++        if rsp.code >= 400:
+
++            raise treq.HTTPError(rsp)
+
++    except Exception as exc:
+
+         _handle_error('create', exc)
+
+ 
+
+     LOG.debug('Got response')
+
+@@ -184,22 +189,24 @@
+     return rsp
+
+ 
+
+ 
+
++@defer.inlineCallbacks
+
+ def _patch(
+
+     url: str,
+
+     data: ty.List[ty.Tuple[str, ty.Any]],
+
+-) -> requests.Response:
+
++):
+
+     """Make PATCH request and handle errors."""
+
+     LOG.debug('PATCH %s, data=%r', url, data)
+
+ 
+
+     try:
+
+-        rsp = requests.patch(
+
++        rsp = yield treq.patch(
+
+             url,
+
+             auth=_get_auth(),
+
+             headers=_get_headers(),
+
+             data=data,
+
+         )
+
+-        rsp.raise_for_status()
+
+-    except requests.exceptions.RequestException as exc:
+
++        if rsp.code >= 400:
+
++            raise treq.HTTPError(rsp)
+
++    except Exception as exc:
+
+         _handle_error('update', exc)
+
+ 
+
+     LOG.debug('Got response')
+
+@@ -207,14 +214,16 @@
+     return rsp
+
+ 
+
+ 
+
+-def _delete(url: str) -> requests.Response:
+
++@defer.inlineCallbacks
+
++def _delete(url: str):
+
+     """Make DELETE request and handle errors."""
+
+     LOG.debug('DELETE %s', url)
+
+ 
+
+     try:
+
+-        rsp = requests.delete(url, auth=_get_auth(), headers=_get_headers())
+
+-        rsp.raise_for_status()
+
+-    except requests.exceptions.RequestException as exc:
+
++        rsp = yield treq.delete(url, auth=_get_auth(), headers=_get_headers())
+
++        if rsp.code >= 400:
+
++            raise treq.HTTPError(rsp)
+
++    except Exception as exc:
+
+         _handle_error('delete', exc)
+
+ 
+
+     LOG.debug('Got response')
+
+@@ -234,6 +243,7 @@
+     return (1, 0)
+
+ 
+
+ 
+
++@defer.inlineCallbacks
+
+ def download(
+
+     url: str,
+
+     params: ty.Optional[Filters] = None,
+
+@@ -256,12 +266,12 @@
+         A path to an output file containing the content, else None if stdout
+
+         used.
+
+     """
+
+-    rsp = _get(url, params, stream=True)
+
++    rsp = yield _get(url, params, stream=True)
+
+ 
+
+     # we don't catch anything here because we should break if these are missing
+
+     header = re.search(
+
+         'filename=(.+)',
+
+-        rsp.headers.get('content-disposition') or '',
+
++        rsp.headers.getRawHeaders('content-disposition', [None])[0] or '',
+
+     )
+
+     if not header:
+
+         LOG.error('Filename was expected but was not provided in response')
+
+@@ -285,14 +295,16 @@
+ 
+
+     try:
+
+         # we use iter_content because patches can be binary
+
+-        for block in rsp.iter_content(1024):
+
+-            output_file.write(block)
+
++        body = yield treq.content(rsp)
+
++        for i in range(0, len(body), 1024):
+
++            output_file.write(body[i:i + 1024])
+
+     finally:
+
+         output_file.close()
+
+ 
+
+     return output_path
+
+ 
+
+ 
+
++@defer.inlineCallbacks
+
+ def index(resource_type: str, params: ty.Optional[Filters] = None) -> dict:
+
+     """List API resources.
+
+ 
+
+@@ -316,9 +328,11 @@
+     params = params or []
+
+     params.append(('project', _get_project()))
+
+ 
+
+-    return _get(url, params).json()
+
+-
+
+-
+
++    rsp = yield _get(url, params)
+
++    return (yield treq.json_content(rsp))
+
++
+
++
+
++@defer.inlineCallbacks
+
+ def detail(
+
+     resource_type: str,
+
+     resource_id: ty.Union[str, int],
+
+@@ -339,9 +353,11 @@
+     # NOTE(stephenfin): All resources must have a trailing '/'
+
+     url = '/'.join([_get_server(), resource_type, str(resource_id), ''])
+
+ 
+
+-    return _get(url, params, stream=False).json()
+
+-
+
+-
+
++    rsp = yield _get(url, params, stream=False)
+
++    return (yield treq.json_content(rsp))
+
++
+
++
+
++@defer.inlineCallbacks
+
+ def create(
+
+     resource_type: str,
+
+     data: ty.List[ty.Tuple[str, ty.Any]],
+
+@@ -360,7 +376,8 @@
+     # NOTE(stephenfin): All resources must have a trailing '/'
+
+     url = '/'.join([_get_server(), resource_type, ''])
+
+ 
+
+-    return _post(url, data).json()
+
++    rsp = yield _post(url, data)
+
++    return (yield treq.json_content(rsp))
+
+ 
+
+ 
+
+ def delete(resource_type: str, resource_id: ty.Union[str, int]) -> None:
+
+@@ -381,6 +398,7 @@
+     _delete(url)
+
+ 
+
+ 
+
++@defer.inlineCallbacks
+
+ def update(
+
+     resource_type: str,
+
+     resource_id: ty.Union[str, int],
+
+@@ -401,7 +419,8 @@
+     # NOTE(stephenfin): All resources must have a trailing '/'
+
+     url = '/'.join([_get_server(), resource_type, str(resource_id), ''])
+
+ 
+
+-    return _patch(url, data).json()
+
++    rsp = yield _patch(url, data)
+
++    return (yield treq.json_content(rsp))
+
+ 
+
+ 
+
+ def validate_minimum_version(

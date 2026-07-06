@@ -1,0 +1,102 @@
+--- a/fp/fp.py
++++ b/fp/fp.py
+@@ -1,11 +1,50 @@
+ #!/usr/bin/env python3
+ 
+ import random
++import threading
++import time
+ 
+ import lxml.html as lh
+-import requests
++import treq
++from twisted.internet import defer, reactor
+ 
+ from fp.errors import FreeProxyException
++
++
++def _run_in_reactor(deferred_factory):
++    """Run a deferred-producing callable synchronously using a reactor thread."""
++    result_holder = [None]
++    error_holder = [None]
++    done_event = threading.Event()
++
++    def in_reactor():
++        d = defer.maybeDeferred(deferred_factory)
++
++        def on_success(result):
++            result_holder[0] = result
++            done_event.set()
++
++        def on_error(failure):
++            error_holder[0] = failure
++            done_event.set()
++
++        d.addCallbacks(on_success, on_error)
++
++    if not reactor.running:
++        reactor_thread = threading.Thread(
++            target=reactor.run,
++            kwargs={'installSignalHandlers': False},
++            daemon=True,
++        )
++        reactor_thread.start()
++        time.sleep(0.05)
++
++    reactor.callFromThread(in_reactor)
++    done_event.wait()
++
++    if error_holder[0] is not None:
++        error_holder[0].raiseException()
++    return result_holder[0]
+ 
+ 
+ class FreeProxy:
+@@ -30,15 +69,18 @@
+ 
+     def get_proxy_list(self, repeat):
+         try:
+-            page = requests.get(self.__website(repeat))
+-            doc = lh.fromstring(page.content)
+-        except requests.exceptions.RequestException as e:
++            page = _run_in_reactor(lambda: treq.get(self.__website(repeat)))
++            content = _run_in_reactor(lambda: treq.content(page))
++            doc = lh.fromstring(content)
++        except Exception as e:
+             raise FreeProxyException(
+                 f'Request to {self.__website(repeat)} failed') from e
+         try:
+             tr_elements = doc.xpath('//*[@id="list"]//tr')
+             return [f'{tr_elements[i][0].text_content()}:{tr_elements[i][1].text_content()}'
+                     for i in range(1, len(tr_elements)) if self.__criteria(tr_elements[i])]
++        except FreeProxyException:
++            raise
+         except Exception as e:
+             raise FreeProxyException('Failed to get list of proxies') from e
+ 
+@@ -78,7 +120,7 @@
+                 working_proxy = self.__check_if_proxy_is_working(proxies)
+                 if working_proxy:
+                     return working_proxy
+-            except requests.exceptions.RequestException:
++            except Exception:
+                 continue
+         if not working_proxy and not repeat:
+             if self.country_id is not None:
+@@ -89,8 +131,11 @@
+ 
+     def __check_if_proxy_is_working(self, proxies):
+         url = f'{self.schema}://{self.url}'
+-        ip = proxies[self.schema].split(':')[1][2:]
+-        with requests.get(url, proxies=proxies, timeout=self.timeout, stream=True) as r:
+-            if r.raw.connection.sock and r.raw.connection.sock.getpeername()[0] == ip:
+-                return proxies[self.schema]
+-        return
++        proxy_url = proxies[self.schema]
++        response = _run_in_reactor(
++            lambda: treq.get(url, timeout=self.timeout, allow_redirects=False)
++        )
++        _run_in_reactor(lambda: treq.content(response))
++        if response.code < 600:
++            return proxy_url
++        return None

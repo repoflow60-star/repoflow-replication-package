@@ -1,0 +1,195 @@
+diff --git a/chessdotcom/client.py b/chessdotcom/client.py
+index 212e20f..753c73f 100644
+--- a/chessdotcom/client.py
++++ b/chessdotcom/client.py
+@@ -1,11 +1,21 @@
+ import asyncio
+ import copy
++import io
++import ssl
+ import time
++import urllib.error
++import urllib.request
++from urllib.parse import urlparse
+ import warnings
+ from functools import wraps
+ 
+-import requests
+ from aiohttp import ClientSession
++import certifi
++
++try:
++    import pycurl
++except ImportError:  # pragma: no cover - exercised only when pycurl is unavailable.
++    pycurl = None
+ 
+ from .errors import ChessDotComClientError
+ from .response_builder import DefaultResponseBuilder
+@@ -43,12 +53,140 @@ class RateLimitHandler(object):
+         return False
+ 
+ 
++class _SyncResponse:
++    def __init__(self, status_code, text, headers):
++        self.status_code = status_code
++        self.text = text
++        self.headers = headers
++
++
++class _PyCurlRequests:
++    @staticmethod
++    def _build_header_list(headers):
++        return [f"{key}: {value}" for key, value in headers.items()]
++
++    @staticmethod
++    def _parse_headers(raw_headers):
++        header_text = raw_headers.decode("iso-8859-1")
++        header_blocks = [block for block in header_text.split("\r\n\r\n") if block.strip()]
++        if not header_blocks:
++            return {}
++
++        parsed_headers = {}
++        for line in header_blocks[-1].splitlines()[1:]:
++            if ":" not in line:
++                continue
++            key, value = line.split(":", 1)
++            parsed_headers[key.strip()] = value.strip()
++        return parsed_headers
++
++    @staticmethod
++    def _resolve_proxy(url, proxy=None, proxies=None):
++        if proxy:
++            return proxy
++
++        if isinstance(proxies, dict):
++            scheme = urlparse(url).scheme.lower()
++            return proxies.get(scheme) or proxies.get("https") or proxies.get("http")
++
++        return None
++
++    def get(self, url, timeout=30, headers=None, verify=True, proxy=None, proxies=None):
++        if pycurl is None:
++            return self._get_with_urllib(
++                url=url,
++                timeout=timeout,
++                headers=headers,
++                verify=verify,
++                proxy=proxy,
++                proxies=proxies,
++            )
++
++        body_buffer = io.BytesIO()
++        header_buffer = io.BytesIO()
++
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.WRITEDATA, body_buffer)
++            curl.setopt(pycurl.HEADERFUNCTION, header_buffer.write)
++            curl.setopt(pycurl.FOLLOWLOCATION, True)
++            curl.setopt(pycurl.MAXREDIRS, 10)
++            curl.setopt(pycurl.TIMEOUT, timeout)
++            curl.setopt(pycurl.NOSIGNAL, 1)
++            curl.setopt(pycurl.CAINFO, certifi.where())
++
++            resolved_proxy = self._resolve_proxy(url, proxy=proxy, proxies=proxies)
++            if resolved_proxy:
++                curl.setopt(pycurl.PROXY, resolved_proxy)
++
++            if isinstance(verify, bool):
++                curl.setopt(pycurl.SSL_VERIFYPEER, 1 if verify else 0)
++                curl.setopt(pycurl.SSL_VERIFYHOST, 2 if verify else 0)
++            else:
++                curl.setopt(pycurl.SSL_VERIFYPEER, 1)
++                curl.setopt(pycurl.SSL_VERIFYHOST, 2)
++                curl.setopt(pycurl.CAINFO, verify)
++
++            if headers:
++                curl.setopt(pycurl.HTTPHEADER, self._build_header_list(headers))
++
++            curl.perform()
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        finally:
++            curl.close()
++
++        text = body_buffer.getvalue().decode("utf-8", errors="replace")
++        response_headers = self._parse_headers(header_buffer.getvalue())
++        return _SyncResponse(status_code=status_code, text=text, headers=response_headers)
++
++    def _get_with_urllib(self, url, timeout, headers, verify, proxy, proxies):
++        request = urllib.request.Request(url=url, headers=headers or {}, method="GET")
++        proxy_url = self._resolve_proxy(url, proxy=proxy, proxies=proxies)
++
++        handlers = []
++        if proxy_url:
++            handlers.append(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
++        else:
++            handlers.append(urllib.request.ProxyHandler({}))
++
++        if isinstance(verify, bool):
++            if verify:
++                context = ssl.create_default_context(cafile=certifi.where())
++            else:
++                context = ssl._create_unverified_context()
++        else:
++            context = ssl.create_default_context(cafile=verify)
++
++        handlers.append(urllib.request.HTTPSHandler(context=context))
++
++        opener = urllib.request.build_opener(*handlers)
++        try:
++            with opener.open(request, timeout=timeout) as response:
++                text = response.read().decode("utf-8", errors="replace")
++                return _SyncResponse(
++                    status_code=response.getcode(),
++                    text=text,
++                    headers=dict(response.headers.items()),
++                )
++        except urllib.error.HTTPError as exc:
++            text = exc.read().decode("utf-8", errors="replace")
++            return _SyncResponse(
++                status_code=exc.code,
++                text=text,
++                headers=dict(exc.headers.items()),
++            )
++
++
++requests = _PyCurlRequests()
++
++
+ class Client:
+     """
+     Client for Chess.com Public API. The client is only responsible for making calls.
+ 
+     :cvar request_config: Dictionary containing extra keyword arguments for
+-        requests to the API (headers, proxy, etc).
++        HTTP requests to the API (headers, proxy, etc).
+     :cvar aio: Determines if the functions behave asynchronously.
+     :cvar :rate_limit_handler: A RateLimitHandler object.
+         See :obj:`chessdotcom.client.RateLimitHandler`.
+@@ -102,9 +240,7 @@ class Client:
+         return options
+ 
+     def _do_sync_get_request(self, resource):
+-        r = requests.get(
+-            url=resource.url, **self._build_request_options(resource), timeout=30
+-        )
++        r = requests.get(url=resource.url, **self._build_request_options(resource), timeout=30)
+         resource.times_requested += 1
+ 
+         if r.status_code != 200:
+@@ -137,12 +273,12 @@ class ChessDotComClient(Client):
+     Client for Chess.com Public API. The client can be initialized withe following options.
+ 
+     :ivar request_config: Dictionary containing extra keyword arguments
+-        for requests to the API (headers, proxy, etc).
++        for HTTP requests to the API (headers, proxy, etc).
+         This value will be set from Client if nothing is provided
+     :ivar aio: Determines if the functions behave asynchronously. Defaults to False
+     :ivar rate_limit_handler: A RateLimitHandler object.
+         See :obj:`chessdotcom.client.RateLimitHandler`.
+-    :ivar user_agent: A string that will be used as the User-Agent header in requests to the API.
++    :ivar user_agent: A string that will be used as the User-Agent header in HTTP requests to the API.
+         This value will override the value in request_config if provided.
+     """
+ 

@@ -1,0 +1,135 @@
+--- a/whatsapp_api_client_python/API.py
++++ b/whatsapp_api_client_python/API.py
+@@ -1,9 +1,9 @@
++import asyncio
+ import json
+ import logging
+ from typing import Any, NoReturn, Optional
+ 
+-from requests import Response, Session
+-from requests.adapters import HTTPAdapter, Retry
++import aiohttp
+ 
+ from .response import Response as GreenAPIResponse
+ from .tools import (
+@@ -18,6 +18,83 @@
+     serviceMethods,
+     webhooks
+ )
++
++
++class _SyncResponse:
++    """Thin wrapper to provide a requests-like interface for aiohttp responses."""
++
++    def __init__(self, status: int, text: str):
++        self.status_code = status
++        self.text = text
++
++
++class Session:
++    """
++    Synchronous session wrapper around aiohttp, providing a requests.Session-compatible
++    interface (specifically the `request` method) so that existing patch targets and
++    call sites continue to work after migrating from requests to aiohttp.
++    """
++
++    def __init__(self):
++        self.headers = {"Connection": "close"}
++        self._max_retries = 3
++        self._retry_statuses = {429}
++        self._backoff_factor = 1.0
++
++    def request(self, method: str, url: str, **kwargs) -> _SyncResponse:
++        """Execute an HTTP request synchronously using aiohttp with retry logic."""
++        headers = dict(self.headers)
++        max_retries = self._max_retries
++        retry_statuses = self._retry_statuses
++        backoff_factor = self._backoff_factor
++
++        # Convert requests-style 'timeout' (a float/int) to aiohttp.ClientTimeout
++        timeout = kwargs.pop("timeout", None)
++        if timeout is not None and not isinstance(timeout, aiohttp.ClientTimeout):
++            timeout = aiohttp.ClientTimeout(total=timeout)
++
++        # Convert requests-style 'files' dict to aiohttp FormData
++        files = kwargs.pop("files", None)
++        if files is not None:
++            data = kwargs.pop("data", None)
++            form = aiohttp.FormData()
++            if data:
++                for key, value in data.items():
++                    form.add_field(key, str(value))
++            for field_name, file_tuple in files.items():
++                file_name, file_obj, content_type = file_tuple
++                form.add_field(
++                    field_name, file_obj,
++                    filename=file_name,
++                    content_type=content_type
++                )
++            kwargs["data"] = form
++
++        async def _do_request():
++            last_exc = None
++            connector = aiohttp.TCPConnector(enable_cleanup_closed=True)
++            async with aiohttp.ClientSession(
++                headers=headers,
++                connector=connector
++            ) as session:
++                for attempt in range(max_retries + 1):
++                    if attempt > 0:
++                        await asyncio.sleep(backoff_factor * (2 ** (attempt - 1)))
++                    try:
++                        async with session.request(
++                            method, url, timeout=timeout, **kwargs
++                        ) as resp:
++                            if resp.status in retry_statuses and attempt < max_retries:
++                                continue
++                            text = await resp.text()
++                            return _SyncResponse(resp.status, text)
++                    except Exception as exc:
++                        last_exc = exc
++                        if attempt < max_retries:
++                            continue
++                raise last_exc
++
++        return asyncio.run(_do_request())
+ 
+ 
+ class GreenApi:
+@@ -50,7 +127,6 @@
+         self.apiTokenInstance = apiTokenInstance
+ 
+         self.session = Session()
+-        self.__prepare_session()
+ 
+         self.account = account.Account(self)
+         self.device = device.Device(self)
+@@ -116,7 +192,7 @@
+ 
+         return GreenAPIResponse(response.status_code, response.text)
+ 
+-    def __handle_response(self, response: Response) -> Optional[NoReturn]:
++    def __handle_response(self, response: Any) -> Optional[NoReturn]:
+         status_code = response.status_code
+         if status_code != 200 or self.debug_mode:
+             try:
+@@ -158,19 +234,6 @@
+         else:
+             self.logger.setLevel(logging.DEBUG)
+ 
+-    def __prepare_session(self) -> None:
+-        self.session.headers["Connection"] = "close"
+-
+-        retry = Retry(
+-            total=3,
+-            backoff_factor=1.0,
+-            allowed_methods=None,
+-            status_forcelist=[429]
+-        )
+-
+-        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+-
+ 
+ class GreenAPI(GreenApi):
+     pass

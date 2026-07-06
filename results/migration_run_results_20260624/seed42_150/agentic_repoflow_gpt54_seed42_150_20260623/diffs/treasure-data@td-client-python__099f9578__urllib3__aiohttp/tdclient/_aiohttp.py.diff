@@ -1,0 +1,252 @@
+--- a/tdclient/_aiohttp.py
++++ b/tdclient/_aiohttp.py
+@@ -0,0 +1,249 @@
++import asyncio
++import base64
++import io
++import os
++import socket
++import ssl
++import threading
++import urllib.parse as urlparse
++from array import array
++
++import aiohttp
++
++try:
++    import certifi
++except ImportError:
++    certifi = None
++
++
++class _SyncResponse(object):
++    def __init__(self, status, headers, body):
++        self.status = status
++        self.data = body
++        self._headers = list(headers.items())
++        self._body = io.BytesIO(body)
++
++    def read(self, amt=None):
++        return self._body.read() if amt is None else self._body.read(amt)
++
++    def getheaders(self):
++        return list(self._headers)
++
++    def stream(self, amt=2**16):
++        while True:
++            chunk = self._body.read(amt)
++            if not chunk:
++                break
++            yield chunk
++
++    def close(self):
++        self._body.close()
++
++
++class _SyncHTTPClient(object):
++    def __init__(self, timeout=None, ssl_context=None, proxy=None, proxy_headers=None):
++        self._timeout = aiohttp.ClientTimeout(total=timeout)
++        self._ssl_context = ssl_context
++        self._proxy = proxy
++        self._proxy_headers = {} if proxy_headers is None else dict(proxy_headers)
++        self._closed = False
++        self._loop = asyncio.new_event_loop()
++        self._thread = threading.Thread(target=self._run_loop, daemon=True)
++        self._thread.start()
++        self._session = self._submit(self._create_session())
++
++    def _run_loop(self):
++        asyncio.set_event_loop(self._loop)
++        self._loop.run_forever()
++        asyncio.set_event_loop(None)
++
++    def _submit(self, awaitable):
++        try:
++            return asyncio.run_coroutine_threadsafe(awaitable, self._loop).result()
++        except asyncio.TimeoutError as error:
++            raise TimeoutError() from error
++        except aiohttp.ClientError as error:
++            raise socket.error(str(error)) from error
++
++    async def _create_session(self):
++        return aiohttp.ClientSession(auto_decompress=True, timeout=self._timeout)
++
++    def _coerce_body(self, body):
++        if isinstance(body, array):
++            return body.tobytes()
++        return body
++
++    async def _request_async(self, method, url, fields=None, body=None, headers=None):
++        request_kwargs = {"headers": headers}
++        if self._proxy is not None:
++            request_kwargs["proxy"] = self._proxy
++            if self._proxy_headers:
++                request_kwargs["proxy_headers"] = self._proxy_headers
++        if self._ssl_context is not None or self._ssl_context is False:
++            request_kwargs["ssl"] = self._ssl_context
++
++        if body is None:
++            if fields is not None:
++                if method in ("GET", "DELETE"):
++                    request_kwargs["params"] = fields
++                else:
++                    request_kwargs["data"] = fields
++        else:
++            request_kwargs["data"] = self._coerce_body(body)
++
++        async with self._session.request(method, url, **request_kwargs) as response:
++            payload = await response.read()
++            return _SyncResponse(response.status, response.headers, payload)
++
++    def request(self, method, url, fields=None, body=None, headers=None, **kwargs):
++        return self._submit(
++            self._request_async(method, url, fields=fields, body=body, headers=headers)
++        )
++
++    def urlopen(self, method, url, body=None, headers=None, **kwargs):
++        return self.request(method, url, body=body, headers=headers, **kwargs)
++
++    def clear(self):
++        if self._closed:
++            return
++        self._closed = True
++        self._submit(self._session.close())
++        self._loop.call_soon_threadsafe(self._loop.stop)
++        self._thread.join()
++        self._loop.close()
++
++
++def _basic_auth_header(username, password):
++    token = "%s:%s" % (username, password)
++    return "Basic %s" % (base64.b64encode(token.encode("utf-8")).decode("ascii"),)
++
++
++def _build_ssl_context(ca_certs=None, cert_reqs=None):
++    if cert_reqs == ssl.CERT_NONE:
++        return False
++    if ca_certs is None and cert_reqs is None:
++        return None
++
++    context = ssl.create_default_context(cafile=ca_certs)
++    if cert_reqs is not None:
++        context.check_hostname = cert_reqs == ssl.CERT_REQUIRED
++        context.verify_mode = cert_reqs
++    return context
++
++
++def _normalize_proxy(http_proxy):
++    if http_proxy is None:
++        return (None, {})
++    if not http_proxy.startswith("http://"):
++        http_proxy = "http://%s" % (http_proxy,)
++
++    parsed = urlparse.urlparse(http_proxy)
++    hostname = parsed.hostname or ""
++    if ":" in hostname and not hostname.startswith("["):
++        hostname = "[%s]" % (hostname,)
++
++    netloc = hostname
++    if parsed.port is not None:
++        netloc = "%s:%s" % (netloc, parsed.port)
++
++    proxy_headers = {}
++    if parsed.username is not None:
++        proxy_headers["proxy-authorization"] = _basic_auth_header(
++            parsed.username, parsed.password or ""
++        )
++
++    return ("%s://%s" % (parsed.scheme, netloc), proxy_headers)
++
++
++def _build_http_options(http_proxy=None, **kwargs):
++    pool_options = dict(kwargs)
++    if "ca_certs" not in pool_options and certifi:
++        pool_options["ca_certs"] = certifi.where()
++
++    if pool_options.get("ca_certs") is not None:
++        pool_options["cert_reqs"] = ssl.CERT_REQUIRED
++
++    if "timeout" not in pool_options:
++        pool_options["timeout"] = 60
++
++    proxy, proxy_headers = _normalize_proxy(http_proxy)
++    return {
++        "timeout": pool_options.get("timeout"),
++        "ssl_context": _build_ssl_context(
++            ca_certs=pool_options.get("ca_certs"),
++            cert_reqs=pool_options.get("cert_reqs"),
++        ),
++        "proxy": proxy,
++        "proxy_headers": proxy_headers,
++    }
++
++
++def _has_instance_override(obj, name):
++    namespace = getattr(obj, "__dict__", None)
++    return isinstance(namespace, dict) and name in namespace
++
++
++def patch_api(api_module):
++    api_class = api_module.API
++    if getattr(api_class, "_aiohttp_patched", False):
++        return
++
++    original_init = api_class.__init__
++    original_send_request = api_class.send_request
++    original_close = api_class.close
++
++    def _ensure_aiohttp_http(self):
++        client = getattr(self, "_aiohttp_http", None)
++        if client is None:
++            client = _SyncHTTPClient(**self._aiohttp_http_options)
++            self._aiohttp_http = client
++        return client
++
++    def __init__(self, *args, **kwargs):
++        http_proxy = kwargs.get("http_proxy")
++        original_init(self, *args, **kwargs)
++        self._aiohttp_http = None
++        self._aiohttp_http_options = _build_http_options(
++            http_proxy if http_proxy else os.getenv("HTTP_PROXY"), **kwargs
++        )
++
++    def send_request(self, method, url, fields=None, body=None, headers=None, **kwargs):
++        if body is None:
++            if _has_instance_override(self.http, "request"):
++                return original_send_request(
++                    self,
++                    method,
++                    url,
++                    fields=fields,
++                    body=body,
++                    headers=headers,
++                    **kwargs
++                )
++            return _ensure_aiohttp_http(self).request(
++                method, url, fields=fields, headers=headers, **kwargs
++            )
++
++        if _has_instance_override(self.http, "urlopen"):
++            return original_send_request(
++                self,
++                method,
++                url,
++                fields=fields,
++                body=body,
++                headers=headers,
++                **kwargs
++            )
++        return _ensure_aiohttp_http(self).urlopen(
++            method, url, body=body, headers=headers, **kwargs
++        )
++
++    def close(self):
++        client = getattr(self, "_aiohttp_http", None)
++        if client is not None:
++            client.clear()
++        original_close(self)
++
++    api_class.__init__ = __init__
++    api_class.send_request = send_request
++    api_class.close = close
++    api_class._aiohttp_patched = True

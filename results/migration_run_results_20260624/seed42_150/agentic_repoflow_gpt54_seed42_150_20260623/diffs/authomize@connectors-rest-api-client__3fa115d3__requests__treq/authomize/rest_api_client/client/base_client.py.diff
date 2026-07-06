@@ -1,0 +1,183 @@
+--- a/authomize/rest_api_client/client/base_client.py
++++ b/authomize/rest_api_client/client/base_client.py
+@@ -1,7 +1,9 @@
++import json
++import threading
+ from typing import Optional
+ 
+-import requests
+-from requests import Response
++import treq
++from twisted.internet import reactor, threads
+ 
+ AUTHOMIZE_API_URL = 'https://api.authomize.com'
+ 
+@@ -11,19 +13,157 @@
+         self.message = message
+ 
+ 
++class _TreqHTTPError(Exception):
++    pass
++
++
++class _TreqResponse:
++    def __init__(
++        self,
++        *,
++        status_code: int,
++        headers: dict[str, str],
++        url: str,
++        content: bytes,
++        reason: str,
++    ):
++        self.status_code = status_code
++        self.headers = headers
++        self.url = url
++        self.content = content
++        self.reason = reason
++
++    @property
++    def ok(self) -> bool:
++        return self.status_code < 400
++
++    @property
++    def text(self) -> str:
++        return self.content.decode('utf-8', errors='replace')
++
++    def json(self):
++        return json.loads(self.text)
++
++    def raise_for_status(self):
++        if not self.ok:
++            raise _TreqHTTPError(f'{self.status_code} {self.reason}: {self.url}')
++
++
++class _TreqSession:
++    def __init__(self):
++        self.headers = {}
++
++    def get(self, url: str, params=None, headers=None):
++        return self.request('GET', url, params=params, headers=headers)
++
++    def post(self, url: str, headers=None, data=None):
++        return self.request('POST', url, headers=headers, data=data)
++
++    def patch(self, url: str, headers=None, data=None):
++        return self.request('PATCH', url, headers=headers, data=data)
++
++    def delete(self, url: str, params=None, headers=None):
++        return self.request('DELETE', url, params=params, headers=headers)
++
++    def request(self, method: str, url: str, params=None, headers=None, data=None):
++        merged_headers = dict(self.headers)
++        if headers:
++            merged_headers.update(headers)
++        return BaseClient._sync_request(
++            method=method,
++            url=url,
++            params=params,
++            headers=merged_headers,
++            data=data,
++        )
++
++
+ class BaseClient:
++    _reactor_lock = threading.Lock()
++    _reactor_ready = threading.Event()
++    _reactor_thread = None
++
+     def __init__(self, auth_token: str, base_url: str = AUTHOMIZE_API_URL):
+         self.auth_token = auth_token
+         self.base_url = base_url
+-        self.session = requests.Session()
++        self.session = _TreqSession()
+         self.session.headers.update({'Authorization': self.authorization_header})
+ 
+     @property
+     def authorization_header(self) -> str:
+         raise NotImplementedError()
+ 
++    @classmethod
++    def _ensure_reactor(cls):
++        if reactor.running:
++            return
++
++        with cls._reactor_lock:
++            if reactor.running:
++                return
++            if cls._reactor_thread is None or not cls._reactor_thread.is_alive():
++                cls._reactor_ready.clear()
++                cls._reactor_thread = threading.Thread(
++                    target=cls._run_reactor,
++                    daemon=True,
++                    name='authomize-treq-reactor',
++                )
++                cls._reactor_thread.start()
++
++        cls._reactor_ready.wait()
++
++    @classmethod
++    def _run_reactor(cls):
++        reactor.callWhenRunning(cls._reactor_ready.set)
++        reactor.run(installSignalHandlers=False)
++
+     @staticmethod
+-    def _handle_response(response: Response):
++    def _response_headers(response) -> dict[str, str]:
++        headers = {}
++        for name, values in response.headers.getAllRawHeaders():
++            header_name = name.decode() if isinstance(name, bytes) else name
++            header_values = [
++                value.decode() if isinstance(value, bytes) else value for value in values
++            ]
++            headers[header_name.lower()] = ', '.join(header_values)
++        return headers
++
++    @classmethod
++    def _sync_request(cls, method: str, url: str, params=None, headers=None, data=None):
++        cls._ensure_reactor()
++
++        def make_request():
++            deferred = treq.request(
++                method,
++                url,
++                params=params,
++                headers=headers,
++                data=data,
++            )
++
++            def read_body(response):
++                body_deferred = treq.content(response)
++
++                def build_response(body):
++                    reason = response.phrase.decode() if isinstance(response.phrase, bytes) else response.phrase
++                    return _TreqResponse(
++                        status_code=response.code,
++                        headers=cls._response_headers(response),
++                        url=url,
++                        content=body,
++                        reason=reason,
++                    )
++
++                body_deferred.addCallback(build_response)
++                return body_deferred
++
++            deferred.addCallback(read_body)
++            return deferred
++
++        return threads.blockingCallFromThread(reactor, make_request)
++
++    @staticmethod
++    def _handle_response(response: _TreqResponse):
+         if response.ok:
+             return BaseClient._handle_ok_response(response)
+         try:
+@@ -38,7 +178,7 @@
+         response.raise_for_status()
+ 
+     @staticmethod
+-    def _handle_ok_response(response: Response) -> dict:
++    def _handle_ok_response(response: _TreqResponse) -> dict:
+         if content_type := response.headers.get('content-type'):
+             if content_type.startswith('application/json'):
+                 return response.json()

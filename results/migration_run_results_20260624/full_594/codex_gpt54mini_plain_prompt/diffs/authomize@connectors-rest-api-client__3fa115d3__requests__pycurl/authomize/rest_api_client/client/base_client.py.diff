@@ -1,0 +1,222 @@
+diff --git a/authomize/rest_api_client/client/base_client.py b/authomize/rest_api_client/client/base_client.py
+index 8c83a9c..154ef22 100644
+--- a/authomize/rest_api_client/client/base_client.py
++++ b/authomize/rest_api_client/client/base_client.py
+@@ -1,22 +1,55 @@
+-from typing import Optional
++import io
++import json
++from dataclasses import dataclass
++from typing import Any, Optional
++from urllib.parse import urlencode, urlsplit, urlunsplit
+ 
+-import requests
+-from requests import Response
++import pycurl
++from pydantic.json import pydantic_encoder
+ 
+ AUTHOMIZE_API_URL = 'https://api.authomize.com'
+ 
+ 
+ class ClientError(Exception):
+     def __init__(self, message):
++        super().__init__(message)
+         self.message = message
+ 
+ 
++@dataclass
++class Response:
++    status_code: int
++    headers: dict[str, str]
++    content: bytes
++    url: str
++    reason: str = ''
++
++    @property
++    def ok(self) -> bool:
++        return 200 <= self.status_code < 400
++
++    @property
++    def text(self) -> str:
++        return self.content.decode('utf-8', errors='replace')
++
++    def json(self) -> Any:
++        return json.loads(self.text)
++
++    def raise_for_status(self):
++        raise ClientError(
++            message={
++                'status_code': self.status_code,
++                'url': self.url,
++                'message': self.reason or 'HTTP error response from API',
++                'raw': self.content,
++            },
++        )
++
++
+ class BaseClient:
+     def __init__(self, auth_token: str, base_url: str = AUTHOMIZE_API_URL):
+         self.auth_token = auth_token
+         self.base_url = base_url
+-        self.session = requests.Session()
+-        self.session.headers.update({'Authorization': self.authorization_header})
+ 
+     @property
+     def authorization_header(self) -> str:
+@@ -52,30 +85,140 @@ class BaseClient:
+             },
+         )
+ 
++    def _build_url(self, url: str, params=None) -> str:
++        full_url = self.base_url.rstrip('/') + url
++        if not params:
++            return full_url
++
++        encoded_params = []
++        for key, value in params.items():
++            if value is None:
++                continue
++            if isinstance(value, (list, tuple, set)):
++                encoded_params.extend(
++                    (key, pydantic_encoder(item)) for item in value
++                )
++                continue
++            encoded_params.append((key, pydantic_encoder(value)))
++
++        query = urlencode(encoded_params, doseq=True)
++        parts = urlsplit(full_url)
++        return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
++
++    def _perform_request(
++        self,
++        method: str,
++        url: str,
++        params=None,
++        body: Optional[Any] = None,
++    ) -> Response:
++        request_url = self._build_url(url, params=params)
++        response_body = io.BytesIO()
++        response_headers: dict[str, str] = {}
++        status_code = 0
++        reason = ''
++        effective_url = request_url
++
++        def _handle_header_line(header_line: bytes):
++            nonlocal status_code, reason, response_headers
++            line = header_line.decode('iso-8859-1').strip()
++            if not line:
++                return
++            if line.startswith('HTTP/'):
++                response_headers = {}
++                parts = line.split(' ', 2)
++                if len(parts) >= 2 and parts[1].isdigit():
++                    status_code = int(parts[1])
++                reason = parts[2] if len(parts) >= 3 else ''
++                return
++            if ':' in line:
++                key, value = line.split(':', 1)
++                response_headers[key.strip().lower()] = value.strip()
++
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, request_url)
++            curl.setopt(pycurl.FOLLOWLOCATION, True)
++            curl.setopt(pycurl.ACCEPT_ENCODING, '')
++            curl.setopt(pycurl.WRITEFUNCTION, response_body.write)
++            curl.setopt(pycurl.HEADERFUNCTION, _handle_header_line)
++
++            if method == 'GET':
++                curl.setopt(pycurl.HTTPHEADER, [f'Authorization: {self.authorization_header}'])
++                pass
++            elif method == 'POST':
++                curl.setopt(
++                    pycurl.HTTPHEADER,
++                    [
++                        f'Authorization: {self.authorization_header}',
++                        'Content-Type: application/json',
++                    ],
++                )
++                curl.setopt(pycurl.POST, True)
++                payload = self._encode_body(body)
++                curl.setopt(pycurl.POSTFIELDS, payload)
++                curl.setopt(pycurl.POSTFIELDSIZE, len(payload))
++            elif method == 'PATCH':
++                curl.setopt(
++                    pycurl.HTTPHEADER,
++                    [
++                        f'Authorization: {self.authorization_header}',
++                        'Content-Type: application/json',
++                    ],
++                )
++                curl.setopt(pycurl.CUSTOMREQUEST, 'PATCH')
++                payload = self._encode_body(body)
++                curl.setopt(pycurl.POSTFIELDS, payload)
++                curl.setopt(pycurl.POSTFIELDSIZE, len(payload))
++            elif method == 'DELETE':
++                curl.setopt(pycurl.HTTPHEADER, [f'Authorization: {self.authorization_header}'])
++                curl.setopt(pycurl.CUSTOMREQUEST, 'DELETE')
++            else:
++                curl.setopt(pycurl.HTTPHEADER, [f'Authorization: {self.authorization_header}'])
++                curl.setopt(pycurl.CUSTOMREQUEST, method)
++                if body is not None:
++                    payload = self._encode_body(body)
++                    curl.setopt(pycurl.POSTFIELDS, payload)
++                    curl.setopt(pycurl.POSTFIELDSIZE, len(payload))
++
++            curl.perform()
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE) or status_code
++            effective_url = curl.getinfo(pycurl.EFFECTIVE_URL) or request_url
++        finally:
++            curl.close()
++
++        return Response(
++            status_code=status_code,
++            headers=response_headers,
++            content=response_body.getvalue(),
++            url=effective_url,
++            reason=reason,
++        )
++
++    @staticmethod
++    def _encode_body(body: Optional[Any]) -> bytes:
++        if body is None:
++            return b''
++        if isinstance(body, bytes):
++            return body
++        if isinstance(body, bytearray):
++            return bytes(body)
++        if isinstance(body, str):
++            return body.encode('utf-8')
++        return json.dumps(body, default=pydantic_encoder).encode('utf-8')
++
+     def http_get(self, url, params=None):
+-        url = self.base_url + url
+-        response = self.session.get(url, params=params)
++        response = self._perform_request('GET', url, params=params)
+         return self._handle_response(response)
+ 
+     def http_post(self, url: str, body: Optional[str] = None):
+-        url = self.base_url + url
+-        response = self.session.post(
+-            url,
+-            headers={'Content-Type': 'application/json'},
+-            data=body,
+-        )
++        response = self._perform_request('POST', url, body=body)
+         return self._handle_response(response)
+ 
+     def http_patch(self, url: str, body: Optional[str] = None):
+-        url = self.base_url + url
+-        response = self.session.patch(
+-            url,
+-            headers={'Content-Type': 'application/json'},
+-            data=body,
+-        )
++        response = self._perform_request('PATCH', url, body=body)
+         return self._handle_response(response)
+ 
+     def http_delete(self, url: str, params=None):
+-        url = self.base_url + url
+-        response = self.session.delete(url, params=params)
++        response = self._perform_request('DELETE', url, params=params)
+         return self._handle_response(response)

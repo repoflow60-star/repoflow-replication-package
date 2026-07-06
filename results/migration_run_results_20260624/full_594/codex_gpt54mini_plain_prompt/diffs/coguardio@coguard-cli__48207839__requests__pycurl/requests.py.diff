@@ -1,0 +1,341 @@
+diff --git /dev/null b/requests.py
+new file mode 100644
+index 0000000..ad747e0
+--- /dev/null
++++ b/requests.py
+@@ -0,0 +1,335 @@
++"""A small requests-compatible HTTP client backed by pycurl.
++
++The project historically used the third-party ``requests`` package directly.
++This module keeps the existing call surface used by the codebase and tests,
++while routing real transport work through ``pycurl`` when it is available.
++"""
++
++from __future__ import annotations
++
++import http.client
++import io
++import json as json_module
++import math
++from typing import Dict, Iterable, Iterator, Optional, Tuple
++from urllib import error as urllib_error
++from urllib import parse as urllib_parse
++from urllib import request as urllib_request
++
++try:
++    import pycurl  # type: ignore
++except Exception:  # pragma: no cover - fallback only used when pycurl is absent
++    pycurl = None
++
++
++class RequestException(Exception):
++    """Base exception for HTTP errors."""
++
++
++class HTTPError(RequestException):
++    """Raised when ``raise_for_status`` sees an error response."""
++
++
++def _to_bytes(value) -> bytes:
++    if value is None:
++        return b""
++    if isinstance(value, bytes):
++        return value
++    if isinstance(value, bytearray):
++        return bytes(value)
++    if isinstance(value, str):
++        return value.encode("utf-8")
++    return str(value).encode("utf-8")
++
++
++def _encode_request_body(data=None, json=None) -> Tuple[Optional[bytes], Dict[str, str]]:
++    headers: Dict[str, str] = {}
++    if json is not None:
++        return json_module.dumps(json).encode("utf-8"), {
++            "Content-Type": "application/json"
++        }
++    if data is None:
++        return None, headers
++    if isinstance(data, (bytes, bytearray)):
++        return bytes(data), headers
++    if isinstance(data, str):
++        return data.encode("utf-8"), headers
++    if hasattr(data, "read"):
++        return _to_bytes(data.read()), headers
++    if isinstance(data, dict):
++        return urllib_parse.urlencode(data).encode("utf-8"), {
++            "Content-Type": "application/x-www-form-urlencoded"
++        }
++    return _to_bytes(data), headers
++
++
++def _merge_headers(base: Optional[Dict[str, str]], extra: Dict[str, str]) -> Dict[str, str]:
++    merged = dict(base or {})
++    merged.update(extra)
++    return merged
++
++
++def _headers_to_list(headers: Dict[str, str]) -> Iterable[str]:
++    return [f"{key}: {value}" for key, value in headers.items()]
++
++
++def _parse_header_lines(raw_header_bytes: bytes) -> Tuple[int, str, Dict[str, str]]:
++    status_code = 0
++    reason = ""
++    headers: Dict[str, str] = {}
++    for raw_line in raw_header_bytes.splitlines():
++        line = raw_line.decode("latin-1", errors="replace").strip()
++        if not line:
++            continue
++        if line.startswith("HTTP/"):
++            parts = line.split(" ", 2)
++            if len(parts) >= 2 and parts[1].isdigit():
++                status_code = int(parts[1])
++            if len(parts) >= 3:
++                reason = parts[2]
++            continue
++        if ":" in line:
++            key, value = line.split(":", 1)
++            headers[key.strip()] = value.strip()
++    return status_code, reason, headers
++
++
++def _response_reason(status_code: int) -> str:
++    return http.client.responses.get(status_code, "")
++
++
++class Response:
++    """A minimal ``requests.Response`` compatible object."""
++
++    def __init__(
++        self,
++        *,
++        status_code: int = 0,
++        reason: str = "",
++        headers: Optional[Dict[str, str]] = None,
++        content: bytes = b"",
++        url: str = "",
++    ):
++        self.status_code = status_code
++        self.reason = reason or _response_reason(status_code)
++        self.headers = headers or {}
++        self.content = content
++        self.url = url
++        self.encoding = self._detect_encoding()
++        self._closed = False
++
++    def _detect_encoding(self) -> str:
++        content_type = ""
++        for key, value in self.headers.items():
++            if key.lower() == "content-type":
++                content_type = value
++                break
++        if "charset=" in content_type:
++            return content_type.split("charset=", 1)[1].split(";", 1)[0].strip()
++        return "utf-8"
++
++    @property
++    def text(self) -> str:
++        if isinstance(self.content, bytes):
++            return self.content.decode(self.encoding or "utf-8", errors="replace")
++        return str(self.content)
++
++    def json(self):
++        return json_module.loads(self.text)
++
++    def iter_content(self, chunk_size: int = 8192) -> Iterator[bytes]:
++        body = _to_bytes(self.content)
++        for start in range(0, len(body), chunk_size):
++            yield body[start:start + chunk_size]
++
++    def raise_for_status(self) -> None:
++        if self.status_code >= 400:
++            raise HTTPError(f"{self.status_code} Error: {self.reason}")
++
++    def close(self) -> None:
++        self._closed = True
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc, tb):
++        self.close()
++        return False
++
++
++def _perform_with_pycurl(
++    method: str,
++    url: str,
++    *,
++    headers: Optional[Dict[str, str]] = None,
++    data=None,
++    json=None,
++    timeout: Optional[float] = None,
++) -> Response:
++    body_bytes, inferred_headers = _encode_request_body(data=data, json=json)
++    merged_headers = _merge_headers(headers, inferred_headers)
++    curl = pycurl.Curl()
++    body_buffer = io.BytesIO()
++    header_buffer = io.BytesIO()
++
++    try:
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.FOLLOWLOCATION, 1)
++        curl.setopt(pycurl.WRITEFUNCTION, body_buffer.write)
++        curl.setopt(pycurl.HEADERFUNCTION, header_buffer.write)
++
++        if timeout is not None:
++            curl.setopt(pycurl.TIMEOUT, max(1, int(math.ceil(timeout))))
++
++        if merged_headers:
++            curl.setopt(pycurl.HTTPHEADER, list(_headers_to_list(merged_headers)))
++
++        if method == "GET":
++            curl.setopt(pycurl.HTTPGET, 1)
++        elif method == "POST":
++            curl.setopt(pycurl.POST, 1)
++            if body_bytes is not None:
++                curl.setopt(pycurl.POSTFIELDS, body_bytes)
++                curl.setopt(pycurl.POSTFIELDSIZE, len(body_bytes))
++        elif method == "PUT":
++            curl.setopt(pycurl.CUSTOMREQUEST, "PUT")
++            if body_bytes is not None:
++                curl.setopt(pycurl.POSTFIELDS, body_bytes)
++                curl.setopt(pycurl.POSTFIELDSIZE, len(body_bytes))
++        else:
++            curl.setopt(pycurl.CUSTOMREQUEST, method)
++            if body_bytes is not None:
++                curl.setopt(pycurl.POSTFIELDS, body_bytes)
++                curl.setopt(pycurl.POSTFIELDSIZE, len(body_bytes))
++
++        curl.perform()
++        status_code = int(curl.getinfo(pycurl.RESPONSE_CODE))
++        raw_headers = header_buffer.getvalue()
++        parsed_status_code, parsed_reason, parsed_headers = _parse_header_lines(raw_headers)
++        if parsed_status_code:
++            status_code = parsed_status_code
++        reason = parsed_reason or _response_reason(status_code)
++        content = body_buffer.getvalue()
++        return Response(
++            status_code=status_code,
++            reason=reason,
++            headers=parsed_headers,
++            content=content,
++            url=url,
++        )
++    except pycurl.error as exc:  # pragma: no cover - depends on live network
++        raise RequestException(str(exc)) from exc
++    finally:
++        curl.close()
++
++
++def _perform_with_urllib(
++    method: str,
++    url: str,
++    *,
++    headers: Optional[Dict[str, str]] = None,
++    data=None,
++    json=None,
++    timeout: Optional[float] = None,
++) -> Response:
++    body_bytes, inferred_headers = _encode_request_body(data=data, json=json)
++    merged_headers = _merge_headers(headers, inferred_headers)
++    request = urllib_request.Request(
++        url,
++        data=body_bytes,
++        headers=merged_headers,
++        method=method,
++    )
++    try:
++        with urllib_request.urlopen(request, timeout=timeout) as response:
++            return Response(
++                status_code=getattr(response, "status", response.getcode()),
++                reason=getattr(response, "reason", "") or _response_reason(
++                    getattr(response, "status", response.getcode())
++                ),
++                headers=dict(response.headers.items()),
++                content=response.read(),
++                url=url,
++            )
++    except urllib_error.HTTPError as exc:
++        return Response(
++            status_code=exc.code,
++            reason=getattr(exc, "reason", "") or _response_reason(exc.code),
++            headers=dict(getattr(exc, "headers", {}) or {}),
++            content=exc.read(),
++            url=url,
++        )
++    except urllib_error.URLError as exc:  # pragma: no cover - depends on live network
++        raise RequestException(str(exc)) from exc
++
++
++def _request(
++    method: str,
++    url: str,
++    *,
++    headers: Optional[Dict[str, str]] = None,
++    data=None,
++    json=None,
++    timeout: Optional[float] = None,
++    stream: bool = False,
++    **kwargs,
++) -> Response:
++    if kwargs:
++        # Unknown kwargs are ignored to preserve compatibility with the old
++        # call sites that used a small subset of requests' API.
++        pass
++    if pycurl is not None:
++        return _perform_with_pycurl(
++            method,
++            url,
++            headers=headers,
++            data=data,
++            json=json,
++            timeout=timeout,
++        )
++    return _perform_with_urllib(
++        method,
++        url,
++        headers=headers,
++        data=data,
++        json=json,
++        timeout=timeout,
++    )
++
++
++def get(url, headers=None, timeout=None, stream=False, **kwargs) -> Response:
++    return _request(
++        "GET",
++        url,
++        headers=headers,
++        timeout=timeout,
++        stream=stream,
++        **kwargs,
++    )
++
++
++def post(url, headers=None, data=None, json=None, timeout=None, stream=False, **kwargs) -> Response:
++    return _request(
++        "POST",
++        url,
++        headers=headers,
++        data=data,
++        json=json,
++        timeout=timeout,
++        stream=stream,
++        **kwargs,
++    )
++
++
++def put(url, headers=None, data=None, json=None, timeout=None, stream=False, **kwargs) -> Response:
++    return _request(
++        "PUT",
++        url,
++        headers=headers,
++        data=data,
++        json=json,
++        timeout=timeout,
++        stream=stream,
++        **kwargs,
++    )
++

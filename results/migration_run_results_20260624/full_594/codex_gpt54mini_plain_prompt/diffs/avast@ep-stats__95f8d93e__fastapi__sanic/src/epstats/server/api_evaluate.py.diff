@@ -1,0 +1,90 @@
+diff --git a/src/epstats/server/api_evaluate.py b/src/epstats/server/api_evaluate.py
+index 87efbaf..149d768 100644
+--- a/src/epstats/server/api_evaluate.py
++++ b/src/epstats/server/api_evaluate.py
+@@ -1,15 +1,16 @@
+ import asyncio
+ import logging
+-from concurrent.futures import ThreadPoolExecutor
+ 
+ import numpy as np
+-from fastapi import APIRouter, Depends, HTTPException
++from pydantic import ValidationError
+ 
+ from ..prometheus import Counter, Summary, get_prometheus_metric
+ from ..toolkit import Dao
+ from ..toolkit import Experiment as EvExperiment
++from .json_response import DataScienceJsonResponse
+ from .req import Experiment
+ from .res import Result
++from .utils import dependency_context, validation_error_response
+ 
+ _logger = logging.getLogger("epstats")
+ evaluation_duration_metric = get_prometheus_metric(
+@@ -24,7 +25,7 @@ evaluation_successes_metric = get_prometheus_metric("evaluation_successes_total"
+ evaluation_requests_metric = get_prometheus_metric("evaluation_requests_total", Counter)
+ 
+ 
+-def get_evaluate_router(get_dao, get_executor_pool) -> APIRouter:
++def register_evaluate_routes(app, get_dao, get_executor_pool) -> None:
+     def _evaluate(experiment: EvExperiment, dao: Dao):
+         try:
+             is_performance_test = experiment.query_parameters.get("is_performance_test") is True
+@@ -37,39 +38,32 @@ def get_evaluate_router(get_dao, get_executor_pool) -> APIRouter:
+                     evaluation = experiment.evaluate_agg(goals)
+                     evaluation_successes_metric.inc()
+                 _logger.info(
+-                    f"Evaluation response: [{experiment.id}]",
+-                    {
+-                        "metrics": (
+-                            evaluation.metrics.replace([np.inf, -np.inf], "inf")
+-                            .replace(np.nan, None)
+-                            .to_dict("records"),
+-                        )
+-                    },
++                    f"Evaluation response: [{experiment.id}] "
++                    f"{evaluation.metrics.replace([np.inf, -np.inf], 'inf').replace(np.nan, None).to_dict('records')}"
+                 )
+             return Result.from_evaluation(experiment, evaluation)
+         except Exception as e:
+             _logger.error(f"Cannot evaluate experiment [{experiment.id}] because of {e}")
+             _logger.exception(e)
+             evaluation_errors_metric.inc()
+-            raise HTTPException(
+-                status_code=500,
+-                detail=f"Cannot evaluate experiment [{experiment.id}] because of {e}",
+-            )
++            raise RuntimeError(f"Cannot evaluate experiment [{experiment.id}] because of {e}") from e
+ 
+-    router = APIRouter()
+-
+-    @router.post("/evaluate", response_model=Result, tags=["Experiment Evaluation"])
+-    async def evaluate_experiment(
+-        experiment: Experiment,
+-        evaluation_pool: ThreadPoolExecutor = Depends(get_executor_pool),
+-        dao: Dao = Depends(get_dao),
+-    ):
++    @app.post("/evaluate")
++    async def evaluate_experiment(request):
+         """
+         Evaluates single `Experiment`.
+         """
+-        _logger.info(f"Evaluation request: [{experiment.id}]", experiment.dict())
+-        evaluation_requests_metric.inc()
+-        loop = asyncio.get_event_loop()
+-        return await loop.run_in_executor(evaluation_pool, _evaluate, experiment.to_experiment(), dao)
++        try:
++            experiment = Experiment.model_validate(await request.json())
++        except ValidationError as exc:
++            return validation_error_response(exc)
+ 
+-    return router
++        _logger.info(f"Evaluation request: [{experiment.id}] {experiment.model_dump()}")
++        evaluation_requests_metric.inc()
++        with dependency_context(app, get_executor_pool) as evaluation_pool:
++            with dependency_context(app, get_dao) as dao:
++                try:
++                    result = _evaluate(experiment.to_experiment(), dao)
++                except Exception as exc:
++                    return DataScienceJsonResponse({"detail": str(exc)}, status=500)
++                return DataScienceJsonResponse(result.model_dump())

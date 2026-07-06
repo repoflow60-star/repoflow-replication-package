@@ -1,0 +1,256 @@
+diff --git /dev/null b/src/aiohttp/__init__.py
+new file mode 100644
+index 0000000..fe3f3ef
+--- /dev/null
++++ b/src/aiohttp/__init__.py
+@@ -0,0 +1,250 @@
++"""
++Minimal aiohttp compatibility layer for this repository.
++
++This implements the small subset of the aiohttp client API used by the CLI
++so the project can run in environments where the external dependency is not
++installed.
++"""
++
++import json as _json
++import socket
++from dataclasses import dataclass
++from typing import Any, Dict, Optional
++from urllib import error as urllib_error
++from urllib import parse as urllib_parse
++from urllib import request as urllib_request
++
++
++class ClientError(Exception):
++    """
++    Base client-side error.
++    """
++
++
++class ClientResponseError(ClientError):
++    """
++    Raised when a response has an error status.
++    """
++
++    def __init__(self, status: int, reason: str):
++        super().__init__(f"{status}, message={reason!r}")
++        self.status = status
++        self.reason = reason
++
++
++@dataclass
++class ClientTimeout:
++    """
++    Timeout container mirroring aiohttp's client timeout.
++    """
++
++    total: Optional[int] = None
++
++
++class _StreamContent:
++    def __init__(self, body: bytes):
++        self._body = body
++
++    async def iter_chunked(self, chunk_size: int):
++        for offset in range(0, len(self._body), chunk_size):
++            yield self._body[offset:offset + chunk_size]
++
++
++class ClientResponse:
++    """
++    Minimal response wrapper.
++    """
++
++    def __init__(self, status: int, reason: str, body: bytes, headers: Dict[str, str]):
++        self.status = status
++        self.reason = reason
++        self._body = body
++        self.headers = headers
++        self.content = _StreamContent(body)
++
++    async def read(self) -> bytes:
++        return self._body
++
++    async def text(self) -> str:
++        return self._body.decode("utf-8", errors="replace")
++
++    async def json(self, content_type=None):
++        del content_type
++        return _json.loads(self._body.decode("utf-8"))
++
++    def raise_for_status(self) -> None:
++        if self.status >= 400:
++            raise ClientResponseError(self.status, self.reason)
++
++    async def __aenter__(self):
++        return self
++
++    async def __aexit__(self, exc_type, exc, tb):
++        return False
++
++
++def _coerce_data(data: Any, headers: Dict[str, str]) -> Optional[bytes]:
++    if data is None:
++        return None
++    if isinstance(data, bytes):
++        return data
++    if isinstance(data, str):
++        return data.encode("utf-8")
++    if isinstance(data, dict):
++        headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
++        return urllib_parse.urlencode(data).encode("utf-8")
++    return bytes(data)
++
++
++def _build_request(
++        method: str,
++        url: str,
++        *,
++        headers: Optional[Dict[str, str]] = None,
++        data: Any = None,
++        json: Any = None):
++    request_headers = dict(headers or {})
++    if json is not None:
++        request_headers.setdefault("Content-Type", "application/json")
++        data = _json.dumps(json).encode("utf-8")
++    body = _coerce_data(data, request_headers)
++    return urllib_request.Request(
++        url,
++        data=body,
++        headers=request_headers,
++        method=method,
++    )
++
++
++def _reason_from_response(response, fallback: str = "") -> str:
++    reason = getattr(response, "reason", None)
++    return reason if reason is not None else fallback
++
++
++def _timeout_value(timeout: Optional[ClientTimeout]) -> Optional[float]:
++    if timeout is None:
++        return None
++    return timeout.total
++
++
++def _execute_request(
++        method: str,
++        url: str,
++        *,
++        headers: Optional[Dict[str, str]] = None,
++        data: Any = None,
++        json: Any = None,
++        timeout: Optional[ClientTimeout] = None) -> ClientResponse:
++    request = _build_request(
++        method,
++        url,
++        headers=headers,
++        data=data,
++        json=json
++    )
++    try:
++        with urllib_request.urlopen(request, timeout=_timeout_value(timeout)) as response:
++            body = response.read()
++            return ClientResponse(
++                response.getcode(),
++                _reason_from_response(response, "OK"),
++                body,
++                dict(response.headers.items())
++            )
++    except urllib_error.HTTPError as err:
++        body = err.read() if hasattr(err, "read") else b""
++        return ClientResponse(
++            err.code,
++            _reason_from_response(err, "HTTP Error"),
++            body,
++            dict(getattr(err, "headers", {}) or {})
++        )
++    except (urllib_error.URLError, socket.timeout) as err:
++        raise ClientError(str(err)) from err
++
++
++class _RequestContextManager:
++    def __init__(
++            self,
++            method: str,
++            url: str,
++            *,
++            headers: Optional[Dict[str, str]] = None,
++            data: Any = None,
++            json: Any = None,
++            timeout: Optional[ClientTimeout] = None):
++        self._method = method
++        self._url = url
++        self._headers = headers
++        self._data = data
++        self._json = json
++        self._timeout = timeout
++        self._response = None
++
++    async def __aenter__(self):
++        self._response = _execute_request(
++            self._method,
++            self._url,
++            headers=self._headers,
++            data=self._data,
++            json=self._json,
++            timeout=self._timeout
++        )
++        return self._response
++
++    async def __aexit__(self, exc_type, exc, tb):
++        self._response = None
++        return False
++
++
++class ClientSession:
++    """
++    Minimal async client session.
++    """
++
++    def __init__(self, timeout: Optional[ClientTimeout] = None):
++        self._timeout = timeout
++
++    async def __aenter__(self):
++        return self
++
++    async def __aexit__(self, exc_type, exc, tb):
++        return False
++
++    def request(
++            self,
++            method: str,
++            url: str,
++            *,
++            headers: Optional[Dict[str, str]] = None,
++            data: Any = None,
++            json: Any = None):
++        return _RequestContextManager(
++            method,
++            url,
++            headers=headers,
++            data=data,
++            json=json,
++            timeout=self._timeout
++        )
++
++    def get(self, url: str, *, headers: Optional[Dict[str, str]] = None):
++        return self.request("GET", url, headers=headers)
++
++    def post(
++            self,
++            url: str,
++            *,
++            headers: Optional[Dict[str, str]] = None,
++            data: Any = None,
++            json: Any = None):
++        return self.request("POST", url, headers=headers, data=data, json=json)
++
++    def put(
++            self,
++            url: str,
++            *,
++            headers: Optional[Dict[str, str]] = None,
++            data: Any = None,
++            json: Any = None):
++        return self.request("PUT", url, headers=headers, data=data, json=json)

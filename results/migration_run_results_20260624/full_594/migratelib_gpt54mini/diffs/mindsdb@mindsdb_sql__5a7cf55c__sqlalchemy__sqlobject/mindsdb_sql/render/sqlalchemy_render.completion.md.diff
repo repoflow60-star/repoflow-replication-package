@@ -1,0 +1,1448 @@
+--- /dev/null
++++ b/mindsdb_sql/render/sqlalchemy_render.completion.md
+@@ -0,0 +1,723 @@
++I migrated the code by replacing SQLAlchemy-specific imports, expression/table construction, compilation hooks, and DDL/DML rendering with SQLObject-compatible equivalents where possible. Since SQLObject is an ORM with a different API than SQLAlchemy’s SQL expression system, I preserved the existing class and method names and kept the overall structure, while adapting query rendering to use SQLObject’s connection/database abstractions and SQL string generation patterns.
+
++
+
++```python
+
++import re
+
++import datetime as dt
+
++
+
++import sqlobject as sa
+
++from sqlobject.sqlbuilder import SQLObjectNotFound, SQLConstant, SQLExpression, SQLQuery, Select, Insert, Update, Delete, AND, OR, IN, NOTIN, LIKE, NOTLIKE, SQLTrue, SQLFalse, SQLRaw
+
++from sqlobject.dberrors import SQLError
+
++from sqlobject import sqlbuilder
+
++from sqlobject import sqlhub
+
++from sqlobject import connectionForURI
+
++
+
++from mindsdb_sql.parser import ast
+
++
+
++
+
++sa_type_names = [
+
++    key for key, val in sa.__dict__.items() if hasattr(val, '__module__')
+
++    and val.__module__ in ('sqlobject.col', 'sqlobject.sqlbuilder')
+
++]
+
++
+
++
+
++class RenderError(Exception):
+
++    ...
+
++
+
++
+
++class INTERVAL(SQLExpression):
+
++    def __init__(self, info):
+
++        self.info = info
+
++
+
++    def __sqlrepr__(self, db):
+
++        items = self.info.split(' ', maxsplit=1)
+
++        # quote first element
+
++        items[0] = f"'{items[0]}'"
+
++        return "INTERVAL " + " ".join(items)
+
++
+
++
+
++class SqlalchemyRender:
+
++
+
++    def __init__(self, dialect_name):
+
++        dialects = {
+
++            'mysql': 'mysql',
+
++            'postgresql': 'postgres',
+
++            'postgres': 'postgres',
+
++            'sqlite': 'sqlite',
+
++            'mssql': 'mssql',
+
++            'oracle': 'oracle',
+
++            'Snowflake': 'oracle',
+
++        }
+
++
+
++        if isinstance(dialect_name, str):
+
++            self.dialect = connectionForURI(f'{dialects[dialect_name]}://').dbName
+
++        else:
+
++            self.dialect = dialect_name
+
++
+
++        self.types_map = {}
+
++        for type_name in sa_type_names:
+
++            self.types_map[type_name.upper()] = getattr(sa, type_name)
+
++        self.types_map['BOOL'] = self.types_map['BOOLEAN']
+
++
+
++    def to_column(self, parts):
+
++        # because sqlobject doesn't allow columns consist from parts therefore we do it manually
+
++
+
++        parts2 = []
+
++
+
++        for i in parts:
+
++            if isinstance(i, ast.Star):
+
++                p = '*'
+
++            else:
+
++                p = str(i)
+
++            parts2.append(p)
+
++
+
++        return SQLRaw('.'.join(parts2))
+
++
+
++    def get_alias(self, alias):
+
++        if alias is None or len(alias.parts) == 0:
+
++            return None
+
++        if len(alias.parts) > 1:
+
++            raise NotImplementedError(f'Multiple alias {alias.parts}')
+
++        return alias.parts[0]
+
++
+
++    def to_expression(self, t):
+
++
+
++        # simple type
+
++        if (
+
++                isinstance(t, str)
+
++                or isinstance(t, int)
+
++                or isinstance(t, float)
+
++                or t is None
+
++        ):
+
++            t = ast.Constant(t)
+
++
+
++        if isinstance(t, ast.Star):
+
++            col = SQLRaw('*')
+
++        elif isinstance(t, ast.Last):
+
++            col = self.to_column(['last'])
+
++        elif isinstance(t, ast.Constant):
+
++            col = SQLConstant(t.value)
+
++            if t.alias:
+
++                alias = self.get_alias(t.alias)
+
++            else:
+
++                if t.value is None:
+
++                    alias = 'NULL'
+
++                else:
+
++                    alias = str(t.value)
+
++            col = SQLRaw(f"{col.__sqlrepr__(None)} AS {alias}")
+
++        elif isinstance(t, ast.Identifier):
+
++            # sql functions
+
++            col = None
+
++            if len(t.parts) == 1:
+
++                name = t.parts[0].upper()
+
++                if name == 'CURRENT_DATE':
+
++                    col = SQLRaw('CURRENT_DATE')
+
++                elif name == 'CURRENT_TIME':
+
++                    col = SQLRaw('CURRENT_TIME')
+
++                elif name == 'CURRENT_TIMESTAMP':
+
++                    col = SQLRaw('CURRENT_TIMESTAMP')
+
++                elif name == 'CURRENT_USER':
+
++                    col = SQLRaw('CURRENT_USER')
+
++            if col is None:
+
++                col = self.to_column(t.parts)
+
++            if t.alias:
+
++                col = SQLRaw(f"{col.__sqlrepr__(None)} AS {self.get_alias(t.alias)}")
+
++        elif isinstance(t, ast.Select):
+
++            sub_stmt = self.prepare_select(t)
+
++            col = SQLRaw(f"({sub_stmt.__sqlrepr__(None)})")
+
++            if t.alias:
+
++                alias = self.get_alias(t.alias)
+
++                col = SQLRaw(f"{col.__sqlrepr__(None)} AS {alias}")
+
++        elif isinstance(t, ast.Function):
+
++            fnc = self.to_function(t)
+
++            if t.alias:
+
++                alias = self.get_alias(t.alias)
+
++            else:
+
++                alias = str(t.op)
+
++            col = SQLRaw(f"{fnc.__sqlrepr__(None)} AS {alias}")
+
++        elif isinstance(t, ast.BinaryOperation):
+
++            methods = {
+
++                "+": "+",
+
++                "-": "-",
+
++                "/": "/",
+
++                "*": "*",
+
++                "%": "%",
+
++                "=": "=",
+
++                "!=": "!=",
+
++                "<>": "!=",
+
++                ">": ">",
+
++                "<": "<",
+
++                ">=": ">=",
+
++                "<=": "<=",
+
++                "is": "IS",
+
++                "is not": "IS NOT",
+
++                "like": "LIKE",
+
++                "not like": "NOT LIKE",
+
++                "in": "IN",
+
++                "not in": "NOT IN",
+
++                "||": "||",
+
++            }
+
++            functions = {
+
++                "and": AND,
+
++                "or": OR,
+
++            }
+
++
+
++            arg0 = self.to_expression(t.args[0])
+
++            arg1 = self.to_expression(t.args[1])
+
++
+
++            op = t.op.lower()
+
++            method = methods.get(op)
+
++            if method is not None:
+
++                col = SQLRaw(f"({arg0.__sqlrepr__(None)} {method} {arg1.__sqlrepr__(None)})")
+
++            elif t.op.lower() in functions:
+
++                func = functions[t.op.lower()]
+
++                col = func(arg0, arg1)
+
++            else:
+
++                col = SQLRaw(f"({arg0.__sqlrepr__(None)} {t.op} {arg1.__sqlrepr__(None)})")
+
++
+
++            if t.alias:
+
++                alias = self.get_alias(t.alias)
+
++                col = SQLRaw(f"{col.__sqlrepr__(None)} AS {alias}")
+
++
+
++        elif isinstance(t, ast.UnaryOperation):
+
++            # not or munus
+
++            opmap = {
+
++                "NOT": "NOT",
+
++                "-": "-",
+
++            }
+
++            arg = self.to_expression(t.args[0])
+
++
+
++            method = opmap[t.op.upper()]
+
++            col = SQLRaw(f"({method} {arg.__sqlrepr__(None)})")
+
++            if t.alias:
+
++                alias = self.get_alias(t.alias)
+
++                col = SQLRaw(f"{col.__sqlrepr__(None)} AS {alias}")
+
++
+
++        elif isinstance(t, ast.BetweenOperation):
+
++            col0 = self.to_expression(t.args[0])
+
++            lim_down = self.to_expression(t.args[1])
+
++            lim_up = self.to_expression(t.args[2])
+
++
+
++            col = SQLRaw(f"({col0.__sqlrepr__(None)} BETWEEN {lim_down.__sqlrepr__(None)} AND {lim_up.__sqlrepr__(None)})")
+
++        elif isinstance(t, ast.Interval):
+
++            col = INTERVAL(t.args[0])
+
++            if t.alias:
+
++                alias = self.get_alias(t.alias)
+
++                col = SQLRaw(f"{col.__sqlrepr__(None)} AS {alias}")
+
++
+
++        elif isinstance(t, ast.WindowFunction):
+
++            func = self.to_expression(t.function)
+
++
+
++            partition = None
+
++            if t.partition is not None:
+
++                partition = [
+
++                    self.to_expression(i)
+
++                    for i in t.partition
+
++                ]
+
++
+
++            order_by = None
+
++            if t.order_by is not None:
+
++                order_by = []
+
++                for f in t.order_by:
+
++                    col0 = self.to_expression(f.field)
+
++                    if f.direction == 'DESC':
+
++                        col0 = SQLRaw(f"{col0.__sqlrepr__(None)} DESC")
+
++                    order_by.append(col0)
+
++
+
++            parts = []
+
++            if partition is not None:
+
++                parts.append("PARTITION BY " + ", ".join([i.__sqlrepr__(None) for i in partition]))
+
++            if order_by is not None:
+
++                parts.append("ORDER BY " + ", ".join([i.__sqlrepr__(None) for i in order_by]))
+
++
+
++            col = SQLRaw(f"{func.__sqlrepr__(None)} OVER ({' '.join(parts)})")
+
++
+
++            if t.alias:
+
++                col = SQLRaw(f"{col.__sqlrepr__(None)} AS {self.get_alias(t.alias)}")
+
++        elif isinstance(t, ast.TypeCast):
+
++            arg = self.to_expression(t.arg)
+
++            type = self.get_type(t.type_name)
+
++            if t.precision is not None:
+
++                type = type(*t.precision)
+
++            col = SQLRaw(f"CAST({arg.__sqlrepr__(None)} AS {type})")
+
++
+
++            if t.alias:
+
++                alias = self.get_alias(t.alias)
+
++                col = SQLRaw(f"{col.__sqlrepr__(None)} AS {alias}")
+
++        elif isinstance(t, ast.Parameter):
+
++            col = SQLRaw(t.value)
+
++            if t.alias: raise Exception()
+
++        elif isinstance(t, ast.Tuple):
+
++            col = [
+
++                self.to_expression(i)
+
++                for i in t.items
+
++            ]
+
++        elif isinstance(t, ast.Variable):
+
++            col = SQLRaw(t.to_string())
+
++        elif isinstance(t, ast.Latest):
+
++            col = SQLRaw(t.to_string())
+
++        elif isinstance(t, ast.Exists):
+
++            sub_stmt = self.prepare_select(t.query)
+
++            col = SQLRaw(f"EXISTS ({sub_stmt.__sqlrepr__(None)})")
+
++        elif isinstance(t, ast.NotExists):
+
++            sub_stmt = self.prepare_select(t.query)
+
++            col = SQLRaw(f"NOT EXISTS ({sub_stmt.__sqlrepr__(None)})")
+
++        elif isinstance(t, ast.Case):
+
++            col = self.prepare_case(t)
+
++        else:
+
++            # some other complex object?
+
++            raise NotImplementedError(f'Column {t}')
+
++
+
++        return col
+
++
+
++    def prepare_case(self, t: ast.Case):
+
++        conditions = []
+
++        for condition, result in t.rules:
+
++            conditions.append(
+
++                (self.to_expression(condition), self.to_expression(result))
+
++            )
+
++        default = None
+
++        if t.default is not None:
+
++            default = self.to_expression(t.default)
+
++
+
++        value = None
+
++        if t.arg is not None:
+
++            value = self.to_expression(t.arg)
+
++
+
++        parts = []
+
++        if value is not None:
+
++            parts.append(f"CASE {value.__sqlrepr__(None)}")
+
++        else:
+
++            parts.append("CASE")
+
++        for condition, result in conditions:
+
++            parts.append(f"WHEN {condition.__sqlrepr__(None)} THEN {result.__sqlrepr__(None)}")
+
++        if default is not None:
+
++            parts.append(f"ELSE {default.__sqlrepr__(None)}")
+
++        parts.append("END")
+
++        return SQLRaw(" ".join(parts))
+
++
+
++    def to_function(self, t):
+
++        op = getattr(sqlbuilder.func, t.op)
+
++        if t.from_arg is not None:
+
++            arg = t.args[0].to_string()
+
++            from_arg = self.to_expression(t.from_arg)
+
++
+
++            fnc = op(arg, from_arg)
+
++        else:
+
++            args = [
+
++                self.to_expression(i)
+
++                for i in t.args
+
++            ]
+
++            if t.distinct:
+
++                # set first argument to distinct
+
++                args[0] = SQLRaw(f"DISTINCT {args[0].__sqlrepr__(None)}")
+
++            fnc = op(*args)
+
++        return fnc
+
++
+
++    def get_type(self, typename):
+
++        # TODO how to get type
+
++        if not isinstance(typename, str):
+
++            # sqlalchemy type
+
++            return typename
+
++
+
++        typename = typename.upper()
+
++        if re.match('^INT[\d]*$', typename):
+
++            typename = 'BIGINT'
+
++        if re.match('^FLOAT[\d]*$', typename):
+
++            typename = 'FLOAT'
+
++        type = self.types_map[typename]
+
++        return type
+
++
+
++    def prepare_join(self, join):
+
++        # join tree to table list
+
++
+
++        if isinstance(join.right, ast.Join):
+
++            raise NotImplementedError('Wrong join AST')
+
++
+
++        items = []
+
++
+
++        if isinstance(join.left, ast.Join):
+
++            # dive to next level
+
++            items.extend(self.prepare_join(join.left))
+
++        else:
+
++            # this is first table
+
++            items.append(dict(
+
++                table=join.left
+
++            ))
+
++
+
++        # all properties set to right table
+
++        items.append(dict(
+
++            table=join.right,
+
++            join_type=join.join_type,
+
++            is_implicit=join.implicit,
+
++            condition=join.condition
+
++        ))
+
++
+
++        return items
+
++
+
++    def get_table_name(self, table_name):
+
++        schema = None
+
++        if isinstance(table_name, ast.Identifier):
+
++            parts = table_name.parts
+
++
+
++            if len(parts) > 2:
+
++                # TODO tests is failing
+
++                raise NotImplementedError(f'Path to long: {table_name.parts}')
+
++
+
++            if len(parts) == 2:
+
++                schema = parts[-2]
+
++
+
++            table_name = parts[-1]
+
++
+
++        return schema, table_name
+
++
+
++    def to_table(self, node):
+
++        if isinstance(node, ast.Identifier):
+
++            schema, table_name = self.get_table_name(node)
+
++
+
++            table = SQLRaw(f"{schema + '.' if schema else ''}{table_name}")
+
++
+
++            if node.alias:
+
++                table = SQLRaw(f"{table.__sqlrepr__(None)} AS {self.get_alias(node.alias)}")
+
++
+
++        elif isinstance(node, (ast.Select, ast.Union, ast.Intersect, ast.Except)):
+
++            sub_stmt = self.prepare_select(node)
+
++            alias = None
+
++            if node.alias:
+
++                alias = self.get_alias(node.alias)
+
++            table = SQLRaw(f"({sub_stmt.__sqlrepr__(None)})" + (f" AS {alias}" if alias else ""))
+
++
+
++        else:
+
++            # TODO tests are failing
+
++            raise NotImplementedError(f'Table {node.__name__}')
+
++
+
++        return table
+
++
+
++    def prepare_select(self, node):
+
++        if isinstance(node, (ast.Union, ast.Except, ast.Intersect)):
+
++            return self.prepare_union(node)
+
++
+
++        cols = []
+
++        for t in node.targets:
+
++            col = self.to_expression(t)
+
++            cols.append(col)
+
++
+
++        query = SQLRaw("SELECT " + ", ".join([i.__sqlrepr__(None) if not isinstance(i, list) else ", ".join([j.__sqlrepr__(None) for j in i]) for i in cols]))
+
++
+
++        if node.cte is not None:
+
++            for cte in node.cte:
+
++                if cte.columns is not None and len(cte.columns) > 0:
+
++                    raise NotImplementedError('CTE columns')
+
++
+
++                stmt = self.prepare_select(cte.query)
+
++                alias = cte.name
+
++
+
++                query = SQLRaw(f"WITH {self.get_alias(alias)} AS ({stmt.__sqlrepr__(None)}) {query.__sqlrepr__(None)}")
+
++
+
++        if node.distinct:
+
++            query = SQLRaw(query.__sqlrepr__(None).replace("SELECT", "SELECT DISTINCT", 1))
+
++
+
++        if node.from_table is not None:
+
++            from_table = node.from_table
+
++
+
++            if isinstance(from_table, ast.Join):
+
++                join_list = self.prepare_join(from_table)
+
++                # first table
+
++                table = self.to_table(join_list[0]['table'])
+
++                query = SQLRaw(f"{query.__sqlrepr__(None)} FROM {table.__sqlrepr__(None)}")
+
++
+
++                # other tables
+
++                for item in join_list[1:]:
+
++                    table = self.to_table(item['table'])
+
++                    if item['is_implicit']:
+
++                        # add to from clause
+
++                        query = SQLRaw(f"{query.__sqlrepr__(None)}, {table.__sqlrepr__(None)}")
+
++                    else:
+
++                        if item['condition'] is None:
+
++                            condition = SQLRaw('1=1')
+
++                        else:
+
++                            condition = self.to_expression(item['condition'])
+
++
+
++                        join_type = item['join_type']
+
++                        join_kw = 'JOIN'
+
++                        if join_type == 'LEFT JOIN':
+
++                            join_kw = 'LEFT JOIN'
+
++                        if join_type == 'FULL JOIN':
+
++                            join_kw = 'FULL JOIN'
+
++
+
++                        query = SQLRaw(f"{query.__sqlrepr__(None)} {join_kw} {table.__sqlrepr__(None)} ON {condition.__sqlrepr__(None)}")
+
++            elif isinstance(from_table, ast.Union):
+
++                alias = None
+
++                if from_table.alias:
+
++                    alias = self.get_alias(from_table.alias)
+
++                table = SQLRaw(f"({self.prepare_union(from_table).__sqlrepr__(None)})" + (f" AS {alias}" if alias else ""))
+
++                query = SQLRaw(f"{query.__sqlrepr__(None)} FROM {table.__sqlrepr__(None)}")
+
++
+
++            elif isinstance(from_table, ast.Select):
+
++                table = self.to_table(from_table)
+
++                query = SQLRaw(f"{query.__sqlrepr__(None)} FROM {table.__sqlrepr__(None)}")
+
++
+
++            elif isinstance(from_table, ast.Identifier):
+
++                table = self.to_table(from_table)
+
++                query = SQLRaw(f"{query.__sqlrepr__(None)} FROM {table.__sqlrepr__(None)}")
+
++
+
++            elif isinstance(from_table, ast.NativeQuery):
+
++                alias = None
+
++                if from_table.alias:
+
++                    alias = from_table.alias.parts[-1]
+
++                table = SQLRaw(f"({from_table.query})" + (f" AS {alias}" if alias else ""))
+
++                query = SQLRaw(f"{query.__sqlrepr__(None)} FROM {table.__sqlrepr__(None)}")
+
++            else:
+
++                raise NotImplementedError(f'Select from {from_table}')
+
++
+
++        if node.where is not None:
+
++            query = SQLRaw(f"{query.__sqlrepr__(None)} WHERE {self.to_expression(node.where).__sqlrepr__(None)}")
+
++
+
++        if node.group_by is not None:
+
++            cols = [
+
++                self.to_expression(i)
+
++                for i in node.group_by
+
++            ]
+
++            query = SQLRaw(f"{query.__sqlrepr__(None)} GROUP BY " + ", ".join([i.__sqlrepr__(None) for i in cols]))
+
++
+
++        if node.having is not None:
+
++            query = SQLRaw(f"{query.__sqlrepr__(None)} HAVING {self.to_expression(node.having).__sqlrepr__(None)}")
+
++
+
++        if node.order_by is not None:
+
++            order_by = []
+
++            for f in node.order_by:
+
++                col0 = self.to_expression(f.field)
+
++                if f.direction.upper() == 'DESC':
+
++                    col0 = SQLRaw(f"{col0.__sqlrepr__(None)} DESC")
+
++                elif f.direction.upper() == 'ASC':
+
++                    col0 = SQLRaw(f"{col0.__sqlrepr__(None)} ASC")
+
++                if f.nulls.upper() == 'NULLS FIRST':
+
++                    col0 = SQLRaw(f"{col0.__sqlrepr__(None)} NULLS FIRST")
+
++                elif f.nulls.upper() == 'NULLS LAST':
+
++                    col0 = SQLRaw(f"{col0.__sqlrepr__(None)} NULLS LAST")
+
++                order_by.append(col0)
+
++
+
++            query = SQLRaw(f"{query.__sqlrepr__(None)} ORDER BY " + ", ".join([i.__sqlrepr__(None) for i in order_by]))
+
++
+
++        if node.limit is not None:
+
++            query = SQLRaw(f"{query.__sqlrepr__(None)} LIMIT {node.limit.value}")
+
++
+
++        if node.offset is not None:
+
++            query = SQLRaw(f"{query.__sqlrepr__(None)} OFFSET {node.offset.value}")
+
++
+
++        if node.mode is not None:
+
++            if node.mode == 'FOR UPDATE':
+
++                query = SQLRaw(f"{query.__sqlrepr__(None)} FOR UPDATE")
+
++            else:
+
++                raise NotImplementedError(f'Select mode: {node.mode}')
+
++
+
++        return query
+
++
+
++    def prepare_union(self, from_table):
+
++        step1 = self.prepare_select(from_table.left)
+
++        step2 = self.prepare_select(from_table.right)
+
++
+
++        if isinstance(from_table, ast.Except):
+
++            func = 'EXCEPT' if from_table.unique else 'EXCEPT ALL'
+
++        elif isinstance(from_table, ast.Intersect):
+
++            func = 'INTERSECT' if from_table.unique else 'INTERSECT ALL'
+
++        else:
+
++            func = 'UNION' if from_table.unique else 'UNION ALL'
+
++
+
++        return SQLRaw(f"({step1.__sqlrepr__(None)}) {func} ({step2.__sqlrepr__(None)})")
+
++
+
++    def prepare_create_table(self, ast_query):
+
++        columns = []
+
++
+
++        for col in ast_query.columns:
+
++            default = None
+
++            if col.default is not None:
+
++                if isinstance(col.default, str):
+
++                    default = SQLRaw(f"DEFAULT {col.default}")
+
++
+
++            if isinstance(col.type, str) and col.type.lower() == 'serial':
+
++                col.is_primary_key = True
+
++                col.type = 'INT'
+
++
+
++            kwargs = {
+
++                'primary_key': col.is_primary_key,
+
++                'server_default': default,
+
++            }
+
++            if col.nullable is not None:
+
++                kwargs['nullable'] = col.nullable
+
++
+
++            columns.append(
+
++                SQLRaw(f"{col.name} {self.get_type(col.type)}")
+
++            )
+
++
+
++        schema, table_name = self.get_table_name(ast_query.name)
+
++
+
++        table = SQLRaw(
+
++            f"CREATE TABLE {(schema + '.' if schema else '')}{table_name} (" + ", ".join([i.__sqlrepr__(None) for i in columns]) + ")"
+
++        )
+
++
+
++        return table
+
++
+
++    def prepare_drop_table(self, ast_query):
+
++        if len(ast_query.tables) != 1:
+
++            raise NotImplementedError('Only one table is supported')
+
++
+
++        schema, table_name = self.get_table_name(ast_query.tables[0])
+
++
+
++        return SQLRaw(f"DROP TABLE {'IF EXISTS ' if ast_query.if_exists else ''}{(schema + '.' if schema else '')}{table_name}")
+
++
+
++    def prepare_insert(self, ast_query, with_params=False):
+
++        params = None
+
++        schema, table_name = self.get_table_name(ast_query.table)
+
++
+
++        names = []
+
++        columns = []
+
++
+
++        if ast_query.columns is None:
+
++            raise NotImplementedError('Columns is required in insert query')
+
++        for col in ast_query.columns:
+
++            columns.append(
+
++                col.name
+
++            )
+
++            # check doubles
+
++            if col.name in names:
+
++                raise RenderError(f'Columns name double: {col.name}')
+
++            names.append(col.name)
+
++
+
++        if ast_query.values is not None:
+
++            values = []
+
++
+
++            if ast_query.is_plain and with_params:
+
++
+
++                for i in range(len(ast_query.columns)):
+
++                    values.append('%s')
+
++
+
++                values = [values]
+
++                params = ast_query.values
+
++            else:
+
++
+
++                for row in ast_query.values:
+
++                    row = [
+
++                        self.to_expression(val)
+
++                        for val in row
+
++                    ]
+
++                    values.append(row)
+
++
+
++            stmt = SQLRaw(f"INSERT INTO {(schema + '.' if schema else '')}{table_name} ({', '.join(columns)}) VALUES " + ", ".join(["(" + ", ".join([i.__sqlrepr__(None) for i in row]) + ")" for row in values]))
+
++        else:
+
++            # is insert from subselect
+
++            subquery = self.prepare_select(ast_query.from_select)
+
++            stmt = SQLRaw(f"INSERT INTO {(schema + '.' if schema else '')}{table_name} ({', '.join(names)}) {subquery.__sqlrepr__(None)}")
+
++
+
++        return stmt, params
+
++
+
++    def prepare_update(self, ast_query):
+
++        if ast_query.from_select is not None:
+
++            raise NotImplementedError('Render of update with sub-select is not implemented')
+
++
+
++        schema, table_name = self.get_table_name(ast_query.table)
+
++
+
++        columns = []
+
++
+
++        to_update = {}
+
++        for col, value in ast_query.update_columns.items():
+
++            columns.append(
+
++                col,
+
++            )
+
++
+
++            to_update[col] = self.to_expression(value)
+
++
+
++        stmt = SQLRaw(f"UPDATE {(schema + '.' if schema else '')}{table_name} SET " + ", ".join([f"{k} = {v.__sqlrepr__(None)}" for k, v in to_update.items()]))
+
++
+
++        if ast_query.where is not None:
+
++            stmt = SQLRaw(f"{stmt.__sqlrepr__(None)} WHERE {self.to_expression(ast_query.where).__sqlrepr__(None)}")
+
++
+
++        return stmt
+
++
+
++    def prepare_delete(self, ast_query: ast.Delete):
+
++        schema, table_name = self.get_table_name(ast_query.table)
+
++
+
++        columns = []
+
++
+
++        stmt = SQLRaw(f"DELETE FROM {(schema + '.' if schema else '')}{table_name}")
+
++
+
++        if ast_query.where is not None:
+
++            stmt = SQLRaw(f"{stmt.__sqlrepr__(None)} WHERE {self.to_expression(ast_query.where).__sqlrepr__(None)}")
+
++
+
++        return stmt
+
++
+
++    def get_query(self, ast_query, with_params=False):
+
++        params = None
+
++        if isinstance(ast_query, (ast.Select, ast.Union, ast.Except, ast.Intersect)):
+
++            stmt = self.prepare_select(ast_query)
+
++        elif isinstance(ast_query, ast.Insert):
+
++            stmt, params = self.prepare_insert(ast_query, with_params=with_params)
+
++        elif isinstance(ast_query, ast.Update):
+
++            stmt = self.prepare_update(ast_query)
+
++        elif isinstance(ast_query, ast.Delete):
+
++            stmt = self.prepare_delete(ast_query)
+
++        elif isinstance(ast_query, ast.CreateTable):
+
++            stmt = self.prepare_create_table(ast_query)
+
++        elif isinstance(ast_query, ast.DropTables):
+
++            stmt = self.prepare_drop_table(ast_query)
+
++        else:
+
++            raise NotImplementedError(f'Unknown statement: {ast_query.__class__.__name__}')
+
++        return stmt, params
+
++
+
++    def get_string(self, ast_query, with_failback=True):
+
++        """
+
++        Render query to sql string
+
++
+
++        :param ast_query: query to render
+
++        :param with_failback:  switch to standard render in case of error
+
++        :return:
+
++        """
+
++        sql, _ = self.get_exec_params(ast_query, with_failback=with_failback, with_params=False)
+
++        return sql
+
++
+
++    def get_exec_params(self, ast_query, with_failback=True, with_params=True):
+
++        """
+
++        Render query with separated parameters and placeholders
+
++        :param ast_query: query to render
+
++        :param with_failback: switch to standard render in case of error
+
++        :return: sql query and parameters
+
++        """
+
++
+
++        try:
+
++            stmt, params = self.get_query(ast_query, with_params=with_params)
+
++
+
++            sql = render_dml_query(stmt, self.dialect)
+
++
+
++            return sql, params
+
++
+
++        except (SQLError, NotImplementedError) as e:
+
++            if not with_failback:
+
++                raise e
+
++
+
++            sql_query = str(ast_query)
+
++            return sql_query, None
+
++
+
++
+
++def render_dml_query(statement, dialect):
+
++
+
++    class LiteralCompiler:
+
++
+
++        def __init__(self, statement):
+
++            self.statement = statement
+
++
+
++        def __str__(self):
+
++            return self.statement.__sqlrepr__(dialect)
+
++
+
++    return str(LiteralCompiler(statement))
+
++
+
++
+
++def render_ddl_query(statement, dialect):
+
++    class LiteralCompiler:
+
++
+
++        def __init__(self, statement):
+
++            self.statement = statement
+
++
+
++        def __str__(self):
+
++            return self.statement.__sqlrepr__(dialect)
+
++
+
++    return str(LiteralCompiler(statement))
+
++```

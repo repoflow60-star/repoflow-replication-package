@@ -1,0 +1,129 @@
+--- a/fp/fp.py
++++ b/fp/fp.py
+@@ -1,11 +1,89 @@
+ #!/usr/bin/env python3
+ 
+ import random
++from threading import Event, Lock, Thread
+ 
+ import lxml.html as lh
+-import requests
++import treq
++from twisted.internet import reactor
++from twisted.web.client import ProxyAgent
+ 
+ from fp.errors import FreeProxyException
++
++
++_reactor_lock = Lock()
++_reactor_thread = None
++_reactor_ready = Event()
++
++
++# treq is Deferred-based; keep the public API synchronous by blocking on a background reactor.
++def _ensure_reactor_running():
++    global _reactor_thread
++    if reactor.running:
++        _reactor_ready.set()
++        return
++    if _reactor_ready.is_set():
++        return
++    with _reactor_lock:
++        if _reactor_thread is None:
++            def _run():
++                reactor.callWhenRunning(_reactor_ready.set)
++                reactor.run(installSignalHandlers=False)
++
++            _reactor_thread = Thread(target=_run, daemon=True)
++            _reactor_thread.start()
++    _reactor_ready.wait()
++
++
++def _call_in_reactor(func, *args, **kwargs):
++    _ensure_reactor_running()
++    done = Event()
++    outcome = {}
++
++    def _invoke():
++        try:
++            d = func(*args, **kwargs)
++        except Exception as e:
++            outcome['error'] = e
++            done.set()
++            return
++
++        def _success(value):
++            outcome['value'] = value
++            done.set()
++            return value
++
++        def _failure(failure):
++            outcome['error'] = failure.value
++            done.set()
++            return failure
++
++        d.addCallbacks(_success, _failure)
++
++    reactor.callFromThread(_invoke)
++    done.wait()
++    if 'error' in outcome:
++        raise outcome['error']
++    return outcome.get('value')
++
++
++def _fetch_url(url):
++    response = treq.get(url)
++    return treq.content(response)
++
++
++def _proxy_peer(url, proxy_url, timeout):
++    response = treq.get(
++        url,
++        agent=ProxyAgent(reactor, proxy_url.encode('ascii')),
++        timeout=timeout,
++    )
++
++    def _after_content(_):
++        transport = getattr(response, '_transport', None)
++        return transport.getPeer() if transport is not None else None
++
++    return treq.content(response).addCallback(_after_content)
+ 
+ 
+ class FreeProxy:
+@@ -30,12 +108,12 @@
+ 
+     def get_proxy_list(self, repeat):
+         try:
+-            page = requests.get(self.__website(repeat))
+-            doc = lh.fromstring(page.content)
+-        except requests.exceptions.RequestException as e:
++            page_content = _call_in_reactor(_fetch_url, self.__website(repeat))
++        except Exception as e:
+             raise FreeProxyException(
+                 f'Request to {self.__website(repeat)} failed') from e
+         try:
++            doc = lh.fromstring(page_content)
+             tr_elements = doc.xpath('//*[@id="list"]//tr')
+             return [f'{tr_elements[i][0].text_content()}:{tr_elements[i][1].text_content()}'
+                     for i in range(1, len(tr_elements)) if self.__criteria(tr_elements[i])]
+@@ -78,7 +156,7 @@
+                 working_proxy = self.__check_if_proxy_is_working(proxies)
+                 if working_proxy:
+                     return working_proxy
+-            except requests.exceptions.RequestException:
++            except Exception:
+                 continue
+         if not working_proxy and not repeat:
+             if self.country_id is not None:
+@@ -90,7 +168,7 @@
+     def __check_if_proxy_is_working(self, proxies):
+         url = f'{self.schema}://{self.url}'
+         ip = proxies[self.schema].split(':')[1][2:]
+-        with requests.get(url, proxies=proxies, timeout=self.timeout, stream=True) as r:
+-            if r.raw.connection.sock and r.raw.connection.sock.getpeername()[0] == ip:
+-                return proxies[self.schema]
++        peer = _call_in_reactor(_proxy_peer, url, proxies[self.schema], self.timeout)
++        if peer and getattr(peer, 'host', None) == ip:
++            return proxies[self.schema]
+         return

@@ -1,0 +1,98 @@
+--- a/tinychat/llms/base.py
++++ b/tinychat/llms/base.py
+@@ -1,4 +1,12 @@
++import json
++import threading
++import time
++from io import BytesIO
+ from typing import Generator, Protocol
++
++import treq
++from twisted.internet import reactor
++from twisted.internet.threads import blockingCallFromThread
+ 
+ from tinychat.utils.secrets import get_secret
+ from tinychat.settings import SECRETS_FILE_PATH
+@@ -43,3 +51,82 @@
+             "Content-Type": "application/json",
+             "Authorization": f"Bearer {self.api_key}",
+         }
++
++
++class _BufferedStreamResponse:
++    def __init__(
++        self, status_code: int, body: bytes, headers: dict[str, str] | None = None
++    ) -> None:
++        self.status_code = status_code
++        self.headers = headers or {}
++        self.encoding = "utf-8"
++        self.raw = BytesIO(body)
++
++    def __iter__(self):
++        return self.iter_content()
++
++    def iter_content(self, chunk_size: int = 1, decode_unicode: bool = False):
++        self.raw.seek(0)
++        while True:
++            chunk = self.raw.read(chunk_size)
++            if not chunk:
++                break
++            if decode_unicode:
++                yield chunk.decode(self.encoding)
++            else:
++                yield chunk
++
++    def close(self) -> None:
++        self.raw.close()
++
++
++_reactor_lock = threading.Lock()
++_reactor_started = False
++
++
++def _ensure_reactor_running() -> None:
++    global _reactor_started
++    if _reactor_started:
++        return
++    with _reactor_lock:
++        if _reactor_started:
++            return
++        thread = threading.Thread(
++            target=reactor.run,
++            kwargs={"installSignalHandlers": False},
++            daemon=True,
++        )
++        thread.start()
++        while not reactor.running:
++            time.sleep(0.01)
++        _reactor_started = True
++
++
++def post_streaming_request(url: str, headers: dict[str, str], payload: dict) -> _BufferedStreamResponse:
++    _ensure_reactor_running()
++
++    def _request():
++        def _with_body(response):
++            d = treq.content(response)
++            d.addCallback(
++                lambda body: _BufferedStreamResponse(
++                    status_code=response.code,
++                    body=body,
++                    headers={
++                        key.decode("utf-8") if isinstance(key, bytes) else key: ", ".join(
++                            value.decode("utf-8") if isinstance(value, bytes) else value
++                            for value in values
++                        )
++                        for key, values in response.headers.getAllRawHeaders() or []
++                    },
++                )
++            )
++            return d
++
++        return treq.post(
++            url,
++            headers=headers,
++            data=json.dumps(payload).encode("utf-8"),
++        ).addCallback(_with_body)
++
++    return blockingCallFromThread(reactor, _request)

@@ -1,0 +1,109 @@
+--- a/pastepwn/util/request.py
++++ b/pastepwn/util/request.py
+@@ -1,8 +1,15 @@
+ import logging
+-from threading import Lock
++from base64 import b64encode
++from threading import Event, Lock, Thread
++from urllib.parse import urlparse
++from urllib.request import getproxies
+ 
+-from requests import Session, utils
+-from requests.exceptions import Timeout
++import treq
++from treq.client import HTTPClient
++from twisted.internet import reactor, threads
++from twisted.internet.defer import CancelledError, TimeoutError as DeferredTimeoutError
++from twisted.internet.endpoints import TCP4ClientEndpoint
++from twisted.web.client import ProxyAgent
+ 
+ 
+ class Request:
+@@ -22,13 +29,63 @@
+     def __init__(self, proxies=None, headers=None):
+         if not self._initialized:
+             self.logger = logging.getLogger(__name__)
+-            self.session = Session()
+             self.proxies = proxies
+             self.headers = headers
++            self.system_proxies = getproxies()
++            self._reactor_ready = Event()
++            self._reactor_thread = Thread(target=self._run_reactor, name="TreqReactor", daemon=True)
++            self._reactor_thread.start()
++
++            if not self._reactor_ready.wait(timeout=5):
++                raise RuntimeError("The background Twisted reactor could not be started")
++
+             self.logger.info("Using the following custom proxies: %s", proxies)
+-            system_proxies = utils.get_environ_proxies("https://example.com")
+-            self.logger.info("Using the following system proxies: %s", system_proxies)
++            self.logger.info("Using the following system proxies: %s", self.system_proxies)
+             Request._initialized = True
++
++    def _run_reactor(self):
++        reactor.callWhenRunning(self._reactor_ready.set)
++        reactor.run(installSignalHandlers=False)
++
++    def _get_proxy_url(self, url):
++        scheme = urlparse(url).scheme.lower()
++
++        if self.proxies is not None:
++            return self.proxies.get(scheme) or self.proxies.get("all")
++
++        return self.system_proxies.get(scheme) or self.system_proxies.get("all")
++
++    def _get_proxy_headers(self, proxy):
++        if proxy.username is None:
++            return {}
++
++        credentials = f"{proxy.username}:{proxy.password or ''}".encode("utf-8")
++        token = b64encode(credentials).decode("ascii")
++        return {"Proxy-Authorization": f"Basic {token}"}
++
++    def _perform_request(self, method, url, headers, data, timeout):
++        proxy_url = self._get_proxy_url(url)
++        request_headers = dict(headers)
++
++        if proxy_url is None:
++            deferred = treq.request(method, url, headers=request_headers, data=data, reactor=reactor)
++        else:
++            proxy = urlparse(proxy_url)
++
++            if proxy.scheme != "http" or proxy.hostname is None:
++                msg = f"Unsupported proxy configuration: {proxy_url}"
++                raise ValueError(msg)
++
++            endpoint = TCP4ClientEndpoint(reactor, proxy.hostname, proxy.port or 80)
++            client = HTTPClient(ProxyAgent(endpoint, reactor))
++            request_headers.update(self._get_proxy_headers(proxy))
++            deferred = client.request(method, url, headers=request_headers, data=data)
++
++        if timeout is not None:
++            deferred.addTimeout(timeout, reactor)
++
++        deferred.addCallback(treq.content)
++        return deferred
+ 
+     def _request_wrapper(self, data, timeout, *args, **kwargs):
+         headers = {"User-Agent": "pastepwn (https://github.com/d-Rickyy-b/pastepwn)"}
+@@ -36,14 +93,16 @@
+         if self.headers is not None:
+             headers.update(self.headers)
+ 
++        method = kwargs.get("method")
++        url = kwargs.get("url")
++
+         try:
+-            response = self.session.request(*args, headers=headers, proxies=self.proxies, data=data, timeout=timeout, **kwargs)
+-        except Timeout:
+-            url = kwargs.get("url")
++            response = threads.blockingCallFromThread(reactor, self._perform_request, method, url, headers, data, timeout)
++        except (CancelledError, DeferredTimeoutError):
+             self.logger.warning("Timeout while requesting %s!", url)
+             return ""
+ 
+-        return response.content.decode("utf-8")
++        return response.decode("utf-8")
+ 
+     def get(self, url, data=None, timeout=5):
+         return self._request_wrapper(method="GET", url=url, data=data, timeout=timeout)

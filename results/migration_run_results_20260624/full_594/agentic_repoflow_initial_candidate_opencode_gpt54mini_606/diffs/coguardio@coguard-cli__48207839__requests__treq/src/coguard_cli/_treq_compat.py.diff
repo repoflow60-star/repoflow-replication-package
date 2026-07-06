@@ -1,0 +1,121 @@
+--- a/src/coguard_cli/_treq_compat.py
++++ b/src/coguard_cli/_treq_compat.py
+@@ -0,0 +1,118 @@
++"""
++Synchronous helpers around treq for existing blocking call sites.
++"""
++
++from __future__ import annotations
++
++import json
++import threading
++import urllib.parse
++from typing import Any, Dict, Optional, Tuple
++
++import treq
++from twisted.internet import reactor
++from twisted.internet.threads import blockingCallFromThread
++
++_reactor_ready = threading.Event()
++_reactor_thread: Optional[threading.Thread] = None
++_reactor_lock = threading.Lock()
++
++
++class TreqResponse:
++    def __init__(self, status_code: int, reason: str, content: bytes):
++        self.status_code = status_code
++        self.reason = reason
++        self.content = content
++        self.text = content.decode("utf-8", errors="replace")
++
++    def json(self) -> Any:
++        return json.loads(self.text)
++
++    def __str__(self) -> str:
++        return f"<TreqResponse [{self.status_code}]>"
++
++    __repr__ = __str__
++
++    def raise_for_status(self) -> None:
++        if self.status_code >= 400:
++            message = f"{self.status_code} {self.reason}".strip()
++            raise RuntimeError(message)
++
++
++def _run_reactor() -> None:
++    reactor.callWhenRunning(_reactor_ready.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor_running() -> None:
++    global _reactor_thread
++    if reactor.running:
++        return
++    with _reactor_lock:
++        if reactor.running:
++            return
++        if _reactor_thread is None or not _reactor_thread.is_alive():
++            _reactor_ready.clear()
++            _reactor_thread = threading.Thread(target=_run_reactor, daemon=True)
++            _reactor_thread.start()
++    _reactor_ready.wait()
++
++
++def _normalize_body(
++        data: Optional[Any],
++        json_body: Optional[Any],
++        headers: Optional[Dict[str, str]]
++) -> Tuple[Optional[bytes], Dict[str, str]]:
++    request_headers = dict(headers or {})
++    if json_body is not None:
++        request_headers.setdefault("content-type", "application/json")
++        return json.dumps(json_body).encode("utf-8"), request_headers
++    if isinstance(data, dict):
++        request_headers.setdefault(
++            "content-type", "application/x-www-form-urlencoded"
++        )
++        return urllib.parse.urlencode(data, doseq=True).encode("utf-8"), request_headers
++    if isinstance(data, str):
++        return data.encode("utf-8"), request_headers
++    return data, request_headers
++
++
++def request(
++        method: str,
++        url: str,
++        timeout: Optional[float] = None,
++        headers: Optional[Dict[str, str]] = None,
++        data: Optional[Any] = None,
++        json_body: Optional[Any] = None,
++        **kwargs: Any
++) -> TreqResponse:
++    _ensure_reactor_running()
++    body, request_headers = _normalize_body(data, json_body, headers)
++
++    def _perform_request() -> Any:
++        request_kwargs = dict(kwargs)
++        request_kwargs["headers"] = request_headers
++        if body is not None:
++            request_kwargs["data"] = body
++        response_deferred = treq.request(method, url, **request_kwargs)
++        if timeout is not None:
++            response_deferred.addTimeout(timeout, reactor)
++
++        def _with_body(response: Any) -> Any:
++            body_deferred = treq.content(response)
++            if timeout is not None:
++                body_deferred.addTimeout(timeout, reactor)
++
++            def _wrap(content: bytes) -> TreqResponse:
++                phrase = getattr(response, "phrase", b"")
++                if isinstance(phrase, bytes):
++                    reason = phrase.decode("utf-8", errors="replace")
++                else:
++                    reason = str(phrase)
++                return TreqResponse(response.code, reason, content)
++
++            return body_deferred.addCallback(_wrap)
++
++        return response_deferred.addCallback(_with_body)
++
++    return blockingCallFromThread(reactor, _perform_request)

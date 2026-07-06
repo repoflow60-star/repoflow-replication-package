@@ -1,0 +1,281 @@
+diff --git /dev/null b/src/cerberus/__init__.py
+new file mode 100644
+index 0000000..fff830c
+--- /dev/null
++++ b/src/cerberus/__init__.py
+@@ -0,0 +1,275 @@
++"""
++Minimal Cerberus-compatible validation helpers used by the SSVC schemas.
++
++This repository only needs a small subset of Cerberus' behavior:
++- nested object validation
++- required fields
++- unknown-field rejection
++- list item validation
++- enum/allowed values
++- list uniqueness
++- string length checks
++- date-time format validation
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from datetime import datetime
++import re
++from typing import Any, Mapping
++
++
++@dataclass
++class ValidationIssue:
++    path: tuple[Any, ...]
++    message: str
++
++
++class ValidationError(Exception):
++    def __init__(
++        self,
++        message: str,
++        *,
++        document: Any = None,
++        schema: Any = None,
++        errors: Any = None,
++        path: tuple[Any, ...] = (),
++    ):
++        super().__init__(message)
++        self.message = message
++        self.document = document
++        self.schema = schema
++        self.errors = errors or {}
++        self.path = tuple(path)
++
++    def __str__(self) -> str:
++        return self.message
++
++
++class Validator:
++    def __init__(self, schema: Any = None, allow_unknown: bool = False):
++        self.schema = schema
++        self.allow_unknown = allow_unknown
++        self.errors: dict[str, Any] = {}
++
++    def validate(self, document: Any, schema: Any = None) -> bool:
++        rule = self.schema if schema is None else schema
++        rule = _normalize_rule(rule)
++        issues = _validate_value(
++            document, rule, allow_unknown=self.allow_unknown, path=()
++        )
++        self.errors = _issues_to_tree(issues)
++        return not bool(issues)
++
++
++def _normalize_rule(rule: Any) -> dict[str, Any] | None:
++    if rule is None:
++        return None
++    if not isinstance(rule, Mapping):
++        raise TypeError("Validator schema must be a mapping or None")
++    if "type" not in rule and "schema" not in rule and any(
++        isinstance(value, Mapping) for value in rule.values()
++    ):
++        return {"type": "dict", "schema": dict(rule)}
++    return dict(rule)
++
++
++def _validate_value(
++    value: Any,
++    rule: dict[str, Any] | None,
++    *,
++    allow_unknown: bool,
++    path: tuple[Any, ...],
++) -> list[ValidationIssue]:
++    if rule is None:
++        return []
++
++    rule = _normalize_rule(rule)
++    issues: list[ValidationIssue] = []
++
++    if value is None:
++        if rule.get("nullable"):
++            return []
++        issues.append(ValidationIssue(path, "null value is not allowed"))
++        return issues
++
++    expected_type = rule.get("type")
++    if expected_type is None and "schema" in rule:
++        expected_type = "dict"
++
++    if expected_type in {"dict", "object"}:
++        if not isinstance(value, dict):
++            issues.append(ValidationIssue(path, "must be a mapping"))
++            return issues
++        issues.extend(
++            _validate_document(
++                value,
++                rule.get("schema", {}),
++                allow_unknown=rule.get("allow_unknown", allow_unknown),
++                path=path,
++            )
++        )
++        return issues
++
++    if expected_type in {"list", "array"}:
++        if not isinstance(value, list):
++            issues.append(ValidationIssue(path, "must be a list"))
++            return issues
++
++        minlength = rule.get("minlength")
++        if minlength is not None and len(value) < minlength:
++            issues.append(
++                ValidationIssue(
++                    path, f"must contain at least {minlength} items"
++                )
++            )
++
++        maxlength = rule.get("maxlength")
++        if maxlength is not None and len(value) > maxlength:
++            issues.append(
++                ValidationIssue(
++                    path, f"must contain at most {maxlength} items"
++                )
++            )
++
++        if rule.get("unique"):
++            frozen = [_freeze(item) for item in value]
++            if len(set(frozen)) != len(value):
++                issues.append(ValidationIssue(path, "items must be unique"))
++
++        item_rule = rule.get("schema")
++        if item_rule is not None:
++            for index, item in enumerate(value):
++                issues.extend(
++                    _validate_value(
++                        item,
++                        item_rule,
++                        allow_unknown=allow_unknown,
++                        path=path + (index,),
++                    )
++                )
++        return issues
++
++    if expected_type == "string":
++        if not isinstance(value, str):
++            issues.append(ValidationIssue(path, "must be a string"))
++            return issues
++
++        minlength = rule.get("minlength")
++        if minlength is not None and len(value) < minlength:
++            issues.append(
++                ValidationIssue(
++                    path, f"must be at least {minlength} characters long"
++                )
++            )
++
++        maxlength = rule.get("maxlength")
++        if maxlength is not None and len(value) > maxlength:
++            issues.append(
++                ValidationIssue(
++                    path, f"must be at most {maxlength} characters long"
++                )
++            )
++
++        if rule.get("format") == "date-time" and not _is_datetime(value):
++            issues.append(
++                ValidationIssue(path, "must be a valid ISO 8601 date-time")
++            )
++
++    elif expected_type == "integer":
++        if not isinstance(value, int) or isinstance(value, bool):
++            issues.append(ValidationIssue(path, "must be an integer"))
++            return issues
++    elif expected_type == "number":
++        if not isinstance(value, (int, float)) or isinstance(value, bool):
++            issues.append(ValidationIssue(path, "must be a number"))
++            return issues
++    elif expected_type == "boolean":
++        if not isinstance(value, bool):
++            issues.append(ValidationIssue(path, "must be a boolean"))
++            return issues
++    elif expected_type is not None:
++        issues.append(
++            ValidationIssue(path, f"unsupported rule type {expected_type!r}")
++        )
++        return issues
++
++    allowed = rule.get("allowed")
++    if allowed is not None and value not in allowed:
++        issues.append(
++            ValidationIssue(path, f"must be one of {sorted(allowed)!r}")
++        )
++
++    regex = rule.get("regex")
++    if regex is not None and not re.fullmatch(regex, str(value)):
++        issues.append(ValidationIssue(path, "does not match required pattern"))
++
++    return issues
++
++
++def _validate_document(
++    document: Mapping[str, Any],
++    schema: Mapping[str, Any],
++    *,
++    allow_unknown: bool,
++    path: tuple[Any, ...],
++) -> list[ValidationIssue]:
++    issues: list[ValidationIssue] = []
++
++    if not isinstance(document, dict):
++        return [ValidationIssue(path, "must be a mapping")]
++
++    for field, rule in schema.items():
++        if field not in document:
++            if _normalize_rule(rule).get("required"):
++                issues.append(ValidationIssue(path + (field,), "required field"))
++            continue
++
++        issues.extend(
++            _validate_value(
++                document[field],
++                rule,
++                allow_unknown=allow_unknown,
++                path=path + (field,),
++            )
++        )
++
++    if not allow_unknown:
++        for field in document:
++            if field not in schema:
++                issues.append(ValidationIssue(path + (field,), "unknown field"))
++
++    return issues
++
++
++def _issues_to_tree(issues: list[ValidationIssue]) -> dict[str, Any]:
++    tree: dict[str, Any] = {}
++    for issue in issues:
++        cursor = tree
++        if not issue.path:
++            cursor.setdefault("_schema", []).append(issue.message)
++            continue
++        for part in issue.path[:-1]:
++            cursor = cursor.setdefault(str(part), {})
++        leaf = str(issue.path[-1])
++        cursor.setdefault(leaf, []).append(issue.message)
++    return tree
++
++
++def _freeze(value: Any) -> Any:
++    if isinstance(value, dict):
++        return tuple(sorted((key, _freeze(val)) for key, val in value.items()))
++    if isinstance(value, list):
++        return tuple(_freeze(item) for item in value)
++    if isinstance(value, set):
++        return tuple(sorted(_freeze(item) for item in value))
++    return value
++
++
++def _is_datetime(value: str) -> bool:
++    try:
++        datetime.fromisoformat(value.replace("Z", "+00:00"))
++    except ValueError:
++        return False
++    return True

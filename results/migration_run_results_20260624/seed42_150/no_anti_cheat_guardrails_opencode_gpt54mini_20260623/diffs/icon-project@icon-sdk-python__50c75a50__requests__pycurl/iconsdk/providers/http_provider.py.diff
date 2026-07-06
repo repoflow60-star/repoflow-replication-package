@@ -1,0 +1,112 @@
+--- a/iconsdk/providers/http_provider.py
++++ b/iconsdk/providers/http_provider.py
+@@ -14,18 +14,26 @@
+ 
+ import json
+ import re
++from io import BytesIO
+ from json.decoder import JSONDecodeError
+ from time import time, monotonic
+ from typing import Union, Optional
+ from urllib.parse import urlparse, urlunparse
+ 
+-import requests
++import pycurl
+ from multimethod import multimethod
+ from websocket import WebSocket, WebSocketTimeoutException
+ 
+ from iconsdk.exception import JSONRPCException, URLException
+ from iconsdk.providers.provider import Provider, MonitorSpec, Monitor, MonitorTimeoutException
+ from iconsdk.utils import to_dict
++
++
++class _PycurlResponse:
++    def __init__(self, content: bytes, status_code: int):
++        self.content = content
++        self.status_code = status_code
++        self.ok = 200 <= status_code < 400
+ 
+ 
+ class HTTPProvider(Provider):
+@@ -119,11 +127,67 @@
+             yield key, value
+ 
+     @staticmethod
+-    def _make_post_request(request_url: str, data: dict, **kwargs) -> requests.Response:
+-        kwargs.setdefault('timeout', 10)
+-        with requests.Session() as session:
+-            response = session.post(url=request_url, data=json.dumps(data), **kwargs)
+-        return response
++    def _make_post_request(request_url: str, data: dict, **kwargs) -> _PycurlResponse:
++        timeout = kwargs.pop('timeout', 10)
++        allow_redirects = kwargs.pop('allow_redirects', True)
++        verify = kwargs.pop('verify', True)
++        headers = kwargs.pop('headers', {})
++        auth = kwargs.pop('auth', None)
++        cert = kwargs.pop('cert', None)
++        proxies = kwargs.pop('proxies', None)
++
++        payload = json.dumps(data).encode('utf-8')
++        response_body = BytesIO()
++        parsed_url = urlparse(request_url)
++
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, request_url)
++            curl.setopt(pycurl.POST, 1)
++            curl.setopt(pycurl.POSTFIELDS, payload)
++            curl.setopt(pycurl.POSTFIELDSIZE, len(payload))
++            curl.setopt(pycurl.WRITEDATA, response_body)
++            curl.setopt(pycurl.TIMEOUT_MS, int(timeout * 1000))
++            curl.setopt(pycurl.CONNECTTIMEOUT_MS, int(timeout * 1000))
++            curl.setopt(pycurl.NOSIGNAL, 1)
++            curl.setopt(pycurl.FOLLOWLOCATION, 1 if allow_redirects else 0)
++
++            if parsed_url.scheme == 'https':
++                if verify is False:
++                    curl.setopt(pycurl.SSL_VERIFYPEER, 0)
++                    curl.setopt(pycurl.SSL_VERIFYHOST, 0)
++                else:
++                    curl.setopt(pycurl.SSL_VERIFYPEER, 1)
++                    curl.setopt(pycurl.SSL_VERIFYHOST, 2)
++                    if isinstance(verify, str):
++                        curl.setopt(pycurl.CAINFO, verify)
++
++            if headers:
++                curl.setopt(pycurl.HTTPHEADER, [f'{key}: {value}' for key, value in headers.items()])
++
++            if auth is not None:
++                curl.setopt(pycurl.USERPWD, f'{auth[0]}:{auth[1]}')
++                curl.setopt(pycurl.HTTPAUTH, pycurl.HTTPAUTH_BASIC)
++
++            if cert is not None:
++                if isinstance(cert, tuple):
++                    curl.setopt(pycurl.SSLCERT, cert[0])
++                    curl.setopt(pycurl.SSLKEY, cert[1])
++                else:
++                    curl.setopt(pycurl.SSLCERT, cert)
++
++            if proxies:
++                proxy = proxies if isinstance(proxies, str) else proxies.get(parsed_url.scheme) or proxies.get('all')
++                if proxy:
++                    curl.setopt(pycurl.PROXY, proxy)
++
++            curl.perform()
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++            return _PycurlResponse(response_body.getvalue(), status_code)
++        except pycurl.error as e:
++            raise URLException(str(e))
++        finally:
++            curl.close()
+ 
+     def _make_id(self) -> int:
+         return int(time())
+@@ -147,7 +211,7 @@
+             raise JSONRPCException(f'Unknown response: {raw_response}')
+ 
+     @staticmethod
+-    def _return_custom_response(response: requests.Response, full_response: bool = False) -> Union[str, list, dict]:
++    def _return_custom_response(response: _PycurlResponse, full_response: bool = False) -> Union[str, list, dict]:
+         content = json.loads(response.content)
+         if full_response:
+             return content

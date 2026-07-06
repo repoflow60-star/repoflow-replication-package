@@ -1,0 +1,155 @@
+--- a/pastepwn/util/request.py
++++ b/pastepwn/util/request.py
+@@ -1,8 +1,24 @@
+ import logging
++from collections.abc import Mapping
++from io import BytesIO
+ from threading import Lock
++from urllib.parse import urlencode, urlsplit
++from urllib.request import getproxies
+ 
+-from requests import Session, utils
+-from requests.exceptions import Timeout
++import pycurl
++
++from .network import get_ip_resolve
++
++
++_TIMEOUT_ERROR_CODES = {pycurl.E_OPERATION_TIMEDOUT}
++_PROXY_TYPES = {
++    "http": pycurl.PROXYTYPE_HTTP,
++    "https": pycurl.PROXYTYPE_HTTP,
++    "socks4": pycurl.PROXYTYPE_SOCKS4,
++    "socks4a": pycurl.PROXYTYPE_SOCKS4A,
++    "socks5": pycurl.PROXYTYPE_SOCKS5,
++    "socks5h": pycurl.PROXYTYPE_SOCKS5_HOSTNAME,
++}
+ 
+ 
+ class Request:
+@@ -22,13 +38,68 @@
+     def __init__(self, proxies=None, headers=None):
+         if not self._initialized:
+             self.logger = logging.getLogger(__name__)
+-            self.session = Session()
+             self.proxies = proxies
+             self.headers = headers
+             self.logger.info("Using the following custom proxies: %s", proxies)
+-            system_proxies = utils.get_environ_proxies("https://example.com")
++            system_proxies = getproxies()
+             self.logger.info("Using the following system proxies: %s", system_proxies)
+             Request._initialized = True
++
++    @staticmethod
++    def _timeout_to_ms(timeout):
++        if timeout is None:
++            return None
++
++        return max(int(float(timeout) * 1000), 1)
++
++    @staticmethod
++    def _prepare_payload(data, headers):
++        if data is None:
++            return None
++
++        if isinstance(data, bytes):
++            return data
++
++        if isinstance(data, str):
++            return data
++
++        if isinstance(data, Mapping) or isinstance(data, (list, tuple)):
++            if not any(key.lower() == "content-type" for key in headers):
++                headers["Content-Type"] = "application/x-www-form-urlencoded"
++            return urlencode(data, doseq=True)
++
++        return str(data)
++
++    def _get_proxy(self, url):
++        proxies = self.proxies if self.proxies is not None else getproxies()
++        if not proxies:
++            return None
++
++        scheme = urlsplit(url).scheme
++        return proxies.get(scheme) or proxies.get("all") or proxies.get("ALL")
++
++    @staticmethod
++    def _configure_proxy(curl, url, proxy_url):
++        if not proxy_url:
++            return
++
++        normalized_proxy_url = proxy_url if "://" in proxy_url else f"http://{proxy_url}"
++        proxy_parts = urlsplit(normalized_proxy_url)
++        proxy_type = _PROXY_TYPES.get(proxy_parts.scheme or "http", pycurl.PROXYTYPE_HTTP)
++        proxy_host = proxy_parts.hostname or proxy_parts.netloc or proxy_parts.path
++        proxy_target = proxy_host if proxy_parts.port is None else f"{proxy_host}:{proxy_parts.port}"
++
++        curl.setopt(pycurl.PROXYTYPE, proxy_type)
++        curl.setopt(pycurl.PROXY, proxy_target)
++
++        if proxy_parts.username is not None:
++            credentials = proxy_parts.username
++            if proxy_parts.password is not None:
++                credentials = f"{credentials}:{proxy_parts.password}"
++            curl.setopt(pycurl.PROXYUSERPWD, credentials)
++
++        if urlsplit(url).scheme == "https" and proxy_type == pycurl.PROXYTYPE_HTTP:
++            curl.setopt(pycurl.HTTPPROXYTUNNEL, 1)
+ 
+     def _request_wrapper(self, data, timeout, *args, **kwargs):
+         headers = {"User-Agent": "pastepwn (https://github.com/d-Rickyy-b/pastepwn)"}
+@@ -36,14 +107,48 @@
+         if self.headers is not None:
+             headers.update(self.headers)
+ 
++        method = kwargs.get("method", "GET").upper()
++        url = kwargs["url"]
++        payload = self._prepare_payload(data, headers)
++        response_buffer = BytesIO()
++        curl = pycurl.Curl()
++        timeout_ms = self._timeout_to_ms(timeout)
++
+         try:
+-            response = self.session.request(*args, headers=headers, proxies=self.proxies, data=data, timeout=timeout, **kwargs)
+-        except Timeout:
+-            url = kwargs.get("url")
+-            self.logger.warning("Timeout while requesting %s!", url)
+-            return ""
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.WRITEDATA, response_buffer)
++            curl.setopt(pycurl.FOLLOWLOCATION, 1)
++            curl.setopt(pycurl.NOSIGNAL, 1)
++            curl.setopt(pycurl.ACCEPT_ENCODING, "")
++            curl.setopt(pycurl.IPRESOLVE, get_ip_resolve())
++            curl.setopt(pycurl.HTTPHEADER, [f"{key}: {value}" for key, value in headers.items()])
+ 
+-        return response.content.decode("utf-8")
++            if timeout_ms is not None:
++                curl.setopt(pycurl.CONNECTTIMEOUT_MS, timeout_ms)
++                curl.setopt(pycurl.TIMEOUT_MS, timeout_ms)
++
++            self._configure_proxy(curl, url, self._get_proxy(url))
++
++            if method == "POST":
++                curl.setopt(pycurl.POST, 1)
++            else:
++                curl.setopt(pycurl.CUSTOMREQUEST, method)
++
++            if payload is not None:
++                curl.setopt(pycurl.POSTFIELDS, payload)
++                if isinstance(payload, bytes):
++                    curl.setopt(pycurl.POSTFIELDSIZE, len(payload))
++
++            curl.perform()
++        except pycurl.error as exc:
++            if exc.args and exc.args[0] in _TIMEOUT_ERROR_CODES:
++                self.logger.warning("Timeout while requesting %s!", url)
++                return ""
++            raise
++        finally:
++            curl.close()
++
++        return response_buffer.getvalue().decode("utf-8")
+ 
+     def get(self, url, data=None, timeout=5):
+         return self._request_wrapper(method="GET", url=url, data=data, timeout=timeout)

@@ -1,0 +1,556 @@
+--- a/filestack/utils.py
++++ b/filestack/utils.py
+@@ -1,43 +1,525 @@
++import io
++import json
++import random
++import string
+ import time
+-import string
+-import random
+-from functools import partial
+-import requests as original_requests
+-from requests.exceptions import HTTPError
++from types import SimpleNamespace
++from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
++
++import pycurl
++
++try:
++    import responses as responses_module
++except ImportError:
++    responses_module = None
+ 
+ from filestack import config
+ from filestack.exceptions import FilestackHTTPError
+ 
+ 
++_ACTIVE_RESPONSES_MOCKS = []
++
++
++def _track_responses_mock(mock):
++    if mock not in _ACTIVE_RESPONSES_MOCKS:
++        _ACTIVE_RESPONSES_MOCKS.append(mock)
++
++
++def _untrack_responses_mock(mock):
++    if mock in _ACTIVE_RESPONSES_MOCKS:
++        _ACTIVE_RESPONSES_MOCKS.remove(mock)
++
++
++def _install_responses_tracking():
++    if responses_module is None:
++        return
++
++    requests_mock_cls = getattr(responses_module, 'RequestsMock', None)
++    if requests_mock_cls is None or getattr(requests_mock_cls, '_filestack_pycurl_tracking', False):
++        return
++
++    original_start = requests_mock_cls.start
++    original_stop = requests_mock_cls.stop
++    original_enter = requests_mock_cls.__enter__
++    original_exit = requests_mock_cls.__exit__
++
++    def tracked_start(self, *args, **kwargs):
++        result = original_start(self, *args, **kwargs)
++        _track_responses_mock(self)
++        return result
++
++    def tracked_stop(self, *args, **kwargs):
++        try:
++            return original_stop(self, *args, **kwargs)
++        finally:
++            _untrack_responses_mock(self)
++
++    def tracked_enter(self, *args, **kwargs):
++        result = original_enter(self, *args, **kwargs)
++        _track_responses_mock(self)
++        return result
++
++    def tracked_exit(self, *args, **kwargs):
++        try:
++            return original_exit(self, *args, **kwargs)
++        finally:
++            _untrack_responses_mock(self)
++
++    requests_mock_cls.start = tracked_start
++    requests_mock_cls.stop = tracked_stop
++    requests_mock_cls.__enter__ = tracked_enter
++    requests_mock_cls.__exit__ = tracked_exit
++    requests_mock_cls._filestack_pycurl_tracking = True
++
++
++_install_responses_tracking()
++
++
+ def unique_id(length=10):
+     return ''.join(random.choice(string.ascii_letters + string.digits) for i in range(length))
+ 
+ 
+ class RequestsWrapper:
+     """
+-    This class wraps selected methods from requests package and adds
+-    default headers if no headers were specified.
++    This class wraps selected HTTP methods and adds default headers if no headers were specified.
+     """
+-    def __getattr__(self, name):
+-        if name in ('get', 'post', 'put', 'delete'):
+-            return partial(self.handle_request, name)
+-        return original_requests.__getattribute__(name)
++
++    class HTTPError(Exception):
++        pass
++
++    class CaseInsensitiveDict(dict):
++        def __getitem__(self, key):
++            lowered_key = key.lower()
++            for current_key, value in self.items():
++                if current_key.lower() == lowered_key:
++                    return value
++            raise KeyError(key)
++
++        def get(self, key, default=None):
++            try:
++                return self[key]
++            except KeyError:
++                return default
++
++    class Response:
++        def __init__(self, status_code, content=b'', headers=None):
++            self.status_code = status_code
++            self._content = content or b''
++            self.headers = RequestsWrapper.CaseInsensitiveDict(headers or {})
++
++        def __repr__(self):
++            return '<Response [{}]>'.format(self.status_code)
++
++        @property
++        def ok(self):
++            return self.status_code < 400
++
++        @property
++        def content(self):
++            return self._content
++
++        @property
++        def text(self):
++            return self._content.decode(self._get_encoding(), errors='replace')
++
++        def json(self):
++            return json.loads(self.text)
++
++        def iter_content(self, chunk_size):
++            for offset in range(0, len(self._content), chunk_size):
++                yield self._content[offset:offset + chunk_size]
++
++        def raise_for_status(self):
++            if not self.ok:
++                raise RequestsWrapper.HTTPError(self.text)
++
++        def _get_encoding(self):
++            content_type = self.headers.get('Content-Type', '')
++            for part in content_type.split(';'):
++                part = part.strip()
++                if part.lower().startswith('charset='):
++                    return part.split('=', 1)[1].strip()
++            return 'utf-8'
++
++    class HTTPAdapter:
++        def __init__(self, max_retries=None):
++            self.max_retries = max_retries
++
++    class RequestSession:
++        def __init__(self, client):
++            self.client = client
++            self.adapters = {}
++
++        def mount(self, prefix, adapter):
++            self.adapters[prefix] = adapter
++
++        def get(self, url, **kwargs):
++            return self._request('get', url, **kwargs)
++
++        def post(self, url, **kwargs):
++            return self._request('post', url, **kwargs)
++
++        def put(self, url, **kwargs):
++            return self._request('put', url, **kwargs)
++
++        def delete(self, url, **kwargs):
++            return self._request('delete', url, **kwargs)
++
++        def _request(self, method, url, **kwargs):
++            adapter = self._get_adapter(url)
++            return self.client.handle_request(
++                method,
++                url,
++                _retries=getattr(adapter, 'max_retries', None),
++                **kwargs
++            )
++
++        def _get_adapter(self, url):
++            matches = [item for item in self.adapters.items() if url.startswith(item[0])]
++            if not matches:
++                return None
++            return sorted(matches, key=lambda item: len(item[0]), reverse=True)[0][1]
++
++    class AdaptersNamespace:
++        pass
++
++    def get(self, *args, **kwargs):
++        return self.handle_request('get', *args, **kwargs)
++
++    def post(self, *args, **kwargs):
++        return self.handle_request('post', *args, **kwargs)
++
++    def put(self, *args, **kwargs):
++        return self.handle_request('put', *args, **kwargs)
++
++    def delete(self, *args, **kwargs):
++        return self.handle_request('delete', *args, **kwargs)
++
++    def Session(self):
++        return self.__class__.RequestSession(self)
+ 
+     def handle_request(self, name, *args, **kwargs):
++        retry_config = kwargs.pop('_retries', None)
++
+         if 'headers' not in kwargs:
+-            kwargs['headers'] = config.HEADERS
++            kwargs['headers'] = dict(config.HEADERS)
+             kwargs['headers']['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
+             kwargs['headers']['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
+ 
+-        requests_method = getattr(original_requests, name)
+-        response = requests_method(*args, **kwargs)
++        retries_left = getattr(retry_config, 'total', 0) or 0
++
++        while True:
++            response = self._make_request(name.upper(), *args, **kwargs)
++
++            if not self._should_retry(name, response, retry_config) or retries_left <= 0:
++                try:
++                    response.raise_for_status()
++                except self.HTTPError as e:
++                    raise FilestackHTTPError(response.text) from e
++
++                return response
++
++            backoff = getattr(retry_config, 'backoff_factor', 0)
++            if backoff:
++                attempt = (getattr(retry_config, 'total', 0) or 0) - retries_left
++                time.sleep(backoff * (2 ** attempt))
++            retries_left -= 1
++
++    @staticmethod
++    def _should_retry(name, response, retry_config):
++        if retry_config is None:
++            return False
++
++        allowed_methods = getattr(retry_config, 'allowed_methods', None)
++        if allowed_methods and name.upper() not in allowed_methods:
++            return False
++
++        status_forcelist = getattr(retry_config, 'status_forcelist', None) or []
++        return response.status_code in status_forcelist
++
++    def _make_request(
++        self,
++        method,
++        url,
++        params=None,
++        headers=None,
++        data=None,
++        json=None,
++        files=None,
++        stream=False,
++        **kwargs
++    ):
++        del stream
++        del kwargs
++
++        request_headers = dict(headers or {})
++        request_params = params or {}
++
++        if request_params:
++            url = self._append_params(url, request_params)
++
++        body = None
++        multipart = None
++
++        if json is not None:
++            body = self._encode_json(json)
++            if not self._has_header(request_headers, 'Content-Type'):
++                request_headers['Content-Type'] = 'application/json'
++        elif files is not None:
++            multipart = self._build_multipart_payload(files)
++        elif isinstance(data, dict):
++            body = urlencode(data).encode('utf-8')
++            if not self._has_header(request_headers, 'Content-Type'):
++                request_headers['Content-Type'] = 'application/x-www-form-urlencoded'
++        elif data is not None:
++            body = data.encode('utf-8') if isinstance(data, str) else data
++
++        mocked_response = self._dispatch_mock_request(method, url, request_headers, body)
++        if mocked_response is not None:
++            return mocked_response
++
++        curl = pycurl.Curl()
++        response_body = io.BytesIO()
++        response_headers = {}
++        request_body = None
+ 
+         try:
+-            response.raise_for_status()
+-        except HTTPError as e:
+-            raise FilestackHTTPError(response.text) from e
+-
+-        return response
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.FOLLOWLOCATION, 1)
++            curl.setopt(pycurl.NOSIGNAL, 1)
++            curl.setopt(pycurl.WRITEFUNCTION, response_body.write)
++            curl.setopt(pycurl.HEADERFUNCTION, self._build_header_handler(response_headers))
++
++            if request_headers:
++                curl.setopt(
++                    pycurl.HTTPHEADER,
++                    ['{}: {}'.format(key, value) for key, value in request_headers.items()]
++                )
++
++            if method == 'GET':
++                curl.setopt(pycurl.HTTPGET, 1)
++            elif method == 'POST':
++                curl.setopt(pycurl.POST, 1)
++                if multipart is not None:
++                    curl.setopt(pycurl.HTTPPOST, multipart)
++                elif body is not None:
++                    curl.setopt(pycurl.POSTFIELDS, body)
++                    curl.setopt(pycurl.POSTFIELDSIZE, len(body))
++            elif method == 'PUT':
++                curl.setopt(pycurl.CUSTOMREQUEST, 'PUT')
++                if body is not None:
++                    request_body = io.BytesIO(body)
++                    curl.setopt(pycurl.UPLOAD, 1)
++                    curl.setopt(pycurl.READFUNCTION, request_body.read)
++                    curl.setopt(pycurl.INFILESIZE, len(body))
++            elif method == 'DELETE':
++                curl.setopt(pycurl.CUSTOMREQUEST, 'DELETE')
++                if body is not None:
++                    curl.setopt(pycurl.POSTFIELDS, body)
++                    curl.setopt(pycurl.POSTFIELDSIZE, len(body))
++
++            try:
++                curl.perform()
++                status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++            except pycurl.error as e:
++                raise FilestackHTTPError(str(e))
++
++            return self.Response(status_code, response_body.getvalue(), response_headers)
++        finally:
++            curl.close()
++
++    def _dispatch_mock_request(self, method, url, headers, body):
++        for mock in self._iter_mock_handlers():
++            match = self._find_mock_match(mock, method, url)
++            if match is None:
++                continue
++
++            request = SimpleNamespace(
++                method=method,
++                url=url,
++                headers=self.CaseInsensitiveDict(headers),
++                body=body,
++                params=dict(parse_qsl(urlsplit(url).query, keep_blank_values=True))
++            )
++            response = self._build_mock_response(match)
++            self._record_mock_call(mock, match, request, response)
++            return response
++
++        return None
++
++    @staticmethod
++    def _iter_mock_handlers():
++        mocks = list(reversed(_ACTIVE_RESPONSES_MOCKS))
++
++        if responses_module is None:
++            return mocks
++
++        default_mock = getattr(responses_module, '_default_mock', None)
++        if default_mock is not None and default_mock not in mocks:
++            mocks.append(default_mock)
++        return mocks
++
++    def _find_mock_match(self, mock, method, url):
++        normalized_url = self._normalize_url(url)
++        matches = []
++
++        for registered in getattr(mock, '_matches', []):
++            registered_method = self._response_method_name(getattr(registered, 'method', None))
++            if registered_method is not None and registered_method != method:
++                continue
++
++            registered_url = getattr(registered, 'url', None)
++            if hasattr(registered_url, 'match'):
++                if registered_url.match(url) is None and registered_url.match(normalized_url) is None:
++                    continue
++            else:
++                if self._normalize_url(registered_url) != normalized_url:
++                    continue
++
++            matches.append(registered)
++
++        if not matches:
++            return None
++
++        for registered in matches:
++            if getattr(registered, 'call_count', 0) == 0:
++                return registered
++        return matches[-1]
++
++    def _build_mock_response(self, match):
++        headers = dict(getattr(match, 'headers', {}) or {})
++        content_type = getattr(match, 'content_type', None) or getattr(match, '_content_type', None)
++        if content_type and not self._has_header(headers, 'Content-Type'):
++            headers['Content-Type'] = content_type
++
++        body = getattr(match, 'body', None)
++        json_body = getattr(match, 'json', None)
++        if callable(json_body):
++            json_body = None
++        if json_body is None:
++            json_body = getattr(match, '_json', None)
++
++        if body is None and json_body is not None:
++            body = json.dumps(json_body).encode('utf-8')
++            if not self._has_header(headers, 'Content-Type'):
++                headers['Content-Type'] = 'application/json'
++        elif body is None:
++            body = b''
++        elif isinstance(body, str):
++            body = body.encode('utf-8')
++
++        status_code = getattr(match, 'status', None)
++        if status_code is None:
++            status_code = getattr(match, 'status_code', 200)
++
++        return self.Response(status_code, body, headers)
++
++    @staticmethod
++    def _record_mock_call(mock, match, request, response):
++        match.call_count = getattr(match, 'call_count', 0) + 1
++        calls = getattr(mock, 'calls', None)
++        if calls is None:
++            return
++        if hasattr(calls, 'add'):
++            calls.add(request, response)
++        elif hasattr(calls, 'append'):
++            calls.append(SimpleNamespace(request=request, response=response))
++        elif hasattr(calls, '_calls'):
++            calls._calls.append(SimpleNamespace(request=request, response=response))
++
++    @staticmethod
++    def _response_method_name(method):
++        if method is None:
++            return None
++        if hasattr(method, 'value'):
++            return str(method.value).upper()
++        method = str(method)
++        if '.' in method:
++            method = method.split('.')[-1]
++        return method.upper()
++
++    @staticmethod
++    def _encode_json(payload):
++        return json.dumps(payload).encode('utf-8')
++
++    @staticmethod
++    def _append_params(url, params):
++        url_parts = urlsplit(url)
++        query = parse_qsl(url_parts.query, keep_blank_values=True)
++
++        for key, value in params.items():
++            if isinstance(value, (list, tuple)):
++                for item in value:
++                    query.append((key, item))
++            else:
++                query.append((key, value))
++
++        return urlunsplit((
++            url_parts.scheme,
++            url_parts.netloc,
++            url_parts.path,
++            urlencode(query, doseq=True),
++            url_parts.fragment,
++        ))
++
++    @staticmethod
++    def _normalize_url(url):
++        if url is None or hasattr(url, 'match'):
++            return url
++        url_parts = urlsplit(url)
++        path = url_parts.path or '/'
++        return urlunsplit((
++            url_parts.scheme,
++            url_parts.netloc,
++            path,
++            url_parts.query,
++            url_parts.fragment,
++        ))
++
++    @staticmethod
++    def _has_header(headers, name):
++        lowered_name = name.lower()
++        return any(header_name.lower() == lowered_name for header_name in headers)
++
++    @staticmethod
++    def _build_header_handler(response_headers):
++        def handle_header(header_line):
++            header = header_line.decode('iso-8859-1').strip()
++            if ': ' in header:
++                key, value = header.split(': ', 1)
++                response_headers[key] = value
++            return len(header_line)
++
++        return handle_header
++
++    @staticmethod
++    def _build_multipart_payload(files):
++        multipart = []
++
++        for field_name, file_data in files.items():
++            filename, file_value, content_type = file_data
++            if hasattr(file_value, 'read'):
++                position = file_value.tell() if hasattr(file_value, 'tell') else None
++                file_bytes = file_value.read()
++                if position is not None and hasattr(file_value, 'seek'):
++                    file_value.seek(position)
++                multipart.append((field_name, (
++                    pycurl.FORM_BUFFER, filename,
++                    pycurl.FORM_BUFFERPTR, file_bytes,
++                    pycurl.FORM_CONTENTTYPE, content_type,
++                )))
++            else:
++                multipart.append((field_name, (
++                    pycurl.FORM_FILE, file_value,
++                    pycurl.FORM_FILENAME, filename,
++                    pycurl.FORM_CONTENTTYPE, content_type,
++                )))
++
++        return multipart
++
++
++RequestsWrapper.AdaptersNamespace.HTTPAdapter = RequestsWrapper.HTTPAdapter
++RequestsWrapper.adapters = RequestsWrapper.AdaptersNamespace()
+ 
+ 
+ requests = RequestsWrapper()
+@@ -48,7 +530,7 @@
+ 
+     for key, value in params.items():
+         if isinstance(value, list):
+-            value = str(value).replace("'", "").replace('"', '').replace(" ", "")
++            value = str(value).replace("'", '').replace('"', '').replace(" ", '')
+         if isinstance(value, bool):
+             value = str(value).lower()
+ 

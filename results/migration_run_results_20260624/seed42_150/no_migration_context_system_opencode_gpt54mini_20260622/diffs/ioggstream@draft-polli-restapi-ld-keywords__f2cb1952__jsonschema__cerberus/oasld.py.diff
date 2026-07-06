@@ -1,0 +1,97 @@
+--- a/oasld.py
++++ b/oasld.py
+@@ -2,7 +2,7 @@
+ from copy import deepcopy
+ from typing import Dict
+ 
+-import jsonschema
++from cerberus import Validator
+ from typing_extensions import Self
+ 
+ CTX = "@context"
+@@ -13,11 +13,16 @@
+ 
+ class RefResolver:
+     def __init__(self, schema: Dict) -> None:
+-        self.resolver = jsonschema.RefResolver("/", "")
+         self.schema = schema
+ 
+     def resolve(self, ref):
+-        return self.resolver.resolve_fragment(self.schema, ref)
++        current = self.schema
++        path = ref.lstrip("#/")
++        if not path:
++            return current
++        for part in path.split("/"):
++            current = current[part.replace("~1", "/").replace("~0", "~")]
++        return current
+ 
+ 
+ class Instance:
+@@ -79,7 +84,66 @@
+     def is_subentry(self):
+         return self.parent is not None
+ 
++    def _cerberus_rule(self, schema: Dict, resolver: RefResolver, seen=None):
++        seen = set() if seen is None else seen
++        if "$ref" in schema:
++            schema = resolver.resolve(schema["$ref"])
++
++        schema_id = id(schema)
++        if schema_id in seen:
++            return {"type": "dict"} if schema.get("type") == "object" else {"type": "list"}
++
++        seen.add(schema_id)
++        try:
++            rule = {}
++            schema_type = schema.get("type")
++            if schema_type == "object":
++                rule["type"] = "dict"
++                rule["allow_unknown"] = schema.get("additionalProperties", True) is not False
++                properties = schema.get("properties", {})
++                if properties:
++                    nested = {}
++                    required = set(schema.get("required", []))
++                    for name, prop_schema in properties.items():
++                        nested_rule = self._cerberus_rule(prop_schema, resolver, seen)
++                        if name in required:
++                            nested_rule["required"] = True
++                        nested[name] = nested_rule
++                    rule["schema"] = nested
++            elif schema_type == "array":
++                rule["type"] = "list"
++                items = schema.get("items")
++                if isinstance(items, dict):
++                    rule["schema"] = self._cerberus_rule(items, resolver, seen)
++            elif schema_type:
++                rule["type"] = schema_type
++
++            if "maxLength" in schema:
++                rule["maxlength"] = schema["maxLength"]
++            if "minLength" in schema:
++                rule["minlength"] = schema["minLength"]
++            return rule
++        finally:
++            seen.remove(schema_id)
++
++    def _validate_with_cerberus(self, resolver: RefResolver) -> None:
++        rules = {}
++        required = set(self.schema.get("required", []))
++        for name, property_schema in self.schema.get("properties", {}).items():
++            nested_rule = self._cerberus_rule(property_schema, resolver)
++            if name in required:
++                nested_rule["required"] = True
++            rules[name] = nested_rule
++
++        validator = Validator(
++            rules,
++            allow_unknown=self.schema.get("additionalProperties", True) is not False,
++        )
++        if not validator.validate(self.json_instance):
++            log.debug("Cerberus validation errors: %s", validator.errors)
++
+     def process_instance(self, resolver: RefResolver):
++        self._validate_with_cerberus(resolver)
+         properties = self.schema["properties"]
+         for k, v in self.ld.items():
+             process_keywords = {"@context", "@type"} - set(self.jcontext.get(k) or {})

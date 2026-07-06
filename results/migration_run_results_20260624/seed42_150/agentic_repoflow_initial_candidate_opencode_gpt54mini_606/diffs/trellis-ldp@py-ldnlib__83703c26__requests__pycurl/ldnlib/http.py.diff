@@ -1,0 +1,160 @@
+--- a/ldnlib/http.py
++++ b/ldnlib/http.py
+@@ -0,0 +1,157 @@
++import json
++import re
++from io import BytesIO
++from urllib.parse import urlencode, urlsplit, urlunsplit
++
++import pycurl
++
++
++class HTTPError(Exception):
++
++    def __init__(self, status_code, message, response=None):
++        super(HTTPError, self).__init__(message)
++        self.status_code = status_code
++        self.response = response
++
++
++class Response(object):
++
++    def __init__(self, url, status_code, headers, body):
++        self.url = url
++        self.status_code = status_code
++        self.headers = headers
++        self._body = body
++        self.text = self._decode_body(body, headers)
++        self.links = self._parse_links(headers.get('link', ''))
++
++    @staticmethod
++    def _decode_body(body, headers):
++        content_type = headers.get('content-type', '')
++        charset = 'utf-8'
++        if 'charset=' in content_type:
++            charset = content_type.split('charset=', 1)[1].split(';', 1)[0].strip()
++        return body.decode(charset or 'utf-8', errors='replace')
++
++    @staticmethod
++    def _parse_links(link_header):
++        links = {}
++        for part in link_header.split(','):
++            match = re.search(r'<([^>]+)>\s*;\s*rel="?([^";,]+)"?', part)
++            if match:
++                links[match.group(2)] = {'url': match.group(1)}
++        return links
++
++    def json(self):
++        return json.loads(self.text)
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise HTTPError(self.status_code, 'HTTP {}'.format(self.status_code), self)
++
++
++def _merge_params(url, params):
++    if not params:
++        return url
++
++    parts = urlsplit(url)
++    query = parts.query
++    if isinstance(params, str):
++        new_query = params.lstrip('?')
++    else:
++        new_query = urlencode(params, doseq=True)
++
++    if query:
++        query = query + '&' + new_query
++    else:
++        query = new_query
++
++    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
++
++
++def request(method, url, **kwargs):
++    headers = kwargs.pop('headers', {}) or {}
++    auth = kwargs.pop('auth', None)
++    allow_redirects = kwargs.pop('allow_redirects', True)
++    params = kwargs.pop('params', None)
++    data = kwargs.pop('data', None)
++    timeout = kwargs.pop('timeout', None)
++    verify = kwargs.pop('verify', True)
++
++    url = _merge_params(url, params)
++
++    curl = pycurl.Curl()
++    body = BytesIO()
++    header_state = {'headers': {}}
++
++    def header_fn(line):
++        text = line.decode('iso-8859-1').strip()
++        if not text:
++            return len(line)
++        if text.startswith('HTTP/'):
++            header_state['headers'] = {}
++            return len(line)
++        if ':' in text:
++            name, value = text.split(':', 1)
++            name = name.strip().lower()
++            value = value.strip()
++            if name in header_state['headers']:
++                header_state['headers'][name] = header_state['headers'][name] + ', ' + value
++            else:
++                header_state['headers'][name] = value
++        return len(line)
++
++    try:
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.FOLLOWLOCATION, 1 if allow_redirects else 0)
++        if allow_redirects:
++            curl.setopt(pycurl.MAXREDIRS, 10)
++        curl.setopt(pycurl.WRITEFUNCTION, body.write)
++        curl.setopt(pycurl.HEADERFUNCTION, header_fn)
++
++        if timeout is not None:
++            curl.setopt(pycurl.TIMEOUT, timeout)
++
++        if verify is False:
++            curl.setopt(pycurl.SSL_VERIFYPEER, 0)
++            curl.setopt(pycurl.SSL_VERIFYHOST, 0)
++
++        if headers:
++            curl.setopt(pycurl.HTTPHEADER, [
++                '{}: {}'.format(name, value) for name, value in headers.items()
++            ])
++
++        if auth is not None:
++            curl.setopt(pycurl.USERPWD, '{}:{}'.format(str(auth[0]), str(auth[1])))
++            curl.setopt(pycurl.HTTPAUTH, pycurl.HTTPAUTH_BASIC)
++
++        method = method.upper()
++        if method == 'HEAD':
++            curl.setopt(pycurl.NOBODY, 1)
++            curl.setopt(pycurl.CUSTOMREQUEST, 'HEAD')
++        elif method == 'POST':
++            curl.setopt(pycurl.POST, 1)
++            if data is not None:
++                if isinstance(data, str):
++                    data = data.encode('utf-8')
++                curl.setopt(pycurl.POSTFIELDS, data)
++                curl.setopt(pycurl.POSTFIELDSIZE, len(data))
++        elif method == 'OPTIONS':
++            curl.setopt(pycurl.CUSTOMREQUEST, 'OPTIONS')
++        elif method != 'GET':
++            curl.setopt(pycurl.CUSTOMREQUEST, method)
++            if data is not None:
++                if isinstance(data, str):
++                    data = data.encode('utf-8')
++                curl.setopt(pycurl.POSTFIELDS, data)
++                curl.setopt(pycurl.POSTFIELDSIZE, len(data))
++
++        curl.perform()
++        response = Response(
++            curl.getinfo(pycurl.EFFECTIVE_URL),
++            int(curl.getinfo(pycurl.RESPONSE_CODE)),
++            header_state['headers'],
++            body.getvalue(),
++        )
++        return response
++    finally:
++        curl.close()

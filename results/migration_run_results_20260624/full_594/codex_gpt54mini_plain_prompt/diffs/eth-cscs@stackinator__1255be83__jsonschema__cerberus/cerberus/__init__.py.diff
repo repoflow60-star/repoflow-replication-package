@@ -1,0 +1,195 @@
+diff --git /dev/null b/cerberus/__init__.py
+new file mode 100644
+index 0000000..be96fa8
+--- /dev/null
++++ b/cerberus/__init__.py
+@@ -0,0 +1,189 @@
++from __future__ import annotations
++
++import copy
++import re
++
++try:
++    from jsonschema.exceptions import ValidationError as _ValidationError
++except ModuleNotFoundError:  # pragma: no cover - fallback only for unusual environments
++    class _ValidationError(Exception):
++        pass
++
++
++class ValidationError(_ValidationError):
++    pass
++
++
++class Validator:
++    def __init__(self, schema):
++        self.schema = schema
++        self.errors = []
++
++    def validate(self, document):
++        normalized = self._validate_schema(self.schema, document, self.schema, ())
++
++        if isinstance(document, dict) and isinstance(normalized, dict):
++            document.clear()
++            document.update(normalized)
++
++        return True
++
++    def _validate_schema(self, schema, value, root_schema, path):
++        schema = self._resolve_ref(schema, root_schema)
++
++        if "oneOf" in schema:
++            return self._validate_one_of(schema["oneOf"], value, root_schema, path)
++
++        if "anyOf" in schema:
++            return self._validate_any_of(schema["anyOf"], value, root_schema, path)
++
++        if "enum" in schema:
++            if value not in schema["enum"]:
++                self._raise_error(path, f"value {value!r} is not one of {schema['enum']!r}")
++            return copy.deepcopy(value)
++
++        if "type" in schema:
++            self._check_type(schema["type"], value, path)
++
++        schema_type = schema.get("type")
++        if schema_type == "object" or (
++            isinstance(value, dict) and any(key in schema for key in ("properties", "patternProperties", "required", "additionalProperties"))
++        ):
++            return self._validate_object(schema, value, root_schema, path)
++        if schema_type == "array" or (isinstance(value, list) and any(key in schema for key in ("items", "minItems"))):
++            return self._validate_array(schema, value, root_schema, path)
++
++        if "pattern" in schema and isinstance(value, str):
++            if re.fullmatch(schema["pattern"], value) is None:
++                self._raise_error(path, f"value {value!r} does not match pattern {schema['pattern']!r}")
++
++        return copy.deepcopy(value)
++
++    def _validate_one_of(self, options, value, root_schema, path):
++        successes = []
++        last_error = None
++        for option in options:
++            candidate = copy.deepcopy(value)
++            try:
++                successes.append(self._validate_schema(option, candidate, root_schema, path))
++            except ValidationError as exc:
++                last_error = exc
++
++        if len(successes) == 1:
++            return successes[0]
++        if len(successes) == 0:
++            if last_error is not None:
++                raise last_error
++            self._raise_error(path, "value does not match any valid schema")
++        self._raise_error(path, "value matches more than one valid schema")
++
++    def _validate_any_of(self, options, value, root_schema, path):
++        last_error = None
++        for option in options:
++            candidate = copy.deepcopy(value)
++            try:
++                return self._validate_schema(option, candidate, root_schema, path)
++            except ValidationError as exc:
++                last_error = exc
++        if last_error is not None:
++            raise last_error
++        self._raise_error(path, "value does not match any valid schema")
++
++    def _validate_object(self, schema, value, root_schema, path):
++        if not isinstance(value, dict):
++            self._raise_error(path, f"expected object, got {type(value).__name__}")
++
++        result = {}
++        properties = schema.get("properties", {})
++        pattern_properties = schema.get("patternProperties", {})
++
++        for key, subschema in properties.items():
++            if key in value:
++                result[key] = self._validate_schema(subschema, value[key], root_schema, path + (key,))
++            elif "default" in subschema:
++                result[key] = copy.deepcopy(subschema["default"])
++            elif key in schema.get("required", []):
++                self._raise_error(path + (key,), "missing required field")
++
++        for key, item in value.items():
++            if key in properties:
++                continue
++
++            matched = False
++            matched_value = item
++            for pattern, subschema in pattern_properties.items():
++                if re.fullmatch(pattern, key):
++                    matched = True
++                    matched_value = self._validate_schema(subschema, matched_value, root_schema, path + (key,))
++            if matched:
++                result[key] = matched_value
++                continue
++
++            if schema.get("additionalProperties", True) is False:
++                self._raise_error(path, f"Additional properties are not allowed ('{key}' was unexpected)")
++
++            result[key] = copy.deepcopy(item)
++
++        for key in schema.get("required", []):
++            if key not in result:
++                self._raise_error(path + (key,), "missing required field")
++
++        return result
++
++    def _validate_array(self, schema, value, root_schema, path):
++        if not isinstance(value, list):
++            self._raise_error(path, f"expected array, got {type(value).__name__}")
++
++        min_items = schema.get("minItems")
++        if min_items is not None and len(value) < min_items:
++            self._raise_error(path, f"expected at least {min_items} items")
++
++        items_schema = schema.get("items")
++        if items_schema is None:
++            return copy.deepcopy(value)
++
++        return [self._validate_schema(items_schema, item, root_schema, path + (idx,)) for idx, item in enumerate(value)]
++
++    def _check_type(self, expected, value, path):
++        if isinstance(expected, list):
++            for item in expected:
++                try:
++                    self._check_type(item, value, path)
++                    return
++                except ValidationError:
++                    pass
++            self._raise_error(path, f"expected one of {expected!r}, got {type(value).__name__}")
++
++        if expected == "object" and not isinstance(value, dict):
++            self._raise_error(path, f"expected object, got {type(value).__name__}")
++        elif expected == "array" and not isinstance(value, list):
++            self._raise_error(path, f"expected array, got {type(value).__name__}")
++        elif expected == "string" and not isinstance(value, str):
++            self._raise_error(path, f"expected string, got {type(value).__name__}")
++        elif expected == "boolean" and not isinstance(value, bool):
++            self._raise_error(path, f"expected boolean, got {type(value).__name__}")
++        elif expected == "null" and value is not None:
++            self._raise_error(path, f"expected null, got {type(value).__name__}")
++        elif expected == "integer" and not (isinstance(value, int) and not isinstance(value, bool)):
++            self._raise_error(path, f"expected integer, got {type(value).__name__}")
++        elif expected == "number" and not (isinstance(value, int) or isinstance(value, float)):
++            self._raise_error(path, f"expected number, got {type(value).__name__}")
++
++    def _resolve_ref(self, schema, root_schema):
++        ref = schema.get("$ref")
++        if ref is None:
++            return schema
++
++        if not ref.startswith("#/"):
++            self._raise_error((), f"unsupported reference {ref!r}")
++
++        target = root_schema
++        for part in ref[2:].split("/"):
++            target = target[part]
++        return target
++
++    def _raise_error(self, path, message):
++        if path:
++            location = ".".join(str(p) for p in path)
++            raise ValidationError(f"{location}: {message}")
++        raise ValidationError(message)

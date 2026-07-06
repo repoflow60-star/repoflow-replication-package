@@ -1,0 +1,134 @@
+diff --git a/pynubank/utils/http.py b/pynubank/utils/http.py
+index 1eb1def..ef06f7d 100644
+--- a/pynubank/utils/http.py
++++ b/pynubank/utils/http.py
+@@ -1,7 +1,92 @@
+-from requests import Response
+-from requests_pkcs12 import get, post
++import json as json_module
++from threading import Event, Thread
+ 
+-from pynubank import NuRequestException
++import treq
++from twisted.internet import defer, reactor, threads
++
++from pynubank.exception import NuRequestException
++from pynubank.utils.response import HttpResponse
++
++_REACTOR_READY = Event()
++_REACTOR_STARTED = False
++
++
++def _ensure_reactor_running():
++    global _REACTOR_STARTED
++
++    if reactor.running or _REACTOR_STARTED:
++        return
++
++    _REACTOR_STARTED = True
++
++    def run():
++        reactor.callWhenRunning(_REACTOR_READY.set)
++        reactor.run(installSignalHandlers=False)
++
++    thread = Thread(target=run, name='pynubank-treq-reactor', daemon=True)
++    thread.start()
++    _REACTOR_READY.wait()
++
++
++def _headers_to_dict(headers):
++    if headers is None:
++        return {}
++
++    if hasattr(headers, 'getAllRawHeaders'):
++        flattened = {}
++        for name, values in headers.getAllRawHeaders():
++            key = name.decode('utf-8') if isinstance(name, bytes) else name
++            value = values[0] if values else ''
++            flattened[key] = value.decode('utf-8') if isinstance(value, bytes) else value
++        return flattened
++
++    return dict(headers)
++
++
++def _perform_request(method: str, url: str, headers: dict, body: bytes = None) -> HttpResponse:
++    _ensure_reactor_running()
++
++    def request():
++        if method == 'GET':
++            request_fn = getattr(treq, 'get', None)
++            deferred = request_fn(url, headers=headers) if request_fn else treq.request('GET', url, headers=headers)
++        else:
++            request_fn = getattr(treq, 'post', None)
++            deferred = request_fn(url, data=body, headers=headers) if request_fn else treq.request(
++                'POST', url, data=body, headers=headers)
++
++        def build_response(response):
++            def wrap(content):
++                status_code = getattr(response, 'code', getattr(response, 'status_code', None))
++                return HttpResponse(
++                    status_code=status_code,
++                    url=url,
++                    headers=_headers_to_dict(getattr(response, 'headers', None)),
++                    content=content,
++                )
++
++            content_fn = getattr(treq, 'content', None)
++            if content_fn is not None:
++                content_deferred = defer.maybeDeferred(content_fn, response)
++            else:
++                content_value = getattr(response, 'content', b'')
++                content_deferred = defer.maybeDeferred(content_value) if callable(content_value) else defer.succeed(
++                    content_value or b'')
++
++            return content_deferred.addCallback(wrap)
++
++        return deferred.addCallback(build_response)
++
++    return threads.blockingCallFromThread(reactor, request)
++
++
++def get(url: str, headers: dict = None, **kwargs) -> HttpResponse:
++    return _perform_request('GET', url, headers=headers or {})
++
++
++def post(url: str, json: dict, headers: dict = None, **kwargs) -> HttpResponse:
++    body = json_module.dumps(json or {}).encode('utf-8')
++    return _perform_request('POST', url, headers=headers or {}, body=body)
+ 
+ 
+ class HttpClient:
+@@ -26,24 +111,22 @@ class HttpClient:
+     def get_header(self, name: str):
+         return self._headers.get(name)
+ 
+-    @property
+-    def _cert_args(self):
+-        return {'pkcs12_data': self._cert, 'pkcs12_password': ''} if self._cert else {}
+-
+-    def _handle_response(self, response: Response) -> dict:
++    def _handle_response(self, response, url: str = None) -> dict:
+         if response.status_code != 200:
++            if url and not getattr(response, 'url', None):
++                response.url = url
+             raise NuRequestException(response)
+ 
+         return response.json()
+ 
+-    def raw_get(self, url: str) -> Response:
+-        return get(url, headers=self._headers, **self._cert_args)
++    def raw_get(self, url: str) -> HttpResponse:
++        return get(url, headers=self._headers)
+ 
+-    def raw_post(self, url: str, json: dict) -> Response:
+-        return post(url, json=json, headers=self._headers, **self._cert_args)
++    def raw_post(self, url: str, json: dict) -> HttpResponse:
++        return post(url, json=json, headers=self._headers)
+ 
+     def get(self, url: str) -> dict:
+-        return self._handle_response(self.raw_get(url))
++        return self._handle_response(self.raw_get(url), url)
+ 
+     def post(self, url: str, json: dict) -> dict:
+-        return self._handle_response(post(url, json=json, headers=self._headers, **self._cert_args))
++        return self._handle_response(self.raw_post(url, json), url)

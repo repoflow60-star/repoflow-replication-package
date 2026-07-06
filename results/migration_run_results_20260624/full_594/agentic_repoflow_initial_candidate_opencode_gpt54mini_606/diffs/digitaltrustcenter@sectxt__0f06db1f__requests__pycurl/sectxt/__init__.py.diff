@@ -1,0 +1,150 @@
+--- a/sectxt/__init__.py
++++ b/sectxt/__init__.py
+@@ -2,19 +2,22 @@
+ # SPDX-License-Identifier: EUPL-1.2
+ #
+ import codecs
++import io
+ 
+ import langcodes
+ import re
+ import sys
+ from email.message import Message
++from types import SimpleNamespace
+ import validators
+ from collections import defaultdict
+ from datetime import datetime, timezone
+-from typing import Optional, Union, List, DefaultDict
++from typing import Optional, Union, List, DefaultDict, Dict
+ from urllib.parse import urlsplit, urlunsplit
+ from pgpy_dtc import PGPMessage
+ from pgpy_dtc.errors import PGPError
+ from dateutil.relativedelta import relativedelta
++import pycurl
+ 
+ if sys.version_info < (3, 8):
+     from typing_extensions import TypedDict
+@@ -22,11 +25,75 @@
+     from typing import TypedDict
+ 
+ import dateutil.parser
+-import requests
+ 
+ __version__ = "0.9.6"
+ 
+-s = requests.Session()
++_USER_AGENT = (
++    'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
++    'Gecko/20100101 Firefox/12.0'
++)
++_SSL_ERROR_CODES = {35, 51, 58, 59, 60, 64, 77}
++
++
++class _FetchedResponse:
++    def __init__(self, url: str, status_code: int, headers: Dict[str, str], content: bytes, history: List[SimpleNamespace]):
++        self.url = url
++        self.status_code = status_code
++        self.headers = headers
++        self.content = content
++        self.history = history
++
++
++def _parse_curl_headers(raw_headers: bytes) -> Dict[str, str]:
++    headers: Dict[str, str] = {}
++    for block in raw_headers.decode("iso-8859-1").split("\r\n\r\n"):
++        if not block.strip():
++            continue
++        block_headers: Dict[str, str] = {}
++        for line in block.split("\r\n")[1:]:
++            if ":" not in line:
++                continue
++            key, value = line.split(":", 1)
++            block_headers[key.strip().lower()] = value.strip()
++        if block_headers:
++            headers = block_headers
++    return headers
++
++
++def _fetch_url(url: str, insecure: bool = False) -> _FetchedResponse:
++    body = io.BytesIO()
++    header_buffer = io.BytesIO()
++    curl = pycurl.Curl()
++    try:
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.USERAGENT, _USER_AGENT)
++        curl.setopt(pycurl.TIMEOUT, 5)
++        curl.setopt(pycurl.NOSIGNAL, 1)
++        curl.setopt(pycurl.ACCEPT_ENCODING, "")
++        curl.setopt(pycurl.FOLLOWLOCATION, 1)
++        curl.setopt(pycurl.MAXREDIRS, 10)
++        curl.setopt(pycurl.WRITEFUNCTION, body.write)
++        curl.setopt(pycurl.HEADERFUNCTION, header_buffer.write)
++        if insecure:
++            curl.setopt(pycurl.SSL_VERIFYPEER, 0)
++            curl.setopt(pycurl.SSL_VERIFYHOST, 0)
++        curl.perform()
++        status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        effective_url = curl.getinfo(pycurl.EFFECTIVE_URL)
++    finally:
++        curl.close()
++
++    history: List[SimpleNamespace] = []
++    if effective_url != url:
++        history = [SimpleNamespace(url=url)]
++
++    return _FetchedResponse(
++        effective_url,
++        status_code,
++        _parse_curl_headers(header_buffer.getvalue()),
++        body.getvalue(),
++        history,
++    )
+ 
+ 
+ class ErrorDict(TypedDict):
+@@ -557,31 +624,21 @@
+                 for path in [".well-known/security.txt", "security.txt"]:
+                     url = urlunsplit((scheme, self._loc, path, None, None))
+                     try:
+-                        resp = requests.get(
+-                            url,
+-                            headers={
+-                                'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                              'Gecko/20100101 Firefox/12.0'},
+-                            timeout=5
+-                        )
+-                    except requests.exceptions.SSLError:
+-                        if not any(d["code"] == "invalid_cert" for d in self._errors):
+-                            self._add_error(
+-                                "invalid_cert",
+-                                "security.txt must be served with a valid TLS certificate.",
+-                            )
+-                        try:
+-                            resp = requests.get(
+-                                url,
+-                                headers={
+-                                    'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                                  'Gecko/20100101 Firefox/12.0'},
+-                                timeout=5,
+-                                verify=False
+-                            )
+-                        except:
++                        resp = _fetch_url(url)
++                    except pycurl.error as e:
++                        if e.args and e.args[0] in _SSL_ERROR_CODES:
++                            if not any(d["code"] == "invalid_cert" for d in self._errors):
++                                self._add_error(
++                                    "invalid_cert",
++                                    "security.txt must be served with a valid TLS certificate.",
++                                )
++                            try:
++                                resp = _fetch_url(url, insecure=True)
++                            except pycurl.error:
++                                continue
++                        else:
+                             continue
+-                    except:
++                    except Exception:
+                         continue
+                     if resp.status_code == 200:
+                         if resp.history:

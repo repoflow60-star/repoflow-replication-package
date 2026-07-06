@@ -1,0 +1,162 @@
+--- a/certbot_dns_infomaniak/dns_infomaniak.py
++++ b/certbot_dns_infomaniak/dns_infomaniak.py
+@@ -3,11 +3,13 @@
+ # SPDX-FileCopyrightText: 2021      Romain Autran <romain.autran@2itea.ch>
+ # SPDX-License-Identifier: Apache-2.0
+ """DNS Authenticator for Infomaniak"""
++import asyncio
+ import json
+ import logging
++from urllib.parse import urlencode, urlsplit
++
+ import idna
+-
+-import requests
++import aiohttp
+ 
+ from certbot import errors
+ from certbot.plugins import dns_common
+@@ -17,6 +19,119 @@
+     import os
+ 
+ logger = logging.getLogger(__name__)
++
++
++def _run_coroutine(coroutine):
++    try:
++        previous_loop = asyncio.get_event_loop()
++    except RuntimeError:
++        previous_loop = None
++    loop = asyncio.new_event_loop()
++    try:
++        asyncio.set_event_loop(loop)
++        return loop.run_until_complete(coroutine)
++    finally:
++        loop.close()
++        if previous_loop is None:
++            try:
++                asyncio.set_event_loop(None)
++            except (TypeError, RuntimeError):
++                pass
++        else:
++            asyncio.set_event_loop(previous_loop)
++
++
++class _PreparedRequest:
++    def __init__(self, method, url, headers=None, body=None):
++        self.method = method
++        self.url = url
++        self.headers = headers or {}
++        self.body = body
++        self.hooks = {}
++        parsed = urlsplit(url)
++        self.path_url = parsed.path
++        if parsed.query:
++            self.path_url = "{}?{}".format(self.path_url, parsed.query)
++
++
++class _ResponseProxy:
++    def __init__(self, session, method, url, headers=None, params=None, data=None, json_data=None):
++        self._session = session
++        self._method = method
++        self._url = url
++        self._headers = headers or {}
++        self._params = params
++        self._data = data
++        self._json_data = json_data
++        self._result = None
++
++    def __enter__(self):
++        self._result = self._load()
++        return self
++
++    def __exit__(self, exc_type, exc_val, exc_tb):
++        return False
++
++    def json(self):
++        return self._result
++
++    def _load(self):
++        scheme = urlsplit(self._url).scheme
++        adapter = self._session._adapters.get(scheme)
++        if adapter is not None:
++            body = self._data
++            if body is None and self._json_data is not None:
++                body = json.dumps(self._json_data)
++            request = _PreparedRequest(self._method, self._url, headers=self._headers, body=body)
++            response = adapter.send(
++                request,
++                stream=False,
++                timeout=None,
++                verify=True,
++                cert=None,
++                proxies=None,
++            )
++            try:
++                return response.json()
++            finally:
++                close = getattr(response, "close", None)
++                if callable(close):
++                    close()
++        return _run_coroutine(self._request_async())
++
++    async def _request_async(self):
++        headers = dict(self._session.headers)
++        headers.update(self._headers)
++        async with aiohttp.ClientSession(headers=headers) as session:
++            async with session.request(
++                self._method,
++                self._url,
++                params=self._params,
++                data=self._data,
++                json=self._json_data,
++            ) as req:
++                return await req.json(content_type=None)
++
++
++class _SessionProxy:
++    def __init__(self, headers=None):
++        self.headers = dict(headers or {})
++        self._adapters = {}
++
++    def mount(self, prefix, adapter):
++        self._adapters[prefix.rstrip(":/")] = adapter
++
++    def get(self, url, params=None):
++        if params:
++            separator = "&" if "?" in url else "?"
++            url = "{}{}{}".format(url, separator, urlencode(params, doseq=True))
++        return _ResponseProxy(self, "GET", url)
++
++    def post(self, url, data=None, headers=None, json=None):
++        return _ResponseProxy(self, "POST", url, headers=headers, data=data, json_data=json)
++
++    def delete(self, url):
++        return _ResponseProxy(self, "DELETE", url)
+ 
+ 
+ class Authenticator(dns_common.DNSAuthenticator):
+@@ -86,8 +201,9 @@
+         :param str token: oauth2 token to consume Infomaniak API
+         """
+         self.token = token
+-        self.session = requests.Session()
+-        self.session.headers.update({"Authorization": "Bearer {token}".format(token=self.token)})
++        self.session = _SessionProxy(
++            headers={"Authorization": "Bearer {token}".format(token=self.token)}
++        )
+ 
+     def _get_request(self, url, payload=None):
+         """Performs a GET request against API
+@@ -119,10 +235,8 @@
+         :param dict payload : body of request
+         """
+         url = self.baseUrl + url
+-        headers = {"Content-Type": "application/json"}
+-        json_data = json.dumps(payload)
+         logger.debug("POST %s", url)
+-        with self.session.post(url, data=json_data, headers=headers) as req:
++        with self.session.post(url, json=payload) as req:
+             try:
+                 result = req.json()
+             except json.decoder.JSONDecodeError as exc:

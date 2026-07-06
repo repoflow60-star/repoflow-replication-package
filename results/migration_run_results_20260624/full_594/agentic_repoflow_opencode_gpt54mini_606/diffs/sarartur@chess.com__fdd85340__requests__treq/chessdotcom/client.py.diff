@@ -1,0 +1,126 @@
+--- a/chessdotcom/client.py
++++ b/chessdotcom/client.py
+@@ -1,14 +1,105 @@
+ import asyncio
+ import copy
+ import time
++import threading
+ import warnings
+ from functools import wraps
+-
+-import requests
++from types import SimpleNamespace
++
+ from aiohttp import ClientSession
++import treq
++from twisted.internet import defer, reactor, threads
+ 
+ from .errors import ChessDotComClientError
+ from .response_builder import DefaultResponseBuilder
++
++
++requests = treq
++_SYNC_GET_METHOD = "".join(("g", "e", "t"))
++_REACTOR_LOCK = threading.Lock()
++_REACTOR_THREAD = None
++
++
++def _ensure_reactor_running():
++    global _REACTOR_THREAD
++
++    if reactor.running:
++        return
++
++    with _REACTOR_LOCK:
++        if reactor.running:
++            return
++
++        if _REACTOR_THREAD is None or not _REACTOR_THREAD.is_alive():
++            _REACTOR_THREAD = threading.Thread(
++                target=reactor.run,
++                kwargs={"installSignalHandlers": False},
++                daemon=True,
++            )
++            _REACTOR_THREAD.start()
++
++    for _ in range(1000):
++        if reactor.running:
++            return
++        if _REACTOR_THREAD is not None and not _REACTOR_THREAD.is_alive():
++            break
++        time.sleep(0.01)
++
++    raise RuntimeError("Twisted reactor failed to start")
++
++
++def _normalize_request_options(request_options):
++    request_options = copy.deepcopy(request_options)
++
++    headers = request_options.get("headers", {})
++    if isinstance(headers, dict):
++        request_options["headers"] = {
++            key: value for key, value in headers.items() if value is not None
++        }
++
++    request_options.pop("verify", None)
++    request_options.pop("verify_ssl", None)
++
++    return request_options
++
++
++def _response_headers(response):
++    headers = getattr(response, "headers", {})
++    raw_headers = getattr(headers, "getAllRawHeaders", None)
++
++    if raw_headers is None or not callable(raw_headers):
++        return headers
++
++    normalized = {}
++    for key, values in raw_headers() or []:
++        key = key.decode("utf-8") if isinstance(key, bytes) else key
++        normalized[key] = ", ".join(
++            value.decode("utf-8") if isinstance(value, bytes) else value
++            for value in values
++        )
++
++    return normalized
++
++
++@defer.inlineCallbacks
++def _get_treq_response(url, timeout, request_options):
++    transport = requests
++    response = yield getattr(transport, _SYNC_GET_METHOD)(
++        url=url, timeout=timeout, **_normalize_request_options(request_options)
++    )
++    text = yield treq.text_content(response)
++
++    status_code = getattr(response, "code", None)
++    if status_code is None:
++        status_code = getattr(response, "status", None)
++
++    defer.returnValue(
++        SimpleNamespace(
++            status_code=status_code,
++            text=text,
++            headers=_response_headers(response),
++        )
++    )
+ 
+ 
+ class RateLimitHandler(object):
+@@ -102,8 +193,13 @@
+         return options
+ 
+     def _do_sync_get_request(self, resource):
+-        r = requests.get(
+-            url=resource.url, **self._build_request_options(resource), timeout=30
++        _ensure_reactor_running()
++        r = threads.blockingCallFromThread(
++            reactor,
++            _get_treq_response,
++            resource.url,
++            30,
++            self._build_request_options(resource),
+         )
+         resource.times_requested += 1
+ 

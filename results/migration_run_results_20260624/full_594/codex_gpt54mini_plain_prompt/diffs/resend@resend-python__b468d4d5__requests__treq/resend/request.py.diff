@@ -1,0 +1,188 @@
+diff --git a/resend/request.py b/resend/request.py
+index fbd42f2..cf8057a 100644
+--- a/resend/request.py
++++ b/resend/request.py
+@@ -1,6 +1,9 @@
+-from typing import Any, Dict, Generic, List, Union, cast
++import asyncio
++import json
++import threading
++from dataclasses import dataclass
++from typing import Any, Awaitable, Dict, Generic, List, Optional, Union, cast
+ 
+-import requests
+ from typing_extensions import Literal, TypeVar
+ 
+ import resend
+@@ -11,6 +14,95 @@ RequestVerb = Literal["get", "post", "put", "patch", "delete"]
+ 
+ T = TypeVar("T")
+ 
++_EVENT_LOOP: Optional[asyncio.AbstractEventLoop] = None
++_EVENT_LOOP_THREAD: Optional[threading.Thread] = None
++
++
++@dataclass
++class _Response:
++    status_code: int
++    headers: Dict[str, str]
++    _body: bytes
++
++    @property
++    def text(self) -> str:
++        charset = _charset_from_content_type(self.headers.get("content-type"))
++        try:
++            return self._body.decode(charset)
++        except LookupError:
++            return self._body.decode("utf-8")
++
++    def json(self) -> Any:
++        return json.loads(self.text)
++
++
++def _charset_from_content_type(content_type: Optional[str]) -> str:
++    if not content_type:
++        return "utf-8"
++
++    parts = [part.strip() for part in content_type.split(";")]
++    for part in parts[1:]:
++        if part.lower().startswith("charset="):
++            charset = part.split("=", 1)[1].strip().strip("'\"")
++            if charset:
++                return charset
++    return "utf-8"
++
++
++def _normalize_headers(raw_headers: Any) -> Dict[str, str]:
++    headers: Dict[str, str] = {}
++
++    for name, values in raw_headers.getAllRawHeaders():
++        if isinstance(name, bytes):
++            key = name.decode("latin-1").lower()
++        else:
++            key = str(name).lower()
++        headers[key] = ", ".join(
++            value.decode("latin-1") if isinstance(value, bytes) else str(value)
++            for value in values
++        )
++    return headers
++
++
++def _ensure_event_loop() -> asyncio.AbstractEventLoop:
++    global _EVENT_LOOP
++    global _EVENT_LOOP_THREAD
++
++    if _EVENT_LOOP is not None:
++        return _EVENT_LOOP
++
++    loop = asyncio.new_event_loop()
++
++    try:
++        from twisted.internet import asyncioreactor
++
++        asyncioreactor.install(loop)
++    except Exception:
++        # If Twisted has already installed a reactor, we leave it alone and still
++        # use the dedicated asyncio loop for blocking treq calls.
++        pass
++
++    def _run_loop() -> None:
++        asyncio.set_event_loop(loop)
++        loop.run_forever()
++
++    thread = threading.Thread(
++        target=_run_loop,
++        name="resend-treq-event-loop",
++        daemon=True,
++    )
++    thread.start()
++
++    _EVENT_LOOP = loop
++    _EVENT_LOOP_THREAD = thread
++    return loop
++
++
++def _run_on_event_loop(coro: Awaitable[Any]) -> Any:
++    loop = _ensure_event_loop()
++    future = asyncio.run_coroutine_threadsafe(coro, loop)
++    return future.result()
++
+ 
+ # This class wraps the HTTP request creation logic
+ class Request(Generic[T]):
+@@ -33,7 +125,7 @@ class Request(Generic[T]):
+             Union[T, None]: A generic type of the Request class or None
+ 
+         Raises:
+-            requests.HTTPError: If the request fails
++            Exception: If the request fails
+         """
+         resp = self.make_request(url=f"{resend.api_url}{self.path}")
+ 
+@@ -43,7 +135,8 @@ class Request(Generic[T]):
+ 
+         # this is a safety net, if we get here it means the Resend API is having issues
+         # and most likely the gateway is returning htmls
+-        if "application/json" not in resp.headers["content-type"]:
++        content_type = resp.headers.get("content-type", "")
++        if "application/json" not in content_type:
+             raise_for_code_and_type(
+                 code=500,
+                 message="Failed to parse Resend API response. Please try again.",
+@@ -52,14 +145,14 @@ class Request(Generic[T]):
+ 
+         # handle error in case there is a statusCode attr present
+         # and status != 200 and response is a json.
+-        if resp.status_code != 200 and resp.json().get("statusCode"):
+-            error = resp.json()
++        error = resp.json()
++        if resp.status_code != 200 and error.get("statusCode"):
+             raise_for_code_and_type(
+                 code=error.get("statusCode"),
+                 message=error.get("message"),
+                 error_type=error.get("name"),
+             )
+-        return cast(T, resp.json())
++        return cast(T, error)
+ 
+     def perform_with_content(self) -> T:
+         """
+@@ -89,7 +182,7 @@ class Request(Generic[T]):
+             "User-Agent": f"resend-python:{get_version()}",
+         }
+ 
+-    def make_request(self, url: str) -> requests.Response:
++    def make_request(self, url: str) -> _Response:
+         """make_request is a helper function that makes the actual
+         HTTP request to the Resend API.
+ 
+@@ -97,16 +190,21 @@ class Request(Generic[T]):
+             url (str): The URL to make the request to
+ 
+         Returns:
+-            requests.Response: The response object from the request
+-
+-        Raises:
+-            requests.HTTPError: If the request fails
++            _Response: The response object from the request
+         """
+         headers = self.__get_headers()
+         params = self.params
+         verb = self.verb
+ 
+-        try:
+-            return requests.request(verb, url, json=params, headers=headers)
+-        except requests.HTTPError as e:
+-            raise e
++        async def _request() -> _Response:
++            import treq
++
++            response = await treq.request(verb, url, json=params, headers=headers)
++            body = await treq.content(response)
++            return _Response(
++                status_code=response.code,
++                headers=_normalize_headers(response.headers),
++                _body=body,
++            )
++
++        return cast(_Response, _run_on_event_loop(_request()))

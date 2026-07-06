@@ -1,0 +1,135 @@
+--- a/webauthn/helpers/validate_certificate_chain.py
++++ b/webauthn/helpers/validate_certificate_chain.py
+@@ -1,11 +1,65 @@
+ from typing import List, Optional
+ 
+-from cryptography.hazmat.backends import default_backend
+-from cryptography.x509 import load_der_x509_certificate
+-from OpenSSL.crypto import X509, X509Store, X509StoreContext, X509StoreContextError
++from Crypto.PublicKey import RSA
++from Crypto.Hash import SHA256
++from Crypto.Signature import pkcs1_15
++from Crypto.Util.asn1 import DerSequence, DerObjectId, DerNull, DerOctetString, DerBitString
++from Crypto.IO import PEM
+ 
+ from .exceptions import InvalidCertificateChain
+ from .pem_cert_bytes_to_open_ssl_x509 import pem_cert_bytes_to_open_ssl_x509
++
++
++def _load_certificate(cert_bytes: bytes):
++    if PEM.detect(cert_bytes):
++        der_bytes, marker, enc_flag = PEM.decode(cert_bytes)
++    else:
++        der_bytes = cert_bytes
++
++    cert = DerSequence()
++    cert.decode(der_bytes)
++
++    tbs_certificate = cert[0]
++    signature_algorithm = cert[1]
++    signature_value = cert[2]
++
++    tbs = DerSequence()
++    tbs.decode(tbs_certificate)
++
++    return {
++        "tbs_certificate": tbs_certificate,
++        "signature_algorithm": signature_algorithm,
++        "signature_value": signature_value,
++        "subject": tbs[5],
++        "issuer": tbs[3],
++        "public_key": tbs[6],
++    }
++
++
++def _get_public_key_from_certificate(cert):
++    spki = DerSequence()
++    spki.decode(cert["public_key"])
++
++    algorithm = DerSequence()
++    algorithm.decode(spki[0])
++
++    public_key_der = spki[1]
++    rsa_key = RSA.import_key(public_key_der)
++    return rsa_key
++
++
++def _verify_certificate_signature(cert, issuer_cert):
++    issuer_public_key = _get_public_key_from_certificate(issuer_cert)
++
++    tbs_certificate = cert["tbs_certificate"]
++    signature_value = cert["signature_value"]
++
++    signature = DerBitString()
++    signature.decode(signature_value)
++    signature_bytes = signature.value
++
++    h = SHA256.new(tbs_certificate)
++    pkcs1_15.new(issuer_public_key).verify(h, signature_bytes)
+ 
+ 
+ def validate_certificate_chain(
+@@ -34,8 +88,7 @@
+     # Prepare leaf cert
+     try:
+         leaf_cert_bytes = x5c[0]
+-        leaf_cert_crypto = load_der_x509_certificate(leaf_cert_bytes, default_backend())
+-        leaf_cert = X509().from_cryptography(leaf_cert_crypto)
++        leaf_cert = _load_certificate(leaf_cert_bytes)
+     except Exception as err:
+         raise InvalidCertificateChain(f"Could not prepare leaf cert: {err}")
+ 
+@@ -43,32 +96,40 @@
+     try:
+         # May be an empty array, that's fine
+         intermediate_certs_bytes = x5c[1:]
+-        intermediate_certs_crypto = [
+-            load_der_x509_certificate(cert, default_backend()) for cert in intermediate_certs_bytes
+-        ]
+-        intermediate_certs = [X509().from_cryptography(cert) for cert in intermediate_certs_crypto]
++        intermediate_certs = [_load_certificate(cert) for cert in intermediate_certs_bytes]
+     except Exception as err:
+         raise InvalidCertificateChain(f"Could not prepare intermediate certs: {err}")
+ 
+     # Prepare a collection of possible root certificates
+-    root_certs_store = X509Store()
++    root_certs_store = []
+     try:
+         for cert in pem_root_certs_bytes:
+-            root_certs_store.add_cert(pem_cert_bytes_to_open_ssl_x509(cert))
++            root_certs_store.append(_load_certificate(cert))
+     except Exception as err:
+         raise InvalidCertificateChain(f"Could not prepare root certs: {err}")
+ 
+     # Load certs into a "context" for validation
+-    context = X509StoreContext(
+-        store=root_certs_store,
+-        certificate=leaf_cert,
+-        chain=intermediate_certs,
+-    )
++    chain = [leaf_cert] + intermediate_certs
+ 
+     # Validate the chain (will raise if it can't)
+     try:
+-        context.verify_certificate()
+-    except X509StoreContextError:
++        for i in range(len(chain) - 1):
++            _verify_certificate_signature(chain[i], chain[i + 1])
++
++        verified = False
++        for root_cert in root_certs_store:
++            try:
++                _verify_certificate_signature(chain[-1], root_cert)
++                verified = True
++                break
++            except Exception:
++                pass
++
++        if not verified:
++            raise InvalidCertificateChain("Certificate chain could not be validated")
++    except InvalidCertificateChain:
++        raise
++    except Exception:
+         raise InvalidCertificateChain("Certificate chain could not be validated")
+ 
+     return True

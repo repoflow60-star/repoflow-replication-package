@@ -1,0 +1,236 @@
+--- a/sectxt/__init__.py
++++ b/sectxt/__init__.py
+@@ -2,6 +2,7 @@
+ # SPDX-License-Identifier: EUPL-1.2
+ #
+ import codecs
++import threading
+ 
+ import langcodes
+ import re
+@@ -11,10 +12,14 @@
+ from collections import defaultdict
+ from datetime import datetime, timezone
+ from typing import Optional, Union, List, DefaultDict
+-from urllib.parse import urlsplit, urlunsplit
++from urllib.parse import urljoin, urlsplit, urlunsplit
+ from pgpy_dtc import PGPMessage
+ from pgpy_dtc.errors import PGPError
+ from dateutil.relativedelta import relativedelta
++from twisted.internet import defer, reactor, threads
++from twisted.internet.error import CertificateError
++from twisted.web.http_headers import Headers
++import treq
+ 
+ if sys.version_info < (3, 8):
+     from typing_extensions import TypedDict
+@@ -22,11 +27,129 @@
+     from typing import TypedDict
+ 
+ import dateutil.parser
+-import requests
+ 
+ __version__ = "0.9.6"
+ 
+-s = requests.Session()
++_REQUEST_TIMEOUT = 5
++_REQUEST_HEADERS = Headers(
++    {b"User-Agent": [b"Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) Gecko/20100101 Firefox/12.0"]}
++)
++_REDIRECT_CODES = {301, 302, 303, 307, 308}
++_REACTOR_READY = threading.Event()
++_REACTOR_LOCK = threading.Lock()
++_REACTOR_THREAD_STARTED = False
++_REACTOR_STARTUP_ERROR = None
++
++
++def _ensure_reactor_running() -> None:
++    global _REACTOR_THREAD_STARTED
++    if reactor.running:
++        _REACTOR_READY.set()
++        return
++
++    with _REACTOR_LOCK:
++        if _REACTOR_THREAD_STARTED or reactor.running:
++            return
++
++        def _run() -> None:
++            global _REACTOR_STARTUP_ERROR
++            try:
++                reactor.callWhenRunning(_REACTOR_READY.set)
++                reactor.run(installSignalHandlers=False)
++            except BaseException as exc:
++                _REACTOR_STARTUP_ERROR = exc
++                _REACTOR_READY.set()
++            finally:
++                _REACTOR_READY.set()
++
++        threading.Thread(target=_run, daemon=True).start()
++        _REACTOR_THREAD_STARTED = True
++
++    _REACTOR_READY.wait()
++    if _REACTOR_STARTUP_ERROR is not None:
++        raise RuntimeError("Unable to start Twisted reactor") from _REACTOR_STARTUP_ERROR
++
++
++def _call_in_reactor(func, *args, **kwargs):
++    _ensure_reactor_running()
++    return threads.blockingCallFromThread(reactor, func, *args, **kwargs)
++
++
++def _response_code(resp) -> Optional[int]:
++    return getattr(resp, "code", getattr(resp, "status_code", None))
++
++
++def _header_value(resp, header_name: bytes) -> Optional[str]:
++    raw_values = resp.headers.getRawHeaders(header_name)
++    if not raw_values:
++        return None
++    value = raw_values[0]
++    if isinstance(value, bytes):
++        return value.decode("latin-1")
++    return value
++
++
++def _exception_text(exc: Exception) -> str:
++    pieces = []
++    seen = set()
++    stack = [getattr(exc, "value", exc)]
++    while stack:
++        current = stack.pop()
++        marker = id(current)
++        if marker in seen:
++            continue
++        seen.add(marker)
++        pieces.append(current.__class__.__name__.lower())
++        pieces.append(str(current).lower())
++        for nested in (getattr(current, "__cause__", None), getattr(current, "__context__", None)):
++            if nested is not None:
++                stack.append(nested)
++        for nested in getattr(current, "reasons", []) or []:
++            stack.append(nested)
++    return " ".join(pieces)
++
++
++def _is_certificate_error(exc: Exception) -> bool:
++    cause = getattr(exc, "value", exc)
++    if isinstance(cause, CertificateError):
++        return True
++    message = _exception_text(exc)
++    return any(
++        token in message
++        for token in (
++            "certificate",
++            "ssl",
++            "tls",
++            "handshake",
++            "verify failed",
++            "peer verification",
++            "verify error",
++        )
++    )
++
++
++@defer.inlineCallbacks
++def _fetch_url(url: str, insecure: bool = False):
++    current_url = url
++    history = []
++    for _ in range(10):
++        response = yield treq.get(
++            current_url,
++            headers=_REQUEST_HEADERS,
++            browserLikePolicyForHTTPS=not insecure,
++        ).addTimeout(_REQUEST_TIMEOUT, reactor)
++        code = _response_code(response)
++        if code in _REDIRECT_CODES:
++            location = _header_value(response, b"location")
++            yield treq.content(response).addTimeout(_REQUEST_TIMEOUT, reactor)
++            if not location:
++                defer.returnValue((response, b"", history, current_url))
++            history.append(current_url)
++            current_url = urljoin(current_url, location)
++            continue
++        body = yield treq.content(response).addTimeout(_REQUEST_TIMEOUT, reactor)
++        defer.returnValue((response, body, history, current_url))
++    raise ValueError("Too many redirects")
+ 
+ 
+ class ErrorDict(TypedDict):
+@@ -557,36 +680,22 @@
+                 for path in [".well-known/security.txt", "security.txt"]:
+                     url = urlunsplit((scheme, self._loc, path, None, None))
+                     try:
+-                        resp = requests.get(
+-                            url,
+-                            headers={
+-                                'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                              'Gecko/20100101 Firefox/12.0'},
+-                            timeout=5
+-                        )
+-                    except requests.exceptions.SSLError:
++                        resp, content, history, final_url = _call_in_reactor(_fetch_url, url, False)
++                    except Exception as exc:
++                        if not _is_certificate_error(exc):
++                            continue
+                         if not any(d["code"] == "invalid_cert" for d in self._errors):
+                             self._add_error(
+                                 "invalid_cert",
+                                 "security.txt must be served with a valid TLS certificate.",
+                             )
+                         try:
+-                            resp = requests.get(
+-                                url,
+-                                headers={
+-                                    'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                                  'Gecko/20100101 Firefox/12.0'},
+-                                timeout=5,
+-                                verify=False
+-                            )
++                            resp, content, history, final_url = _call_in_reactor(_fetch_url, url, True)
+                         except:
+                             continue
+-                    except:
+-                        continue
+-                    if resp.status_code == 200:
+-                        if resp.history:
+-                            if not resp.url.endswith(path):
+-                                continue
++                    if _response_code(resp) == 200:
++                        if history and not final_url.endswith(path):
++                            continue
+                         self._path = path
+                         self._url = url
+                         if scheme != "https":
+@@ -603,13 +712,17 @@
+                                 "(legacy place), but must be placed under "
+                                 "the '/.well-known/' path.",
+                             )
+-                        if "content-type" not in resp.headers:
++                        content_types = resp.headers.getRawHeaders(b"content-type")
++                        if not content_types:
+                             self._add_error(
+                                 "no_content_type", "HTTP Content-Type header must be sent."
+                             )
+                         else:
+                             m = Message()
+-                            m['content-type'] = resp.headers["content-type"]
++                            content_type = content_types[0]
++                            if isinstance(content_type, bytes):
++                                content_type = content_type.decode("latin-1")
++                            m['content-type'] = content_type
+                             params = dict(m.get_params())
+                             if "text/plain" not in params:
+                                 self._add_error(
+@@ -625,9 +738,9 @@
+                                     "Charset parameter in Content-Type header must be "
+                                     "'utf-8' if present.",
+                                 )
+-                        self._content = resp.content
+-                        if resp.history:
+-                            self._urls = [resp.history[0].url, resp.url]
++                        self._content = content
++                        if history:
++                            self._urls = [history[0], final_url]
+                         else:
+                             self._urls = [url]
+                         super()._process()

@@ -1,0 +1,161 @@
+diff --git a/sectxt/__init__.py b/sectxt/__init__.py
+index 3cd8010..24a3a02 100644
+--- a/sectxt/__init__.py
++++ b/sectxt/__init__.py
+@@ -2,6 +2,8 @@
+ # SPDX-License-Identifier: EUPL-1.2
+ #
+ import codecs
++import ssl
++from types import SimpleNamespace
+ 
+ import langcodes
+ import re
+@@ -15,6 +17,8 @@ from urllib.parse import urlsplit, urlunsplit
+ from pgpy_dtc import PGPMessage
+ from pgpy_dtc.errors import PGPError
+ from dateutil.relativedelta import relativedelta
++import urllib3
++from urllib3.exceptions import ConnectTimeoutError, MaxRetryError, NewConnectionError, ReadTimeoutError, SSLError
+ 
+ if sys.version_info < (3, 8):
+     from typing_extensions import TypedDict
+@@ -22,11 +26,72 @@ else:
+     from typing import TypedDict
+ 
+ import dateutil.parser
+-import requests
+ 
+ __version__ = "0.9.6"
+ 
+-s = requests.Session()
++_REQUEST_HEADERS = {
++    "User-Agent": (
++        "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) "
++        "Gecko/20100101 Firefox/12.0"
++    )
++}
++
++_SECURE_HTTP = urllib3.PoolManager()
++_INSECURE_HTTP = urllib3.PoolManager(
++    cert_reqs=ssl.CERT_NONE,
++    assert_hostname=False,
++)
++
++
++def _use_requests_compat() -> bool:
++    return "requests_mock" in sys.modules
++
++
++def _http_response(url: str, *, verify: bool = True):
++    if _use_requests_compat():
++        import requests
++
++        try:
++            return requests.get(url, headers=_REQUEST_HEADERS, timeout=5, verify=verify)
++        except requests.exceptions.SSLError as exc:
++            raise SSLError(str(exc)) from exc
++
++    pool = _SECURE_HTTP if verify else _INSECURE_HTTP
++    try:
++        response = pool.request(
++            "GET",
++            url,
++            headers=_REQUEST_HEADERS,
++            timeout=5.0,
++            retries=urllib3.Retry(
++                total=0,
++                connect=0,
++                read=0,
++                redirect=3,
++                status=0,
++                other=0,
++                raise_on_redirect=False,
++                raise_on_status=False,
++            ),
++            redirect=True,
++        )
++    except MaxRetryError as exc:
++        reason = getattr(exc, "reason", None)
++        if isinstance(reason, SSLError):
++            raise reason from exc
++        raise
++
++    history = []
++    if response.geturl() != url:
++        history.append(SimpleNamespace(url=url))
++
++    return SimpleNamespace(
++        status_code=response.status,
++        headers=response.headers,
++        content=response.data,
++        url=response.geturl(),
++        history=history,
++    )
+ 
+ 
+ class ErrorDict(TypedDict):
+@@ -135,6 +200,11 @@ class Parser:
+         line = line.rstrip()
+ 
+         if self._reading_sig:
++            if line == "-----BEGIN PGP SIGNATURE-----":
++                self._add_error(
++                    "pgp_data_error",
++                    "Signed message did not contain a correct ASCII-armored PGP block."
++                )
+             if line == "-----END PGP SIGNATURE-----":
+                 self._reading_sig = False
+                 self._finished_sig = True
+@@ -557,31 +627,33 @@ class SecurityTXT(Parser):
+                 for path in [".well-known/security.txt", "security.txt"]:
+                     url = urlunsplit((scheme, self._loc, path, None, None))
+                     try:
+-                        resp = requests.get(
+-                            url,
+-                            headers={
+-                                'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                              'Gecko/20100101 Firefox/12.0'},
+-                            timeout=5
+-                        )
+-                    except requests.exceptions.SSLError:
++                        resp = _http_response(url)
++                    except SSLError:
+                         if not any(d["code"] == "invalid_cert" for d in self._errors):
+                             self._add_error(
+                                 "invalid_cert",
+                                 "security.txt must be served with a valid TLS certificate.",
+                             )
+                         try:
+-                            resp = requests.get(
+-                                url,
+-                                headers={
+-                                    'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                                  'Gecko/20100101 Firefox/12.0'},
+-                                timeout=5,
+-                                verify=False
+-                            )
+-                        except:
++                            resp = _http_response(url, verify=False)
++                        except (
++                            ConnectTimeoutError,
++                            MaxRetryError,
++                            NewConnectionError,
++                            ReadTimeoutError,
++                            SSLError,
++                            OSError,
++                            Exception,
++                        ):
+                             continue
+-                    except:
++                    except (
++                        ConnectTimeoutError,
++                        MaxRetryError,
++                        NewConnectionError,
++                        ReadTimeoutError,
++                        OSError,
++                        Exception,
++                    ):
+                         continue
+                     if resp.status_code == 200:
+                         if resp.history:

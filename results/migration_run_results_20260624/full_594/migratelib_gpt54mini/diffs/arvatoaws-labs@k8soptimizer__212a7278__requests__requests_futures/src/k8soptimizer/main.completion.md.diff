@@ -1,0 +1,1192 @@
+--- /dev/null
++++ b/src/k8soptimizer/main.completion.md
+@@ -0,0 +1,595 @@
++I replaced the direct `requests.get(...)` calls with a `FuturesSession` from `requests_futures`, which returns future objects. The Prometheus helper functions now wait for the async response via `.result()` before reading the response body, keeping the rest of the logic unchanged.
+
++
+
++```python
+
++"""
+
++This is a skeleton file that can serve as a starting point for a Python
+
++console script. To run this script uncomment the following lines in the
+
++``[options.entry_points]`` section in ``setup.cfg``::
+
++
+
++    console_scripts =
+
++         k8soptimizer = k8soptimizer.main:run
+
++
+
++Then run ``pip install .`` (or ``pip install -e .`` for editable mode)
+
++which will install the command ``k8soptimizer`` inside your current environment.
+
++
+
++Besides console scripts, the header (i.e. until ``_logger``...) of this file can
+
++also be used as template for Python modules.
+
++
+
++Note:
+
++    This file can be renamed depending on your needs or safely removed if not needed.
+
++
+
++References:
+
++    - https://setuptools.pypa.io/en/latest/userguide/entry_point.html
+
++    - https://pip.pypa.io/en/stable/reference/pip_install
+
++"""
+
++
+
++import argparse
+
++import json
+
++import logging
+
++import os
+
++import re
+
++import sys
+
++import time
+
++
+
++from requests_futures.sessions import FuturesSession
+
++from beartype import beartype
+
++from beartype.typing import Optional, Tuple
+
++from kubernetes import client, config
+
++from kubernetes.client.models import (
+
++    V1Container,
+
++    V1Deployment,
+
++    V1DeploymentList,
+
++    V1NamespaceList,
+
++    V2HorizontalPodAutoscaler,
+
++)
+
++from pythonjsonlogger import jsonlogger
+
++
+
++from . import __version__, helpers
+
++
+
++__author__ = "Philipp Hellmich"
+
++__copyright__ = "Arvato Systems GmbH"
+
++__license__ = "MIT"
+
++
+
++__domain__ = "arvato-aws.io"
+
++
+
++_logger = logging.getLogger(__name__)
+
++
+
++
+
++PROMETHEUS_URL = os.getenv("PROMETHEUS_URL", "http://localhost:9090")
+
++
+
++NAMESPACE_PATTERN = os.getenv("NAMESPACE_PATTERN", ".*")
+
++DEPLOYMENT_PATTERN = os.getenv("DEPLOYMENT_PATTERN", ".*")
+
++CONTAINER_PATTERN = os.getenv("CONTAINER_PATTERN", ".*")
+
++
+
++# in minutes
+
++# cannot not be less than 5 minutes)
+
++DEFAULT_LOOKBACK_MINUTES = int(os.getenv("DEFAULT_LOOKBACK_MINUTES", 60 * 4))
+
++DEFAULT_OFFSET_MINUTES = int(
+
++    os.getenv("DEFAULT_OFFSET_MINUTES", (60 * 24 * 7) - (DEFAULT_LOOKBACK_MINUTES))
+
++)
+
++DEFAULT_QUANTILE_OVER_TIME = float(os.getenv("DEFAULT_QUANTILE_OVER_TIME", 0.95))
+
++
+
++DEFAULT_QUANTILE_OVER_TIME_STATIC_CPU = float(
+
++    os.getenv("DEFAULT_QUANTILE_OVER_TIME_STATIC_CPU", 0.95)
+
++)
+
++DEFAULT_QUANTILE_OVER_TIME_HPA_CPU = float(
+
++    os.getenv("DEFAULT_QUANTILE_OVER_TIME_HPA_CPU", 0.7)
+
++)
+
++
+
++DEFAULT_QUANTILE_OVER_TIME_STATIC_MEMORY = float(
+
++    os.getenv("DEFAULT_QUANTILE_OVER_TIME_STATIC_MEMORY", 0.95)
+
++)
+
++DEFAULT_QUANTILE_OVER_TIME_HPA_MEMORY = float(
+
++    os.getenv("DEFAULT_QUANTILE_OVER_TIME_HPA_MEMORY", 0.8)
+
++)
+
++
+
++# operating mode
+
++DRY_RUN_MODE = os.getenv("DRY_RUN_MODE", "false").lower() in ["true", "1", "yes"]
+
++CLUSTER_RUN_MODE = os.getenv("CLUSTER_RUN_MODE", "false").lower() in [
+
++    "true",
+
++    "1",
+
++    "yes",
+
++]
+
++
+
++MIN_CPU_REQUEST = float(
+
++    helpers.convert_cpu_request_to_cores(os.getenv("MIN_CPU_REQUEST", "10m"))
+
++)  # below 10m will not work reliable with hpa
+
++MAX_CPU_REQUEST = float(
+
++    helpers.convert_cpu_request_to_cores(os.getenv("MAX_CPU_REQUEST", "16"))
+
++)
+
++MAX_CPU_REQUEST_NODEJS = 1.0
+
++CPU_REQUEST_RATIO = float(os.getenv("CPU_REQUEST_RATIO", 1.0))
+
++
+
++MIN_MEMORY_REQUEST = int(
+
++    helpers.convert_memory_request_to_bytes(os.getenv("MIN_MEMORY_REQUEST", "16Mi"))
+
++)
+
++MAX_MEMORY_REQUEST = int(
+
++    helpers.convert_memory_request_to_bytes(os.getenv("MAX_MEMORY_REQUEST", "16Gi"))
+
++)
+
++
+
++MEMORY_REQUEST_RATIO = float(os.getenv("MEMORY_REQUEST_RATIO", 1.5))
+
++MEMORY_LIMIT_RATIO = float(os.getenv("MEMORY_LIMIT_RATIO", 2.0))
+
++MIN_MEMORY_LIMIT = int(
+
++    os.getenv("MIN_MEMORY_LIMIT", MIN_MEMORY_REQUEST * MEMORY_LIMIT_RATIO)
+
++)
+
++MAX_MEMORY_LIMIT = int(
+
++    os.getenv("MAX_MEMORY_LIMIT", MAX_MEMORY_REQUEST * MEMORY_LIMIT_RATIO)
+
++)
+
++CHANGE_THRESHOLD = float(os.getenv("CHANGE_THRESHOLD", 0.1))
+
++HPA_TARGET_REPLICAS_RATIO = float(os.getenv("HPA_TARGET_REPLICAS_RATIO", 0.1))
+
++
+
++TREND_LOOKBOOK_MINUTES = int(os.getenv("TREND_LOOKBOOK_MINUTES", 60 * 4))
+
++TREND_OFFSET_MINUTES = int(os.getenv("TREND_OFFSET_MINUTES", (60 * 24 * 7)))
+
++TREND_MAX_RATIO = float(os.getenv("TREND_MAX_RATIO", 1.5))
+
++TREND_MIN_RATIO = float(os.getenv("TREND_MIN_RATIO", 0.5))
+
++TREND_QUANTILE_OVER_TIME = float(os.getenv("TREND_QUANTILE_OVER_TIME", 0.8))
+
++
+
++DELAY_BETWEEN_UPDATES = float(os.getenv("DELAY_BETWEEN_UPDATES", 0.0))
+
++
+
++LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
++LOG_FORMAT = os.getenv("LOG_FORMAT", "json").lower()
+
++
+
++stats = {}
+
++stats["old_cpu_sum"] = 0
+
++stats["new_cpu_sum"] = 0
+
++stats["old_memory_sum"] = 0
+
++stats["new_memory_sum"] = 0
+
++stats["old_memory_limits_sum"] = 0
+
++stats["new_memory_limits_sum"] = 0
+
++
+
++_session = FuturesSession()
+
++
+
++# ---- Python API ----
+
++# The functions defined in this section can be imported by users in their
+
++# Python scripts/interactive interpreter, e.g. via
+
++# `from k8soptimizer.skeleton import fib`,
+
++# when using this Python module as a library.
+
++
+
++
+
++class AppFilter(logging.Filter):
+
++    extra = {}
+
++
+
++    def __init__(self, extra={}):
+
++        self.extra = extra
+
++        super(AppFilter, self).__init__()
+
++
+
++    def filter(self, record):
+
++        for key, value in self.extra.items():
+
++            record.__setattr__(key, value)
+
++        for key in list(record.__dict__.keys()):
+
++            if key not in self.extra and key not in [
+
++                "name",
+
++                "msg",
+
++                "args",
+
++                "levelname",
+
++                "levelno",
+
++                "pathname",
+
++                "filename",
+
++                "module",
+
++                "exc_info",
+
++                "exc_text",
+
++                "stack_info",
+
++                "lineno",
+
++                "funcName",
+
++                "created",
+
++                "msecs",
+
++                "relativeCreated",
+
++                "thread",
+
++                "threadName",
+
++                "processName",
+
++                "process",
+
++            ]:
+
++                del record.__dict__[key]
+
++        return True
+
++
+
++
+
++@beartype
+
++def query_prometheus(query: str) -> dict:
+
++    """
+
++    Query Prometheus API with the specified query string.
+
++
+
++    Args:
+
++        query (str): The Prometheus query string.
+
++
+
++    Returns:
+
++        dict: The JSON response from the Prometheus API.
+
++
+
++    Raises:
+
++        RuntimeError: If the response is missing expected data fields.
+
++
+
++    Example:
+
++        response = query_prometheus('sum(rate(http_requests_total{job="api"}[5m]))')
+
++    """
+
++    _logger.debug("Query to prometheus: %s", query)
+
++    response = _session.get(PROMETHEUS_URL + "/api/v1/query", params={"query": query}).result()
+
++    j = json.loads(response.text)
+
++    _logger.debug("Response from prometheus: %s", j)
+
++    if "data" not in j:
+
++        raise RuntimeError("Got invalid results from query: {}".format(query))
+
++    if "result" not in j["data"]:
+
++        raise RuntimeError("Got invalid results from query: {}".format(query))
+
++    return j
+
++
+
++
+
++@beartype
+
++def verify_prometheus_connection() -> bool:
+
++    """
+
++    Verify connection to the Prometheus API.
+
++
+
++    Returns:
+
++        bool: True if the connection is successful, False otherwise.
+
++
+
++    Raises:
+
++        RuntimeError: If the response is missing expected data fields or the connection fails.
+
++
+
++    Example:
+
++        connection_successful = verify_prometheus_connection()
+
++    """
+
++    response = _session.get(PROMETHEUS_URL + "/api/v1/status/buildinfo").result()
+
++    j = json.loads(response.text)
+
++    _logger.debug(j)
+
++    if "status" not in j:
+
++        raise RuntimeError("Got invalid results request: {}".format(response.text))
+
++    if j["status"] == "success":
+
++        return True
+
++    raise RuntimeError("Connection to prometheus api failed")
+
++
+
++
+
++@beartype
+
++def verify_kubernetes_connection() -> bool:
+
++    """
+
++    Verify connection to the Kubernetes API.
+
++
+
++    Returns:
+
++        bool: True if the connection is successful, False otherwise.
+
++
+
++    Raises:
+
++        RuntimeError: If the connection to the Kubernetes API fails or if there is a configuration error.
+
++
+
++    Example:
+
++        connection_successful = verify_kubernetes_connection()
+
++    """
+
++    if CLUSTER_RUN_MODE:
+
++        config.load_incluster_config()
+
++    else:
+
++        config.load_kube_config()
+
++    client.ApisApi().get_api_versions_with_http_info()
+
++    return True
+
++
+
++
+
++@beartype
+
++def get_max_cpu_cores_per_runtime(runtime: str) -> int:
+
++    """
+
++    Get the maximum number of CPU cores allowed per runtime.
+
++
+
++    Args:
+
++        runtime (str): The name of the runtime.
+
++
+
++    Returns:
+
++        int: The maximum number of CPU cores.
+
++
+
++    Example:
+
++        max_cores = get_max_cpu_cores_per_runtime("nodejs")
+
++    """
+
++    if runtime == "nodejs":
+
++        return 1
+
++    return 100
+
++
+
++
+
++@beartype
+
++def format_offset_minutes(offset_minutes: int) -> str:
+
++    """
+
++    Get the offset minutes as a string for Prometheus queries.
+
++
+
++    Args:
+
++        offset_minutes (int): The offset minutes.
+
++
+
++    Returns:
+
++        str: The offset minutes as a string.
+
++
+
++    Example:
+
++        offset_minutes_str = get_offset_minutes_str(5)
+
++    """
+
++    if offset_minutes == 0:
+
++        return ""
+
++    return "offset {}m".format(offset_minutes)
+
++
+
++
+
++@beartype
+
++def get_number_of_samples_from_history(
+
++    namespace: str,
+
++    workload: str,
+
++    workload_type: str = "deployment",
+
++    lookback_minutes: int = DEFAULT_LOOKBACK_MINUTES,
+
++    offset_minutes: int = DEFAULT_OFFSET_MINUTES,
+
++) -> int:
+
++    """
+
++    Get the CPU cores usage history for a specific container.
+
++
+
++    Args:
+
++        namespace (str): The name of the Kubernetes namespace.
+
++        workload (str): The name of the workload (e.g., myapp).
+
++        workload_type (str, optional): The type of workload. Default is "deployment".
+
++        lookback_minutes (int, optional): The number of minutes to look back in time for the query. Default is DEFAULT_LOOKBACK_MINUTES.
+
++        offset_minutes (int, optional): The offset in minutes for the query. Default is DEFAULT_OFFSET_MINUTES.
+
++
+
++    Returns:
+
++        float: The number of samples from prometheus.
+
++
+
++    Raises:
+
++        RuntimeError: If no data is found for the Prometheus query.
+
++
+
++    Example:
+
++        samples = get_number_of_samples_from_history("my-namespace", "my-deployment")
+
++    """
+
++    query = 'max by (namespace,workload,workload_type) (count_over_time(kube_workload_container_resource_usage_cpu_cores_avg{{namespace="{namespace}", workload="{workload}", workload_type="{workload_type}"}}[{lookback_minutes}m] {offset_minutes_str}))'.format(
+
++        namespace=namespace,
+
++        workload=workload,
+
++        workload_type=workload_type,
+
++        lookback_minutes=lookback_minutes,
+
++        offset_minutes_str=format_offset_minutes(offset_minutes),
+
++    )
+
++    j = query_prometheus(query)
+
++
+
++    if j["data"]["result"] == []:
+
++        raise RuntimeError("No data found for prometheus query: {}".format(query))
+
++    return int(j["data"]["result"][0]["value"][1])
+
++
+
++
+
++# FIXME not used anymore
+
++@beartype
+
++def get_max_pods_per_deployment_history(
+
++    namespace_name: str,
+
++    deployment_name: str,
+
++    lookback_minutes: int = DEFAULT_LOOKBACK_MINUTES,
+
++    offset_minutes: int = DEFAULT_OFFSET_MINUTES,
+
++    quantile_over_time: float = DEFAULT_QUANTILE_OVER_TIME,
+
++) -> int:
+
++    """
+
++    Get the maximum number of pods for a deployment based on historical data.
+
++
+
++    Args:
+
++        namespace_name (str): The name of the Kubernetes namespace.
+
++        deployment_name (str): The name of the deployment.
+
++        lookback_minutes (int, optional): The number of minutes to look back in time for the query. Default is DEFAULT_LOOKBACK_MINUTES.
+
++        offset_minutes (int, optional): The offset in minutes for the query. Default is DEFAULT_OFFSET_MINUTES.
+
++        quantile_over_time (float, optional): The quantile value for the query. Default is DEFAULT_QUANTILE_OVER_TIME.
+
++
+
++    Returns:
+
++        int: The maximum number of pods.
+
++
+
++    Raises:
+
++        RuntimeError: If no data is found for the Prometheus query.
+
++
+
++    Example:
+
++        max_pods = get_max_pods_per_deployment_history("my-namespace", "my-deployment")
+
++    """
+
++    query = 'max(quantile_over_time({quantile_over_time}, kube_deployment_spec_replicas{{job="kube-state-metrics", namespace="{namespace_name}", deployment="{deployment_name}"}}[{lookback_minutes}m] {offset_minutes_str}))'.format(
+
++        quantile_over_time=quantile_over_time,
+
++        namespace_name=namespace_name,
+
++        deployment_name=deployment_name,
+
++        lookback_minutes=lookback_minutes,
+
++        offset_minutes_str=format_offset_minutes(offset_minutes),
+
++    )
+
++    j = query_prometheus(query)
+
++
+
++    if j["data"]["result"] == []:
+
++        raise RuntimeError("No data found for prometheus query: {}".format(query))
+
++    return int(j["data"]["result"][0]["value"][1])
+
++
+
++
+
++@beartype
+
++def get_cpu_cores_usage_history(
+
++    namespace: str,
+
++    workload: str,
+
++    container: str,
+
++    workload_type: str = "deployment",
+
++    lookback_minutes: int = DEFAULT_LOOKBACK_MINUTES,
+
++    offset_minutes: int = DEFAULT_OFFSET_MINUTES,
+
++    quantile_over_time: float = DEFAULT_QUANTILE_OVER_TIME,
+
++    metric: str = "kube_workload_container_resource_usage_cpu_cores_avg",
+
++) -> float:
+
++    """
+
++    Get the CPU cores usage history for a specific container.
+
++
+
++    Args:
+
++        namespace (str): The name of the Kubernetes namespace.
+
++        workload (str): The name of the workload (e.g., myapp).
+
++        container (str): The name of the container.
+
++        workload_type (str, optional): The type of workload. Default is "deployment".
+
++        lookback_minutes (int, optional): The number of minutes to look back in time for the query. Default is DEFAULT_LOOKBACK_MINUTES.
+
++        offset_minutes (int, optional): The offset in minutes for the query. Default is DEFAULT_OFFSET_MINUTES.
+
++        quantile_over_time (float, optional): The quantile value for the query. Default is DEFAULT_QUANTILE_OVER_TIME.
+
++        metric (str, optional): The metric used for the query. Default is "kube_workload_container_resource_usage_cpu_cores_avg".
+
++
+
++
+
++    Returns:
+
++        float: The CPU cores usage value.
+
++
+
++    Raises:
+
++        RuntimeError: If no data is found for the Prometheus query.
+
++
+
++    Example:
+
++        cpu_usage = get_cpu_cores_usage_history("my-namespace", "my-deployment", "my-container")
+
++    """
+
++    query = 'quantile_over_time({quantile_over_time}, {metric}{{namespace="{namespace}", workload="{workload}", workload_type="{workload_type}", container="{container}"}}[{lookback_minutes}m] {offset_minutes_str})'.format(
+
++        quantile_over_time=quantile_over_time,
+
++        metric=metric,
+
++        namespace=namespace,
+
++        workload=workload,
+
++        workload_type=workload_type,
+
++        container=container,
+
++        lookback_minutes=lookback_minutes,
+
++        offset_minutes_str=format_offset_minutes(offset_minutes),
+
++    )
+
++    j = query_prometheus(query)
+
++
+
++    if j["data"]["result"] == []:
+
++        raise RuntimeError("No data found for prometheus query: {}".format(query))
+
++    return float(j["data"]["result"][0]["value"][1])
+
++
+
++
+
++@beartype
+
++def get_memory_bytes_usage_history(
+
++    namespace: str,
+
++    workload: str,
+
++    container: str,
+
++    workload_type: str = "deployment",
+
++    lookback_minutes: int = DEFAULT_LOOKBACK_MINUTES,
+
++    offset_minutes: int = DEFAULT_OFFSET_MINUTES,
+
++    quantile_over_time: float = DEFAULT_QUANTILE_OVER_TIME,
+
++    metric: str = "kube_workload_container_resource_usage_memory_bytes_max",
+
++) -> float:
+
++    """
+
++    Get the memory usage history (in bytes) for a specific container.
+
++
+
++    Args:
+
++        namespace (str): The name of the Kubernetes namespace.
+
++        workload (str): The name of the workload (e.g., myapp).
+
++        container (str): The name of the container.
+
++        workload_type (str, optional): The type of workload. Default is "deployment".
+
++        lookback_minutes (int, optional): The number of minutes to look back in time for the query. Default is DEFAULT_LOOKBACK_MINUTES.
+
++        offset_minutes (int, optional): The offset in minutes for the query. Default is DEFAULT_OFFSET_MINUTES.
+
++        quantile_over_time (float, optional): The quantile value for the query. Default is DEFAULT_QUANTILE_OVER_TIME.
+
++        metric (str, optional): The metric used for the query. Default is "kube_workload_container_resource_usage_memory_bytes_max".
+
++
+
++
+
++    Returns:
+
++        float: The memory usage value in bytes.
+
++
+
++    Raises:
+
++        RuntimeError: If no data is found for the Prometheus query.
+
++
+
++    Example:
+
++        memory_usage = get_memory_bytes_usage_history("my-namespace", "my-deployment", "my-container")
+
++    """
+
++    query = 'quantile_over_time({quantile_over_time}, {metric}{{namespace="{namespace}", workload="{workload}", workload_type="{workload_type}", container="{container}"}}[{lookback_minutes}m] {offset_minutes_str})'.format(
+
++        quantile_over_time=quantile_over_time,
+
++        metric=metric,
+
++        namespace=namespace,
+
++        workload=workload,
+
++        workload_type=workload_type,
+
++        container=container,
+
++        lookback_minutes=lookback_minutes,
+
++        offset_minutes_str=format_offset_minutes(offset_minutes),
+
++    )
+
++    j = query_prometheus(query)
+
++
+
++    if j["data"]["result"] == []:
+
++        raise RuntimeError("No data found for prometheus query: {}".format(query))
+
++    return float(j["data"]["result"][0]["value"][1])
+
++
+
++
+
++@beartype
+
++def discover_container_runtime(
+
++    namespace: str, workload: str, container: str, workload_type: str = "deployment"
+
++) -> Optional[str]:
+
++    """
+
++    Discover the container runtime for a specific container.
+
++
+
++    Args:
+
++        namespace (str): The name of the Kubernetes namespace.
+
++        workload (str): The name of the workload (e.g., myapp).
+
++        container (str): The name of the container.
+
++        workload_type (str, optional): The type of workload. Default is "deployment".
+
++
+
++    Returns:
+
++        Optional[str]: The name of the container runtime, or None if it couldn't be determined.
+
++
+
++    Example:
+
++        runtime = discover_container_runtime("my-namespace", "my-deployment", "my-container")
+
++    """
+
++    if is_nodejs_container(namespace, workload, container, workload_type):
+
++        return "nodejs"
+
++    return None
+
++
+
++
+
++@beartype
+
++def get_hpa_for_deployment(
+
++    namespace_name: str, deployment_name: str
+
++) -> Optional[V2HorizontalPodAutoscaler]:
+
++    """
+
++    Get the Horizontal Pod Autoscaler (HPA) associated with a specific deployment.
+
++
+
++    Args:
+
++        namespace_name (str): The name of the Kubernetes namespace.
+
++        deployment_name (str): The name of the deployment.
+
++
+
++    Returns:
+
++        Optional[V2HorizontalPodAutoscaler]: The HPA object if found, or None if not found.
+
++
+
++    Example:
+
++        hpa = get_hpa_for_deployment("my-namespace", "my-deployment")
+
++    """
+
++    autoscaling_api = client.AutoscalingV2Api()
+
++    _logger.debug("Listing HPA for namespace: %s" % namespace_name)
+
++    for hpa in autoscaling_api.list_namespaced_horizontal_pod_autoscaler(
+
++        namespace=namespace_name
+
++    ).items:
+
++        _logger.debug(hpa)
+
++        if hpa.spec.scale_target_ref.kind != "Deployment":
+
++            continue
+
++        if hpa.spec.scale_target_ref.name != deployment_name:
+
++            continue
+
++        return hpa
+
++    return None
+
++
+
++
+
++@beartype
+
++def is_hpa_enabled_for_deployment(namespace_name: str, deployment_name: str) -> bool:
+
++    """
+
++    Check if Horizontal Pod Autoscaling (HPA) is enabled for a specific deployment.
+
++
+
++    Args:
+
++        namespace_name (str): The name of the Kubernetes namespace.
+
++        deployment_name (str): The name of the deployment.
+
++
+
++    Returns:
+
++        bool: True if HPA is enabled, False otherwise.
+
++
+
++    Example:
+
++        hpa_enabled = is_hpa_enabled_for_deployment("my-namespace", "my-deployment")
+
++    """
+
++    return get_hpa_for_deployment(namespace_name, deployment_name) is not None
+
++
+
++
+
++@beartype
+
++def calculate_quantile_over_time(namespace_name: str, deployment_name: str) -> dict:
+
++    """
+
++    Calculate the target ratio for Horizontal Pod Autoscaling (HPA) based on historical data.
+
++
+
++    Args:
+
++        namespace_name (str): The name of the Kubernetes namespace.
+
++        deployment_name (str): The name of the deployment.
+
++        lookback_minutes (int, optional): The number of minutes to look back in time for historical data. Default is DEFAULT_LOOKBACK_MINUTES.
+
++
+
++    Returns:
+
++        dict: A dictionary with target ratios for CPU and memory.
+
++
+
++    Example:
+
++        target_ratios = calculate_hpa_target_ratio("my-namespace", "my-deployment")
+
++    """
+
++
+
++    target_quantile_cpu = DEFAULT_QUANTILE_OVER_TIME_STATIC_CPU
+
++    target_quantile_memory = DEFAULT_QUANTILE_OVER_TIME_STATIC_MEMORY
+
++
+
++    hpa = get_hpa_for_deployment(namespace_name, deployment_name)
+
++    if hpa is None:
+
++        _logger.debug("Hpa not found for: %s" % deployment_name)
+
++        return {
+
++            "cpu": float(target_quantile_cpu),
+
++            "memory": float(target_quantile_memory),
+
++        }
+
++
+
++    for metric in hpa.spec.metrics:
+
++        if metric.type != "Resource":
+
++            continue
+
++        if metric.resource.name == "cpu":
+
++            target_quantile_cpu = DEFAULT_QUANTILE_OVER_TIME_HPA_CPU
+
++        if metric.resource.name == "memory":
+
++            target_quantile_memory = DEFAULT_QUANTILE_OVER_TIME_HPA_MEMORY
+
++
+
++    return {"cpu": float(target_quantile_cpu), "memory": float(target_quantile_memory)}
+
++
+
++# ... rest of the code remains unchanged ...
+
++```

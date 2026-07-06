@@ -1,0 +1,240 @@
+--- a/olclient/openlibrary.py
++++ b/olclient/openlibrary.py
+@@ -2,6 +2,7 @@
+ 
+ 
+ import json
++import asyncio
+ from typing import List, Dict, Optional, Any
+ 
+ import jsonschema
+@@ -12,8 +13,7 @@
+ from urllib.request import pathname2url
+ 
+ import backoff
+-import requests
+-from requests import Response
++import aiohttp
+ 
+ from olclient import common
+ from olclient.config import Config
+@@ -21,6 +21,104 @@
+ from olclient.utils import merge_unique_lists
+ 
+ logger = logging.getLogger('openlibrary')
++
++
++class _AiohttpResponse:
++    def __init__(self, *, url, status, headers, body):
++        self.url = url
++        self.status = status
++        self.headers = headers
++        self._body = body
++
++    def json(self):
++        return self._body
++
++    def raise_for_status(self):
++        return None
++
++
++class _AiohttpSession:
++    def __init__(self, base_url):
++        self._base_url = base_url
++        self._loop = asyncio.new_event_loop()
++        self._cookie_jar = aiohttp.CookieJar(unsafe=True, loop=self._loop)
++
++    @property
++    def cookies(self):
++        return self._cookie_jar.filter_cookies(self._base_url)
++
++    def get(self, url, **kwargs):
++        return self._request('GET', url, **kwargs)
++
++    def post(self, url, data=None, json=None, **kwargs):
++        if data is not None:
++            kwargs['data'] = data
++        if json is not None:
++            kwargs['json'] = json
++        return self._request('POST', url, **kwargs)
++
++    def put(self, url, data=None, json=None, **kwargs):
++        if data is not None:
++            kwargs['data'] = data
++        if json is not None:
++            kwargs['json'] = json
++        return self._request('PUT', url, **kwargs)
++
++    def close(self):
++        if not self._loop.is_closed():
++            self._loop.close()
++        return None
++
++    def _request(self, method, url, **kwargs):
++        return self._loop.run_until_complete(self._request_async(method, url, **kwargs))
++
++    async def _request_async(self, method, url, **kwargs):
++        files = kwargs.pop('files', None)
++        if files is not None:
++            form_data = aiohttp.FormData()
++            for name, value in files.items():
++                if isinstance(value, tuple):
++                    if len(value) == 2:
++                        filename, field_value = value
++                        if filename is None:
++                            form_data.add_field(name, field_value, filename='')
++                        else:
++                            form_data.add_field(name, field_value, filename=filename)
++                    elif len(value) == 3:
++                        filename, field_value, content_type = value
++                        if filename is None:
++                            form_data.add_field(
++                                name,
++                                field_value,
++                                filename='',
++                                content_type=content_type,
++                            )
++                        else:
++                            form_data.add_field(
++                                name,
++                                field_value,
++                                filename=filename,
++                                content_type=content_type,
++                            )
++                    else:
++                        form_data.add_field(name, value[1])
++                else:
++                    form_data.add_field(name, value, filename='')
++            kwargs['data'] = form_data
++
++        async with aiohttp.ClientSession(cookie_jar=self._cookie_jar) as session:
++            async with session.request(method, url, **kwargs) as response:
++                response.raise_for_status()
++                try:
++                    body = await response.json(content_type=None)
++                except (aiohttp.ContentTypeError, ValueError):
++                    body = await response.text()
++                return _AiohttpResponse(
++                    url=str(response.url),
++                    status=response.status,
++                    headers=response.headers,
++                    body=body,
++                )
+ 
+ 
+ class OpenLibrary:
+@@ -51,9 +149,8 @@
+     VALID_IDS = ['isbn_10', 'isbn_13', 'lccn', 'ocaid']
+     BACKOFF_KWARGS = {
+         'wait_gen': backoff.expo,
+-        'exception': requests.exceptions.RequestException,
+-        'giveup': lambda e: hasattr(e.response, 'status_code')
+-        and 400 <= e.response.status_code < 500,
++        'exception': aiohttp.ClientError,
++        'giveup': lambda e: 400 <= getattr(e, 'status', 0) < 500,
+         'max_tries': 5,
+     }
+ 
+@@ -62,14 +159,17 @@
+     WORKS_PAGINATION_OFFSET = 0
+ 
+     def __init__(self, credentials=None, base_url='https://openlibrary.org'):
+-        self.session = requests.Session()
++        self.session = _AiohttpSession(base_url)
+         self.base_url = base_url
+         credentials = credentials or Config().get_config().get('s3', None)
+         if credentials:
+             self.login(credentials)
+ 
++    def close(self):
++        return self.session.close()
++
+     def login(self, credentials):
+-        """Login to Open Library with given credentials, ensures the requests
++        """Login to Open Library with given credentials, ensures the HTTP
+         session has valid cookies for future requests.
+         """
+ 
+@@ -78,7 +178,7 @@
+             data = urlencode(credentials._asdict())
+         else:  # s3 login
+             headers = {'Content-Type': 'application/json'}
+-            data = json.dumps(credentials._asdict())
++            data = credentials._asdict()
+         url = self.base_url + '/account/login'
+ 
+         err = lambda e: logger.exception("Error at login: %s", e)
+@@ -86,7 +186,7 @@
+         @backoff.on_exception(on_giveup=err, **self.BACKOFF_KWARGS)
+         def _login(url, headers, data):
+             """Makes best effort to perform request w/ exponential backoff"""
+-            return self.session.post(url, data=data, headers=headers)
++            return self.session.post(url, json=data, headers=headers)
+ 
+         _ = _login(url, headers, data)
+ 
+@@ -115,11 +215,11 @@
+         CAUTION: This does not make any checks for backreference consistency,
+         Editions could be orphaned, or books left without Authors. Use with care!
+         """
+-        data = json.dumps({'type': {'key': '/type/delete'}, '_comment': comment})
++        data = {'type': {'key': '/type/delete'}, '_comment': comment}
+         url = self._generate_url_from_olid(olid)
+-        return self.session.put(url, data=data)
+-
+-    def save_many(self, docs, comment) -> Response:
++        return self.session.put(url, json=data)
++
++    def save_many(self, docs, comment) -> Any:
+         """
+         Uses the Open Library save_many API endpoint to
+         write any number or combination of documents (Edition, Work, or Author)
+@@ -132,10 +232,10 @@
+         }
+         doc_json = [doc.json() for doc in docs]
+         return self.session.post(
+-            f'{self.base_url}/api/save_many', json.dumps(doc_json), headers=headers
++            f'{self.base_url}/api/save_many', json=doc_json, headers=headers
+         )
+ 
+-    def delete_many(self, ol_ids: List[str], comment: str) -> Response:
++    def delete_many(self, ol_ids: List[str], comment: str) -> Any:
+         return self.save_many(
+             [self.Delete(ol_id) for ol_id in ol_ids],
+             comment=comment
+@@ -284,7 +384,7 @@
+                 body = self.json()
+                 body['_comment'] = comment
+                 url = self.OL.base_url + f'/books/{self.olid}.json'
+-                return self.OL.session.put(url, json.dumps(body))
++                return self.OL.session.put(url, json=body)
+ 
+             @classmethod
+             def create(cls, book, work_olid, debug=False):
+@@ -517,7 +617,7 @@
+                 body = self.json()
+                 body['_comment'] = comment
+                 url = self.OL.base_url + f'/authors/{self.olid}.json'
+-                return self.OL.session.put(url, json.dumps(body))
++                return self.OL.session.put(url, json=body)
+ 
+             def works(self, limit=OL.WORKS_LIMIT, offset=OL.WORKS_PAGINATION_OFFSET):
+                 """Returns a list of OpenLibrary Works associated with an OpenLibrary Author.
+@@ -691,7 +791,7 @@
+                 body = self.json()
+                 body['_comment'] = comment
+                 url = self.OL._generate_url_from_olid(self.olid)
+-                return self.OL.session.put(url, json.dumps(body))
++                return self.OL.session.put(url, json=body)
+ 
+         return Delete
+ 
+@@ -738,7 +838,7 @@
+                 body = self.json()
+                 body['_comment'] = comment
+                 url = self.OL._generate_url_from_olid(self.olid)
+-                return self.OL.session.put(url, json.dumps(body))
++                return self.OL.session.put(url, json=body)
+ 
+         return Redirect
+ 

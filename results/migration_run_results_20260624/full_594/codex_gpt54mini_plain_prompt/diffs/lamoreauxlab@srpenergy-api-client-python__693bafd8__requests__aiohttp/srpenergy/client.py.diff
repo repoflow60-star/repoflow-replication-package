@@ -1,0 +1,199 @@
+diff --git a/srpenergy/client.py b/srpenergy/client.py
+index 113b89f..be7aa2e 100644
+--- a/srpenergy/client.py
++++ b/srpenergy/client.py
+@@ -1,17 +1,27 @@
+-"""Client module.
+-
+-This module houses the main class used to fetch energy usage.
+-
+-"""
+-
+-from datetime import datetime, timedelta
+-import re
+-from urllib.parse import unquote
+-
+-from dateutil.parser import parse
+-import requests
+-
+-BASE_USAGE_URL = "https://myaccount.srpnet.com/myaccountapi/api/"
++"""Client module.
++
++This module houses the main class used to fetch energy usage.
++
++"""
++
++import asyncio
++import http.cookiejar
++import json
++import re
++import threading
++from datetime import datetime, timedelta
++from types import SimpleNamespace
++from urllib.parse import unquote, urlencode
++from urllib.request import HTTPCookieProcessor, Request, build_opener
++
++from dateutil.parser import parse
++
++try:
++    import aiohttp
++except ImportError:  # pragma: no cover
++    aiohttp = None
++
++BASE_USAGE_URL = "https://myaccount.srpnet.com/myaccountapi/api/"
+ 
+ 
+ def get_pretty_date(date_part):
+@@ -26,7 +36,7 @@ def get_pretty_time(date_part):
+     return date.strftime("%H:%M %p")
+ 
+ 
+-def get_rate(str_usage_time):
++def get_rate(str_usage_time):
+     """Return the time of use pricing for the given time.
+ 
+     From the SRP website
+@@ -109,10 +119,139 @@ def get_rate(str_usage_time):
+     else:
+         rate = non_peak_rate
+ 
+-    return rate, is_peak
+-
+-
+-class SrpEnergyClient:
++    return rate, is_peak
++
++
++class _Response:
++    """Simple response wrapper with a requests-like surface."""
++
++    def __init__(self, json_data, cookies=None, status_code=200):
++        self._json_data = json_data
++        self.cookies = cookies or {}
++        self.status_code = status_code
++
++    def json(self):
++        """Return the parsed JSON payload."""
++        return self._json_data
++
++
++class _Session:
++    """Compatibility session that uses aiohttp when available."""
++
++    def __init__(self):
++        self._loop = None
++        self._thread = None
++        self._session = None
++        self._cookie_jar = None
++        self._opener = None
++
++    def __enter__(self):
++        """Enter the context manager."""
++        if aiohttp is not None:
++            self._start_aiohttp_session()
++
++        return self
++
++    def __exit__(self, exc_type, exc_value, traceback):  # noqa: D401
++        """Exit the context manager."""
++        if aiohttp is not None:
++            self._close_aiohttp_session()
++
++        return False
++
++    def _start_aiohttp_session(self):
++        """Start the background event loop used by aiohttp."""
++        if self._loop is not None:
++            return
++
++        self._loop = asyncio.new_event_loop()
++        self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
++        self._thread.start()
++        self._session = self._run_coroutine(self._create_aiohttp_session())
++
++    async def _create_aiohttp_session(self):
++        """Create a client session on the background event loop."""
++        return aiohttp.ClientSession()
++
++    def _close_aiohttp_session(self):
++        """Close the aiohttp session and loop."""
++        if self._loop is None:
++            return
++
++        if self._session is not None:
++            self._run_coroutine(self._session.close())
++            self._session = None
++
++        self._loop.call_soon_threadsafe(self._loop.stop)
++        if self._thread is not None:
++            self._thread.join()
++            self._thread = None
++
++        self._loop.close()
++        self._loop = None
++
++    def _run_coroutine(self, coroutine):
++        """Run a coroutine on the background loop."""
++        future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
++        return future.result()
++
++    async def _request_aiohttp(self, method, url, **kwargs):
++        """Execute an aiohttp request and adapt the response."""
++        async with self._session.request(method, url, **kwargs) as response:
++            payload = await response.json(content_type=None)
++            cookies = {name: morsel.value for name, morsel in response.cookies.items()}
++            return _Response(payload, cookies, response.status)
++
++    def _ensure_urllib(self):
++        """Create the fallback urllib transport."""
++        if self._opener is not None:
++            return
++
++        self._cookie_jar = http.cookiejar.CookieJar()
++        self._opener = build_opener(HTTPCookieProcessor(self._cookie_jar))
++
++    def _request_urllib(self, method, url, data=None, headers=None):
++        """Execute a request using urllib as a local fallback."""
++        self._ensure_urllib()
++
++        request_data = data
++        if isinstance(data, dict):
++            request_data = urlencode(data).encode()
++        elif isinstance(data, str):
++            request_data = data.encode()
++
++        request = Request(url, data=request_data, headers=headers or {}, method=method)
++        with self._opener.open(request) as response:
++            payload = json.loads(response.read().decode())
++            cookies = {
++                cookie.name: cookie.value
++                for cookie in self._cookie_jar
++            }
++            return _Response(payload, cookies, response.status)
++
++    def get(self, url, headers=None):
++        """Execute a GET request."""
++        if aiohttp is None:
++            return self._request_urllib("GET", url, headers=headers)
++
++        self._start_aiohttp_session()
++        return self._run_coroutine(self._request_aiohttp("GET", url, headers=headers))
++
++    def post(self, url, data=None, headers=None):
++        """Execute a POST request."""
++        if aiohttp is None:
++            return self._request_urllib("POST", url, data=data, headers=headers)
++
++        self._start_aiohttp_session()
++        return self._run_coroutine(
++            self._request_aiohttp("POST", url, data=data, headers=headers)
++        )
++
++
++requests = SimpleNamespace(Session=_Session)
++
++
++class SrpEnergyClient:
+     """SrpEnergyClient(accountid, username, password).
+ 
+     Client used to fetch srp energy usage.

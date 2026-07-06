@@ -1,0 +1,179 @@
+--- a/qface/generator.py
++++ b/qface/generator.py
+@@ -1,10 +1,8 @@
+ 
+ # Copyright (c) Pelagicore AB 2016
+ 
+-from jinja2 import Environment, Template, Undefined, StrictUndefined
+-from jinja2 import FileSystemLoader, PackageLoader, ChoiceLoader
+-from jinja2 import TemplateSyntaxError, TemplateNotFound, TemplateError
+ from pathlib import Path
++from types import SimpleNamespace
+ from antlr4 import InputStream, FileStream, CommonTokenStream, ParseTreeWalker
+ from antlr4.error import DiagnosticErrorListener, ErrorListener
+ import shelve
+@@ -14,6 +12,9 @@
+ import click
+ import sys
+ import os
++from mako import exceptions as mako_exceptions
++from mako.lookup import TemplateLookup
++from mako.template import Template
+ 
+ import antlr4.atn.ATNDeserializer
+ if (antlr4.atn.ATNDeserializer.SERIALIZED_VERSION == 3):
+@@ -45,14 +46,6 @@
+         else:
+             a[key] = b[key]
+     return a
+-
+-
+-class TestableUndefined(StrictUndefined):
+-    """Return an error for all undefined values, but allow testing them in if statements"""
+-    def __bool__(self):
+-        return False
+-
+-
+ class ReportingErrorListener(ErrorListener.ErrorListener):
+     """ Provides an API for accessing the file system and controlling the generator """
+     def __init__(self, document):
+@@ -81,22 +74,57 @@
+     def __init__(self, search_path, context={}, force=False):
+         if not isinstance(search_path, (list, tuple)):
+             search_path = [search_path]
+-        loader = ChoiceLoader([
+-            FileSystemLoader(search_path),
+-            PackageLoader('qface')
+-        ])
+-        self.env = Environment(
+-            loader=loader,
+-            trim_blocks=True,
+-            lstrip_blocks=True,
++        template_dirs = [str(path) for path in search_path]
++        template_dirs.append(str(Path(__file__).resolve().parent / 'templates'))
++        self.lookup = TemplateLookup(
++            directories=template_dirs,
++            strict_undefined=Generator.strict,
++            input_encoding='utf-8',
+         )
+-        self.env.filters.update(get_filters())
++        self._filters = get_filters()
+         self._destination = Path()
+         self._path = Path()
+         self._source = ''
+         self.context = context
+         self.force = force
+ 
++    def _namespace(self, values):
++        children = {}
++        for name, value in values.items():
++            target = children
++            parts = name.split('.')
++            for part in parts[:-1]:
++                target = target.setdefault(part, {})
++            target[parts[-1]] = value
++
++        def build(node):
++            if isinstance(node, dict):
++                return SimpleNamespace(**{key: build(value) for key, value in node.items()})
++            return node
++
++        return {key: build(value) for key, value in children.items()}
++
++    def _render_context(self, context=None):
++        render_context = dict(self.context)
++        if context:
++            render_context.update(context)
++        render_context.update(self._namespace(self._filters))
++        return render_context
++
++    def _template_error(self, exc):
++        if isinstance(exc, getattr(mako_exceptions, 'TopLevelLookupException', Exception)):
++            name = getattr(exc, 'uri', None) or getattr(exc, 'filename', None) or str(exc)
++            return '{0}: error: Template not found'.format(name)
++        if isinstance(exc, getattr(mako_exceptions, 'SyntaxException', Exception)) or isinstance(exc, getattr(mako_exceptions, 'CompileException', Exception)):
++            return '{0}:{1}: error: {2}'.format(getattr(exc, 'filename', '<template>'), getattr(exc, 'lineno', 0), exc)
++        traceback = mako_exceptions.RichTraceback()
++        frames = getattr(traceback, 'traceback', [])
++        if frames:
++            filename, lineno, function, line = frames[-1]
++        else:
++            filename, lineno = '<template>', 0
++        return '{0}:{1}: error: {2}'.format(filename, lineno, getattr(traceback, 'error', exc))
++
+     @property
+     def destination(self):
+         """destination prefix for generator write"""
+@@ -132,35 +160,30 @@
+ 
+     @property
+     def filters(self):
+-        return self.env.filters
++        return self._filters
+ 
+     @filters.setter
+     def filters(self, filters):
+-        self.env.filters.update(filters)
++        self._filters.update(filters)
+ 
+     def get_template(self, name):
+         """Retrieves a single template file from the template loader"""
+         source = name
+         if name and name[0] == '/':
+             source = name[1:]
+-        elif self.source is not None:
++        elif self.source:
+             source = '/'.join((self.source, name))
+-        return self.env.get_template(source)
++        return self.lookup.get_template(source)
+ 
+     def render(self, name, context):
+         """Returns the rendered text from a single template file from the
+         template loader using the given context data"""
+-        if Generator.strict:
+-            self.env.undefined = TestableUndefined
+-        else:
+-            self.env.undefined = Undefined
+         template = self.get_template(name)
+-        return template.render(context)
++        return template.render(**self._render_context(context))
+ 
+     def apply(self, template, context={}):
+-        context.update(self.context)
+         """Return the rendered text of a template instance"""
+-        return self.env.from_string(template).render(context)
++        return Template(template, lookup=self.lookup, strict_undefined=Generator.strict).render(**self._render_context(context))
+ 
+     def write(self, file_path, template, context={}, preserve=False, force=False):
+         """Using a template file name it renders a template
+@@ -174,19 +197,8 @@
+         error = False
+         try:
+             self._write(file_path, template, context, preserve, force)
+-        except TemplateSyntaxError as exc:
+-            message = '{0}:{1}: error: {2}'.format(exc.filename, exc.lineno, exc.message)
+-            click.secho(message, fg='red', err=True)
+-            error = True
+-        except TemplateNotFound as exc:
+-            message = '{0}: error: Template not found'.format(exc.name)
+-            click.secho(message, fg='red', err=True)
+-            error = True
+-        except TemplateError as exc:
+-            exc_tb = sys.exc_info()[2]
+-            while exc_tb.tb_next != None:
+-                exc_tb = exc_tb.tb_next
+-            message = '{0}:{1}: error: {2}'.format(exc_tb.tb_frame.f_code.co_filename, exc_tb.tb_lineno, exc.message)
++        except Exception as exc:
++            message = self._template_error(exc)
+             click.secho(message, fg='red', err=True)
+             error = True
+ 
+@@ -216,7 +228,7 @@
+ 
+     def register_filter(self, name, callback):
+         """Register your custom template filter"""
+-        self.env.filters[name] = callback
++        self._filters[name] = callback
+ 
+ 
+ class RuleGenerator(Generator):

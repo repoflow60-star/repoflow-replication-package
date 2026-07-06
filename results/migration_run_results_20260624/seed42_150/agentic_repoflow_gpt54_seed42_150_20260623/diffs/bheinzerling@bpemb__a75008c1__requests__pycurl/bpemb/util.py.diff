@@ -1,0 +1,107 @@
+--- a/bpemb/util.py
++++ b/bpemb/util.py
+@@ -12,38 +12,72 @@
+ 
+ # source: https://github.com/allenai/allennlp/blob/master/allennlp/common/file_utils.py#L147  # NOQA
+ def http_get_temp(url: str, temp_file: IO) -> None:
+-    import requests
+-    import warnings
+-    from urllib3.exceptions import InsecureRequestWarning
++    import pycurl
++    from urllib.error import HTTPError
+ 
+-    # temporary fix for dealing with this SSL certificate issue:
+-    # https://github.com/bheinzerling/bpemb/issues/63
+-    with warnings.catch_warnings():
+-        warnings.simplefilter("ignore", InsecureRequestWarning)
+-        req = requests.get(url, stream=True, verify=False)
+-
+-    req.raise_for_status()
+-    content_length = req.headers.get('Content-Length')
+-    total = int(content_length) if content_length is not None else None
++    headers = {}
+     try:
+         from tqdm import tqdm
+-        progress = tqdm(unit="B", total=total)
+     except ImportError:
+-        progress = None
+-    for chunk in req.iter_content(chunk_size=1024):
+-        if chunk:  # filter out keep-alive new chunks
+-            if progress is not None:
+-                progress.update(len(chunk))
+-            temp_file.write(chunk)
+-    if progress is not None:
+-        progress.close()
+-    return req.headers
++        tqdm = None
++
++    progress = None
++
++    def on_header(header_line: bytes) -> int:
++        header = header_line.decode("iso-8859-1").strip()
++        if not header:
++            return len(header_line)
++        if header.startswith("HTTP/"):
++            headers.clear()
++            return len(header_line)
++        name, sep, value = header.partition(":")
++        if sep:
++            value = value.strip()
++            headers[name] = value
++            headers[name.lower()] = value
++        return len(header_line)
++
++    def on_write(chunk: bytes) -> int:
++        nonlocal progress
++        if progress is None and tqdm is not None:
++            content_length = headers.get("Content-Length")
++            total = int(content_length) if content_length is not None else None
++            progress = tqdm(unit="B", total=total)
++        if progress is not None:
++            progress.update(len(chunk))
++        temp_file.write(chunk)
++        return len(chunk)
++
++    curl = pycurl.Curl()
++    curl.setopt(pycurl.URL, url)
++    curl.setopt(pycurl.FOLLOWLOCATION, True)
++    curl.setopt(pycurl.FAILONERROR, True)
++    curl.setopt(pycurl.SSL_VERIFYPEER, False)
++    curl.setopt(pycurl.SSL_VERIFYHOST, False)
++    curl.setopt(pycurl.HEADERFUNCTION, on_header)
++    curl.setopt(pycurl.WRITEFUNCTION, on_write)
++
++    try:
++        try:
++            curl.perform()
++        except pycurl.error as exc:
++            status = curl.getinfo(pycurl.RESPONSE_CODE)
++            if status >= 400:
++                raise HTTPError(url, status, "HTTP error {}".format(status), headers, None) from exc
++            raise
++    finally:
++        curl.close()
++        if progress is not None:
++            progress.close()
++
++    return headers
+ 
+ 
+ # source: https://github.com/allenai/allennlp/blob/master/allennlp/common/file_utils.py#L147  # NOQA
+ def http_get(url: str, outfile: Path, ignore_tardir=False) -> None:
+     import tempfile
+     import shutil
++    import tarfile
+     with tempfile.NamedTemporaryFile() as temp_file:
+         headers = http_get_temp(url, temp_file)
+         # we are copying the file before closing it, flush to avoid truncation
+@@ -52,8 +86,7 @@
+         temp_file.seek(0)
+         outfile.parent.mkdir(exist_ok=True, parents=True)
+         content_header = headers.get("Content-Type")
+-        if content_header and "gzip" in content_header:
+-            import tarfile
++        if (content_header and "gzip" in content_header) or url.endswith(".tar.gz"):
+             tf = tarfile.open(fileobj=temp_file)
+             members = tf.getmembers()
+             if len(members) != 1:

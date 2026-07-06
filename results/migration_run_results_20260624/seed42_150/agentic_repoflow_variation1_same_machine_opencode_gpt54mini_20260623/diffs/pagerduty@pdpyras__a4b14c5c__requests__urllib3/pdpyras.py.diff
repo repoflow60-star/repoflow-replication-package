@@ -1,0 +1,290 @@
+--- a/pdpyras.py
++++ b/pdpyras.py
+@@ -3,24 +3,197 @@
+ # See LICENSE for details.
+ 
+ # Standard libraries
++import json
+ import logging
+ import sys
+ import time
+ from copy import deepcopy
+-from datetime import datetime
++from datetime import datetime, timedelta
+ from random import random
++from types import SimpleNamespace
+ from typing import Iterator, Union
++from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+ from warnings import warn
+ 
++try:
++    from importlib.metadata import PackageNotFoundError, version as package_version
++except ImportError:
++    from pkg_resources import DistributionNotFound as PackageNotFoundError
++    from pkg_resources import get_distribution
++
++    def package_version(name):
++        return get_distribution(name).version
++
+ # Upstream components on which this client is based:
+-from requests import Response, Session
+-from requests import __version__ as REQUESTS_VERSION
++from urllib3 import PoolManager
+ 
+ # HTTP client exceptions:
+ from urllib3.exceptions import HTTPError, PoolError
+-from requests.exceptions import RequestException
++
++RequestException = HTTPError
+ 
+ __version__ = '5.4.0'
++
++
++class Response:
++    """Compatibility wrapper for urllib3 responses."""
++
++    def __init__(self, method, url, status_code, headers, body, elapsed,
++            reason=None, raw=None, request_body=None):
++        self.request = SimpleNamespace(
++            method=method,
++            url=url,
++            headers={},
++            body=body if request_body is None else request_body,
++        )
++        self.status_code = 0 if status_code is None else status_code
++        self.status = self.status_code
++        self.headers = headers or {}
++        self.elapsed = elapsed if isinstance(elapsed, timedelta) else \
++            timedelta(seconds=elapsed or 0)
++        self.reason = reason
++        self.url = url
++        self.raw = raw
++        self._body = body
++
++    @property
++    def ok(self):
++        return bool(self.status_code) and 200 <= self.status_code < 400
++
++    def __bool__(self):
++        return self.ok
++
++    @property
++    def text(self):
++        if isinstance(self._body, (bytes, bytearray, memoryview)):
++            return bytes(self._body).decode('utf-8', errors='replace')
++        if isinstance(self._body, str):
++            return self._body
++        if self.raw is not None:
++            raw_text = getattr(self.raw, 'text', None)
++            if isinstance(raw_text, str):
++                return raw_text
++        return ''
++
++    @property
++    def content(self):
++        if isinstance(self._body, (bytes, bytearray, memoryview)):
++            return bytes(self._body)
++        if isinstance(self._body, str):
++            return self._body.encode('utf-8')
++        if self.raw is not None:
++            raw_data = getattr(self.raw, 'data', None)
++            if isinstance(raw_data, (bytes, bytearray, memoryview)):
++                return bytes(raw_data)
++            raw_content = getattr(self.raw, 'content', None)
++            if isinstance(raw_content, (bytes, bytearray, memoryview)):
++                return bytes(raw_content)
++            raw_text = getattr(self.raw, 'text', None)
++            if isinstance(raw_text, str):
++                return raw_text.encode('utf-8')
++        return b''
++
++    def json(self):
++        if not isinstance(self._body, (bytes, bytearray, memoryview, str)):
++            try:
++                return json.loads(self.text)
++            except ValueError:
++                pass
++        if self.raw is not None:
++            raw_json = getattr(self.raw, 'json', None)
++            if callable(raw_json):
++                value = raw_json()
++                if value is not None:
++                    return value
++        return json.loads(self.text)
++
++
++def merge_query_params(url, params):
++    """Merge query parameters into a URL."""
++    if not params:
++        return url
++    split = urlsplit(url)
++    query = parse_qsl(split.query, keep_blank_values=True)
++    if hasattr(params, 'items'):
++        query.extend(params.items())
++    else:
++        query.extend(params)
++    return urlunsplit((
++        split.scheme,
++        split.netloc,
++        split.path,
++        urlencode(query, doseq=True),
++        split.fragment,
++    ))
++
++
++class HTTPClient:
++    """Thin urllib3 adapter that accepts requests-style kwargs."""
++
++    def __init__(self):
++        self._pool = PoolManager(retries=False)
++
++    def request(self, method, url, **kwargs):
++        method = method.upper()
++        start = time.monotonic()
++        req_kw = deepcopy(kwargs)
++        headers = req_kw.pop('headers', {})
++        params = req_kw.pop('params', None)
++        if params:
++            url = merge_query_params(url, params)
++
++        data = req_kw.pop('data', None)
++        body = req_kw.pop('body', None)
++        fields = req_kw.pop('fields', None)
++        json_body = req_kw.pop('json', None)
++        timeout = req_kw.pop('timeout', TIMEOUT)
++        redirect = req_kw.pop('redirect', req_kw.pop('allow_redirects', None))
++        if redirect is None:
++            redirect = method.upper() in ('GET', 'HEAD', 'OPTIONS')
++        req_kw.pop('stream', None)
++        req_kw.pop('retries', None)
++        req_kw.pop('preload_content', None)
++
++        if json_body is not None:
++            body = json.dumps(json_body).encode('utf-8')
++        elif body is None and fields is None and data is not None:
++            if hasattr(data, 'items') or isinstance(data, (list, tuple)):
++                fields = data
++            else:
++                body = data
++        if body is not None and isinstance(body, str):
++            body = body.encode('utf-8')
++
++        raw_response = self._pool.request(
++            method,
++            url,
++            headers=headers,
++            body=body,
++            fields=fields,
++            timeout=timeout,
++            redirect=redirect,
++            retries=False,
++            preload_content=True,
++            **req_kw,
++        )
++        elapsed = time.monotonic() - start
++        response_body = getattr(raw_response, 'data', None)
++        if response_body is None:
++            response_body = getattr(raw_response, 'content', None)
++        if response_body is None:
++            response_body = getattr(raw_response, 'text', None)
++        status_code = getattr(raw_response, 'status', getattr(raw_response, 'status_code', 0))
++        return Response(
++            method=method,
++            url=url,
++            status_code=status_code,
++            headers=getattr(raw_response, 'headers', {}) or {},
++            body=response_body,
++            elapsed=elapsed,
++            reason=getattr(raw_response, 'reason', None),
++            raw=raw_response,
++            request_body=body if body is not None else fields,
++        )
+ 
+ #######################
+ ### CLIENT DEFAULTS ###
+@@ -862,7 +1035,7 @@
+ ### CLASSES ###
+ ###############
+ 
+-class PDSession(Session):
++class PDSession:
+     """
+     Base class for making HTTP requests to PagerDuty APIs
+ 
+@@ -911,7 +1084,7 @@
+     """
+ 
+     parent = None
+-    """The ``super`` object (`requests.Session`_)"""
++    """Internal HTTP client object."""
+ 
+     permitted_methods = ()
+     """
+@@ -966,8 +1139,8 @@
+     url = ""
+ 
+     def __init__(self, api_key: str, debug=False):
+-        self.parent = super(PDSession, self)
+-        self.parent.__init__()
++        self.parent = HTTPClient()
++        self.headers = {}
+         self.api_key = api_key
+         self.log = logging.getLogger(__name__)
+         self.print_debug = debug
+@@ -1100,7 +1273,7 @@
+             The path/URL to request. If it does not start with the base URL, the
+             base URL will be prepended.
+         :param **kwargs:
+-            Custom keyword arguments to pass to ``requests.Session.request``.
++            Custom keyword arguments to pass to the underlying HTTP client.
+         :type method: str
+         :type url: str
+         :returns:
+@@ -1122,6 +1295,7 @@
+         headers = kwargs.get('headers', {})
+         req_kw.update({
+             'headers': self.prepare_headers(method, user_headers=headers),
++            'data': req_kw.get('data', None),
+             'stream': False,
+             'timeout': self.timeout
+         })
+@@ -1135,7 +1309,7 @@
+             try:
+                 response = self.parent.request(method, full_url, **req_kw)
+                 self.postprocess(response)
+-            except (HTTPError, PoolError, RequestException) as e:
++            except (HTTPError, PoolError) as e:
+                 network_attempts += 1
+                 if network_attempts > self.max_network_attempts:
+                     error_msg = f"{endpoint}: Non-transient network " \
+@@ -1237,12 +1411,29 @@
+ 
+     @property
+     def user_agent(self) -> str:
++        try:
++            requests_version = package_version('requests')
++        except PackageNotFoundError:
++            requests_version = 'unknown'
+         return 'pdpyras/%s python-requests/%s Python/%d.%d'%(
+             __version__,
+-            REQUESTS_VERSION,
++            requests_version,
+             sys.version_info.major,
+             sys.version_info.minor
+         )
++
++    def get(self, url, **kwargs) -> Response:
++        kwargs.setdefault('allow_redirects', True)
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, **kwargs) -> Response:
++        return self.request('POST', url, **kwargs)
++
++    def put(self, url, **kwargs) -> Response:
++        return self.request('PUT', url, **kwargs)
++
++    def delete(self, url, **kwargs) -> Response:
++        return self.request('DELETE', url, **kwargs)
+ 
+ class EventsAPISession(PDSession):
+ 

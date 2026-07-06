@@ -1,0 +1,244 @@
+--- a/github_nonpublic_api/api.py
++++ b/github_nonpublic_api/api.py
+@@ -17,15 +17,132 @@
+ import os.path
+ import functools
+ from enum import Enum
++import http.cookies
+ import re
++from urllib.parse import urlencode
+ from urllib.parse import urljoin
+ 
+ import html5lib
+ import pyotp
+-import requests
++import urllib3
+ from absl import logging
+ from configobj import ConfigObj
+ from typing import Optional
++
++
++class _HTTPError(RuntimeError):
++    def __init__(self, response):
++        super().__init__(f"{response.status_code} Error for url: {response.url}")
++        self.response = response
++
++
++class _HistoryResponse:
++    def __init__(self, url: str):
++        self.url = url
++
++
++class _Response:
++    def __init__(self, response, url: str, history):
++        self._response = response
++        self.status_code = response.status
++        self.url = url
++        self.history = history
++        self.content = response.data
++        self.text = _decode_body(response.headers, response.data)
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise _HTTPError(self)
++
++
++class _CookieJar:
++    def __init__(self):
++        self._cookies = {}
++
++    def clear(self):
++        self._cookies.clear()
++
++    def get_header(self):
++        if not self._cookies:
++            return None
++        return "; ".join(f"{key}={value}" for key, value in self._cookies.items())
++
++    def update(self, headers):
++        set_cookie_values = []
++        getlist = getattr(headers, "getlist", None)
++        if callable(getlist):
++            set_cookie_values = getlist("Set-Cookie") or getlist("set-cookie")
++        else:
++            get_all = getattr(headers, "get_all", None)
++            if callable(get_all):
++                set_cookie_values = get_all("Set-Cookie") or []
++            else:
++                cookie = headers.get("Set-Cookie")
++                if cookie:
++                    set_cookie_values = [cookie]
++
++        for cookie_header in set_cookie_values:
++            jar = http.cookies.SimpleCookie()
++            jar.load(cookie_header)
++            for key, morsel in jar.items():
++                self._cookies[key] = morsel.value
++
++
++class _Session:
++    def __init__(self):
++        self._pool = urllib3.PoolManager()
++        self.cookies = _CookieJar()
++
++    def get(self, url: str):
++        return self._request("GET", url)
++
++    def post(self, url: str, data=None):
++        return self._request("POST", url, data=data)
++
++    def _request(self, method: str, url: str, data=None):
++        history = []
++        body = None
++        if data is not None:
++            body = urlencode(data).encode("utf-8")
++
++        for _ in range(10):
++            headers = {}
++            cookie_header = self.cookies.get_header()
++            if cookie_header:
++                headers["Cookie"] = cookie_header
++            if body is not None:
++                headers["Content-Type"] = "application/x-www-form-urlencoded"
++
++            response = self._pool.request(
++                method,
++                url,
++                body=body,
++                headers=headers or None,
++                redirect=False,
++            )
++            self.cookies.update(response.headers)
++
++            if response.status not in (301, 302, 303, 307, 308):
++                return _Response(response, url, history)
++
++            location = response.headers.get("Location")
++            if not location:
++                return _Response(response, url, history)
++
++            history.append(_HistoryResponse(url))
++            url = urljoin(url, location)
++            if response.status in (301, 302, 303):
++                method = "GET"
++                body = None
++
++        return _Response(response, url, history)
++
++
++def _decode_body(headers, data):
++    content_type = headers.get("Content-Type", "")
++    match = re.search(r"charset=([^;\s]+)", content_type)
++    encoding = match.group(1) if match else "utf-8"
++    return data.decode(encoding, errors="replace")
+ 
+ 
+ def _get_and_submit_form(
+@@ -85,10 +202,10 @@
+     username: str,
+     password: str,
+     tfa_callback,
+-    session: Optional[requests.Session] = None,
+-) -> requests.Session:
+-    """Create a requests.Session object with logged in GitHub cookies for the user."""
+-    session = session or requests.Session()
++    session: Optional[_Session] = None,
++) -> _Session:
++    """Create an urllib3-backed session object with logged in GitHub cookies."""
++    session = session or _Session()
+ 
+     # Clear cookies before re-authentication
+     session.cookies.clear()
+@@ -150,7 +267,7 @@
+         username: str,
+         password: str,
+         tfa_callback=None,
+-        session: Optional[requests.Session] = None,
++        session: Optional[_Session] = None,
+     ):
+         self._session = session or create_login_session(
+             username=username,
+@@ -159,7 +276,7 @@
+             session=session,
+         )
+ 
+-    def request_usage(self, enterprise_name: str, days: int = 30) -> requests.Response:
++    def request_usage(self, enterprise_name: str, days: int = 30):
+         """Requests a GitHub usage report.
+ 
+         Github will send an email link when the report is available.
+@@ -183,7 +300,7 @@
+         contact_email: str,
+         org_usage: OrganizationUsage,
+         business_name: Optional[str] = None,
+-    ) -> requests.Response:
++    ):
+         """Create the specified GitHub organization.
+ 
+         Right now, only creates free tier organizations.
+@@ -207,7 +324,7 @@
+ 
+     def install_application_in_organization(
+         self, app_name: str, org_id: int
+-    ) -> requests.Response:
++    ):
+         """Installs the specified app on the given organization."""
+         url = _INSTALL_APP_URL.format(app_name=app_name, org_id=org_id)
+ 
+@@ -223,7 +340,7 @@
+ 
+     def toggle_app_suspended(
+         self, org_name: str, app_install_id: int
+-    ) -> requests.Response:
++    ):
+         """Set this applicaiton install to be suspended or not."""
+         url = _APP_SUSPEND_URL.format(org_name=org_name, app_install_id=app_install_id)
+ 
+@@ -235,14 +352,14 @@
+ 
+     def download_usage_report(
+         self, enterprise_name: str, report_id: int
+-    ) -> requests.Response:
++    ):
+         """Download a usage report based on an id recieved in an email"""
+         url = _USAGE_REPORT_URL.format(
+             enterprise_name=enterprise_name, report_id=report_id
+         )
+         return _get_url_with_session(session=self._session, url=url)
+ 
+-    def request_dormant_users_report(self, enterprise_name: str) -> requests.Response:
++    def request_dormant_users_report(self, enterprise_name: str):
+         """Requests a GitHub dormant users report.
+ 
+         Github will send an email link when the report is available.
+@@ -256,13 +373,13 @@
+             form_matcher=lambda form: form.attrib.get("action") == action,
+         )
+ 
+-    def download_dormant_users_report(self, enterprise_name: str) -> requests.Response:
++    def download_dormant_users_report(self, enterprise_name: str):
+         """Download a usage report based on an id received in an email"""
+         url = _REQUEST_DORMANTUSERS_URL.format(enterprise_name=enterprise_name)
+         page = _get_url_with_session(session=self._session, url=url)
+         link = re.search(
+-            r"https://github.com/enterprises/alphabet/settings/dormant-users/exports/[0-9A-Fa-f]{8}\\-[0-9A-Fa-f]{4}\\-[0-9A-Fa-f]{4}\\-[0-9A-Fa-f]{4}\\-[0-9A-Fa-f]{12}",
+-            page.content,
++            rf"https://github.com/enterprises/{re.escape(enterprise_name)}/settings/dormant-users/exports/[0-9A-Fa-f]{{8}}\\-[0-9A-Fa-f]{{4}}\\-[0-9A-Fa-f]{{4}}\\-[0-9A-Fa-f]{{4}}\\-[0-9A-Fa-f]{{12}}",
++            page.text,
+         )
+         if link is None:
+             raise ValueError("Unable to find dormant users report link in content.")
+@@ -272,7 +389,7 @@
+         self,
+         org_name: str,
+         app_install_id: str,
+-    ) -> requests.Response:
++    ):
+         """Approve a request for updated permissions for a GitHub app installation in an org"""
+ 
+         return _get_and_submit_form(
+@@ -324,4 +441,4 @@
+         username=config["username"],
+         password=config["password"],
+         tfa_callback=lambda: pyotp.TOTP(config["otp_seed"]).now(),
+-    )+    )

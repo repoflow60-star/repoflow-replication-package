@@ -1,0 +1,167 @@
+--- a/appstoreserverlibrary/api_client.py
++++ b/appstoreserverlibrary/api_client.py
+@@ -2,10 +2,14 @@
+ 
+ import calendar
+ import datetime
++import json as jsonlib
+ from enum import IntEnum, Enum
+ from typing import Any, Dict, List, MutableMapping, Optional, Type, TypeVar, Union
+ from attr import define
+-import requests
++
++from urllib.error import HTTPError
++from urllib.parse import urlencode
++from urllib.request import Request, urlopen
+ 
+ import jwt
+ from cryptography.hazmat.backends import default_backend
+@@ -489,6 +493,11 @@
+     
+     def _get_full_url(self, path) -> str:
+         return self._base_url + path
++
++    def _get_full_url_with_params(self, path, params: Dict[str, Union[str, List[str]]]) -> str:
++        if not params:
++            return self._get_full_url(path)
++        return self._get_full_url(path) + "?" + urlencode(params, doseq=True)
+     
+     def _get_headers(self) -> Dict[str, str]:
+         return {
+@@ -500,6 +509,36 @@
+     def _get_request_json(self, body) -> Dict[str, Any]:
+         c = _get_cattrs_converter(type(body)) if body is not None else None
+         return c.unstructure(body) if body is not None else None
++
++    def _normalize_headers(self, headers) -> Dict[str, str]:
++        normalized_headers: Dict[str, str] = dict()
++        if headers is None:
++            return normalized_headers
++        if hasattr(headers, "getAllRawHeaders"):
++            for header_name, header_values in headers.getAllRawHeaders():
++                name = header_name.decode("latin-1") if isinstance(header_name, bytes) else str(header_name)
++                if header_values:
++                    value = header_values[0]
++                    normalized_headers[name.lower()] = value.decode("latin-1") if isinstance(value, bytes) else str(value)
++        elif hasattr(headers, "items"):
++            for header_name, header_value in headers.items():
++                normalized_headers[str(header_name).lower()] = str(header_value)
++        return normalized_headers
++
++    def _get_response_status(self, response) -> int:
++        status = getattr(response, "status", None)
++        if status is None:
++            status = getattr(response, "code", None)
++        if status is None:
++            status = getattr(response, "status_code", None)
++        return status
++
++    def _get_response_body(self, response):
++        if hasattr(response, "content"):
++            return response.content
++        if hasattr(response, "read"):
++            return response.read()
++        return None
+ 
+     def _parse_response(self, status_code: int, headers: MutableMapping, json_supplier, destination_class: Type[T]) -> T:
+         if 200 <= status_code < 300:
+@@ -527,14 +566,29 @@
+     
+     def _make_request(self, path: str, method: str, queryParameters: Dict[str, Union[str, List[str]]], body, destination_class: Type[T]) -> T:
+         url = self._get_full_url(path)
+-        json = self._get_request_json(body)
++        request_json = self._get_request_json(body)
+         headers = self._get_headers()
+         
+-        response = self._execute_request(method, url, queryParameters, headers, json)
+-        return self._parse_response(response.status_code, response.headers, lambda: response.json(), destination_class)
+-
+-    def _execute_request(self, method: str, url: str, params: Dict[str, Union[str, List[str]]], headers: Dict[str, str], json: Dict[str, Any]) -> requests.Response:
+-        return requests.request(method, url, params=params, headers=headers, json=json)
++        response = self._execute_request(method, url, queryParameters, headers, request_json)
++        response_body = self._get_response_body(response)
++        return self._parse_response(
++            self._get_response_status(response),
++            self._normalize_headers(getattr(response, "headers", None)),
++            lambda: jsonlib.loads(response_body.decode("utf-8")) if response_body else None,
++            destination_class,
++        )
++
++    def _execute_request(self, method: str, url: str, params: Dict[str, Union[str, List[str]]], headers: Dict[str, str], json: Dict[str, Any]):
++        request_url = self._get_full_url_with_params(url, params)
++        data = None if json is None else jsonlib.dumps(json).encode("utf-8")
++        request_headers = dict(headers)
++        if data is not None:
++            request_headers["Content-Type"] = "application/json"
++        request = Request(request_url, data=data, headers=request_headers, method=method)
++        try:
++            return urlopen(request)
++        except HTTPError as e:
++            return e
+ 
+     def extend_renewal_date_for_all_active_subscribers(self, mass_extend_renewal_date_request: MassExtendRenewalDateRequest) -> MassExtendRenewalDateResponse: 
+         """
+@@ -720,24 +774,54 @@
+     def __init__(self, signing_key: bytes, key_id: str, issuer_id: str, bundle_id: str, environment: Environment):
+         super().__init__(signing_key=signing_key, key_id=key_id, issuer_id=issuer_id, bundle_id=bundle_id, environment=environment)
+         try:
+-            import httpx
+-            self.http_client = httpx.AsyncClient()
+-        except:
+-            raise ModuleNotFoundError("httpx not found but attempting to instantiate an async client")
++            import treq
++
++            self._treq = treq
++        except ModuleNotFoundError:
++            raise ModuleNotFoundError("treq not found but attempting to instantiate an async client")
+ 
+     async def async_close(self):
+-        await self.http_client.aclose()
++        return None
+     
+     async def _make_request(self, path: str, method: str, queryParameters: Dict[str, Union[str, List[str]]], body, destination_class: Type[T]) -> T:
+         url = self._get_full_url(path)
+-        json = self._get_request_json(body)
++        request_json = self._get_request_json(body)
+         headers = self._get_headers()
+         
+-        response = await self._execute_request(method, url, queryParameters, headers, json)
+-        return self._parse_response(response.status_code, response.headers, lambda: response.json(), destination_class)
++        response = await self._execute_request(method, url, queryParameters, headers, request_json)
++        response_body = await self._read_response_body(response)
++        return self._parse_response(
++            self._get_response_status(response),
++            self._normalize_headers(getattr(response, "headers", None)),
++            lambda: jsonlib.loads(response_body.decode("utf-8")) if response_body else None,
++            destination_class,
++        )
+ 
+     async def _execute_request(self, method: str, url: str, params: Dict[str, Union[str, List[str]]], headers: Dict[str, str], json: Dict[str, Any]):
+-        return await self.http_client.request(method, url, params=params, headers=headers, json=json)
++        request_url = self._get_full_url_with_params(url, params)
++        data = None if json is None else jsonlib.dumps(json).encode("utf-8")
++        request_headers = dict(headers)
++        if data is not None:
++            request_headers["Content-Type"] = "application/json"
++        request_method = method.encode("ascii") if isinstance(method, str) else method
++        return await self._treq.request(request_method, request_url, headers=request_headers, data=data)
++
++    async def _read_response_body(self, response):
++        content = getattr(response, "content", None)
++        if content is not None:
++            if isinstance(content, (bytes, bytearray)):
++                return bytes(content)
++            if callable(content):
++                content = content()
++                if hasattr(content, "__await__"):
++                    return await content
++                return content
++        if hasattr(response, "read"):
++            body = response.read()
++            if hasattr(body, "__await__"):
++                return await body
++            return body
++        return await self._treq.content(response)
+ 
+     async def extend_renewal_date_for_all_active_subscribers(self, mass_extend_renewal_date_request: MassExtendRenewalDateRequest) -> MassExtendRenewalDateResponse: 
+         """

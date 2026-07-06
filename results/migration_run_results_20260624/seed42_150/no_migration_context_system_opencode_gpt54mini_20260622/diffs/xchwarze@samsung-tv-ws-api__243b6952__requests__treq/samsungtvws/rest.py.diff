@@ -1,0 +1,90 @@
+--- a/samsungtvws/rest.py
++++ b/samsungtvws/rest.py
+@@ -7,13 +7,42 @@
+ """
+ 
+ import logging
++import threading
+ from typing import Any, Dict, Optional
+ 
+-import requests
++import treq
++from twisted.internet import error as twisted_error
++from twisted.internet import reactor, threads
+ 
+ from . import connection, exceptions, helper
+ 
+ _LOGGING = logging.getLogger(__name__)
++_REACTOR_THREAD: Optional[threading.Thread] = None
++_REACTOR_READY = threading.Event()
++_REACTOR_LOCK = threading.Lock()
++
++
++def _run_reactor() -> None:
++    # treq is Deferred-based, so run a dedicated reactor thread for sync callers.
++    reactor.callWhenRunning(_REACTOR_READY.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor_running() -> None:
++    if reactor.running:
++        return
++
++    global _REACTOR_THREAD
++    with _REACTOR_LOCK:
++        if reactor.running:
++            return
++
++        if _REACTOR_THREAD is None or not _REACTOR_THREAD.is_alive():
++            _REACTOR_READY.clear()
++            _REACTOR_THREAD = threading.Thread(target=_run_reactor, daemon=True)
++            _REACTOR_THREAD.start()
++
++    _REACTOR_READY.wait()
+ 
+ 
+ class SamsungTVRest(connection.SamsungTVWSBaseConnection):
+@@ -30,19 +59,33 @@
+             timeout=timeout,
+         )
+ 
++    @staticmethod
++    def _request(url: str, method: str, timeout: Optional[float]) -> bytes:
++        request_kwargs: Dict[str, Any] = {
++            "browser_like_policy_for_https": False,
++        }
++        if timeout is not None:
++            request_kwargs["timeout"] = timeout
++
++        request = treq.request(method, url, **request_kwargs)
++        return request.addCallback(treq.content)
++
+     def _rest_request(self, target: str, method: str = "GET") -> Dict[str, Any]:
+         url = self._format_rest_url(target)
+         try:
+-            if method == "POST":
+-                response = requests.post(url, timeout=self.timeout, verify=False)
+-            elif method == "PUT":
+-                response = requests.put(url, timeout=self.timeout, verify=False)
+-            elif method == "DELETE":
+-                response = requests.delete(url, timeout=self.timeout, verify=False)
+-            else:
+-                response = requests.get(url, timeout=self.timeout, verify=False)
+-            return helper.process_api_response(response.text)
+-        except requests.ConnectionError as err:
++            _ensure_reactor_running()
++            response = threads.blockingCallFromThread(
++                reactor, self._request, url, method, self.timeout
++            )
++            return helper.process_api_response(response)
++        except exceptions.ResponseError:
++            raise
++        except (
++            twisted_error.ConnectError,
++            twisted_error.ConnectionLost,
++            twisted_error.DNSLookupError,
++            twisted_error.TimeoutError,
++        ) as err:
+             raise exceptions.HttpApiError(
+                 "TV unreachable or feature not supported on this model."
+             ) from err

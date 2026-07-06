@@ -1,0 +1,114 @@
+--- a/samsungtvws/rest.py
++++ b/samsungtvws/rest.py
+@@ -7,13 +7,49 @@
+ """
+ 
+ import logging
++import threading
++import time
+ from typing import Any, Dict, Optional
+ 
+-import requests
++import treq
++from twisted.internet import reactor, ssl
++from twisted.web.client import Agent
+ 
+ from . import connection, exceptions, helper
+ 
+ _LOGGING = logging.getLogger(__name__)
++_REACTOR_THREAD: Optional[threading.Thread] = None
++_REACTOR_LOCK = threading.Lock()
++
++
++def _ensure_reactor_running() -> None:
++    global _REACTOR_THREAD
++
++    if reactor.running:
++        return
++
++    with _REACTOR_LOCK:
++        if _REACTOR_THREAD is None:
++            _REACTOR_THREAD = threading.Thread(
++                target=reactor.run,
++                kwargs={"installSignalHandlers": False},
++                daemon=True,
++            )
++            _REACTOR_THREAD.start()
++
++    while not reactor.running:
++        if _REACTOR_THREAD is not None and not _REACTOR_THREAD.is_alive():
++            raise exceptions.HttpApiError(
++                "TV unreachable or feature not supported on this model."
++            )
++        time.sleep(0.01)
++
++
++def _request_agent(is_ssl: bool) -> Agent:
++    if is_ssl:
++        return Agent(reactor, contextFactory=ssl.ClientContextFactory())
++
++    return Agent(reactor)
+ 
+ 
+ class SamsungTVRest(connection.SamsungTVWSBaseConnection):
+@@ -32,20 +68,48 @@
+ 
+     def _rest_request(self, target: str, method: str = "GET") -> Dict[str, Any]:
+         url = self._format_rest_url(target)
+-        try:
+-            if method == "POST":
+-                response = requests.post(url, timeout=self.timeout, verify=False)
+-            elif method == "PUT":
+-                response = requests.put(url, timeout=self.timeout, verify=False)
+-            elif method == "DELETE":
+-                response = requests.delete(url, timeout=self.timeout, verify=False)
+-            else:
+-                response = requests.get(url, timeout=self.timeout, verify=False)
+-            return helper.process_api_response(response.text)
+-        except requests.ConnectionError as err:
++        _ensure_reactor_running()
++
++        response_body: Optional[bytes] = None
++        request_error: Optional[Any] = None
++        request_done = threading.Event()
++
++        def _request_failed(err: Any) -> None:
++            nonlocal request_error
++            request_error = err
++            request_done.set()
++
++        def _response_received(response: Any) -> None:
++            content = treq.content(response)
++            content.addCallbacks(_response_body_received, _request_failed)
++
++        def _response_body_received(body: bytes) -> None:
++            nonlocal response_body
++            response_body = body
++            request_done.set()
++
++        def _dispatch_request() -> None:
++            kwargs = {"agent": _request_agent(self._is_ssl_connection())}
++            if self.timeout is not None:
++                kwargs["timeout"] = self.timeout
++
++            try:
++                request = treq.request(method, url, **kwargs)
++                request.addCallbacks(_response_received, _request_failed)
++            except BaseException as err:
++                _request_failed(err)
++
++        reactor.callFromThread(_dispatch_request)
++        request_done.wait()
++
++        if request_error is not None:
++            failure = getattr(request_error, "value", request_error)
+             raise exceptions.HttpApiError(
+                 "TV unreachable or feature not supported on this model."
+-            ) from err
++            ) from failure
++
++        assert response_body is not None
++        return helper.process_api_response(response_body)
+ 
+     def rest_device_info(self) -> Dict[str, Any]:
+         _LOGGING.debug("Get device info via rest api")

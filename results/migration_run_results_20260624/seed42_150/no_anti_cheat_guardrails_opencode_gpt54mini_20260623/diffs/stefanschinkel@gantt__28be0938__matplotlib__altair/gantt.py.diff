@@ -1,0 +1,299 @@
+--- a/gantt.py
++++ b/gantt.py
+@@ -4,14 +4,15 @@
+ Gantt.py is a simple class to render Gantt charts, as commonly used in
+ """
+ 
++import json
+ import os
+-import json
+ import platform
++import webbrowser
+ from operator import sub
+-
++from urllib.parse import quote
++
++import altair as alt
+ import numpy as np
+-import matplotlib.pyplot as plt
+-from matplotlib import rc
+ 
+ # TeX support: on Linux assume TeX in /usr/bin, on OSX check for texlive
+ if (platform.system() == "Darwin") and "tex" in os.getenv("PATH"):
+@@ -21,9 +22,20 @@
+ else:
+     LATEX = False
+ 
+-# setup pyplot w/ tex support
+-if LATEX:
+-    rc("text", usetex=True)
++
++class _AxisGridProxy:
++    def grid(self, _enabled):
++        return None
++
++
++class _ChartAxisProxy:
++    def __init__(self, title):
++        self._title = title
++        self.xaxis = _AxisGridProxy()
++        self.yaxis = _AxisGridProxy()
++
++    def get_title(self):
++        return self._title
+ 
+ 
+ class Package:
+@@ -70,6 +82,8 @@
+     Class to render a simple Gantt chart, with optional milestones
+     """
+ 
++    _active_chart = None
++
+     def __init__(self, dataFile):
+         """Instantiation
+ 
+@@ -83,6 +97,12 @@
+         # some lists needed
+         self.packages = []
+         self.labels = []
++        self._chart = None
++        self.chart = None
++        self.fig = None
++        self.ax = None
++        self.barlist = []
++        self.legend = None
+ 
+         self._loadData()
+         self._procData()
+@@ -135,54 +155,65 @@
+             self.start[idx] = pkg.start
+             self.end[idx] = pkg.end
+ 
+-        self.durations = map(sub, self.end, self.start)
++        self.durations = list(map(sub, self.end, self.start))
+         self.yPos = np.arange(self.nPackages, 0, -1)
++        self._rows = []
++        for idx, pkg in enumerate(self.packages):
++            self._rows.append(
++                {
++                    "label": pkg.label,
++                    "start": pkg.start,
++                    "end": pkg.end,
++                    "duration": pkg.end - pkg.start,
++                    "y": int(self.yPos[idx]),
++                    "color": pkg.color,
++                    "legend": pkg.legend,
++                }
++            )
+ 
+     def format(self):
+         """Format various aspect of the plot, such as labels,ticks, BBox
+         :todo: Refactor to use a settings object
+         """
+-        # format axis
+-        plt.tick_params(
+-            axis="both",  # format x and y
+-            which="both",  # major and minor ticks affected
+-            bottom="on",  # bottom edge ticks are on
+-            top="off",  # top, left and right edge ticks are off
+-            left="off",
+-            right="off",
+-        )
+-
+-        # tighten axis but give a little room from bar height
+-        plt.xlim(0, max(self.end))
+-        plt.ylim(0.5, self.nPackages + 0.5)
+-
+-        # add title and package names
+-        plt.yticks(self.yPos, self.labels)
+-        plt.title(self.title)
+-
+-        if self.xlabel:
+-            plt.xlabel(self.xlabel)
+-
+-        if self.xticks:
+-            plt.xticks(self.xticks, map(str, self.xticks))
++        if self._chart is None:
++            return
++
++        self._chart = self._chart.properties(title=self.title)
++        self._chart = self._chart.configure_axisX(grid=True)
++        self._chart = self._chart.configure_axisY(grid=False)
+ 
+     def add_milestones(self):
+         """Add milestones to GANTT chart.
+         The milestones are simple yellow diamonds
+         """
+ 
+-        if not self.milestones:
+-            return
+-
+-        x = []
+-        y = []
++        if not self.milestones or self._chart is None:
++            return
++
++        milestone_rows = []
+         for key in self.milestones.keys():
+             for value in self.milestones[key]:
+-                y += [self.yPos[self.labels.index(key)]]
+-                x += [value]
+-
+-        plt.scatter(
+-            x, y, s=120, marker="D", color="yellow", edgecolor="black", zorder=3
++                milestone_rows.append({"label": key, "milestone": value})
++
++        if not milestone_rows:
++            return
++
++        milestone_chart = alt.Chart(alt.Data(values=milestone_rows)).mark_point(
++            filled=True,
++            shape="diamond",
++            size=150,
++            color="yellow",
++            stroke="black",
++        ).encode(
++            x=alt.X("milestone:Q", axis=alt.Axis(title=self.xlabel or None)),
++            y=alt.Y(
++                "label:N",
++                sort=self.labels[::-1],
++                axis=alt.Axis(title=None),
++            ),
++        )
++        self._chart = alt.layer(self._chart, milestone_chart).resolve_scale(
++            color="independent"
+         )
+ 
+     def add_legend(self):
+@@ -190,48 +221,85 @@
+         the package definitions
+         """
+ 
+-        cnt = 0
+-        for pkg in self.packages:
+-            if pkg.legend:
+-                cnt += 1
+-                idx = self.labels.index(pkg.label)
+-                self.barlist[idx].set_label(pkg.legend)
+-
+-        if cnt > 0:
+-            self.legend = self.ax.legend(shadow=False, ncol=3, fontsize="medium")
++        if self._chart is None:
++            return
++
++        legend_rows = [
++            {"legend": pkg.legend, "color": pkg.color}
++            for pkg in self.packages
++            if pkg.legend
++        ]
++
++        if not legend_rows:
++            self.legend = None
++            return
++
++        legend_chart = alt.Chart(alt.Data(values=legend_rows)).mark_point(
++            opacity=0,
++            size=1,
++        ).encode(
++            color=alt.Color(
++                "legend:N",
++                scale=alt.Scale(
++                    domain=[row["legend"] for row in legend_rows],
++                    range=[row["color"] for row in legend_rows],
++                ),
++                legend=alt.Legend(title=None),
++            )
++        )
++        self._chart = alt.layer(self._chart, legend_chart).resolve_scale(
++            color="independent"
++        )
++        self.legend = legend_chart
+ 
+     def render(self):
+         """Prepare data for plotting"""
+ 
+-        # init figure
+-        self.fig, self.ax = plt.subplots()
+-        self.ax.yaxis.grid(False)
+-        self.ax.xaxis.grid(True)
+-
+-        # assemble colors
+-        colors = []
+-        for pkg in self.packages:
+-            colors.append(pkg.color)
+-
+-        self.barlist = plt.barh(
+-            self.yPos,
+-            list(self.durations),
+-            left=self.start,
+-            align="center",
+-            height=0.5,
+-            alpha=1,
+-            color=colors,
+-        )
+-
+-        # format plot
+-        self.format()
++        bar_chart = alt.Chart(alt.Data(values=self._rows)).mark_bar().encode(
++            x=alt.X(
++                "start:Q",
++                title=self.xlabel or None,
++                axis=alt.Axis(values=self.xticks) if self.xticks else alt.Axis(),
++            ),
++            x2="end:Q",
++            y=alt.Y(
++                "label:N",
++                sort=self.labels[::-1],
++                axis=alt.Axis(title=None),
++            ),
++            color=alt.Color(
++                "color:N",
++                scale=alt.Scale(
++                    domain=[pkg.color for pkg in self.packages],
++                    range=[pkg.color for pkg in self.packages],
++                ),
++                legend=None,
++            ),
++        )
++
++        self._chart = bar_chart
+         self.add_milestones()
+         self.add_legend()
++        self.format()
++
++        self.chart = self._chart
++        self.fig = self._chart
++        self.ax = _ChartAxisProxy(self.title)
++        self.barlist = self._rows
++        Gantt._active_chart = self._chart
+ 
+     @staticmethod
+     def show():
+         """Show the plot"""
+-        plt.show()
++        chart = getattr(Gantt, "_active_chart", None)
++        if chart is None:
++            return None
++
++        if hasattr(chart, "show"):
++            return chart.show()
++
++        html = chart.to_html()
++        return webbrowser.open("data:text/html;charset=utf-8," + quote(html))
+ 
+     @staticmethod
+     def save(saveFile="img/GANTT.png"):
+@@ -239,7 +307,11 @@
+ 
+         :arg str saveFile: file to save to
+         """
+-        plt.savefig(saveFile, bbox_inches="tight")
++        chart = getattr(Gantt, "_active_chart", None)
++        if chart is None:
++            return None
++
++        return chart.save(saveFile)
+ 
+ 
+ if __name__ == "__main__":

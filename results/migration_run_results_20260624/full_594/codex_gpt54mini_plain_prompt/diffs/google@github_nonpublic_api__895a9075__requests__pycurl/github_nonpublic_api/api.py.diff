@@ -1,0 +1,391 @@
+diff --git a/github_nonpublic_api/api.py b/github_nonpublic_api/api.py
+index be69954..c3d3b3e 100644
+--- a/github_nonpublic_api/api.py
++++ b/github_nonpublic_api/api.py
+@@ -14,18 +14,206 @@
+ 
+ """An API to do things that aren't in the official public GitHub REST API."""
+ 
+-import os.path
+ import functools
+-from enum import Enum
++import io
++import os.path
+ import re
+-from urllib.parse import urljoin
++from dataclasses import dataclass, field
++from enum import Enum
++from typing import Any, Dict, List, Mapping, Optional, Protocol
++from urllib.error import HTTPError as UrllibHTTPError
++from urllib.parse import urlencode, urljoin
++from http.cookiejar import CookieJar
++from urllib.request import HTTPCookieProcessor, Request, build_opener
+ 
+ import html5lib
+ import pyotp
+-import requests
+ from absl import logging
+ from configobj import ConfigObj
+-from typing import Optional
++
++try:
++    import pycurl
++except ImportError:  # pragma: no cover - exercised when pycurl is unavailable.
++    pycurl = None
++
++
++class _ResponseLike(Protocol):
++    text: str
++    content: bytes
++    url: str
++    history: List["_ResponseLike"]
++    status_code: int
++
++    def raise_for_status(self) -> None:
++        """Raise an exception for 4xx/5xx responses."""
++
++
++class _SessionLike(Protocol):
++    def get(self, url: str) -> _ResponseLike:
++        """Fetch a URL."""
++
++    def post(self, url: str, data: Optional[Mapping[str, Any]] = None) -> _ResponseLike:
++        """Submit a form."""
++
++    def clear_cookies(self) -> None:
++        """Clear session cookies."""
++
++
++@dataclass
++class _HttpResponse:
++    """Minimal response object compatible with the old requests-based call sites."""
++
++    status_code: int
++    url: str
++    content: bytes
++    headers: Dict[str, str] = field(default_factory=dict)
++    history: List["_HttpResponse"] = field(default_factory=list)
++
++    @property
++    def text(self) -> str:
++        encoding = "utf-8"
++        content_type = self.headers.get("content-type", "")
++        match = re.search(r"charset=([A-Za-z0-9._-]+)", content_type, re.IGNORECASE)
++        if match:
++            encoding = match.group(1)
++        return self.content.decode(encoding, errors="replace")
++
++    def raise_for_status(self) -> None:
++        if 400 <= self.status_code:
++            raise RuntimeError(f"HTTP {self.status_code} for {self.url}")
++
++
++def _extract_headers(raw_headers: bytes) -> Dict[str, str]:
++    headers: Dict[str, str] = {}
++    for line in raw_headers.decode("iso-8859-1", errors="replace").splitlines():
++        if ":" not in line:
++            continue
++        name, value = line.split(":", 1)
++        headers[name.strip().lower()] = value.strip()
++    return headers
++
++
++class _PycurlSession:
++    """Persistent HTTP session backed by pycurl."""
++
++    def __init__(self):
++        if pycurl is None:
++            raise RuntimeError("pycurl is not available")
++        self._curl = pycurl.Curl()
++        self._curl.setopt(pycurl.FOLLOWLOCATION, True)
++        self._curl.setopt(pycurl.MAXREDIRS, 10)
++        self._curl.setopt(pycurl.COOKIEFILE, "")
++        self._curl.setopt(pycurl.COOKIEJAR, "")
++        self._curl.setopt(pycurl.NOSIGNAL, 1)
++
++    def clear_cookies(self) -> None:
++        self._curl.setopt(pycurl.COOKIELIST, "ALL")
++
++    def _request(self, url: str, method: str, data: Optional[Mapping[str, Any]] = None):
++        body = io.BytesIO()
++        header_bytes = io.BytesIO()
++
++        self._curl.setopt(pycurl.URL, url)
++        self._curl.setopt(pycurl.WRITEDATA, body)
++        self._curl.setopt(pycurl.HEADERFUNCTION, header_bytes.write)
++
++        if method == "GET":
++            self._curl.setopt(pycurl.HTTPGET, 1)
++            self._curl.setopt(pycurl.POST, 0)
++            self._curl.setopt(pycurl.POSTFIELDS, "")
++            self._curl.setopt(pycurl.HTTPHEADER, [])
++        else:
++            encoded = urlencode(dict(data or {}))
++            self._curl.setopt(pycurl.HTTPGET, 0)
++            self._curl.setopt(pycurl.POST, 1)
++            self._curl.setopt(pycurl.POSTFIELDS, encoded)
++            self._curl.setopt(
++                pycurl.HTTPHEADER, ["Content-Type: application/x-www-form-urlencoded"]
++            )
++
++        self._curl.perform()
++        status_code = int(self._curl.getinfo(pycurl.RESPONSE_CODE))
++        effective_url = self._curl.getinfo(pycurl.EFFECTIVE_URL)
++        headers = _extract_headers(header_bytes.getvalue())
++        return _HttpResponse(
++            status_code=status_code,
++            url=effective_url,
++            content=body.getvalue(),
++            headers=headers,
++        )
++
++    def get(self, url: str) -> _ResponseLike:
++        return self._request(url=url, method="GET")
++
++    def post(self, url: str, data: Optional[Mapping[str, Any]] = None) -> _ResponseLike:
++        return self._request(url=url, method="POST", data=data)
++
++
++class _UrllibSession:
++    """Compatibility fallback for environments without pycurl."""
++
++    def __init__(self):
++        self._cookie_jar = CookieJar()
++        self._opener = build_opener(HTTPCookieProcessor(self._cookie_jar))
++
++    def clear_cookies(self) -> None:
++        self._cookie_jar.clear()
++
++    def _request(self, url: str, method: str, data: Optional[Mapping[str, Any]] = None):
++        if method == "POST":
++            encoded = urlencode(dict(data or {})).encode("utf-8")
++            request = Request(
++                url,
++                data=encoded,
++                headers={"Content-Type": "application/x-www-form-urlencoded"},
++            )
++        else:
++            request = Request(url)
++
++        try:
++            response = self._opener.open(request)
++        except UrllibHTTPError as exc:
++            content = exc.read()
++            headers = {}
++            if exc.headers is not None:
++                headers = {k.lower(): v for k, v in exc.headers.items()}
++            return _HttpResponse(
++                status_code=exc.code,
++                url=exc.geturl(),
++                content=content,
++                headers=headers,
++            )
++
++        with response:
++            content = response.read()
++            headers = {k.lower(): v for k, v in dict(response.headers.items()).items()}
++            return _HttpResponse(
++                status_code=response.getcode(),
++                url=response.geturl(),
++                content=content,
++                headers=headers,
++            )
++
++    def get(self, url: str) -> _ResponseLike:
++        return self._request(url=url, method="GET")
++
++    def post(self, url: str, data: Optional[Mapping[str, Any]] = None) -> _ResponseLike:
++        return self._request(url=url, method="POST", data=data)
++
++
++def _create_default_session():
++    if pycurl is not None:
++        return _PycurlSession()
++    return _UrllibSession()
++
++
++def _clear_session_cookies(session: _SessionLike) -> None:
++    if hasattr(session, "clear_cookies"):
++        session.clear_cookies()
++        return
++    cookies = getattr(session, "cookies", None)
++    if cookies is not None and hasattr(cookies, "clear"):
++        cookies.clear()
+ 
+ 
+ def _get_and_submit_form(
+@@ -36,7 +224,7 @@ def _get_and_submit_form(
+     response.raise_for_status()
+ 
+     logging.info("Fetching URL %s", response.url)
+-    for redirect_response in response.history:
++    for redirect_response in getattr(response, "history", []) or []:
+         logging.info("Redirected from: %s", redirect_response.url)
+ 
+     doc = html5lib.parse(response.text, namespaceHTMLElements=False)
+@@ -85,13 +273,13 @@ def create_login_session(
+     username: str,
+     password: str,
+     tfa_callback,
+-    session: Optional[requests.Session] = None,
+-) -> requests.Session:
+-    """Create a requests.Session object with logged in GitHub cookies for the user."""
+-    session = session or requests.Session()
++    session: Optional[_SessionLike] = None,
++) -> _SessionLike:
++    """Create a logged-in HTTP session for the user."""
++    session = session or _create_default_session()
+ 
+     # Clear cookies before re-authentication
+-    session.cookies.clear()
++    _clear_session_cookies(session)
+ 
+     def _login_callback(data):
+         data.update(dict(login=username, password=password))
+@@ -150,7 +338,7 @@ class Api(object):
+         username: str,
+         password: str,
+         tfa_callback=None,
+-        session: Optional[requests.Session] = None,
++        session: Optional[_SessionLike] = None,
+     ):
+         self._session = session or create_login_session(
+             username=username,
+@@ -159,7 +347,7 @@ class Api(object):
+             session=session,
+         )
+ 
+-    def request_usage(self, enterprise_name: str, days: int = 30) -> requests.Response:
++    def request_usage(self, enterprise_name: str, days: int = 30) -> _ResponseLike:
+         """Requests a GitHub usage report.
+ 
+         Github will send an email link when the report is available.
+@@ -169,7 +357,7 @@ class Api(object):
+             data["days"] = days
+ 
+         action = f"/enterprises/{enterprise_name}/settings/metered_exports"
+-        url = url = _REQUEST_USAGE_URL.format(enterprise_name=enterprise_name)
++        url = _REQUEST_USAGE_URL.format(enterprise_name=enterprise_name)
+         return _get_and_submit_form(
+             session=self._session,
+             url=url,
+@@ -183,7 +371,7 @@ class Api(object):
+         contact_email: str,
+         org_usage: OrganizationUsage,
+         business_name: Optional[str] = None,
+-    ) -> requests.Response:
++    ) -> _ResponseLike:
+         """Create the specified GitHub organization.
+ 
+         Right now, only creates free tier organizations.
+@@ -207,7 +395,7 @@ class Api(object):
+ 
+     def install_application_in_organization(
+         self, app_name: str, org_id: int
+-    ) -> requests.Response:
++    ) -> _ResponseLike:
+         """Installs the specified app on the given organization."""
+         url = _INSTALL_APP_URL.format(app_name=app_name, org_id=org_id)
+ 
+@@ -223,7 +411,7 @@ class Api(object):
+ 
+     def toggle_app_suspended(
+         self, org_name: str, app_install_id: int
+-    ) -> requests.Response:
++    ) -> _ResponseLike:
+         """Set this applicaiton install to be suspended or not."""
+         url = _APP_SUSPEND_URL.format(org_name=org_name, app_install_id=app_install_id)
+ 
+@@ -235,14 +423,14 @@ class Api(object):
+ 
+     def download_usage_report(
+         self, enterprise_name: str, report_id: int
+-    ) -> requests.Response:
++    ) -> _ResponseLike:
+         """Download a usage report based on an id recieved in an email"""
+         url = _USAGE_REPORT_URL.format(
+             enterprise_name=enterprise_name, report_id=report_id
+         )
+         return _get_url_with_session(session=self._session, url=url)
+ 
+-    def request_dormant_users_report(self, enterprise_name: str) -> requests.Response:
++    def request_dormant_users_report(self, enterprise_name: str) -> _ResponseLike:
+         """Requests a GitHub dormant users report.
+ 
+         Github will send an email link when the report is available.
+@@ -256,13 +444,13 @@ class Api(object):
+             form_matcher=lambda form: form.attrib.get("action") == action,
+         )
+ 
+-    def download_dormant_users_report(self, enterprise_name: str) -> requests.Response:
++    def download_dormant_users_report(self, enterprise_name: str) -> _ResponseLike:
+         """Download a usage report based on an id received in an email"""
+         url = _REQUEST_DORMANTUSERS_URL.format(enterprise_name=enterprise_name)
+         page = _get_url_with_session(session=self._session, url=url)
+         link = re.search(
+-            r"https://github.com/enterprises/alphabet/settings/dormant-users/exports/[0-9A-Fa-f]{8}\\-[0-9A-Fa-f]{4}\\-[0-9A-Fa-f]{4}\\-[0-9A-Fa-f]{4}\\-[0-9A-Fa-f]{12}",
+-            page.content,
++            rf"https://github\.com/enterprises/{re.escape(enterprise_name)}/settings/dormant-users/exports/[0-9A-Fa-f]{{8}}(?:-[0-9A-Fa-f]{{4}}){{3}}-[0-9A-Fa-f]{{12}}",
++            page.text,
+         )
+         if link is None:
+             raise ValueError("Unable to find dormant users report link in content.")
+@@ -272,7 +460,7 @@ class Api(object):
+         self,
+         org_name: str,
+         app_install_id: str,
+-    ) -> requests.Response:
++    ) -> _ResponseLike:
+         """Approve a request for updated permissions for a GitHub app installation in an org"""
+ 
+         return _get_and_submit_form(
+@@ -295,26 +483,36 @@ class Api(object):
+             return doc.findall(".//input[@name='%s']" % name)
+         
+         if code_scanning_autofix is not None:
++
+             def _data_callback(data):
+-                data['code_scanning_autofix'] = 'enabled' if code_scanning_autofix else 'disabled'
++                data["code_scanning_autofix"] = (
++                    "enabled" if code_scanning_autofix else "disabled"
++                )
++
+             _get_and_submit_form(
+                 session=self._session,
+                 url=_UPDATE_GHAS_SETTINGS_URL.format(
+                     org_name=org_name,
+                 ),
+-                form_matcher=functools.partial(_form_matcher, name='code_scanning_autofix'),
+-                data_callback=_data_callback
++                form_matcher=functools.partial(_form_matcher, name="code_scanning_autofix"),
++                data_callback=_data_callback,
+             )
+         if code_scanning_autofix_third_party_tools is not None:
++
+             def _data_callback(data):
+-                data['code_scanning_autofix_third_party_tools'] = 'enabled' if code_scanning_autofix_third_party_tools else 'disabled'
++                data["code_scanning_autofix_third_party_tools"] = (
++                    "enabled" if code_scanning_autofix_third_party_tools else "disabled"
++                )
++
+             _get_and_submit_form(
+                 session=self._session,
+                 url=_UPDATE_GHAS_SETTINGS_URL.format(
+                     org_name=org_name,
+                 ),
+-                form_matcher=functools.partial(_form_matcher, name='code_scanning_autofix_third_party_tools'),
+-                data_callback=_data_callback
++                form_matcher=functools.partial(
++                    _form_matcher, name="code_scanning_autofix_third_party_tools"
++                ),
++                data_callback=_data_callback,
+             )
+ 
+ if __name__ == "__main__":
+@@ -324,4 +522,4 @@ if __name__ == "__main__":
+         username=config["username"],
+         password=config["password"],
+         tfa_callback=lambda: pyotp.TOTP(config["otp_seed"]).now(),
+-    )
+\ No newline at end of file
++    )

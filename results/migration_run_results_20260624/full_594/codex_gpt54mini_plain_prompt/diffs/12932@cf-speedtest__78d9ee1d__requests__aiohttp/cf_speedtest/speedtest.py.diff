@@ -1,0 +1,179 @@
+diff --git a/cf_speedtest/speedtest.py b/cf_speedtest/speedtest.py
+index 37b72d8..3ca35ca 100644
+--- a/cf_speedtest/speedtest.py
++++ b/cf_speedtest/speedtest.py
+@@ -1,19 +1,162 @@
+ #! /usr/bin/env python3
+ from __future__ import annotations
+ 
++import atexit
++import asyncio
+ import argparse
+ import math
+ import statistics
+ import time
+ from timeit import default_timer as timer
++from dataclasses import dataclass
++from typing import Any
+ 
+-import requests
+-import urllib3
++import aiohttp
++
++try:
++    from aiohttp_socks import ProxyConnector
++except ImportError:  # pragma: no cover - optional dependency
++    ProxyConnector = None
+ 
+ import cf_speedtest.locations as locations
+ import cf_speedtest.options as options
+ 
+-REQ_SESSION = requests.Session()
++@dataclass
++class AiohttpResponse:
++    status: int
++    headers: dict[str, str]
++    text: str
++    content: bytes
++
++    def raise_for_status(self) -> None:
++        if 400 <= self.status:
++            raise RuntimeError(f'HTTP error {self.status}')
++
++
++class AiohttpSession:
++    # Keep one loop/session alive so aiohttp can reuse connections like requests.Session did.
++    def __init__(self) -> None:
++        self._loop = asyncio.new_event_loop()
++        self._session: aiohttp.ClientSession | None = None
++        self._session_proxy_url: str | None = None
++        atexit.register(self.close)
++
++    def _proxy_url(self, proxies: dict[str, str] | None) -> str | None:
++        if not proxies:
++            return None
++        return proxies.get('https') or proxies.get('http')
++
++    def _connector(self, proxy_url: str | None) -> Any:
++        if not proxy_url or not proxy_url.startswith('socks'):
++            return None
++        if ProxyConnector is None:
++            raise RuntimeError(
++                'SOCKS proxy support requires aiohttp_socks to be installed',
++            )
++        return ProxyConnector.from_url(proxy_url)
++
++    async def _create_session(self, proxy_url: str | None) -> aiohttp.ClientSession:
++        connector = self._connector(proxy_url)
++        timeout = aiohttp.ClientTimeout(total=None)
++        return aiohttp.ClientSession(
++            connector=connector,
++            timeout=timeout,
++        )
++
++    def _ensure_session(self, proxies: dict[str, str] | None) -> None:
++        proxy_url = self._proxy_url(proxies)
++        if (
++            self._session is not None
++            and not self._session.closed
++            and proxy_url == self._session_proxy_url
++        ):
++            return
++
++        if self._session is not None and not self._session.closed:
++            self._loop.run_until_complete(self._session.close())
++
++        self._session_proxy_url = proxy_url
++        self._session = self._loop.run_until_complete(
++            self._create_session(proxy_url),
++        )
++
++    async def _request(
++        self,
++        method: str,
++        url: str,
++        *,
++        data: Any = None,
++        headers: dict[str, str] | None = None,
++        verify: bool = True,
++    ) -> AiohttpResponse:
++        request_kwargs: dict[str, Any] = {}
++        if data is not None:
++            request_kwargs['data'] = data
++        if headers is not None:
++            request_kwargs['headers'] = headers
++        if self._session_proxy_url and not self._session_proxy_url.startswith('socks'):
++            request_kwargs['proxy'] = self._session_proxy_url
++        if not verify:
++            request_kwargs['ssl'] = False
++
++        assert self._session is not None
++        async with self._session.request(method, url, **request_kwargs) as response:
++            content = await response.read()
++            text = content.decode(response.charset or 'utf-8', errors='replace')
++            return AiohttpResponse(
++                status=response.status,
++                headers=dict(response.headers),
++                text=text,
++                content=content,
++            )
++
++    def get(
++        self,
++        url: str,
++        *,
++        verify: bool = True,
++        proxies: dict[str, str] | None = None,
++    ) -> AiohttpResponse:
++        self._ensure_session(proxies)
++        return self._loop.run_until_complete(
++            self._request(
++                'GET',
++                url,
++                verify=verify,
++            ),
++        )
++
++    def post(
++        self,
++        url: str,
++        *,
++        data: Any = None,
++        headers: dict[str, str] | None = None,
++        verify: bool = True,
++        proxies: dict[str, str] | None = None,
++    ) -> AiohttpResponse:
++        self._ensure_session(proxies)
++        return self._loop.run_until_complete(
++            self._request(
++                'POST',
++                url,
++                data=data,
++                headers=headers,
++                verify=verify,
++            ),
++        )
++
++    def close(self) -> None:
++        if self._loop.is_closed():
++            return
++        if self._session is not None and not self._session.closed:
++            self._loop.run_until_complete(self._session.close())
++        self._session = None
++        self._session_proxy_url = None
++        self._loop.close()
++
++
++REQ_SESSION = AiohttpSession()
+ 
+ CGI_ENDPOINT = 'https://speed.cloudflare.com/cdn-cgi/trace'
+ DOWNLOAD_ENDPOINT = 'https://speed.cloudflare.com/__down?measId=0&bytes={}'
+@@ -290,8 +433,6 @@ def run_standard_test(
+ 
+ def main(argv=None) -> int:
+     global PROXY_DICT, VERIFY_SSL, OUTPUT_FILE
+-    # disable annoying warning when using verify=False in requests.get("x", verify=False)
+-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+ 
+     parser = argparse.ArgumentParser()
+     parser_with_args = options.add_run_options(parser)

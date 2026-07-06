@@ -1,0 +1,111 @@
+--- a/segment/analytics/request.py
++++ b/segment/analytics/request.py
+@@ -1,16 +1,78 @@
++import asyncio
+ from datetime import date, datetime
++from gzip import GzipFile
+ from io import BytesIO
+-from gzip import GzipFile
++import json
+ import logging
+-import json
++import threading
++from urllib.parse import urlparse
++
++import aiohttp
+ from dateutil.tz import tzutc
+-from requests.auth import HTTPBasicAuth
+-from requests import sessions
+ 
+ from segment.analytics.version import VERSION
+ from segment.analytics.utils import remove_trailing_slash
+ 
+-_session = sessions.Session()
++
++def _run_sync(coro):
++    try:
++        asyncio.get_running_loop()
++    except RuntimeError:
++        return asyncio.run(coro)
++
++    result = {}
++    error = {}
++
++    def runner():
++        try:
++            result["value"] = asyncio.run(coro)
++        except BaseException as exc:
++            error["exc"] = exc
++
++    thread = threading.Thread(target=runner)
++    thread.start()
++    thread.join()
++
++    if "exc" in error:
++        raise error["exc"]
++    return result.get("value")
++
++
++def _resolve_proxy(proxies, url):
++    if not proxies:
++        return None
++    if isinstance(proxies, str):
++        return proxies
++    if isinstance(proxies, dict):
++        scheme = urlparse(url).scheme
++        return proxies.get(scheme) or proxies.get('all') or proxies.get('all://')
++    return None
++
++
++class _Response:
++    def __init__(self, status_code, reason, headers, text):
++        self.status_code = status_code
++        self.reason = reason
++        self.headers = headers
++        self.text = text
++
++    def json(self):
++        return json.loads(self.text)
++
++
++class ReadTimeout(TimeoutError):
++    pass
++
++
++async def _request(url, data, headers, timeout, proxy=None):
++    timeout_config = aiohttp.ClientTimeout(total=timeout)
++    try:
++        async with aiohttp.ClientSession(timeout=timeout_config) as session:
++            async with session.post(url, data=data, headers=headers, proxy=proxy) as res:
++                text = await res.text()
++                return _Response(res.status, res.reason, dict(res.headers), text)
++    except asyncio.TimeoutError as exc:
++        raise ReadTimeout(str(exc)) from exc
+ 
+ 
+ def post(write_key, host=None, gzip=False, timeout=15, proxies=None, oauth_manager=None, **kwargs):
+@@ -42,21 +104,13 @@
+             gz.write(data.encode('utf-8'))
+         data = buf.getvalue()
+ 
+-    kwargs = {
+-        "data": data,
+-        "headers": headers,
+-        "timeout": 15,
+-    }
+-
+-    if proxies:
+-        kwargs['proxies'] = proxies
+     res = None
+     try:
+-        res = _session.post(url, data=data, headers=headers, timeout=timeout)
++        res = _run_sync(_request(url, data, headers, timeout, _resolve_proxy(proxies, url)))
+     except Exception as e:
+         log.error(e)
+-        raise e
+-        
++        raise
++
+     if res.status_code == 200:
+         log.debug('data uploaded successfully')
+         return res

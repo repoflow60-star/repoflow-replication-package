@@ -1,0 +1,81 @@
+--- a/src/epstats/server/api_evaluate.py
++++ b/src/epstats/server/api_evaluate.py
+@@ -3,13 +3,16 @@
+ from concurrent.futures import ThreadPoolExecutor
+ 
+ import numpy as np
+-from fastapi import APIRouter, Depends, HTTPException
++from pydantic import ValidationError
++from sanic.exceptions import InvalidUsage, ServerError
++from sanic.blueprints import Blueprint
+ 
+ from ..prometheus import Counter, Summary, get_prometheus_metric
+ from ..toolkit import Dao
+ from ..toolkit import Experiment as EvExperiment
+ from .req import Experiment
+ from .res import Result
++from .json_response import data_science_json_response
+ 
+ _logger = logging.getLogger("epstats")
+ evaluation_duration_metric = get_prometheus_metric(
+@@ -24,7 +27,13 @@
+ evaluation_requests_metric = get_prometheus_metric("evaluation_requests_total", Counter)
+ 
+ 
+-def get_evaluate_router(get_dao, get_executor_pool) -> APIRouter:
++def get_evaluate_router(get_dao, get_executor_pool) -> Blueprint:
++    def _parse_experiment(payload):
++        try:
++            return Experiment.model_validate(payload)
++        except ValidationError as exc:
++            raise InvalidUsage(str(exc), status_code=422) from exc
++
+     def _evaluate(experiment: EvExperiment, dao: Dao):
+         try:
+             is_performance_test = experiment.query_parameters.get("is_performance_test") is True
+@@ -37,7 +46,8 @@
+                     evaluation = experiment.evaluate_agg(goals)
+                     evaluation_successes_metric.inc()
+                 _logger.info(
+-                    f"Evaluation response: [{experiment.id}]",
++                    "Evaluation response: [%s] %s",
++                    experiment.id,
+                     {
+                         "metrics": (
+                             evaluation.metrics.replace([np.inf, -np.inf], "inf")
+@@ -51,25 +61,23 @@
+             _logger.error(f"Cannot evaluate experiment [{experiment.id}] because of {e}")
+             _logger.exception(e)
+             evaluation_errors_metric.inc()
+-            raise HTTPException(
+-                status_code=500,
+-                detail=f"Cannot evaluate experiment [{experiment.id}] because of {e}",
+-            )
++            raise ServerError(f"Cannot evaluate experiment [{experiment.id}] because of {e}") from e
+ 
+-    router = APIRouter()
++    router = Blueprint("evaluate", url_prefix="")
+ 
+-    @router.post("/evaluate", response_model=Result, tags=["Experiment Evaluation"])
++    @router.post("/evaluate", name="evaluate_experiment")
+     async def evaluate_experiment(
+-        experiment: Experiment,
+-        evaluation_pool: ThreadPoolExecutor = Depends(get_executor_pool),
+-        dao: Dao = Depends(get_dao),
++        request,
+     ):
+         """
+         Evaluates single `Experiment`.
+         """
+-        _logger.info(f"Evaluation request: [{experiment.id}]", experiment.dict())
++        experiment = _parse_experiment(request.json)
++        _logger.info("Evaluation request: [%s] %s", experiment.id, experiment.model_dump())
+         evaluation_requests_metric.inc()
+-        loop = asyncio.get_event_loop()
+-        return await loop.run_in_executor(evaluation_pool, _evaluate, experiment.to_experiment(), dao)
++        with get_executor_pool() as evaluation_pool, get_dao() as dao:
++            loop = asyncio.get_running_loop()
++            result = await loop.run_in_executor(evaluation_pool, _evaluate, experiment.to_experiment(), dao)
++        return data_science_json_response(result.model_dump(mode="json"))
+ 
+     return router

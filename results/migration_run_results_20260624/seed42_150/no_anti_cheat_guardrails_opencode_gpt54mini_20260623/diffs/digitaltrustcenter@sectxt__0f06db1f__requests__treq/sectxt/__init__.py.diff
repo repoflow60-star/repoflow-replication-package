@@ -1,0 +1,233 @@
+--- a/sectxt/__init__.py
++++ b/sectxt/__init__.py
+@@ -2,6 +2,7 @@
+ # SPDX-License-Identifier: EUPL-1.2
+ #
+ import codecs
++import threading
+ 
+ import langcodes
+ import re
+@@ -22,11 +23,138 @@
+     from typing import TypedDict
+ 
+ import dateutil.parser
+-import requests
++from OpenSSL.SSL import Error as OpenSSLError
++from twisted.internet import defer, reactor, threads
++from twisted.internet.error import CertificateError, SSLError as TwistedSSLError
++from twisted.internet.ssl import ClientContextFactory
++from twisted.web.client import Agent, BrowserLikePolicyForHTTPS
++import treq
+ 
+ __version__ = "0.9.6"
+ 
+-s = requests.Session()
++_REACTOR_THREAD_STARTED = False
++_REACTOR_THREAD_LOCK = threading.Lock()
++_REACTOR_READY = threading.Event()
++
++
++def _ensure_reactor_running():
++    global _REACTOR_THREAD_STARTED
++    if _REACTOR_THREAD_STARTED:
++        if reactor.running:
++            _REACTOR_READY.set()
++        return
++    with _REACTOR_THREAD_LOCK:
++        if _REACTOR_THREAD_STARTED:
++            if reactor.running:
++                _REACTOR_READY.set()
++            return
++        if not reactor.running:
++            def _run_reactor():
++                reactor.callWhenRunning(_REACTOR_READY.set)
++                reactor.run(installSignalHandlers=False)
++
++            thread = threading.Thread(target=_run_reactor, daemon=True)
++            thread.start()
++            _REACTOR_READY.wait()
++        _REACTOR_THREAD_STARTED = True
++
++
++_HTTPS_AGENT = Agent(reactor, contextFactory=BrowserLikePolicyForHTTPS())
++_INSECURE_HTTPS_AGENT = Agent(reactor, contextFactory=ClientContextFactory())
++
++
++def _run_async(coro):
++    _ensure_reactor_running()
++    return threads.blockingCallFromThread(reactor, lambda: defer.ensureDeferred(coro))
++
++
++def _response_status(response) -> Optional[int]:
++    return getattr(response, "status_code", getattr(response, "code", None))
++
++
++def _response_history(response):
++    return getattr(response, "history", None) or []
++
++
++def _response_url(response, fallback: str) -> str:
++    return getattr(response, "url", fallback)
++
++
++def _response_header(headers, name: str):
++    if headers is None:
++        return None
++    if hasattr(headers, "getRawHeaders"):
++        values = headers.getRawHeaders(name)
++        if not values:
++            values = headers.getRawHeaders(name.encode("ascii"))
++        if values:
++            value = values[0]
++            if isinstance(value, bytes):
++                return value.decode("latin1")
++            return value
++    if hasattr(headers, "get"):
++        value = headers.get(name)
++        if value is not None:
++            if isinstance(value, bytes):
++                return value.decode("latin1")
++            return value
++    try:
++        value = headers[name]
++    except Exception:
++        return None
++    if isinstance(value, bytes):
++        return value.decode("latin1")
++    return value
++
++
++def _is_ssl_error(exc: Exception) -> bool:
++    pending = [exc]
++    seen = set()
++    while pending:
++        current = pending.pop()
++        if id(current) in seen:
++            continue
++        seen.add(id(current))
++        if isinstance(current, (OpenSSLError, TwistedSSLError, CertificateError)):
++            return True
++        value = getattr(current, "value", None)
++        if isinstance(value, BaseException):
++            pending.append(value)
++        reasons = getattr(current, "reasons", None)
++        if reasons:
++            pending.extend(reason for reason in reasons if reason is not None)
++        args = getattr(current, "args", ())
++        for part in args:
++            if isinstance(part, BaseException):
++                pending.append(part)
++        name = current.__class__.__name__.lower()
++        if "ssl" in name or "certificate" in name:
++            return True
++        cause = getattr(current, "__cause__", None)
++        context = getattr(current, "__context__", None)
++        if cause is not None:
++            pending.append(cause)
++        if context is not None:
++            pending.append(context)
++    return False
++
++
++async def _fetch_url(url: str, verify: bool):
++    request_kwargs = {
++        "headers": {
++            "User-Agent": "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) "
++            "Gecko/20100101 Firefox/12.0"
++        },
++        "timeout": 5,
++    }
++    agent = _HTTPS_AGENT if verify else _INSECURE_HTTPS_AGENT
++
++    try:
++        response = await treq.request("GET", url, agent=agent, **request_kwargs)
++    except TypeError:
++        response = await treq.request("GET", url, **request_kwargs)
++    content = await treq.content(response)
++    return response, content
+ 
+ 
+ class ErrorDict(TypedDict):
+@@ -557,35 +685,23 @@
+                 for path in [".well-known/security.txt", "security.txt"]:
+                     url = urlunsplit((scheme, self._loc, path, None, None))
+                     try:
+-                        resp = requests.get(
+-                            url,
+-                            headers={
+-                                'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                              'Gecko/20100101 Firefox/12.0'},
+-                            timeout=5
+-                        )
+-                    except requests.exceptions.SSLError:
++                        resp, content = _run_async(_fetch_url(url, verify=True))
++                    except Exception as exc:
++                        if not _is_ssl_error(exc):
++                            continue
+                         if not any(d["code"] == "invalid_cert" for d in self._errors):
+                             self._add_error(
+                                 "invalid_cert",
+                                 "security.txt must be served with a valid TLS certificate.",
+                             )
+                         try:
+-                            resp = requests.get(
+-                                url,
+-                                headers={
+-                                    'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                                  'Gecko/20100101 Firefox/12.0'},
+-                                timeout=5,
+-                                verify=False
+-                            )
+-                        except:
++                            resp, content = _run_async(_fetch_url(url, verify=False))
++                        except Exception:
+                             continue
+-                    except:
+-                        continue
+-                    if resp.status_code == 200:
+-                        if resp.history:
+-                            if not resp.url.endswith(path):
++                    if _response_status(resp) == 200:
++                        history = _response_history(resp)
++                        if history:
++                            if not _response_url(resp, url).endswith(path):
+                                 continue
+                         self._path = path
+                         self._url = url
+@@ -603,13 +719,17 @@
+                                 "(legacy place), but must be placed under "
+                                 "the '/.well-known/' path.",
+                             )
+-                        if "content-type" not in resp.headers:
++                        content_type = _response_header(
++                            getattr(resp, "headers", getattr(resp, "responseHeaders", None)),
++                            "content-type",
++                        )
++                        if content_type is None:
+                             self._add_error(
+                                 "no_content_type", "HTTP Content-Type header must be sent."
+                             )
+                         else:
+                             m = Message()
+-                            m['content-type'] = resp.headers["content-type"]
++                            m['content-type'] = content_type
+                             params = dict(m.get_params())
+                             if "text/plain" not in params:
+                                 self._add_error(
+@@ -625,9 +745,12 @@
+                                     "Charset parameter in Content-Type header must be "
+                                     "'utf-8' if present.",
+                                 )
+-                        self._content = resp.content
+-                        if resp.history:
+-                            self._urls = [resp.history[0].url, resp.url]
++                        self._content = content
++                        if history:
++                            self._urls = [
++                                _response_url(history[0], url),
++                                _response_url(resp, url),
++                            ]
+                         else:
+                             self._urls = [url]
+                         super()._process()

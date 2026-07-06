@@ -1,0 +1,292 @@
+diff --git /dev/null b/httpx.py
+new file mode 100644
+index 0000000..de8c5dd
+--- /dev/null
++++ b/httpx.py
+@@ -0,0 +1,286 @@
++"""Lightweight synchronous HTTP client compatible with the subset of httpx used here."""
++
++
++from __future__ import annotations
++
++import json as _json
++import mimetypes
++import urllib.error
++import urllib.parse
++import urllib.request
++import uuid
++from dataclasses import dataclass
++from http import cookiejar
++from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
++
++
++class RequestError(Exception):
++    def __init__(self, message: str = "", request: Any = None, response: Any = None):
++        super().__init__(message)
++        self.request = request
++        self.response = response
++
++
++class HTTPStatusError(RequestError):
++    pass
++
++
++HTTPError = HTTPStatusError
++
++
++class ConnectTimeout(RequestError):
++    pass
++
++
++class ReadTimeout(RequestError):
++    pass
++
++
++class Timeout(RequestError):
++    pass
++
++
++class ConnectionError(RequestError):
++    pass
++
++
++class RetryError(RequestError):
++    pass
++
++
++@dataclass
++class Request:
++    method: str = "GET"
++    url: str = ""
++    headers: Optional[Dict[str, str]] = None
++    data: Any = None
++
++
++class PreparedRequest(Request):
++    pass
++
++
++class CaseInsensitiveDict(dict):
++    def __init__(self, data: Optional[Mapping[str, Any]] = None):
++        super().__init__()
++        if data:
++            self.update(data)
++
++    def __setitem__(self, key: str, value: Any) -> None:
++        super().__setitem__(key.lower(), value)
++
++    def __getitem__(self, key: str) -> Any:
++        return super().__getitem__(key.lower())
++
++    def get(self, key: str, default: Any = None) -> Any:
++        return super().get(key.lower(), default)
++
++    def update(self, data: Optional[Mapping[str, Any]] = None, **kwargs: Any) -> None:
++        if data:
++            for key, value in data.items():
++                super().__setitem__(str(key).lower(), value)
++        for key, value in kwargs.items():
++            super().__setitem__(str(key).lower(), value)
++
++
++class Response:
++    def __init__(
++        self,
++        status_code: int = 200,
++        headers: Optional[Mapping[str, Any]] = None,
++        content: bytes = b"",
++        url: str = "",
++        request: Optional[Request] = None,
++        reason: str = "",
++    ):
++        self.status_code = status_code
++        self.headers = CaseInsensitiveDict(headers or {})
++        self.content = content
++        self.url = url
++        self.request = request
++        self.reason = reason
++
++    @property
++    def text(self) -> str:
++        return self.content.decode("utf-8", errors="replace")
++
++    def json(self) -> Any:
++        return _json.loads(self.text or self.content.decode("utf-8"))
++
++    def raise_for_status(self) -> None:
++        if 400 <= self.status_code:
++            raise HTTPStatusError(
++                f"HTTP {self.status_code}", request=self.request, response=self
++            )
++
++
++def _normalize_params(url: str, params: Optional[Mapping[str, Any]]) -> str:
++    if not params:
++        return url
++    parsed = urllib.parse.urlsplit(url)
++    query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
++    for key, value in params.items():
++        if isinstance(value, (list, tuple)):
++            query.extend((key, str(item)) for item in value)
++        elif value is not None:
++            query.append((key, str(value)))
++    new_query = urllib.parse.urlencode(query, doseq=True)
++    return urllib.parse.urlunsplit(
++        (parsed.scheme, parsed.netloc, parsed.path, new_query, parsed.fragment)
++    )
++
++
++def _encode_multipart(fields: Mapping[str, Any]) -> Tuple[bytes, str]:
++    boundary = uuid.uuid4().hex
++    body = bytearray()
++    for name, value in fields.items():
++        filename = None
++        content_type = None
++        data = value
++        if isinstance(value, tuple):
++            if len(value) == 3:
++                filename, data, content_type = value
++            elif len(value) == 2:
++                filename, data = value
++            else:
++                data = value[0]
++        body.extend(f"--{boundary}\r\n".encode())
++        disposition = f'Content-Disposition: form-data; name="{name}"'
++        if filename is not None:
++            disposition += f'; filename="{filename}"'
++        body.extend(f"{disposition}\r\n".encode())
++        if content_type is None:
++            content_type = (
++                mimetypes.guess_type(filename or "")[0]
++                if filename
++                else "text/plain; charset=utf-8"
++            )
++        if content_type:
++            body.extend(f"Content-Type: {content_type}\r\n".encode())
++        body.extend(b"\r\n")
++        if isinstance(data, bytes):
++            body.extend(data)
++        else:
++            body.extend(str(data).encode("utf-8"))
++        body.extend(b"\r\n")
++    body.extend(f"--{boundary}--\r\n".encode())
++    return bytes(body), f"multipart/form-data; boundary={boundary}"
++
++
++def _coerce_body(
++    data: Any = None,
++    json: Any = None,
++    files: Optional[Mapping[str, Any]] = None,
++) -> Tuple[Optional[bytes], Optional[str]]:
++    if files is not None:
++        return _encode_multipart(files)
++    if json is not None:
++        return _json.dumps(json).encode("utf-8"), "application/json"
++    if data is None:
++        return None, None
++    if isinstance(data, bytes):
++        return data, None
++    if isinstance(data, str):
++        return data.encode("utf-8"), None
++    if isinstance(data, Mapping):
++        return urllib.parse.urlencode(data, doseq=True).encode("utf-8"), (
++            "application/x-www-form-urlencoded"
++        )
++    return str(data).encode("utf-8"), None
++
++
++def _response_from_urllib(
++    response: Any,
++    request: Request,
++    content: Optional[bytes] = None,
++) -> Response:
++    body = content if content is not None else response.read()
++    headers = dict(getattr(response, "headers", {}).items())
++    status_code = getattr(response, "status", getattr(response, "code", 0))
++    if not status_code:
++        status_code = response.getcode()
++    return Response(
++        status_code=status_code,
++        headers=headers,
++        content=body,
++        url=getattr(response, "url", request.url),
++        request=request,
++    )
++
++
++class Client:
++    def __init__(
++        self,
++        headers: Optional[Mapping[str, Any]] = None,
++        follow_redirects: bool = True,
++        timeout: Optional[float] = None,
++    ):
++        self.headers = CaseInsensitiveDict(headers or {})
++        self.follow_redirects = follow_redirects
++        self.timeout = timeout
++        self.cookies = cookiejar.CookieJar()
++        self._mounts: Dict[str, Any] = {}
++
++    def mount(self, prefix: str, adapter: Any) -> None:
++        self._mounts[prefix] = adapter
++
++    def close(self) -> None:
++        return None
++
++    def __enter__(self) -> "Client":
++        return self
++
++    def __exit__(self, exc_type, exc, tb) -> None:
++        self.close()
++
++    def request(
++        self,
++        method: str,
++        url: str,
++        params: Optional[Mapping[str, Any]] = None,
++        data: Any = None,
++        json: Any = None,
++        files: Optional[Mapping[str, Any]] = None,
++        headers: Optional[Mapping[str, Any]] = None,
++        timeout: Optional[float] = None,
++        **_: Any,
++    ) -> Response:
++        full_url = _normalize_params(url, params)
++        body, content_type = _coerce_body(data=data, json=json, files=files)
++        merged_headers = CaseInsensitiveDict(self.headers)
++        if headers:
++            merged_headers.update(headers)
++        if content_type and "content-type" not in merged_headers:
++            merged_headers["Content-Type"] = content_type
++
++        request = Request(method=method.upper(), url=full_url, headers=dict(merged_headers), data=body)
++        req = urllib.request.Request(
++            full_url,
++            data=body,
++            headers=dict(merged_headers),
++            method=method.upper(),
++        )
++
++        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cookies))
++        try:
++            with opener.open(req, timeout=timeout if timeout is not None else self.timeout) as resp:
++                return _response_from_urllib(resp, request)
++        except urllib.error.HTTPError as exc:
++            return _response_from_urllib(exc, request, content=exc.read())
++        except urllib.error.URLError as exc:
++            raise RequestError(str(exc), request=request) from exc
++
++    def get(self, url: str, **kwargs: Any) -> Response:
++        return self.request("GET", url, **kwargs)
++
++    def post(self, url: str, **kwargs: Any) -> Response:
++        return self.request("POST", url, **kwargs)
++
++    def put(self, url: str, **kwargs: Any) -> Response:
++        return self.request("PUT", url, **kwargs)
++
++    def delete(self, url: str, **kwargs: Any) -> Response:
++        return self.request("DELETE", url, **kwargs)
++
++
++RequestException = RequestError

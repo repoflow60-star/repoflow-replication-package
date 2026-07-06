@@ -1,0 +1,103 @@
+diff --git a/appstoreserverlibrary/api_client.py b/appstoreserverlibrary/api_client.py
+index 9946fce..9fd90e6 100644
+--- a/appstoreserverlibrary/api_client.py
++++ b/appstoreserverlibrary/api_client.py
+@@ -1,7 +1,10 @@
+ # Copyright (c) 2023 Apple Inc. Licensed under MIT License.
+ 
++import asyncio
+ import calendar
+ import datetime
++import json as jsonlib
++from functools import partial
+ from enum import IntEnum, Enum
+ from typing import Any, Dict, List, MutableMapping, Optional, Type, TypeVar, Union
+ from attr import define
+@@ -501,6 +504,12 @@ class BaseAppStoreServerAPIClient:
+         c = _get_cattrs_converter(type(body)) if body is not None else None
+         return c.unstructure(body) if body is not None else None
+ 
++    def _get_response_status_code(self, response) -> int:
++        status_code = getattr(response, "status_code", None)
++        if status_code is not None:
++            return status_code
++        return getattr(response, "status")
++
+     def _parse_response(self, status_code: int, headers: MutableMapping, json_supplier, destination_class: Type[T]) -> T:
+         if 200 <= status_code < 300:
+             if destination_class is None:
+@@ -510,7 +519,7 @@ class BaseAppStoreServerAPIClient:
+             return c.structure(response_body, destination_class)
+         else:
+             # Best effort parsing of the response body
+-            if not 'content-type' in headers or headers['content-type'] != 'application/json':
++            if 'content-type' not in headers or 'application/json' not in headers['content-type']:
+                 raise APIException(status_code)
+             try:
+                 response_body = json_supplier()
+@@ -531,7 +540,7 @@ class AppStoreServerAPIClient(BaseAppStoreServerAPIClient):
+         headers = self._get_headers()
+         
+         response = self._execute_request(method, url, queryParameters, headers, json)
+-        return self._parse_response(response.status_code, response.headers, lambda: response.json(), destination_class)
++        return self._parse_response(self._get_response_status_code(response), response.headers, lambda: response.json(), destination_class)
+ 
+     def _execute_request(self, method: str, url: str, params: Dict[str, Union[str, List[str]]], headers: Dict[str, str], json: Dict[str, Any]) -> requests.Response:
+         return requests.request(method, url, params=params, headers=headers, json=json)
+@@ -720,13 +729,26 @@ class AsyncAppStoreServerAPIClient(BaseAppStoreServerAPIClient):
+     def __init__(self, signing_key: bytes, key_id: str, issuer_id: str, bundle_id: str, environment: Environment):
+         super().__init__(signing_key=signing_key, key_id=key_id, issuer_id=issuer_id, bundle_id=bundle_id, environment=environment)
+         try:
+-            import httpx
+-            self.http_client = httpx.AsyncClient()
+-        except:
+-            raise ModuleNotFoundError("httpx not found but attempting to instantiate an async client")
++            import urllib3
++            self.http_client = urllib3.PoolManager()
++        except ModuleNotFoundError:
++            raise ModuleNotFoundError("urllib3 not found but attempting to instantiate an async client")
+ 
+     async def async_close(self):
+-        await self.http_client.aclose()
++        await asyncio.get_running_loop().run_in_executor(None, self.http_client.clear)
++
++    def _normalize_query_parameters(self, query_parameters: Dict[str, Union[str, List[str]]]):
++        fields = []
++        for key, value in query_parameters.items():
++            if isinstance(value, list):
++                fields.extend((key, item) for item in value)
++            else:
++                fields.append((key, value))
++        return fields
++
++    async def _run_in_executor(self, func, *args, **kwargs):
++        loop = asyncio.get_running_loop()
++        return await loop.run_in_executor(None, partial(func, *args, **kwargs))
+     
+     async def _make_request(self, path: str, method: str, queryParameters: Dict[str, Union[str, List[str]]], body, destination_class: Type[T]) -> T:
+         url = self._get_full_url(path)
+@@ -734,10 +756,22 @@ class AsyncAppStoreServerAPIClient(BaseAppStoreServerAPIClient):
+         headers = self._get_headers()
+         
+         response = await self._execute_request(method, url, queryParameters, headers, json)
+-        return self._parse_response(response.status_code, response.headers, lambda: response.json(), destination_class)
++        return self._parse_response(self._get_response_status_code(response), response.headers, lambda: response.json(), destination_class)
+ 
+     async def _execute_request(self, method: str, url: str, params: Dict[str, Union[str, List[str]]], headers: Dict[str, str], json: Dict[str, Any]):
+-        return await self.http_client.request(method, url, params=params, headers=headers, json=json)
++        fields = self._normalize_query_parameters(params)
++        request_headers = dict(headers)
++        body = None if json is None else jsonlib.dumps(json).encode("utf-8")
++        if body is not None and 'content-type' not in {key.lower(): value for key, value in request_headers.items()}:
++            request_headers['Content-Type'] = 'application/json'
++        return await self._run_in_executor(
++            self.http_client.request,
++            method,
++            url,
++            fields=fields if fields else None,
++            headers=request_headers,
++            body=body,
++        )
+ 
+     async def extend_renewal_date_for_all_active_subscribers(self, mass_extend_renewal_date_request: MassExtendRenewalDateRequest) -> MassExtendRenewalDateResponse: 
+         """

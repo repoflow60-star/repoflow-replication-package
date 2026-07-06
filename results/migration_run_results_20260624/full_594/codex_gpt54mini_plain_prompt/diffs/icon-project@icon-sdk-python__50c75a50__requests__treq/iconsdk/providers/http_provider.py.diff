@@ -1,0 +1,105 @@
+diff --git a/iconsdk/providers/http_provider.py b/iconsdk/providers/http_provider.py
+index 472d63d..9bbdb13 100644
+--- a/iconsdk/providers/http_provider.py
++++ b/iconsdk/providers/http_provider.py
+@@ -14,12 +14,13 @@
+ 
+ import json
+ import re
++import asyncio
++from dataclasses import dataclass
+ from json.decoder import JSONDecodeError
+ from time import time, monotonic
+ from typing import Union, Optional
+ from urllib.parse import urlparse, urlunparse
+ 
+-import requests
+ from multimethod import multimethod
+ from websocket import WebSocket, WebSocketTimeoutException
+ 
+@@ -27,6 +28,62 @@ from iconsdk.exception import JSONRPCException, URLException
+ from iconsdk.providers.provider import Provider, MonitorSpec, Monitor, MonitorTimeoutException
+ from iconsdk.utils import to_dict
+ 
++try:
++    _TREQ_LOOP = None
++    from twisted.internet import asyncioreactor
++    _TREQ_LOOP = asyncio.new_event_loop()
++    asyncioreactor.install(eventloop=_TREQ_LOOP)
++    import treq
++except Exception:  # pragma: no cover - exercised when treq/twisted is unavailable.
++    if _TREQ_LOOP is not None:
++        _TREQ_LOOP.close()
++    _TREQ_LOOP = None
++    treq = None
++
++
++@dataclass
++class _HTTPResponse:
++    content: bytes
++    status_code: int
++    ok: bool
++
++
++class _TreqRuntime:
++    def __init__(self):
++        self.available = treq is not None and _TREQ_LOOP is not None
++
++    def post(self, request_url: str, data: dict, **kwargs) -> _HTTPResponse:
++        timeout = kwargs.pop('timeout', 10)
++        headers = kwargs.pop('headers', {})
++        if self.available:
++            return self._post_with_treq(request_url, data, headers=headers, timeout=timeout)
++        return self._post_with_requests(request_url, data, headers=headers, timeout=timeout, **kwargs)
++
++    @staticmethod
++    def _post_with_treq(request_url: str, data: dict, headers: dict, timeout: float) -> _HTTPResponse:
++        body = json.dumps(data).encode()
++        deferred = treq.post(request_url, data=body, headers=headers)
++        if timeout is not None:
++            deferred.addTimeout(timeout, _TREQ_LOOP)
++        response = _TREQ_LOOP.run_until_complete(deferred.asFuture(_TREQ_LOOP))
++        content = _TREQ_LOOP.run_until_complete(treq.content(response).asFuture(_TREQ_LOOP))
++        code = getattr(response, 'code', 200)
++        return _HTTPResponse(content=content, status_code=code, ok=200 <= code < 400)
++
++    @staticmethod
++    def _post_with_requests(request_url: str, data: dict, headers: dict, timeout: float, **kwargs) -> _HTTPResponse:
++        import requests
++
++        kwargs.setdefault('timeout', timeout)
++        request_kwargs = dict(kwargs)
++        request_kwargs['headers'] = headers
++        with requests.Session() as session:
++            response = session.post(url=request_url, data=json.dumps(data), **request_kwargs)
++        return _HTTPResponse(content=response.content, status_code=response.status_code, ok=response.ok)
++
++
++_TREQ_RUNTIME = _TreqRuntime()
++
+ 
+ class HTTPProvider(Provider):
+     """
+@@ -119,11 +176,8 @@ class HTTPProvider(Provider):
+             yield key, value
+ 
+     @staticmethod
+-    def _make_post_request(request_url: str, data: dict, **kwargs) -> requests.Response:
+-        kwargs.setdefault('timeout', 10)
+-        with requests.Session() as session:
+-            response = session.post(url=request_url, data=json.dumps(data), **kwargs)
+-        return response
++    def _make_post_request(request_url: str, data: dict, **kwargs) -> _HTTPResponse:
++        return _TREQ_RUNTIME.post(request_url, data, **kwargs)
+ 
+     def _make_id(self) -> int:
+         return int(time())
+@@ -147,7 +201,7 @@ class HTTPProvider(Provider):
+             raise JSONRPCException(f'Unknown response: {raw_response}')
+ 
+     @staticmethod
+-    def _return_custom_response(response: requests.Response, full_response: bool = False) -> Union[str, list, dict]:
++    def _return_custom_response(response: _HTTPResponse, full_response: bool = False) -> Union[str, list, dict]:
+         content = json.loads(response.content)
+         if full_response:
+             return content

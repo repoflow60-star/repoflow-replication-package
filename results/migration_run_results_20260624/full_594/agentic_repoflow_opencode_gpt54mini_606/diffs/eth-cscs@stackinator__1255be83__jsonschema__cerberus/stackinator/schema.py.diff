@@ -1,0 +1,333 @@
+--- a/stackinator/schema.py
++++ b/stackinator/schema.py
+@@ -1,37 +1,266 @@
++import copy
+ import json
+ import pathlib
+-
+-import jsonschema
++import re
++
++from cerberus import Validator
+ import yaml
+ 
+ prefix = pathlib.Path(__file__).parent.resolve()
+ 
+-# create a validator that will insert optional fields with their default values
+-# if they have not been provided.
+-
+-
+-def extend_with_default(validator_class):
+-    validate_properties = validator_class.VALIDATORS["properties"]
+-
+-    def set_defaults(validator, properties, instance, schema):
+-        # if instance is none, it's not possible to set any default for any sub-property
+-        if instance is not None:
+-            for property, subschema in properties.items():
+-                if "default" in subschema:
+-                    instance.setdefault(property, subschema["default"])
+-
+-        for error in validate_properties(
+-            validator,
+-            properties,
+-            instance,
+-            schema,
+-        ):
+-            yield error
+-
+-    return jsonschema.validators.extend(
+-        validator_class,
+-        {"properties": set_defaults},
+-    )
++
++class ValidationError(Exception):
++    pass
++
++
++def _resolve_ref(schema, defs):
++    ref = schema["$ref"]
++    if not ref.startswith("#/defs/"):
++        raise ValueError(f"Unsupported schema reference: {ref}")
++    return defs[ref[len("#/defs/"):]]
++
++
++def _cerberus_regex(pattern):
++    return f"^(?:{pattern})$"
++
++
++def _schema_is_object_like(schema, defs):
++    if "$ref" in schema:
++        return _schema_is_object_like(_resolve_ref(schema, defs), defs)
++
++    if schema.get("type") == "object":
++        return True
++
++    return any(key in schema for key in ("properties", "patternProperties", "additionalProperties"))
++
++
++def _schema_allows_null(schema, defs):
++    if "$ref" in schema:
++        return _schema_allows_null(_resolve_ref(schema, defs), defs)
++
++    if schema.get("type") == "null":
++        return True
++
++    if None in schema.get("enum", []):
++        return True
++
++    for key in ("oneOf", "anyOf"):
++        if key in schema and any(_schema_allows_null(option, defs) for option in schema[key]):
++            return True
++
++    return False
++
++
++def _translate_schema(schema, defs):
++    if "$ref" in schema:
++        return _translate_schema(_resolve_ref(schema, defs), defs)
++
++    if "oneOf" in schema:
++        rule = {"oneof": [_translate_schema(option, defs) for option in schema["oneOf"]]}
++        if _schema_allows_null(schema, defs):
++            rule["nullable"] = True
++        return rule
++
++    if "anyOf" in schema:
++        rule = {"anyof": [_translate_schema(option, defs) for option in schema["anyOf"]]}
++        if _schema_allows_null(schema, defs):
++            rule["nullable"] = True
++        return rule
++
++    if "enum" in schema:
++        rule = {"allowed": list(schema["enum"])}
++        if None in schema["enum"]:
++            rule["nullable"] = True
++        return rule
++
++    schema_type = schema.get("type")
++
++    if schema_type == "object" or _schema_is_object_like(schema, defs):
++        rule = {"type": "dict"}
++
++        properties = schema.get("properties", {})
++        if properties:
++            required = set(schema.get("required", []))
++            rule["schema"] = {
++                name: {
++                    **_translate_schema(subschema, defs),
++                    **({"required": True} if name in required else {}),
++                }
++                for name, subschema in properties.items()
++            }
++
++        pattern_properties = schema.get("patternProperties", {})
++        if pattern_properties:
++            pattern, subschema = next(iter(pattern_properties.items()))
++            rule["keysrules"] = {"type": "string", "regex": _cerberus_regex(pattern)}
++            rule["valuesrules"] = _translate_schema(subschema, defs)
++
++        additional_properties = schema.get("additionalProperties")
++        if pattern_properties:
++            rule["allow_unknown"] = True
++        elif additional_properties is False:
++            rule["allow_unknown"] = False
++        elif isinstance(additional_properties, dict):
++            rule["allow_unknown"] = _translate_schema(additional_properties, defs)
++
++        if schema_type is None or _schema_allows_null(schema, defs):
++            rule["nullable"] = True
++
++        return rule
++
++    if schema_type == "array":
++        rule = {"type": "list"}
++        if "items" in schema:
++            rule["schema"] = _translate_schema(schema["items"], defs)
++        if "minItems" in schema:
++            rule["minlength"] = schema["minItems"]
++        if "maxItems" in schema:
++            rule["maxlength"] = schema["maxItems"]
++        return rule
++
++    if schema_type == "string":
++        rule = {"type": "string"}
++        if "pattern" in schema:
++            rule["regex"] = _cerberus_regex(schema["pattern"])
++        return rule
++
++    if schema_type == "boolean":
++        return {"type": "boolean"}
++
++    if schema_type == "integer":
++        return {"type": "integer"}
++
++    if schema_type == "number":
++        return {"type": "number"}
++
++    if schema_type == "null":
++        return {"allowed": [None], "nullable": True}
++
++    return {}
++
++
++def _apply_defaults(schema, document, defs):
++    if "$ref" in schema:
++        _apply_defaults(_resolve_ref(schema, defs), document, defs)
++        return
++
++    if "oneOf" in schema:
++        for option in schema["oneOf"]:
++            if isinstance(document, dict) and _schema_is_object_like(option, defs):
++                _apply_defaults(option, document, defs)
++            elif isinstance(document, list) and option.get("type") == "array":
++                _apply_defaults(option, document, defs)
++        return
++
++    if "anyOf" in schema:
++        for option in schema["anyOf"]:
++            if isinstance(document, dict) and _schema_is_object_like(option, defs):
++                _apply_defaults(option, document, defs)
++            elif isinstance(document, list) and option.get("type") == "array":
++                _apply_defaults(option, document, defs)
++        return
++
++    if schema.get("type") == "object" or _schema_is_object_like(schema, defs):
++        if not isinstance(document, dict):
++            return
++
++        for name, subschema in schema.get("properties", {}).items():
++            if name not in document and "default" in subschema:
++                document[name] = copy.deepcopy(subschema["default"])
++
++            if name in document:
++                _apply_defaults(subschema, document[name], defs)
++
++        for pattern, subschema in schema.get("patternProperties", {}).items():
++            for key, value in document.items():
++                if re.search(pattern, key):
++                    _apply_defaults(subschema, value, defs)
++
++        additional_properties = schema.get("additionalProperties")
++        if isinstance(additional_properties, dict):
++            for key, value in document.items():
++                if key not in schema.get("properties", {}) and not any(
++                    re.search(pattern, key) for pattern in schema.get("patternProperties", {})
++                ):
++                    _apply_defaults(additional_properties, value, defs)
++
++        return
++
++    if schema.get("type") == "array" and isinstance(document, list):
++        items = schema.get("items")
++        if items is not None:
++            for item in document:
++                _apply_defaults(items, item, defs)
++
++
++def _validate_pattern_properties(schema, document, defs):
++    if "$ref" in schema:
++        return _validate_pattern_properties(_resolve_ref(schema, defs), document, defs)
++
++    if "oneOf" in schema:
++        for option in schema["oneOf"]:
++            if _schema_is_object_like(option, defs):
++                error = _validate_pattern_properties(option, document, defs)
++                if error is None:
++                    return None
++        return None
++
++    if "anyOf" in schema:
++        for option in schema["anyOf"]:
++            if _schema_is_object_like(option, defs):
++                error = _validate_pattern_properties(option, document, defs)
++                if error is None:
++                    return None
++        return None
++
++    if not isinstance(document, dict):
++        return None
++
++    properties = schema.get("properties", {})
++    patterns = list(schema.get("patternProperties", {}))
++
++    if schema.get("additionalProperties") is False:
++        extras = [
++            key
++            for key in document
++            if key not in properties and not any(re.search(pattern, key) for pattern in patterns)
++        ]
++        if extras:
++            return f"Additional properties are not allowed ('{extras[0]}' was unexpected)"
++
++    for key, subschema in properties.items():
++        if key in document:
++            error = _validate_pattern_properties(subschema, document[key], defs)
++            if error is not None:
++                return error
++
++    for pattern, subschema in schema.get("patternProperties", {}).items():
++        for key, value in document.items():
++            if re.search(pattern, key):
++                error = _validate_pattern_properties(subschema, value, defs)
++                if error is not None:
++                    return error
++
++    if "schema" in schema:
++        for key, subschema in schema["schema"].items():
++            if key in document:
++                error = _validate_pattern_properties(subschema, document[key], defs)
++                if error is not None:
++                    return error
++
++    if "valuesrules" in schema:
++        for value in document.values():
++            error = _validate_pattern_properties(schema["valuesrules"], value, defs)
++            if error is not None:
++                return error
++
++    if schema.get("type") == "array" and isinstance(document, list) and "schema" in schema:
++        for item in document:
++            error = _validate_pattern_properties(schema["schema"], item, defs)
++            if error is not None:
++                return error
++
++    return None
+ 
+ 
+ def py2yaml(data, indent):
+@@ -41,7 +270,34 @@
+     return res
+ 
+ 
+-validator = extend_with_default(jsonschema.Draft7Validator)
++class _SchemaValidator:
++    def __init__(self, schema):
++        self._json_schema = schema
++        self._defs = schema.get("defs", {})
++        self._cerberus_schema = _translate_schema(schema, self._defs)
++        self._validator = Validator({"_root": self._cerberus_schema})
++
++    def validate(self, document):
++        _apply_defaults(self._json_schema, document, self._defs)
++
++        additional_properties_error = _validate_pattern_properties(self._json_schema, document, self._defs)
++        if additional_properties_error is not None:
++            raise ValidationError(additional_properties_error)
++
++        wrapper = {"_root": document}
++        if self._validator.validate(wrapper):
++            normalized = self._validator.document.get("_root")
++            if isinstance(document, dict) and isinstance(normalized, dict):
++                document.clear()
++                document.update(normalized)
++            return True
++
++        raise ValidationError(str(self._validator.errors))
++
++
++def validator(schema):
++    return _SchemaValidator(schema)
++
+ 
+ # load recipe yaml schema
+ config_schema = json.load(open(prefix / "schema/config.json"))

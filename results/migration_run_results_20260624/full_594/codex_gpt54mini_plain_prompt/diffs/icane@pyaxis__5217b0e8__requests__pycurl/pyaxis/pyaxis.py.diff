@@ -1,0 +1,184 @@
+diff --git a/pyaxis/pyaxis.py b/pyaxis/pyaxis.py
+index b9151c1..bec3245 100755
+--- a/pyaxis/pyaxis.py
++++ b/pyaxis/pyaxis.py
+@@ -22,6 +22,12 @@ Example:
+ 
+ import logging
+ import re
++from contextlib import suppress
++from http.client import responses as http_responses
++from io import BytesIO
++from urllib.error import HTTPError as UrllibHTTPError
++from urllib.error import URLError
++from urllib.request import Request, urlopen
+ 
+ from numpy import nan
+ 
+@@ -29,6 +35,9 @@ from pandas import Series
+ 
+ import requests
+ 
++with suppress(ImportError):
++    import pycurl
++
+ from pyaxis.metadata_processing import metadata_extract, metadata_split_to_dict, multilingual_parse
+ 
+ from pyaxis.data_processing import get_dimensions, build_dataframe
+@@ -37,6 +46,104 @@ from pyaxis.data_processing import get_dimensions, build_dataframe
+ logging.basicConfig(level=logging.INFO)
+ logger = logging.getLogger(__name__)
+ 
++try:
++    PY_CURL_AVAILABLE = pycurl is not None
++except NameError:
++    PY_CURL_AVAILABLE = False
++
++
++def _build_response(uri, body, encoding, status_code=200, reason=''):
++    """Build a requests-like response object from raw bytes."""
++    response = requests.Response()
++    response.url = uri
++    response.status_code = status_code
++    response.reason = reason or http_responses.get(status_code, '')
++    response.encoding = encoding
++    response._content = body
++    response.headers = {}
++    return response
++
++
++def _raise_http_error(uri, body, encoding, status_code, reason=''):
++    """Raise a requests-compatible HTTP error for URL fetches."""
++    response = _build_response(uri, body, encoding, status_code, reason)
++    logger.error('HTTPError = %s', str(status_code) + ' ' + response.reason)
++    response.raise_for_status()
++
++
++def _decode_body(body, encoding):
++    """Decode bytes into text with a consistent fallback."""
++    if isinstance(body, str):
++        return body
++    return body.decode(encoding or 'utf-8')
++
++
++def _pycurl_error_to_requests(exc):
++    """Translate pycurl failures to requests exceptions."""
++    errno = exc.args[0] if exc.args else None
++    message = exc.args[1] if len(exc.args) > 1 else str(exc)
++    connect_timeout_errno = getattr(pycurl, 'E_OPERATION_TIMEDOUT', 28)
++    could_not_connect_errno = getattr(pycurl, 'E_COULDNT_CONNECT', 7)
++    could_not_resolve_host_errno = getattr(pycurl, 'E_COULDNT_RESOLVE_HOST', 6)
++    could_not_resolve_proxy_errno = getattr(pycurl, 'E_COULDNT_RESOLVE_PROXY', 5)
++    url_malformed_errno = getattr(pycurl, 'E_URL_MALFORMAT', 3)
++
++    if errno == connect_timeout_errno:
++        logger.error('ConnectionTimeout = %s', message)
++        return requests.exceptions.ConnectTimeout(message)
++    if errno in {could_not_connect_errno, could_not_resolve_host_errno,
++                 could_not_resolve_proxy_errno}:
++        logger.error('ConnectionError = %s', message)
++        return requests.exceptions.ConnectionError(message)
++    if errno == url_malformed_errno:
++        logger.error('URLError = %s', message)
++        return requests.exceptions.InvalidURL(message)
++
++    logger.error('Generic exception: %s', message)
++    return requests.exceptions.ConnectionError(message)
++
++
++def _read_url_with_pycurl(uri, encoding, timeout):
++    """Fetch a URL using pycurl and return decoded text."""
++    buffer = BytesIO()
++    curl = pycurl.Curl()
++    try:
++        curl.setopt(pycurl.URL, uri)
++        curl.setopt(pycurl.WRITEDATA, buffer)
++        curl.setopt(pycurl.CONNECTTIMEOUT, timeout)
++        curl.setopt(pycurl.TIMEOUT, timeout)
++        curl.setopt(pycurl.FOLLOWLOCATION, True)
++        curl.setopt(pycurl.NOSIGNAL, 1)
++        curl.perform()
++        status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        body = buffer.getvalue()
++        if status_code >= 400:
++            _raise_http_error(uri, body, encoding, status_code)
++        return _decode_body(body, encoding)
++    except pycurl.error as curl_error:
++        raise _pycurl_error_to_requests(curl_error)
++    finally:
++        curl.close()
++
++
++def _read_url_with_urllib(uri, encoding, timeout):
++    """Fetch a URL using urllib as a compatibility fallback."""
++    request = Request(uri)
++    try:
++        with urlopen(request, timeout=timeout) as response:
++            status_code = getattr(response, 'status', 200)
++            body = response.read()
++            if status_code >= 400:
++                _raise_http_error(uri, body, encoding, status_code)
++            return _decode_body(body, encoding)
++    except UrllibHTTPError as http_error:
++        body = http_error.read()
++        _raise_http_error(uri, body, encoding, http_error.code, http_error.reason)
++    except URLError as url_error:
++        message = getattr(url_error, 'reason', url_error)
++        logger.error('ConnectionError = %s', message)
++        raise requests.exceptions.ConnectionError(message)
++
+ 
+ def uri_type(uri):
+     """Determine the type of URI.
+@@ -83,34 +190,25 @@ def read(uri, encoding, timeout=10):
+ 
+     if uri_type(uri) == 'URL':
+         try:
+-            response = requests.get(uri, stream=True, timeout=timeout)
+-            response.raise_for_status()
+-            response.encoding = encoding
+-            raw_pcaxis = response.text
+-            response.close()
+-        except requests.exceptions.ConnectTimeout as connect_timeout:
+-            logger.error('ConnectionTimeout = %s', str(connect_timeout))
++            if PY_CURL_AVAILABLE:
++                raw_pcaxis = _read_url_with_pycurl(uri, encoding, timeout)
++            else:
++                raw_pcaxis = _read_url_with_urllib(uri, encoding, timeout)
++        except requests.exceptions.ConnectTimeout:
+             raise
+-        except requests.exceptions.ConnectionError as connection_error:
+-            logger.error('ConnectionError = %s', str(connection_error))
++        except requests.exceptions.ConnectionError:
+             raise
+-        except requests.exceptions.HTTPError as http_error:
+-            logger.error('HTTPError = %s',
+-                         str(http_error.response.status_code) + ' ' +
+-                         http_error.response.reason)
++        except requests.exceptions.HTTPError:
+             raise
+-        except requests.exceptions.InvalidURL as url_error:
+-            logger.error('URLError = ' + url_error.response.status_code + ' ' +
+-                         url_error.response.reason)
++        except requests.exceptions.InvalidURL:
+             raise
+         except Exception:
+             import traceback
+             logger.error('Generic exception: %s', traceback.format_exc())
+             raise
+     else:  # file parsing
+-        file_object = open(uri, encoding=encoding)
+-        raw_pcaxis = file_object.read()
+-        file_object.close()
++        with open(uri, encoding=encoding) as file_object:
++            raw_pcaxis = file_object.read()
+ 
+     return raw_pcaxis
+ 
+@@ -176,4 +274,4 @@ def parse(uri, encoding, timeout=10,
+         'DATA': df,
+         'TRANSLATION' : translation_dict
+     }
+-    return parsed_pc_axis
+\ No newline at end of file
++    return parsed_pc_axis

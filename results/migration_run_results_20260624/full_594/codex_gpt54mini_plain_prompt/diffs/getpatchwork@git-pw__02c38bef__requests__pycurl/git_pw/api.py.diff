@@ -1,0 +1,387 @@
+diff --git a/git_pw/api.py b/git_pw/api.py
+index fac6854..afd9d7f 100644
+--- a/git_pw/api.py
++++ b/git_pw/api.py
+@@ -3,15 +3,25 @@ Simple wrappers around request methods.
+ """
+ 
+ from functools import update_wrapper
++import base64
++import io
++import json
+ import logging
+ import os.path
+ import re
+ import sys
+ import tempfile
+ import typing as ty
++from urllib import error as urllib_error
++from urllib import parse as urllib_parse
++from urllib import request as urllib_request
+ 
+ import click
+-import requests
++
++try:
++    import pycurl
++except ImportError:  # pragma: no cover - fallback for environments without pycurl
++    pycurl = None
+ 
+ import git_pw
+ from git_pw import config
+@@ -22,30 +32,51 @@ LOG = logging.getLogger(__name__)
+ Filters = ty.List[ty.Tuple[str, str]]
+ 
+ 
+-class HTTPTokenAuth(requests.auth.AuthBase):
+-    """Attaches HTTP Token Authentication to the given Request object."""
++class _RequestException(Exception):
++    def __init__(
++        self,
++        message: str,
++        response: ty.Optional['_Response'] = None,
++    ):
++        super().__init__(message)
++        self.response = response
+ 
+-    def __init__(self, token: str):
+-        self.token = token
+ 
+-    def __call__(
++class _Response:
++    def __init__(
+         self,
+-        r: requests.PreparedRequest,
+-    ) -> requests.PreparedRequest:
+-        r.headers['Authorization'] = self._token_auth_str(self.token)
+-        return r
+-
+-    @staticmethod
+-    def _token_auth_str(token: str) -> str:
+-        """Return a Token auth string."""
+-        return 'Token {}'.format(token.strip())
++        status_code: int,
++        headers: ty.Dict[str, str],
++        content: bytes,
++    ):
++        self.status_code = status_code
++        self.headers = headers
++        self._content = content
++
++    @property
++    def content(self) -> bytes:
++        return self._content
++
++    def iter_content(self, chunk_size: int):
++        for idx in range(0, len(self._content), chunk_size):
++            yield self._content[idx : idx + chunk_size]
++
++    def json(self) -> ty.Any:
++        return json.loads(self._content.decode('utf-8'))
++
++    def raise_for_status(self) -> None:
++        if self.status_code >= 400:
++            raise _RequestException(
++                'HTTP %s' % self.status_code,
++                response=self,
++            )
+ 
+ 
+-def _get_auth(optional: bool = False) -> ty.Optional[requests.auth.AuthBase]:
++def _get_auth(optional: bool = False) -> ty.Optional[ty.Tuple[str, ...]]:
+     if CONF.token:
+-        return HTTPTokenAuth(CONF.token)
++        return ('token', CONF.token.strip())
+     elif CONF.username and CONF.password:
+-        return requests.auth.HTTPBasicAuth(CONF.username, CONF.password)
++        return ('basic', CONF.username, CONF.password)
+     elif not optional:
+         LOG.error('Authentication information missing')
+         LOG.error(
+@@ -56,12 +87,6 @@ def _get_auth(optional: bool = False) -> ty.Optional[requests.auth.AuthBase]:
+     return None
+ 
+ 
+-def _get_headers() -> ty.Dict[str, str]:
+-    return {
+-        'User-Agent': 'git-pw ({})'.format(git_pw.__version__),
+-    }
+-
+-
+ def _get_server() -> str:
+     if CONF.server:
+         server = CONF.server.rstrip('/')
+@@ -107,7 +132,7 @@ def _get_project() -> str:
+ 
+ def _handle_error(
+     operation: str,
+-    exc: requests.exceptions.RequestException,
++    exc: _RequestException,
+ ) -> None:
+     if exc.response is not None and exc.response.content:
+         # server errors should always be reported
+@@ -136,27 +161,193 @@ def _handle_error(
+         sys.exit(1)
+ 
+ 
++def _build_url(url: str, params: ty.Optional[Filters]) -> str:
++    if not params:
++        return url
++
++    query = urllib_parse.urlencode(params, doseq=True)
++    delimiter = '&' if '?' in url else '?'
++    return url + delimiter + query
++
++
++def _build_headers() -> ty.List[str]:
++    return [
++        'User-Agent: git-pw ({})'.format(git_pw.__version__),
++    ]
++
++
++def _auth_header(auth: ty.Optional[ty.Tuple[str, ...]]) -> ty.Optional[str]:
++    if not auth:
++        return None
++
++    if auth[0] == 'token':
++        return 'Authorization: Token {}'.format(auth[1])
++
++    user = auth[1]
++    password = auth[2]
++    token = base64.b64encode(
++        '{}:{}'.format(user, password).encode('utf-8')
++    ).decode('ascii')
++    return 'Authorization: Basic {}'.format(token)
++
++
++def _perform_request(
++    method: str,
++    url: str,
++    auth: ty.Optional[ty.Tuple[str, ...]] = None,
++    params: ty.Optional[Filters] = None,
++    data: ty.Optional[ty.List[ty.Tuple[str, ty.Any]]] = None,
++) -> _Response:
++    if pycurl is not None:
++        return _perform_request_pycurl(method, url, auth, params, data)
++
++    return _perform_request_urllib(method, url, auth, params, data)
++
++
++def _perform_request_pycurl(
++    method: str,
++    url: str,
++    auth: ty.Optional[ty.Tuple[str, ...]] = None,
++    params: ty.Optional[Filters] = None,
++    data: ty.Optional[ty.List[ty.Tuple[str, ty.Any]]] = None,
++) -> _Response:
++    curl = pycurl.Curl()
++    body = io.BytesIO()
++    header_lines: ty.List[bytes] = []
++    response_headers: ty.Dict[str, str] = {}
++
++    final_url = _build_url(url, params)
++    encoded_data = (
++        urllib_parse.urlencode(data, doseq=True).encode('utf-8')
++        if data is not None
++        else None
++    )
++
++    def collect_headers(chunk: bytes) -> int:
++        header_lines.append(chunk)
++        return len(chunk)
++
++    try:
++        curl.setopt(pycurl.URL, final_url)
++        curl.setopt(pycurl.WRITEFUNCTION, body.write)
++        curl.setopt(pycurl.HEADERFUNCTION, collect_headers)
++        headers = _build_headers()
++        auth_header = _auth_header(auth)
++        if auth_header and auth and auth[0] == 'token':
++            headers.append(auth_header)
++        curl.setopt(pycurl.HTTPHEADER, headers)
++
++        if auth and auth[0] == 'basic':
++            curl.setopt(pycurl.USERPWD, '{}:{}'.format(auth[1], auth[2]))
++            curl.setopt(pycurl.HTTPAUTH, pycurl.HTTPAUTH_BASIC)
++
++        if method == 'GET':
++            curl.setopt(pycurl.HTTPGET, 1)
++        elif method == 'POST':
++            curl.setopt(pycurl.POST, 1)
++            curl.setopt(pycurl.POSTFIELDS, encoded_data or b'')
++        elif method == 'PATCH':
++            curl.setopt(pycurl.CUSTOMREQUEST, 'PATCH')
++            curl.setopt(pycurl.POSTFIELDS, encoded_data or b'')
++        elif method == 'DELETE':
++            curl.setopt(pycurl.CUSTOMREQUEST, 'DELETE')
++        else:
++            curl.setopt(pycurl.CUSTOMREQUEST, method)
++            if encoded_data is not None:
++                curl.setopt(pycurl.POSTFIELDS, encoded_data)
++
++        curl.perform()
++        status_code = int(curl.getinfo(pycurl.RESPONSE_CODE))
++    except pycurl.error as exc:
++        raise _RequestException(str(exc)) from exc
++    finally:
++        curl.close()
++
++    for line in header_lines:
++        line = line.strip()
++        if not line or line.startswith(b'HTTP/'):
++            continue
++        if b':' not in line:
++            continue
++        key, value = line.split(b':', 1)
++        response_headers[key.decode('iso-8859-1').strip().lower()] = (
++            value.decode('iso-8859-1').strip()
++        )
++
++    response = _Response(status_code, response_headers, body.getvalue())
++    if status_code >= 400:
++        raise _RequestException('HTTP %s' % status_code, response=response)
++
++    return response
++
++
++def _perform_request_urllib(
++    method: str,
++    url: str,
++    auth: ty.Optional[ty.Tuple[str, ...]] = None,
++    params: ty.Optional[Filters] = None,
++    data: ty.Optional[ty.List[ty.Tuple[str, ty.Any]]] = None,
++) -> _Response:
++    final_url = _build_url(url, params)
++    headers = {'User-Agent': 'git-pw ({})'.format(git_pw.__version__)}
++    if auth:
++        header = _auth_header(auth)
++        if header:
++            key, value = header.split(': ', 1)
++            headers[key] = value
++
++    payload = (
++        urllib_parse.urlencode(data, doseq=True).encode('utf-8')
++        if data is not None
++        else None
++    )
++    request = urllib_request.Request(
++        final_url,
++        data=payload,
++        headers=headers,
++        method=method,
++    )
++
++    try:
++        with urllib_request.urlopen(request) as response:
++            content = response.read()
++            response_headers = {
++                key.lower(): value
++                for key, value in response.headers.items()
++            }
++            status_code = response.getcode()
++    except urllib_error.HTTPError as exc:
++        content = exc.read()
++        response_headers = {
++            key.lower(): value for key, value in exc.headers.items()
++        }
++        status_code = exc.code
++    except urllib_error.URLError as exc:
++        raise _RequestException(str(exc)) from exc
++
++    response = _Response(status_code, response_headers, content)
++    if status_code >= 400:
++        raise _RequestException('HTTP %s' % status_code, response=response)
++
++    return response
++
++
+ def _get(
+     url: str,
+     params: ty.Optional[Filters] = None,
+     stream: bool = False,
+-) -> requests.Response:
++) -> _Response:
+     """Make GET request and handle errors."""
+     LOG.debug('GET %s', url)
+ 
+     try:
+-        # TODO(stephenfin): We only use a subset of the types possible for
+-        # 'params' (namely a list of tuples) but it doesn't seem possible to
+-        # indicate this
+-        rsp = requests.get(
++        rsp = _perform_request(
++            'GET',
+             url,
+             auth=_get_auth(optional=True),
+-            headers=_get_headers(),
+-            stream=stream,
+             params=params,
+-        )  # type: ignore
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++        )
++    except _RequestException as exc:
+         _handle_error('fetch', exc)
+ 
+     LOG.debug('Got response')
+@@ -167,16 +358,13 @@ def _get(
+ def _post(
+     url: str,
+     data: ty.List[ty.Tuple[str, ty.Any]],
+-) -> requests.Response:
++) -> _Response:
+     """Make POST request and handle errors."""
+     LOG.debug('POST %s, data=%r', url, data)
+ 
+     try:
+-        rsp = requests.post(
+-            url, auth=_get_auth(), headers=_get_headers(), data=data
+-        )
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++        rsp = _perform_request('POST', url, auth=_get_auth(), data=data)
++    except _RequestException as exc:
+         _handle_error('create', exc)
+ 
+     LOG.debug('Got response')
+@@ -187,19 +375,13 @@ def _post(
+ def _patch(
+     url: str,
+     data: ty.List[ty.Tuple[str, ty.Any]],
+-) -> requests.Response:
++) -> _Response:
+     """Make PATCH request and handle errors."""
+     LOG.debug('PATCH %s, data=%r', url, data)
+ 
+     try:
+-        rsp = requests.patch(
+-            url,
+-            auth=_get_auth(),
+-            headers=_get_headers(),
+-            data=data,
+-        )
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++        rsp = _perform_request('PATCH', url, auth=_get_auth(), data=data)
++    except _RequestException as exc:
+         _handle_error('update', exc)
+ 
+     LOG.debug('Got response')
+@@ -207,14 +389,13 @@ def _patch(
+     return rsp
+ 
+ 
+-def _delete(url: str) -> requests.Response:
++def _delete(url: str) -> _Response:
+     """Make DELETE request and handle errors."""
+     LOG.debug('DELETE %s', url)
+ 
+     try:
+-        rsp = requests.delete(url, auth=_get_auth(), headers=_get_headers())
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++        rsp = _perform_request('DELETE', url, auth=_get_auth())
++    except _RequestException as exc:
+         _handle_error('delete', exc)
+ 
+     LOG.debug('Got response')

@@ -1,0 +1,262 @@
+--- a/filestack/utils.py
++++ b/filestack/utils.py
+@@ -1,46 +1,237 @@
++import asyncio
++import json
++import random
++import string
+ import time
+-import string
+-import random
+ from functools import partial
+-import requests as original_requests
+-from requests.exceptions import HTTPError
++from urllib.parse import urlencode, urlsplit, urlunsplit
++
++from twisted.internet import asyncioreactor
++from twisted.web.client import readBody
++
++import treq
+ 
+ from filestack import config
+ from filestack.exceptions import FilestackHTTPError
+ 
+ 
++_EVENT_LOOP = asyncio.new_event_loop()
++asyncio.set_event_loop(_EVENT_LOOP)
++asyncioreactor.install(eventloop=_EVENT_LOOP)
++
++
+ def unique_id(length=10):
+     return ''.join(random.choice(string.ascii_letters + string.digits) for i in range(length))
+ 
+ 
+ class RequestsWrapper:
+     """
+-    This class wraps selected methods from requests package and adds
++    This class wraps selected methods from treq and adds
+     default headers if no headers were specified.
+     """
+     def __getattr__(self, name):
+         if name in ('get', 'post', 'put', 'delete'):
+             return partial(self.handle_request, name)
+-        return original_requests.__getattribute__(name)
++        raise AttributeError(name)
+ 
+     def handle_request(self, name, *args, **kwargs):
+-        if 'headers' not in kwargs:
+-            kwargs['headers'] = config.HEADERS
+-            kwargs['headers']['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
+-            kwargs['headers']['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
+-
+-        requests_method = getattr(original_requests, name)
+-        response = requests_method(*args, **kwargs)
+-
++        response = raw_request(name, *args, **kwargs)
++        response.raise_for_status()
++        return response
++
++
++class HeaderMap(dict):
++    def __getitem__(self, key):
+         try:
+-            response.raise_for_status()
+-        except HTTPError as e:
+-            raise FilestackHTTPError(response.text) from e
+-
+-        return response
+-
+-
+-requests = RequestsWrapper()
++            return super().__getitem__(key)
++        except KeyError:
++            key_lower = key.lower()
++            for existing_key, value in self.items():
++                if existing_key.lower() == key_lower:
++                    return value
++            raise
++
++    def get(self, key, default=None):
++        try:
++            return self[key]
++        except KeyError:
++            return default
++
++    def __contains__(self, key):
++        try:
++            self[key]
++        except KeyError:
++            return False
++        return True
++
++
++class Response:
++    def __init__(self, status_code, headers, content):
++        self.status_code = status_code
++        self.headers = headers
++        self._content = content or b''
++
++    @property
++    def content(self):
++        return self._content
++
++    @property
++    def text(self):
++        return self._content.decode('utf-8', errors='replace')
++
++    @property
++    def ok(self):
++        return 200 <= self.status_code < 400
++
++    def json(self):
++        return json.loads(self.text)
++
++    def iter_content(self, chunk_size):
++        chunk_size = chunk_size or len(self._content) or 1
++        for offset in range(0, len(self._content), chunk_size):
++            yield self._content[offset:offset + chunk_size]
++
++    def raise_for_status(self):
++        if not self.ok:
++            raise FilestackHTTPError(self.text)
++
++
++def _wait_for(deferred):
++    future = _EVENT_LOOP.create_future()
++
++    def _resolve(value):
++        if not future.done():
++            future.set_result(value)
++        return value
++
++    def _reject(failure):
++        if not future.done():
++            future.set_exception(getattr(failure, 'value', failure))
++        return failure
++
++    deferred.addCallbacks(_resolve, _reject)
++    return _EVENT_LOOP.run_until_complete(future)
++
++
++def _append_params(url, params):
++    if not params:
++        return url
++
++    parts = list(urlsplit(url))
++    query = parts[3]
++    encoded = urlencode(params, doseq=True)
++    parts[3] = '&'.join([item for item in (query, encoded) if item])
++    return urlunsplit(parts)
++
++
++def _encode_multipart(data=None, files=None):
++    boundary = 'filestack-{}'.format(unique_id(16))
++    body = bytearray()
++
++    def append_line(value):
++        if isinstance(value, bytes):
++            body.extend(value)
++        else:
++            body.extend(str(value).encode('utf-8'))
++        body.extend(b'\r\n')
++
++    def append_field(name, value):
++        append_line('--{}'.format(boundary))
++        append_line('Content-Disposition: form-data; name="{}"'.format(name))
++        append_line('')
++        append_line(value)
++
++    if data:
++        for key, value in data.items():
++            append_field(key, value)
++
++    if files:
++        for key, file_info in files.items():
++            if len(file_info) == 3:
++                filename, file_obj, content_type = file_info
++            elif len(file_info) == 2:
++                filename, file_obj = file_info
++                content_type = 'application/octet-stream'
++            else:
++                filename, file_obj, content_type = file_info[0], file_info[1], file_info[2]
++
++            append_line('--{}'.format(boundary))
++            append_line('Content-Disposition: form-data; name="{}"; filename="{}"'.format(key, filename))
++            append_line('Content-Type: {}'.format(content_type))
++            append_line('')
++
++            position = None
++            if hasattr(file_obj, 'tell') and hasattr(file_obj, 'seek'):
++                try:
++                    position = file_obj.tell()
++                except Exception:
++                    position = None
++
++            file_bytes = file_obj.read() if hasattr(file_obj, 'read') else file_obj
++            if position is not None:
++                try:
++                    file_obj.seek(position)
++                except Exception:
++                    pass
++
++            if isinstance(file_bytes, str):
++                file_bytes = file_bytes.encode('utf-8')
++            append_line(file_bytes)
++
++    append_line('--{}--'.format(boundary))
++    return bytes(body), 'multipart/form-data; boundary={}'.format(boundary)
++
++
++def _build_response(response):
++    content = _wait_for(readBody(response))
++    headers = HeaderMap()
++    for header_name, header_values in response.headers.getAllRawHeaders() or []:
++        name = header_name.decode('utf-8') if isinstance(header_name, bytes) else header_name
++        headers[name] = ', '.join(
++            value.decode('utf-8') if isinstance(value, bytes) else str(value)
++            for value in header_values
++        )
++    return Response(response.code, headers, content)
++
++
++def raw_request(name, *args, **kwargs):
++    url = args[0]
++    headers = kwargs.pop('headers', None)
++    params = kwargs.pop('params', None)
++    json_payload = kwargs.pop('json', None)
++    data = kwargs.pop('data', None)
++    files = kwargs.pop('files', None)
++
++    if headers is None:
++        headers = dict(config.HEADERS)
++        headers['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
++        headers['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
++
++    url = _append_params(url, params)
++
++    request_kwargs = {'headers': headers}
++    if json_payload is not None:
++        request_kwargs['data'] = json.dumps(json_payload).encode('utf-8')
++        request_kwargs['headers'] = dict(headers)
++        request_kwargs['headers'].setdefault('Content-Type', 'application/json')
++    elif files is not None:
++        request_kwargs['data'], content_type = _encode_multipart(data=data, files=files)
++        request_kwargs['headers'] = dict(headers)
++        request_kwargs['headers'].setdefault('Content-Type', content_type)
++    elif data is not None:
++        if isinstance(data, dict):
++            request_kwargs['data'] = urlencode(data, doseq=True).encode('utf-8')
++            request_kwargs['headers'] = dict(headers)
++            request_kwargs['headers'].setdefault('Content-Type', 'application/x-www-form-urlencoded')
++        else:
++            request_kwargs['data'] = data
++
++    response = _wait_for(treq.request(name.upper(), url, **request_kwargs))
++    return _build_response(response)
++
++
++http = RequestsWrapper()
++requests = http
+ 
+ 
+ def return_transform_task(transformation, params):

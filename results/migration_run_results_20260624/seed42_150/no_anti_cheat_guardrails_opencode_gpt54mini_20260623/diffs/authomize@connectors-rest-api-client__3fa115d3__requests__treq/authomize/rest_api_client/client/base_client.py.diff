@@ -1,0 +1,192 @@
+--- a/authomize/rest_api_client/client/base_client.py
++++ b/authomize/rest_api_client/client/base_client.py
+@@ -1,7 +1,8 @@
+-from typing import Optional
++from threading import Event, Lock, Thread
++from typing import Any, Optional
+ 
+-import requests
+-from requests import Response
++import treq
++from twisted.internet import reactor, threads
+ 
+ AUTHOMIZE_API_URL = 'https://api.authomize.com'
+ 
+@@ -12,70 +13,148 @@
+ 
+ 
+ class BaseClient:
++    _reactor_lock = Lock()
++    _reactor_started = False
++
+     def __init__(self, auth_token: str, base_url: str = AUTHOMIZE_API_URL):
+         self.auth_token = auth_token
+         self.base_url = base_url
+-        self.session = requests.Session()
+-        self.session.headers.update({'Authorization': self.authorization_header})
++        self._ensure_reactor_running()
+ 
+     @property
+     def authorization_header(self) -> str:
+         raise NotImplementedError()
+ 
++    @classmethod
++    def _ensure_reactor_running(cls):
++        if reactor.running or cls._reactor_started:
++            return
++
++        with cls._reactor_lock:
++            if reactor.running or cls._reactor_started:
++                return
++
++            started = Event()
++
++            def run_reactor():
++                reactor.callWhenRunning(started.set)
++                reactor.run(installSignalHandlers=False)
++
++            # treq is Twisted-based, so keep a reactor alive for sync calls.
++            Thread(target=run_reactor, daemon=True).start()
++            started.wait()
++            cls._reactor_started = True
++
+     @staticmethod
+-    def _handle_response(response: Response):
+-        if response.ok:
+-            return BaseClient._handle_ok_response(response)
++    def _request(method: str, url: str, **kwargs):
++        BaseClient._ensure_reactor_running()
++        return threads.blockingCallFromThread(
++            reactor,
++            treq.request,
++            method,
++            url,
++            **kwargs,
++        )
++
++    @staticmethod
++    def _read_json(response):
++        BaseClient._ensure_reactor_running()
++        return threads.blockingCallFromThread(reactor, treq.json_content, response)
++
++    @staticmethod
++    def _read_content(response):
++        BaseClient._ensure_reactor_running()
++        return threads.blockingCallFromThread(reactor, treq.content, response)
++
++    @staticmethod
++    def _handle_response(response: Any, url: str):
++        if response.code < 400:
++            return BaseClient._handle_ok_response(response, url)
+         try:
+-            response_json = response.json()
++            response_json = BaseClient._read_json(response)
+             detail = response_json.get('detail')
+-            if 400 <= response.status_code < 500:
+-                response.reason = response.text
+         except Exception:
+             detail = None
+         if detail:
+             raise ClientError(str(detail))
+-        response.raise_for_status()
++        raise ClientError(
++            message={
++                'status_code': response.code,
++                'url': url,
++                'message': 'Unexpected response from API',
++                'raw': BaseClient._read_content(response),
++            },
++        )
+ 
+     @staticmethod
+-    def _handle_ok_response(response: Response) -> dict:
+-        if content_type := response.headers.get('content-type'):
++    def _handle_ok_response(response: Any, url: str) -> dict:
++        content_type = None
++        if response.headers:
++            headers = response.headers.getRawHeaders('content-type')
++            if not headers:
++                headers = response.headers.getRawHeaders('Content-Type')
++            if headers:
++                content_type = headers[0]
++                if isinstance(content_type, bytes):
++                    content_type = content_type.decode('utf-8', errors='ignore')
++
++        if content_type:
+             if content_type.startswith('application/json'):
+-                return response.json()
++                return BaseClient._read_json(response)
+ 
+         raise ClientError(
+             message={
+-                'status_code': response.status_code,
+-                'url': response.url,
++                'status_code': response.code,
++                'url': url,
+                 'message': 'Unexpected response from API',
+-                'raw': response.content,
++                'raw': BaseClient._read_content(response),
+             },
+         )
+ 
+     def http_get(self, url, params=None):
+         url = self.base_url + url
+-        response = self.session.get(url, params=params)
+-        return self._handle_response(response)
++        response = self._request(
++            url=url,
++            method='GET',
++            params=params,
++            headers={'Authorization': self.authorization_header},
++        )
++        return self._handle_response(response, url)
+ 
+     def http_post(self, url: str, body: Optional[str] = None):
+         url = self.base_url + url
+-        response = self.session.post(
+-            url,
+-            headers={'Content-Type': 'application/json'},
+-            data=body,
++        payload = body.encode('utf-8') if isinstance(body, str) else body
++        response = self._request(
++            url=url,
++            method='POST',
++            headers={
++                'Authorization': self.authorization_header,
++                'Content-Type': 'application/json',
++            },
++            data=payload,
+         )
+-        return self._handle_response(response)
++        return self._handle_response(response, url)
+ 
+     def http_patch(self, url: str, body: Optional[str] = None):
+         url = self.base_url + url
+-        response = self.session.patch(
+-            url,
+-            headers={'Content-Type': 'application/json'},
+-            data=body,
++        payload = body.encode('utf-8') if isinstance(body, str) else body
++        response = self._request(
++            url=url,
++            method='PATCH',
++            headers={
++                'Authorization': self.authorization_header,
++                'Content-Type': 'application/json',
++            },
++            data=payload,
+         )
+-        return self._handle_response(response)
++        return self._handle_response(response, url)
+ 
+     def http_delete(self, url: str, params=None):
+         url = self.base_url + url
+-        response = self.session.delete(url, params=params)
+-        return self._handle_response(response)
++        response = self._request(
++            url=url,
++            method='DELETE',
++            params=params,
++            headers={'Authorization': self.authorization_header},
++        )
++        return self._handle_response(response, url)

@@ -1,0 +1,218 @@
+diff --git /dev/null b/pyschlage/http.py
+new file mode 100644
+index 0000000..1221f03
+--- /dev/null
++++ b/pyschlage/http.py
+@@ -0,0 +1,212 @@
++"""Small pycurl-based HTTP transport layer."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from io import BytesIO
++import json as json_module
++from http import HTTPStatus
++from json import JSONDecodeError
++from typing import Any, Callable, Mapping
++from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
++
++try:  # pragma: no cover - the runtime used for local editing may not have pycurl
++    import pycurl
++except ImportError:  # pragma: no cover
++    pycurl = None
++
++from .exceptions import UnknownError
++
++
++@dataclass
++class Request:
++    """Minimal request object used by the Cognito auth hook."""
++
++    headers: dict[str, str] = field(default_factory=dict)
++
++
++class HTTPError(Exception):
++    """Raised when the HTTP response status is an error."""
++
++    def __init__(self, message: str, response: Response) -> None:
++        super().__init__(message)
++        self.response = response
++
++
++@dataclass
++class Response:
++    """A requests-like response wrapper backed by pycurl."""
++
++    status_code: int
++    reason: str
++    headers: dict[str, str]
++    content: bytes
++    url: str
++
++    @property
++    def text(self) -> str:
++        """Returns the decoded response body."""
++        charset = "utf-8"
++        content_type = self.headers.get("Content-Type", "")
++        for part in content_type.split(";"):
++            part = part.strip()
++            if part.lower().startswith("charset="):
++                charset = part.split("=", 1)[1].strip().strip('"')
++                break
++        return self.content.decode(charset, errors="replace")
++
++    def json(self) -> Any:
++        """Parses the response body as JSON."""
++        return json_module.loads(self.text)
++
++    def raise_for_status(self) -> None:
++        """Raises an HTTPError for 4xx and 5xx responses."""
++        if 400 <= self.status_code:
++            error_type = "Client Error" if self.status_code < 500 else "Server Error"
++            message = (
++                f"{self.status_code} {error_type}: {self.reason} for url: {self.url}"
++            )
++            raise HTTPError(message, self)
++
++
++def _merge_query(url: str, params: Mapping[str, Any] | list[tuple[str, Any]] | None) -> str:
++    if not params:
++        return url
++    parts = urlsplit(url)
++    query = parse_qsl(parts.query, keep_blank_values=True)
++    if isinstance(params, Mapping):
++        query.extend((str(k), v) for k, v in params.items())
++    else:
++        query.extend((str(k), v) for k, v in params)
++    return urlunsplit(
++        parts._replace(query=urlencode(query, doseq=True))
++    )
++
++
++def _serialize_body(
++    *,
++    data: Any = None,
++    json: Any = None,
++    headers: dict[str, str],
++) -> bytes | None:
++    if json is not None:
++        headers.setdefault("Content-Type", "application/json")
++        return json_module.dumps(json).encode("utf-8")
++    if data is None:
++        return None
++    if isinstance(data, bytes):
++        return data
++    if isinstance(data, bytearray):
++        return bytes(data)
++    if isinstance(data, str):
++        return data.encode("utf-8")
++    if isinstance(data, Mapping):
++        headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
++        return urlencode(data, doseq=True).encode("utf-8")
++    return str(data).encode("utf-8")
++
++
++def _parse_headers(raw_headers: bytes) -> tuple[int, str, dict[str, str]]:
++    header_blocks = [block for block in raw_headers.split(b"\r\n\r\n") if block.strip()]
++    if not header_blocks:
++        return 0, "", {}
++
++    header_lines = header_blocks[-1].splitlines()
++    status_line = header_lines[0].decode("iso-8859-1", errors="replace")
++    parts = status_line.split(None, 2)
++    status_code = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
++    reason = parts[2] if len(parts) > 2 else ""
++    if not reason and status_code:
++        try:
++            reason = HTTPStatus(status_code).phrase
++        except ValueError:
++            reason = ""
++
++    headers: dict[str, str] = {}
++    for line in header_lines[1:]:
++        if b":" not in line:
++            continue
++        key, value = line.split(b":", 1)
++        headers[key.decode("iso-8859-1").strip()] = value.decode(
++            "iso-8859-1", errors="replace"
++        ).strip()
++
++    return status_code, reason, headers
++
++
++def request(
++    method: str,
++    url: str,
++    *,
++    params: Mapping[str, Any] | list[tuple[str, Any]] | None = None,
++    data: Any = None,
++    json: Any = None,
++    headers: Mapping[str, str] | None = None,
++    auth: Callable[[Request], Request] | None = None,
++    timeout: int = 60,
++    **kwargs: Any,
++) -> Response:
++    """Performs an HTTP request via pycurl."""
++    if pycurl is None:  # pragma: no cover
++        raise RuntimeError("pycurl is required to make HTTP requests")
++    if kwargs:  # pragma: no cover - the current code only uses the supported kwargs
++        unsupported = ", ".join(sorted(kwargs))
++        raise TypeError(f"Unsupported request arguments: {unsupported}")
++
++    request_headers = dict(headers or {})
++    request_body = _serialize_body(data=data, json=json, headers=request_headers)
++    full_url = _merge_query(url, params)
++
++    if auth is not None:
++        auth_request = auth(Request(headers=request_headers))
++        request_headers = dict(auth_request.headers)
++
++    body_buffer = BytesIO()
++    header_buffer = BytesIO()
++    curl = pycurl.Curl()
++    try:
++        curl.setopt(pycurl.URL, full_url)
++        curl.setopt(pycurl.WRITEFUNCTION, body_buffer.write)
++        curl.setopt(pycurl.HEADERFUNCTION, header_buffer.write)
++        curl.setopt(pycurl.TIMEOUT, timeout)
++        curl.setopt(pycurl.CONNECTTIMEOUT, timeout)
++        curl.setopt(pycurl.NOSIGNAL, 1)
++        curl.setopt(pycurl.FOLLOWLOCATION, True)
++
++        method_upper = method.upper()
++        if method_upper == "GET":
++            curl.setopt(pycurl.HTTPGET, True)
++        elif method_upper == "POST":
++            curl.setopt(pycurl.POST, True)
++        elif method_upper == "HEAD":
++            curl.setopt(pycurl.NOBODY, True)
++        else:
++            curl.setopt(pycurl.CUSTOMREQUEST, method_upper)
++
++        if request_body is not None:
++            curl.setopt(pycurl.POSTFIELDS, request_body)
++            curl.setopt(pycurl.POSTFIELDSIZE, len(request_body))
++
++        if request_headers:
++            curl.setopt(
++                pycurl.HTTPHEADER,
++                [f"{key}: {value}" for key, value in request_headers.items()],
++            )
++
++        curl.perform()
++        status_code, reason, response_headers = _parse_headers(header_buffer.getvalue())
++        if not status_code:
++            status_code = int(curl.getinfo(pycurl.RESPONSE_CODE))
++        if not reason:
++            reason = response_headers.get("Status", "")
++        return Response(
++            status_code=status_code,
++            reason=reason,
++            headers=response_headers,
++            content=body_buffer.getvalue(),
++            url=curl.getinfo(pycurl.EFFECTIVE_URL),
++        )
++    except pycurl.error as ex:  # pragma: no cover - depends on network/runtime
++        raise UnknownError(str(ex)) from ex
++    finally:
++        curl.close()

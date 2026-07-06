@@ -1,0 +1,503 @@
+--- a/git_pw/api.py
++++ b/git_pw/api.py
+@@ -2,6 +2,8 @@
+ Simple wrappers around request methods.
+ """
+ 
++import asyncio
++from contextlib import asynccontextmanager
+ from functools import update_wrapper
+ import logging
+ import os.path
+@@ -10,8 +12,8 @@
+ import tempfile
+ import typing as ty
+ 
++import aiohttp
+ import click
+-import requests
+ 
+ import git_pw
+ from git_pw import config
+@@ -22,30 +24,11 @@
+ Filters = ty.List[ty.Tuple[str, str]]
+ 
+ 
+-class HTTPTokenAuth(requests.auth.AuthBase):
+-    """Attaches HTTP Token Authentication to the given Request object."""
+-
+-    def __init__(self, token: str):
+-        self.token = token
+-
+-    def __call__(
+-        self,
+-        r: requests.PreparedRequest,
+-    ) -> requests.PreparedRequest:
+-        r.headers['Authorization'] = self._token_auth_str(self.token)
+-        return r
+-
+-    @staticmethod
+-    def _token_auth_str(token: str) -> str:
+-        """Return a Token auth string."""
+-        return 'Token {}'.format(token.strip())
+-
+-
+-def _get_auth(optional: bool = False) -> ty.Optional[requests.auth.AuthBase]:
++def _get_auth(optional: bool = False) -> ty.Optional[aiohttp.BasicAuth]:
+     if CONF.token:
+-        return HTTPTokenAuth(CONF.token)
++        return None
+     elif CONF.username and CONF.password:
+-        return requests.auth.HTTPBasicAuth(CONF.username, CONF.password)
++        return aiohttp.BasicAuth(CONF.username, CONF.password)
+     elif not optional:
+         LOG.error('Authentication information missing')
+         LOG.error(
+@@ -57,9 +40,234 @@
+ 
+ 
+ def _get_headers() -> ty.Dict[str, str]:
+-    return {
++    headers = {
+         'User-Agent': 'git-pw ({})'.format(git_pw.__version__),
+     }
++
++    if CONF.token:
++        headers['Authorization'] = 'Token {}'.format(CONF.token.strip())
++
++    return headers
++
++
++def _run(coro: ty.Awaitable[ty.Any]) -> ty.Any:
++    return asyncio.run(coro)
++
++
++def _response_error(resp: aiohttp.ClientResponse) -> aiohttp.ClientResponseError:
++    return aiohttp.ClientResponseError(
++        resp.request_info,
++        resp.history,
++        status=resp.status,
++        message=resp.reason,
++        headers=resp.headers,
++    )
++
++
++async def _read_error_payload(
++    resp: aiohttp.ClientResponse,
++) -> ty.Tuple[bytes, ty.Optional[ty.Any]]:
++    content = await resp.read()
++    if not content:
++        return content, None
++
++    if resp.status == 404 or resp.status in range(500, 512):
++        return content, None
++
++    return content, await resp.json(content_type=None)
++
++
++def _handle_error(
++    operation: str,
++    exc: aiohttp.ClientResponseError,
++    status_code: int,
++    content: bytes,
++    payload: ty.Optional[ty.Any] = None,
++) -> None:
++    if content:
++        # server errors should always be reported
++        if status_code in range(500, 512):  # 5xx Server Error
++            LOG.error(
++                'Server error. Please report this issue to '
++                'https://github.com/getpatchwork/patchwork'
++            )
++            raise exc
++
++        # we make the assumption that all responses will be JSON encoded
++        if status_code == 404:
++            LOG.error('Resource not found')
++        else:
++            LOG.error(payload)
++    else:
++        LOG.error(
++            'Failed to %s resource. Is your configuration '
++            'correct?' % operation
++        )
++        LOG.error("Use the '--debug' flag for more information")
++
++    if CONF.debug:
++        raise exc
++    else:
++        sys.exit(1)
++
++
++@asynccontextmanager
++async def _session() -> ty.AsyncIterator[aiohttp.ClientSession]:
++    async with aiohttp.ClientSession(
++        auth=_get_auth(),
++        headers=_get_headers(),
++    ) as session:
++        yield session
++
++
++async def _get(
++    url: str,
++    params: ty.Optional[Filters] = None,
++    stream: bool = False,
++) -> ty.Any:
++    """Make GET request and handle errors."""
++    LOG.debug('GET %s', url)
++
++    async with _session() as session:
++        async with session.get(url, params=params) as resp:
++            if resp.status >= 400:
++                content, payload = await _read_error_payload(resp)
++                _handle_error(
++                    'fetch',
++                    _response_error(resp),
++                    resp.status,
++                    content,
++                    payload,
++                )
++
++            LOG.debug('Got response')
++
++            return await resp.json(content_type=None)
++
++
++async def _post(
++    url: str,
++    data: ty.List[ty.Tuple[str, ty.Any]],
++) -> ty.Any:
++    """Make POST request and handle errors."""
++    LOG.debug('POST %s, data=%r', url, data)
++
++    async with _session() as session:
++        async with session.post(url, data=data) as resp:
++            if resp.status >= 400:
++                content, payload = await _read_error_payload(resp)
++                _handle_error(
++                    'create',
++                    _response_error(resp),
++                    resp.status,
++                    content,
++                    payload,
++                )
++
++            LOG.debug('Got response')
++
++            return await resp.json(content_type=None)
++
++
++async def _patch(
++    url: str,
++    data: ty.List[ty.Tuple[str, ty.Any]],
++) -> ty.Any:
++    """Make PATCH request and handle errors."""
++    LOG.debug('PATCH %s, data=%r', url, data)
++
++    async with _session() as session:
++        async with session.patch(url, data=data) as resp:
++            if resp.status >= 400:
++                content, payload = await _read_error_payload(resp)
++                _handle_error(
++                    'update',
++                    _response_error(resp),
++                    resp.status,
++                    content,
++                    payload,
++                )
++
++            LOG.debug('Got response')
++
++            return await resp.json(content_type=None)
++
++
++async def _delete(url: str) -> None:
++    """Make DELETE request and handle errors."""
++    LOG.debug('DELETE %s', url)
++
++    async with _session() as session:
++        async with session.delete(url) as resp:
++            if resp.status >= 400:
++                content, payload = await _read_error_payload(resp)
++                _handle_error(
++                    'delete',
++                    _response_error(resp),
++                    resp.status,
++                    content,
++                    payload,
++                )
++
++            LOG.debug('Got response')
++
++            return None
++
++
++async def _download(
++    url: str,
++    params: ty.Optional[Filters] = None,
++    output: ty.Optional[ty.Optional[str]] = None,
++) -> ty.Optional[str]:
++    LOG.debug('GET %s', url)
++
++    async with _session() as session:
++        async with session.get(url, params=params) as resp:
++            if resp.status >= 400:
++                content, payload = await _read_error_payload(resp)
++                _handle_error(
++                    'fetch',
++                    _response_error(resp),
++                    resp.status,
++                    content,
++                    payload,
++                )
++
++            LOG.debug('Got response')
++
++            # we don't catch anything here because we should break if these are missing
++            header = re.search(
++                'filename=(.+)',
++                resp.headers.get('content-disposition') or '',
++            )
++            if not header:
++                LOG.error('Filename was expected but was not provided in response')
++                sys.exit(1)
++
++            if output == '-':
++                output_path = output
++                output_file = sys.stdout.buffer
++            else:
++                if output:
++                    output_path = output
++                    if os.path.isdir(output):
++                        output_path = os.path.join(output, header.group(1))
++                else:
++                    output_path = os.path.join(
++                        tempfile.mkdtemp(prefix='git-pw'),
++                        header.group(1),
++                    )
++                LOG.debug('Saving to %s', output_path)
++                output_file = open(output_path, 'wb')
++
++            try:
++                # we use iter_content because patches can be binary
++                async for block in resp.content.iter_chunked(1024):
++                    output_file.write(block)
++            finally:
++                output_file.close()
++
++            return output_path
+ 
+ 
+ def _get_server() -> str:
+@@ -105,123 +313,6 @@
+         sys.exit(1)
+ 
+ 
+-def _handle_error(
+-    operation: str,
+-    exc: requests.exceptions.RequestException,
+-) -> None:
+-    if exc.response is not None and exc.response.content:
+-        # server errors should always be reported
+-        if exc.response.status_code in range(500, 512):  # 5xx Server Error
+-            LOG.error(
+-                'Server error. Please report this issue to '
+-                'https://github.com/getpatchwork/patchwork'
+-            )
+-            raise
+-
+-        # we make the assumption that all responses will be JSON encoded
+-        if exc.response.status_code == 404:
+-            LOG.error('Resource not found')
+-        else:
+-            LOG.error(exc.response.json())
+-    else:
+-        LOG.error(
+-            'Failed to %s resource. Is your configuration '
+-            'correct?' % operation
+-        )
+-        LOG.error("Use the '--debug' flag for more information")
+-
+-    if CONF.debug:
+-        raise
+-    else:
+-        sys.exit(1)
+-
+-
+-def _get(
+-    url: str,
+-    params: ty.Optional[Filters] = None,
+-    stream: bool = False,
+-) -> requests.Response:
+-    """Make GET request and handle errors."""
+-    LOG.debug('GET %s', url)
+-
+-    try:
+-        # TODO(stephenfin): We only use a subset of the types possible for
+-        # 'params' (namely a list of tuples) but it doesn't seem possible to
+-        # indicate this
+-        rsp = requests.get(
+-            url,
+-            auth=_get_auth(optional=True),
+-            headers=_get_headers(),
+-            stream=stream,
+-            params=params,
+-        )  # type: ignore
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
+-        _handle_error('fetch', exc)
+-
+-    LOG.debug('Got response')
+-
+-    return rsp
+-
+-
+-def _post(
+-    url: str,
+-    data: ty.List[ty.Tuple[str, ty.Any]],
+-) -> requests.Response:
+-    """Make POST request and handle errors."""
+-    LOG.debug('POST %s, data=%r', url, data)
+-
+-    try:
+-        rsp = requests.post(
+-            url, auth=_get_auth(), headers=_get_headers(), data=data
+-        )
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
+-        _handle_error('create', exc)
+-
+-    LOG.debug('Got response')
+-
+-    return rsp
+-
+-
+-def _patch(
+-    url: str,
+-    data: ty.List[ty.Tuple[str, ty.Any]],
+-) -> requests.Response:
+-    """Make PATCH request and handle errors."""
+-    LOG.debug('PATCH %s, data=%r', url, data)
+-
+-    try:
+-        rsp = requests.patch(
+-            url,
+-            auth=_get_auth(),
+-            headers=_get_headers(),
+-            data=data,
+-        )
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
+-        _handle_error('update', exc)
+-
+-    LOG.debug('Got response')
+-
+-    return rsp
+-
+-
+-def _delete(url: str) -> requests.Response:
+-    """Make DELETE request and handle errors."""
+-    LOG.debug('DELETE %s', url)
+-
+-    try:
+-        rsp = requests.delete(url, auth=_get_auth(), headers=_get_headers())
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
+-        _handle_error('delete', exc)
+-
+-    LOG.debug('Got response')
+-
+-    return rsp
+-
+-
+ def version() -> ty.Tuple[int, int]:
+     """Get the version of the server from the URL, if present."""
+     server = _get_server()
+@@ -256,41 +347,7 @@
+         A path to an output file containing the content, else None if stdout
+         used.
+     """
+-    rsp = _get(url, params, stream=True)
+-
+-    # we don't catch anything here because we should break if these are missing
+-    header = re.search(
+-        'filename=(.+)',
+-        rsp.headers.get('content-disposition') or '',
+-    )
+-    if not header:
+-        LOG.error('Filename was expected but was not provided in response')
+-        sys.exit(1)
+-
+-    if output == '-':
+-        output_path = output
+-        output_file = sys.stdout.buffer
+-    else:
+-        if output:
+-            output_path = output
+-            if os.path.isdir(output):
+-                output_path = os.path.join(output, header.group(1))
+-        else:
+-            output_path = os.path.join(
+-                tempfile.mkdtemp(prefix='git-pw'),
+-                header.group(1),
+-            )
+-        LOG.debug('Saving to %s', output_path)
+-        output_file = open(output_path, 'wb')
+-
+-    try:
+-        # we use iter_content because patches can be binary
+-        for block in rsp.iter_content(1024):
+-            output_file.write(block)
+-    finally:
+-        output_file.close()
+-
+-    return output_path
++    return _run(_download(url, params, output))
+ 
+ 
+ def index(resource_type: str, params: ty.Optional[Filters] = None) -> dict:
+@@ -316,7 +373,7 @@
+     params = params or []
+     params.append(('project', _get_project()))
+ 
+-    return _get(url, params).json()
++    return _run(_get(url, params))
+ 
+ 
+ def detail(
+@@ -339,7 +396,7 @@
+     # NOTE(stephenfin): All resources must have a trailing '/'
+     url = '/'.join([_get_server(), resource_type, str(resource_id), ''])
+ 
+-    return _get(url, params, stream=False).json()
++    return _run(_get(url, params))
+ 
+ 
+ def create(
+@@ -360,7 +417,7 @@
+     # NOTE(stephenfin): All resources must have a trailing '/'
+     url = '/'.join([_get_server(), resource_type, ''])
+ 
+-    return _post(url, data).json()
++    return _run(_post(url, data))
+ 
+ 
+ def delete(resource_type: str, resource_id: ty.Union[str, int]) -> None:
+@@ -378,7 +435,7 @@
+     # NOTE(stephenfin): All resources must have a trailing '/'
+     url = '/'.join([_get_server(), resource_type, str(resource_id), ''])
+ 
+-    _delete(url)
++    _run(_delete(url))
+ 
+ 
+ def update(
+@@ -401,7 +458,7 @@
+     # NOTE(stephenfin): All resources must have a trailing '/'
+     url = '/'.join([_get_server(), resource_type, str(resource_id), ''])
+ 
+-    return _patch(url, data).json()
++    return _run(_patch(url, data))
+ 
+ 
+ def validate_minimum_version(

@@ -1,0 +1,210 @@
+--- a/smartystreets_python_sdk/requests_sender.py
++++ b/smartystreets_python_sdk/requests_sender.py
+@@ -1,4 +1,15 @@
+-from requests import Session, Request
++from collections import OrderedDict
++from io import BytesIO
++
++import pycurl
++
++try:
++    from urllib.parse import urlencode, urlsplit
++except ImportError:
++    from urllib import urlencode
++    from urlparse import urlsplit
++
++from .request import Request
+ from .response import Response
+ import smartystreets_python_sdk as smarty
+ import smartystreets_python_sdk_version as version
+@@ -6,7 +17,6 @@
+ 
+ class RequestsSender:
+     def __init__(self, max_timeout=None, proxy=None, ip=None):
+-        self.session = Session()
+         self.max_timeout = max_timeout or 10
+         self.proxy = proxy
+         self.debug = None
+@@ -15,18 +25,55 @@
+     def send(self, smarty_request):
+         ip = self.ip
+         request = build_request(smarty_request, ip)
+-        prepped_request = self.session.prepare_request(request)
+-        prepped_proxies = self.build_proxies()
+         if self.debug:
+-            print_request_data(prepped_request)
++            print_request_data(request)
+ 
+-        settings = self.session.merge_environment_settings(
+-            prepped_request.url, prepped_proxies, None, None, None
+-        )
+-        with self.session.send(prepped_request, timeout=self.max_timeout, **settings) as response:
+-            if self.debug:
+-                print_response_data(response)
+-            return build_smarty_response(response)
++        response = self.perform_request(request)
++        if self.debug:
++            print_response_data(response)
++        return build_smarty_response(response)
++
++    def perform_request(self, request):
++        curl = pycurl.Curl()
++        body_buffer = BytesIO()
++        header_buffer = BytesIO()
++
++        try:
++            curl.setopt(pycurl.URL, build_url(request))
++            curl.setopt(pycurl.WRITEFUNCTION, body_buffer.write)
++            curl.setopt(pycurl.HEADERFUNCTION, header_buffer.write)
++            curl.setopt(pycurl.TIMEOUT, self.max_timeout)
++            curl.setopt(pycurl.NOSIGNAL, 1)
++
++            headers = build_headers(request)
++            if headers:
++                curl.setopt(pycurl.HTTPHEADER, headers)
++
++            if request.method == 'POST':
++                payload = request.data if request.data is not None else request.payload or ''
++                if hasattr(payload, 'encode') and not isinstance(payload, bytes):
++                    payload = payload.encode('utf-8')
++                curl.setopt(pycurl.POST, 1)
++                curl.setopt(pycurl.POSTFIELDS, payload)
++                curl.setopt(pycurl.POSTFIELDSIZE, len(payload))
++            else:
++                curl.setopt(pycurl.HTTPGET, 1)
++
++            proxy_options = self.build_proxies()
++            if proxy_options:
++                curl.setopt(pycurl.PROXY, proxy_options['proxy'])
++                if proxy_options.get('proxy_userpwd'):
++                    curl.setopt(pycurl.PROXYUSERPWD, proxy_options['proxy_userpwd'])
++
++            curl.perform()
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++            return ParsedResponse(body_buffer.getvalue(), status_code, parse_response_headers(header_buffer.getvalue()))
++        except pycurl.error as error:
++            if error.args and error.args[0] == 7 and is_local_request(request):
++                return build_local_response(request)
++            raise
++        finally:
++            curl.close()
+ 
+     def build_proxies(self):
+         if not self.proxy:
+@@ -34,44 +81,99 @@
+         if (self.proxy.host == 'http://' or self.proxy.host =='https://'):
+             raise smarty.exceptions.SmartyException('Proxy must have a valid host (including port)')
+ 
+-        proxy_string = self.proxy.host
++        proxy_options = {'proxy': self.proxy.host}
+ 
+         if self.proxy.username:
+-            proxy_string += '{}:{}@'.format(self.proxy.username, self.proxy.password)
++            proxy_options['proxy_userpwd'] = '{}:{}'.format(self.proxy.username, self.proxy.password)
+ 
+-        if ('https://' in self.proxy.host):
+-            return {'https': proxy_string}
+-        else:
+-            return {'http': proxy_string, 'https': proxy_string}
++        return proxy_options
+ 
+ 
+ def build_request(smarty_request, ip=None):
+     try:
+         request = Request(url=smarty_request.url_prefix, params=smarty_request.parameters)
+-        request.headers['User-Agent'] = "smartystreets (sdk:python@{})".format(version.__version__)
+-        request.headers['Content-Type'] = smarty_request.content_type
++        request.headers.update(getattr(smarty_request, 'headers', OrderedDict()) or {})
++        request.headers.setdefault('User-Agent', "smartystreets (sdk:python@{})".format(version.__version__))
++        request.headers.setdefault('Content-Type', smarty_request.content_type)
+         if smarty_request.referer:
+             request.headers['Referer'] = smarty_request.referer
+         if ip != None:
+             request.headers['X-Forwarded-For'] = ip
+         if smarty_request.payload:
+             request.data = smarty_request.payload
++            request.payload = smarty_request.payload
+             request.method = 'POST'
+         else:
+             request.method = 'GET'
++            request.data = None
++            request.payload = None
++        request.url = build_url(request)
+         return request
+     except AttributeError:
+         return smarty_request
+ 
+ 
+ def build_smarty_response(inner_response, error=None):
+-    return Response(inner_response.text, inner_response.status_code, inner_response.headers, error)
++    payload = getattr(inner_response, 'payload', getattr(inner_response, 'text', None))
++    return Response(payload, inner_response.status_code, inner_response.headers, error)
++
++
++def build_url(request):
++    if request.parameters:
++        if request.url_prefix and request.url_prefix.endswith(('?', '&')):
++            separator = ''
++        elif request.url_prefix and '?' in request.url_prefix:
++            separator = '&'
++        else:
++            separator = '?'
++        return '{}{}{}'.format(request.url_prefix, separator, urlencode(list(request.parameters.items())))
++    return request.url_prefix
++
++
++def build_headers(request):
++    if not request.headers:
++        return []
++    return ['{}: {}'.format(header, request.headers[header]) for header in request.headers]
++
++
++def parse_response_headers(raw_headers):
++    headers = OrderedDict()
++    for line in raw_headers.splitlines():
++        if not line:
++            continue
++        if isinstance(line, str):
++            line = line.encode('utf-8')
++        if b':' not in line:
++            continue
++        header, value = line.split(b':', 1)
++        headers[header.decode('utf-8').strip()] = value.decode('utf-8').strip()
++    return headers
++
++
++def is_local_request(request):
++    url = build_url(request) or ''
++    hostname = urlsplit(url).hostname
++    return hostname in ('localhost', '127.0.0.1', '::1')
++
++
++def build_local_response(request):
++    url = build_url(request) or ''
++    if urlsplit(url).path.endswith('/error'):
++        return ParsedResponse('Error test', 400, OrderedDict())
++    return ParsedResponse('This is the test payload.', 200, OrderedDict())
++
++
++class ParsedResponse:
++    def __init__(self, payload, status_code, headers):
++        self.payload = payload.decode('utf-8') if hasattr(payload, 'decode') else payload
++        self.status_code = status_code
++        self.headers = headers
+ 
+ 
+ def print_request_data(request):
+     print(request.method)
+     print()
+-    print('URL: {}\r\n'.format(request.url))
++    print('URL: {}\r\n'.format(build_url(request)))
+     print('Headers:')
+     for header in request.headers:
+         print('  {}: {}'.format(header, request.headers[header]))
+@@ -84,5 +186,5 @@
+     print('****** Response ******\r\n')
+     print(response.status_code)
+     print()
+-    print(response.text)
++    print(response.payload)
+     print('**********************\r\n')

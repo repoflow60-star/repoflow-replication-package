@@ -1,0 +1,95 @@
+--- a/py_clob_client/http_helpers/helpers.py
++++ b/py_clob_client/http_helpers/helpers.py
+@@ -1,4 +1,9 @@
+-import requests
++import json
++import threading
++
++import treq
++from twisted.internet import reactor
++from twisted.internet.threads import blockingCallFromThread
+ 
+ from py_clob_client.clob_types import (
+     DropNotificationParams,
+@@ -17,6 +22,39 @@
+ PUT = "PUT"
+ 
+ 
++_reactor_thread = None
++_reactor_lock = threading.Lock()
++_reactor_ready = threading.Event()
++
++
++def _ensure_reactor_running():
++    global _reactor_thread
++
++    if reactor.running:
++        return
++
++    # treq is Deferred-based, so we keep a private reactor alive for blocking calls.
++    with _reactor_lock:
++        if _reactor_thread is None:
++            def _run():
++                _reactor_ready.set()
++                reactor.run(installSignalHandlers=False)
++
++            _reactor_thread = threading.Thread(target=_run, daemon=True)
++            _reactor_thread.start()
++
++    _reactor_ready.wait()
++
++
++def _decode_body(body):
++    try:
++        return json.loads(body)
++    except Exception:
++        if isinstance(body, bytes):
++            return body.decode("utf-8", errors="replace")
++        return body
++
++
+ def overloadHeaders(method: str, headers: dict) -> dict:
+     if headers is None:
+         headers = dict()
+@@ -34,19 +72,30 @@
+ 
+ def request(endpoint: str, method: str, headers=None, data=None):
+     try:
++        _ensure_reactor_running()
+         headers = overloadHeaders(method, headers)
+-        resp = requests.request(
+-            method=method, url=endpoint, headers=headers, json=data if data else None
++        body = json.dumps(data).encode("utf-8") if data is not None else None
++        resp = blockingCallFromThread(
++            reactor,
++            treq.request,
++            method.encode("ascii"),
++            endpoint,
++            headers=headers,
++            data=body,
+         )
+-        if resp.status_code != 200:
+-            raise PolyApiException(resp)
+-
+-        try:
+-            return resp.json()
+-        except requests.JSONDecodeError:
+-            return resp.text
+-
+-    except requests.RequestException:
++        status_code = getattr(resp, "code", getattr(resp, "status_code", None))
++        content = blockingCallFromThread(reactor, treq.content, resp)
++        parsed_content = _decode_body(content)
++
++        if status_code != 200:
++            raise PolyApiException(error_msg=parsed_content, status_code=status_code)
++
++        return parsed_content
++
++    except PolyApiException:
++        raise
++
++    except Exception:
+         raise PolyApiException(error_msg="Request exception!")
+ 
+ 

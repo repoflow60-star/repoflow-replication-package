@@ -1,0 +1,189 @@
+diff --git /dev/null b/srpenergy/requests.py
+new file mode 100644
+index 0000000..d3e4c17
+--- /dev/null
++++ b/srpenergy/requests.py
+@@ -0,0 +1,183 @@
++"""Minimal requests-compatible wrapper backed by pycurl.
++
++This module provides the small portion of the ``requests`` API used by the
++client. It keeps the original call shape so the tests can continue patching
++``Session.get`` and ``Session.post`` while the implementation uses pycurl when
++available.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from http.cookies import SimpleCookie
++from io import BytesIO
++import json
++from typing import Any
++from urllib.error import HTTPError, URLError
++from urllib.parse import urlencode
++import urllib.request
++
++try:  # pragma: no cover - exercised indirectly when pycurl is available.
++    import pycurl
++except ImportError:  # pragma: no cover - fallback for environments without pycurl.
++    pycurl = None
++
++
++@dataclass
++class Response:
++    """Tiny response object with the fields the client needs."""
++
++    text: str
++    status_code: int
++    headers: dict[str, str]
++    cookies: dict[str, str]
++
++    def json(self) -> Any:
++        """Return the response body decoded as JSON."""
++        return json.loads(self.text)
++
++
++class Session:
++    """Simple stateful HTTP session."""
++
++    def __init__(self):
++        self.cookies: dict[str, str] = {}
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc, tb):
++        return False
++
++    def get(self, url, headers=None):
++        """Send a GET request."""
++        return self._request("GET", url, headers=headers)
++
++    def post(self, url, data=None, headers=None):
++        """Send a POST request."""
++        return self._request("POST", url, data=data, headers=headers)
++
++    def _request(self, method, url, data=None, headers=None):
++        request_headers = self._build_headers(headers)
++        encoded_data = None if data is None else urlencode(data).encode("utf-8")
++
++        if pycurl is not None:
++            response = self._request_with_pycurl(
++                method, url, encoded_data, request_headers
++            )
++        else:
++            response = self._request_with_urllib(
++                method, url, encoded_data, request_headers
++            )
++
++        self.cookies.update(response.cookies)
++        return response
++
++    def _build_headers(self, headers):
++        combined_headers = {}
++        if headers:
++            combined_headers.update(headers)
++        if self.cookies:
++            combined_headers["Cookie"] = "; ".join(
++                f"{key}={value}" for key, value in self.cookies.items()
++            )
++        return combined_headers
++
++    def _request_with_pycurl(self, method, url, data, headers):
++        buffer = BytesIO()
++        header_buffer = []
++        curl = pycurl.Curl()
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.WRITEDATA, buffer)
++        curl.setopt(
++            pycurl.HEADERFUNCTION,
++            lambda line: header_buffer.append(line) or len(line),
++        )
++        curl.setopt(pycurl.FOLLOWLOCATION, True)
++        curl.setopt(pycurl.NOSIGNAL, True)
++
++        request_headers = [f"{key}: {value}" for key, value in headers.items()]
++        if request_headers:
++            curl.setopt(pycurl.HTTPHEADER, request_headers)
++
++        if method == "POST":
++            curl.setopt(pycurl.POST, True)
++            if data is not None:
++                curl.setopt(pycurl.POSTFIELDS, data)
++        else:
++            curl.setopt(pycurl.HTTPGET, True)
++
++        try:
++            curl.perform()
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        except pycurl.error as error:
++            raise URLError(error) from error
++        finally:
++            curl.close()
++
++        return self._build_response(buffer.getvalue(), status_code, header_buffer)
++
++    def _request_with_urllib(self, method, url, data, headers):
++        request = urllib.request.Request(url, data=data, method=method)
++        for key, value in headers.items():
++            request.add_header(key, value)
++
++        opener = urllib.request.build_opener()
++
++        try:
++            with opener.open(request) as response:
++                status_code = response.getcode()
++                body = response.read()
++                response_headers = dict(response.headers.items())
++        except HTTPError as error:
++            status_code = error.code
++            body = error.read()
++            response_headers = dict(error.headers.items())
++
++        return self._build_response(body, status_code, response_headers.items())
++
++    def _build_response(self, body, status_code, headers):
++        text = body.decode("utf-8") if isinstance(body, bytes) else body
++        header_pairs = self._parse_headers(headers)
++        headers_dict = self._normalize_headers(header_pairs)
++        cookies = self._extract_cookies(header_pairs)
++        return Response(text=text, status_code=status_code, headers=headers_dict, cookies=cookies)
++
++    def _normalize_headers(self, headers):
++        normalized = {}
++        for key, value in headers:
++            normalized[str(key).lower()] = value
++        return normalized
++
++    def _extract_cookies(self, headers):
++        cookies = {}
++        for key, value in headers:
++            if isinstance(key, bytes):
++                key = key.decode("utf-8", errors="ignore")
++            if isinstance(value, bytes):
++                value = value.decode("utf-8", errors="ignore")
++            if str(key).lower() != "set-cookie":
++                continue
++            cookie = SimpleCookie()
++            cookie.load(value)
++            for morsel in cookie.values():
++                cookies[morsel.key] = morsel.value
++        return cookies
++
++    def _parse_headers(self, headers):
++        parsed_headers = []
++        for item in headers:
++            if isinstance(item, bytes):
++                line = item.decode("utf-8", errors="ignore").strip()
++                if not line or line.startswith("HTTP/"):
++                    continue
++                if ":" not in line:
++                    continue
++                key, value = line.split(":", 1)
++                parsed_headers.append((key.strip(), value.strip()))
++                continue
++
++            key, value = item
++            parsed_headers.append((key, value))
++
++        return parsed_headers

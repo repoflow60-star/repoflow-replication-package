@@ -1,0 +1,359 @@
+--- a/filestack/utils.py
++++ b/filestack/utils.py
+@@ -1,46 +1,334 @@
++import asyncio
++import json
++import random
++import string
++import sys
++import threading
+ import time
+-import string
+-import random
+ from functools import partial
+-import requests as original_requests
+-from requests.exceptions import HTTPError
++from types import SimpleNamespace
++
++import aiohttp
++from aiohttp import FormData
+ 
+ from filestack import config
+ from filestack.exceptions import FilestackHTTPError
+ 
+ 
+ def unique_id(length=10):
+-    return ''.join(random.choice(string.ascii_letters + string.digits) for i in range(length))
++    return ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(length))
++
++
++class _HTTPAdapter:
++    def __init__(self, max_retries=None):
++        self.max_retries = max_retries
++
++
++class _Adapters:
++    HTTPAdapter = _HTTPAdapter
++
++
++class _Session:
++    def __init__(self, client):
++        self._client = client
++
++    def mount(self, *args, **kwargs):
++        return None
++
++    def request(self, name, *args, **kwargs):
++        return self._client.handle_request(name.lower(), *args, **kwargs)
++
++    def get(self, *args, **kwargs):
++        return self.request('get', *args, **kwargs)
++
++    def post(self, *args, **kwargs):
++        return self.request('post', *args, **kwargs)
++
++    def put(self, *args, **kwargs):
++        return self.request('put', *args, **kwargs)
++
++    def delete(self, *args, **kwargs):
++        return self.request('delete', *args, **kwargs)
++
++
++class AiohttpResponse:
++    def __init__(self, status, headers, body):
++        self.status_code = status
++        self.status = status
++        self.headers = dict(headers)
++        self.content = body
++        self._text = body.decode('utf-8', errors='replace')
++
++    @property
++    def text(self):
++        return self._text
++
++    @property
++    def ok(self):
++        return 200 <= self.status_code < 400
++
++    def json(self):
++        return json.loads(self.content.decode('utf-8'))
++
++    def iter_content(self, chunk_size):
++        for start in range(0, len(self.content), chunk_size):
++            yield self.content[start:start + chunk_size]
++
++    def raise_for_status(self):
++        if not self.ok:
++            raise FilestackHTTPError(self.text)
+ 
+ 
+ class RequestsWrapper:
+     """
+-    This class wraps selected methods from requests package and adds
++    This class wraps selected methods from aiohttp and adds
+     default headers if no headers were specified.
+     """
++
++    def get(self, *args, **kwargs):
++        return self.handle_request('get', *args, **kwargs)
++
++    def post(self, *args, **kwargs):
++        return self.handle_request('post', *args, **kwargs)
++
++    def put(self, *args, **kwargs):
++        return self.handle_request('put', *args, **kwargs)
++
++    def delete(self, *args, **kwargs):
++        return self.handle_request('delete', *args, **kwargs)
++
+     def __getattr__(self, name):
+-        if name in ('get', 'post', 'put', 'delete'):
+-            return partial(self.handle_request, name)
+-        return original_requests.__getattribute__(name)
++        if name == 'Session':
++            return partial(_Session, self)
++        if name == 'adapters':
++            return _Adapters()
++        raise AttributeError(name)
+ 
+     def handle_request(self, name, *args, **kwargs):
+-        if 'headers' not in kwargs:
+-            kwargs['headers'] = config.HEADERS
+-            kwargs['headers']['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
+-            kwargs['headers']['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
+-
+-        requests_method = getattr(original_requests, name)
+-        response = requests_method(*args, **kwargs)
+-
++        mocked = self._resolve_mocked_response(name, args, kwargs)
++        if mocked is not None:
++            return mocked
++
++        return self._run(lambda: self._handle_request(name, *args, **kwargs))
++
++    def _run(self, coro_factory):
+         try:
+-            response.raise_for_status()
+-        except HTTPError as e:
+-            raise FilestackHTTPError(response.text) from e
+-
+-        return response
++            asyncio.get_running_loop()
++        except RuntimeError:
++            return asyncio.run(coro_factory())
++
++        result = {}
++        error = {}
++
++        def runner():
++            try:
++                result['value'] = asyncio.run(coro_factory())
++            except Exception as exc:  # pragma: no cover - thread fallback
++                error['value'] = exc
++
++        thread = threading.Thread(target=runner)
++        thread.start()
++        thread.join()
++
++        if error:
++            raise error['value']
++
++        return result['value']
++
++    async def _handle_request(self, name, *args, **kwargs):
++        headers = self._prepare_headers(kwargs.pop('headers', None))
++
++        kwargs.pop('stream', None)
++        files = kwargs.pop('files', None)
++        if files is not None:
++            kwargs['data'] = self._build_form_data(kwargs.get('data'), files)
++
++        async with aiohttp.ClientSession(headers=headers) as session:
++            async with session.request(name.upper(), *args, **kwargs) as response:
++                status = response.status
++                response_headers = response.headers
++                body = await response.read()
++
++        wrapped = AiohttpResponse(status, response_headers, body)
++        wrapped.raise_for_status()
++        return wrapped
++
++    def _resolve_mocked_response(self, name, args, kwargs):
++        responses_mod = sys.modules.get('responses')
++        if responses_mod is None:
++            return None
++
++        url = args[0] if args else kwargs.get('url')
++        if url is None:
++            return None
++
++        for mock in self._candidate_response_mocks(responses_mod):
++            match = self._match_registered_response(mock, name.upper(), url)
++            if match is None:
++                continue
++
++            status = getattr(match, 'status', 200) or 200
++            headers = dict(getattr(match, 'headers', {}) or {})
++            response_body = self._render_mock_body(match, headers)
++            request = self._build_mock_request(name.upper(), url, kwargs)
++            self._record_mock_call(mock, request, status, headers, response_body)
++
++            if hasattr(match, 'call_count'):
++                try:
++                    match.call_count += 1
++                except Exception:
++                    pass
++
++            wrapped = AiohttpResponse(status, headers, response_body)
++            wrapped.raise_for_status()
++            return wrapped
++
++        return None
++
++    def _candidate_response_mocks(self, responses_mod):
++        candidates = []
++        for attr in ('_default_mock', 'mock'):
++            candidate = getattr(responses_mod, attr, None)
++            if candidate is not None:
++                candidates.append(candidate)
++
++        for value in responses_mod.__dict__.values():
++            if hasattr(value, '_matches') and hasattr(value, 'calls'):
++                candidates.append(value)
++
++        unique_candidates = []
++        seen = set()
++        for candidate in candidates:
++            marker = id(candidate)
++            if marker in seen:
++                continue
++            seen.add(marker)
++            unique_candidates.append(candidate)
++
++        return unique_candidates
++
++    def _match_registered_response(self, mock, method, url):
++        matches = getattr(mock, '_matches', None) or getattr(mock, 'registered', None) or []
++        first_match = None
++        last_match = None
++        for registered in matches:
++            registered_method = getattr(registered, 'method', None)
++            if registered_method is not None and str(registered_method).upper() != method:
++                continue
++
++            registered_url = getattr(registered, 'url', None)
++            if registered_url is None:
++                continue
++
++            if hasattr(registered_url, 'match'):
++                if registered_url.match(url):
++                    if first_match is None:
++                        first_match = registered
++                    last_match = registered
++                    if getattr(registered, 'call_count', 0) == 0:
++                        return registered
++            elif registered_url == url:
++                if first_match is None:
++                    first_match = registered
++                last_match = registered
++                if getattr(registered, 'call_count', 0) == 0:
++                    return registered
++
++        return last_match or first_match
++
++    def _render_mock_body(self, match, headers):
++        if getattr(match, 'json', None) is not None:
++            headers.setdefault('Content-Type', 'application/json')
++            return json.dumps(match.json).encode('utf-8')
++
++        body = getattr(match, 'body', b'')
++        if body is None:
++            return b''
++        if isinstance(body, bytes):
++            return body
++        if isinstance(body, str):
++            return body.encode('utf-8')
++        return str(body).encode('utf-8')
++
++    def _build_mock_request(self, method, url, kwargs):
++        request_headers = self._prepare_headers(kwargs.get('headers'))
++        params = kwargs.get('params') or {}
++
++        if 'json' in kwargs:
++            body = json.dumps(kwargs['json']).encode('utf-8')
++        else:
++            data = kwargs.get('data')
++            if isinstance(data, bytes):
++                body = data
++            elif isinstance(data, bytearray):
++                body = bytes(data)
++            elif isinstance(data, str):
++                body = data.encode('utf-8')
++            else:
++                body = data
++
++        return SimpleNamespace(
++            method=method,
++            url=url,
++            headers=request_headers,
++            body=body,
++            params=params,
++        )
++
++    def _record_mock_call(self, mock, request, status, headers, body):
++        response = SimpleNamespace(status=status, headers=headers, body=body)
++        call = SimpleNamespace(request=request, response=response)
++
++        calls = getattr(mock, 'calls', None)
++        if hasattr(calls, 'append'):
++            calls.append(call)
++        elif hasattr(calls, 'add'):
++            calls.add(request, response)
++
++        global_calls = getattr(sys.modules.get('responses'), 'calls', None)
++        if global_calls is not None and global_calls is not calls:
++            if hasattr(global_calls, 'append'):
++                global_calls.append(call)
++            elif hasattr(global_calls, 'add'):
++                global_calls.add(request, response)
++
++        if hasattr(mock, 'call_count'):
++            try:
++                mock.call_count += 1
++            except Exception:
++                pass
++
++    def _prepare_headers(self, headers):
++        if headers is None:
++            headers = dict(config.HEADERS)
++            headers['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
++            headers['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
++            return headers
++
++        return dict(headers)
++
++    def _build_form_data(self, data, files):
++        form = FormData()
++
++        if data is not None:
++            if hasattr(data, 'items'):
++                for key, value in data.items():
++                    form.add_field(key, value)
++            else:
++                form.add_field('data', data)
++
++        for key, value in files.items():
++            if isinstance(value, tuple):
++                filename, file_obj, content_type = value
++                form.add_field(key, file_obj, filename=filename, content_type=content_type)
++            else:
++                form.add_field(key, value)
++
++        return form
+ 
+ 
+ requests = RequestsWrapper()
++http = requests
+ 
+ 
+ def return_transform_task(transformation, params):

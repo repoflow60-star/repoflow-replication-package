@@ -1,0 +1,121 @@
+--- a/ninjemail/sms_services/_treq.py
++++ b/ninjemail/sms_services/_treq.py
+@@ -0,0 +1,118 @@
++import json
++import threading
++from http import HTTPStatus
++
++import treq
++from twisted.internet import defer, reactor
++
++
++_REACTOR_THREAD = None
++_REACTOR_READY = threading.Event()
++
++
++class HTTPError(Exception):
++    pass
++
++
++def _ensure_reactor():
++    global _REACTOR_THREAD
++
++    if reactor.running:
++        _REACTOR_READY.set()
++        return
++
++    if _REACTOR_THREAD is not None:
++        _REACTOR_READY.wait()
++        return
++
++    def _run():
++        reactor.callWhenRunning(_REACTOR_READY.set)
++        reactor.run(installSignalHandlers=False)
++
++    _REACTOR_THREAD = threading.Thread(target=_run, daemon=True)
++    _REACTOR_THREAD.start()
++    _REACTOR_READY.wait()
++
++
++def _run_sync(factory):
++    _ensure_reactor()
++
++    finished = threading.Event()
++    outcome = {}
++
++    def _submit():
++        try:
++            deferred = defer.maybeDeferred(factory)
++        except BaseException as exc:
++            outcome["error"] = exc
++            finished.set()
++            return
++
++        def _ok(value):
++            outcome["value"] = value
++            finished.set()
++            return value
++
++        def _err(failure):
++            outcome["error"] = failure.value
++            finished.set()
++            return failure
++
++        deferred.addCallbacks(_ok, _err)
++
++    reactor.callFromThread(_submit)
++    finished.wait()
++
++    if "error" in outcome:
++        raise outcome["error"]
++    return outcome.get("value")
++
++
++def _http_error(url, code):
++    try:
++        phrase = HTTPStatus(code).phrase
++    except ValueError:
++        phrase = "HTTP Error"
++
++    if 400 <= code < 500:
++        kind = "Client Error"
++    elif 500 <= code < 600:
++        kind = "Server Error"
++    else:
++        kind = "HTTP Error"
++
++    return HTTPError(f"{code} {kind}: {phrase} for url: {url}")
++
++
++def _decode_body(body):
++    if isinstance(body, bytes):
++        return body.decode()
++    return body
++
++
++def request_text(method, url, **kwargs):
++    def _do_request():
++        request = getattr(treq, method.lower())
++
++        def _handle(response):
++            if response.code >= 400:
++                raise _http_error(url, response.code)
++            return defer.maybeDeferred(treq.content, response).addCallback(_decode_body)
++
++        return defer.maybeDeferred(request, url, **kwargs).addCallback(_handle)
++
++    return _run_sync(_do_request)
++
++
++def request_json(method, url, **kwargs):
++    def _do_request():
++        request = getattr(treq, method.lower())
++
++        def _handle(response):
++            if response.code >= 400:
++                raise _http_error(url, response.code)
++            return defer.maybeDeferred(treq.content, response).addCallback(lambda body: json.loads(_decode_body(body)))
++
++        return defer.maybeDeferred(request, url, **kwargs).addCallback(_handle)
++
++    return _run_sync(_do_request)

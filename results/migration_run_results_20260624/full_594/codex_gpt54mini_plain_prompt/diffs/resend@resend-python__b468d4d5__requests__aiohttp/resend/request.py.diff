@@ -1,0 +1,112 @@
+diff --git a/resend/request.py b/resend/request.py
+index fbd42f2..544fb19 100644
+--- a/resend/request.py
++++ b/resend/request.py
+@@ -1,6 +1,10 @@
++import asyncio
++import json
++import threading
++from dataclasses import dataclass
+ from typing import Any, Dict, Generic, List, Union, cast
+ 
+-import requests
++import aiohttp
+ from typing_extensions import Literal, TypeVar
+ 
+ import resend
+@@ -12,6 +16,16 @@ RequestVerb = Literal["get", "post", "put", "patch", "delete"]
+ T = TypeVar("T")
+ 
+ 
++@dataclass
++class _Response:
++    status_code: int
++    headers: Dict[str, str]
++    text: str
++
++    def json(self) -> Any:
++        return json.loads(self.text)
++
++
+ # This class wraps the HTTP request creation logic
+ class Request(Generic[T]):
+     def __init__(
+@@ -32,8 +46,6 @@ class Request(Generic[T]):
+         Returns:
+             Union[T, None]: A generic type of the Request class or None
+ 
+-        Raises:
+-            requests.HTTPError: If the request fails
+         """
+         resp = self.make_request(url=f"{resend.api_url}{self.path}")
+ 
+@@ -43,7 +55,8 @@ class Request(Generic[T]):
+ 
+         # this is a safety net, if we get here it means the Resend API is having issues
+         # and most likely the gateway is returning htmls
+-        if "application/json" not in resp.headers["content-type"]:
++        content_type = resp.headers.get("content-type") or resp.headers.get("Content-Type") or ""
++        if "application/json" not in content_type:
+             raise_for_code_and_type(
+                 code=500,
+                 message="Failed to parse Resend API response. Please try again.",
+@@ -89,24 +102,49 @@ class Request(Generic[T]):
+             "User-Agent": f"resend-python:{get_version()}",
+         }
+ 
+-    def make_request(self, url: str) -> requests.Response:
++    def make_request(self, url: str) -> _Response:
+         """make_request is a helper function that makes the actual
+-        HTTP request to the Resend API.
++        HTTP request to the Resend API using aiohttp.
+ 
+         Args:
+             url (str): The URL to make the request to
+ 
+         Returns:
+-            requests.Response: The response object from the request
+-
+-        Raises:
+-            requests.HTTPError: If the request fails
++            _Response: The response object from the request
+         """
++        try:
++            asyncio.get_running_loop()
++        except RuntimeError:
++            return asyncio.run(self.__make_request_async(url))
++        return self.__make_request_in_thread(url)
++
++    def __make_request_in_thread(self, url: str) -> _Response:
++        result: Dict[str, Any] = {}
++
++        def runner() -> None:
++            try:
++                result["response"] = asyncio.run(self.__make_request_async(url))
++            except Exception as exc:  # pragma: no cover - propagated to caller
++                result["error"] = exc
++
++        thread = threading.Thread(target=runner, daemon=True)
++        thread.start()
++        thread.join()
++
++        if "error" in result:
++            raise cast(Exception, result["error"])
++        return cast(_Response, result["response"])
++
++    async def __make_request_async(self, url: str) -> _Response:
+         headers = self.__get_headers()
+         params = self.params
+         verb = self.verb
+ 
+-        try:
+-            return requests.request(verb, url, json=params, headers=headers)
+-        except requests.HTTPError as e:
+-            raise e
++        async with aiohttp.ClientSession(headers=headers) as session:
++            async with session.request(verb.upper(), url, json=params) as response:
++                text = await response.text()
++                return _Response(
++                    status_code=response.status,
++                    headers=dict(response.headers),
++                    text=text,
++                )

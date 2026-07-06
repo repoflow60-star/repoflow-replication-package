@@ -1,0 +1,183 @@
+--- a/olclient/openlibrary.py
++++ b/olclient/openlibrary.py
+@@ -1,19 +1,20 @@
+ """Basic wrapper (client) over OpenLibrary REST API"""
+ 
+ 
++import asyncio
+ import json
+-from typing import List, Dict, Optional, Any
+-
+-import jsonschema
+ import logging
+ import os
+ import re
++from types import SimpleNamespace
++from typing import List, Dict, Optional, Any
++
++import aiohttp
++import jsonschema
+ from urllib.parse import urlencode
+ from urllib.request import pathname2url
+ 
+ import backoff
+-import requests
+-from requests import Response
+ 
+ from olclient import common
+ from olclient.config import Config
+@@ -21,6 +22,104 @@
+ from olclient.utils import merge_unique_lists
+ 
+ logger = logging.getLogger('openlibrary')
++
++
++class _AiohttpResponse:
++    def __init__(self, *, url, status, headers, body, method):
++        self.url = url
++        self.status = status
++        self.headers = headers
++        self._body = body
++        self._method = method
++
++    def json(self):
++        return self._body
++
++    def raise_for_status(self):
++        if 400 <= self.status:
++            raise aiohttp.ClientResponseError(
++                request_info=SimpleNamespace(real_url=self.url, method=self._method),
++                history=(),
++                status=self.status,
++                message=str(self._body),
++                headers=self.headers,
++            )
++
++
++class _AiohttpSession:
++    def __init__(self, base_url):
++        self._base_url = base_url
++        self._loop = asyncio.new_event_loop()
++        self._cookie_jar = aiohttp.CookieJar(unsafe=True, loop=self._loop)
++
++    @property
++    def cookies(self):
++        return self._cookie_jar.filter_cookies(self._base_url)
++
++    def get(self, url, **kwargs):
++        return self._request('GET', url, **kwargs)
++
++    def post(self, url, data=None, json=None, **kwargs):
++        if data is not None:
++            kwargs['data'] = data
++        if json is not None:
++            kwargs['json'] = json
++        return self._request('POST', url, **kwargs)
++
++    def put(self, url, data=None, json=None, **kwargs):
++        if data is not None:
++            kwargs['data'] = data
++        if json is not None:
++            kwargs['json'] = json
++        return self._request('PUT', url, **kwargs)
++
++    def close(self):
++        if not self._loop.is_closed():
++            self._loop.close()
++
++    def _request(self, method, url, **kwargs):
++        return self._loop.run_until_complete(self._request_async(method, url, **kwargs))
++
++    async def _request_async(self, method, url, **kwargs):
++        files = kwargs.pop('files', None)
++        if files is not None:
++            form_data = aiohttp.FormData()
++            for name, value in files.items():
++                if isinstance(value, tuple):
++                    if len(value) == 2:
++                        filename, field_value = value
++                        form_data.add_field(
++                            name,
++                            field_value,
++                            filename='' if filename is None else filename,
++                        )
++                    elif len(value) == 3:
++                        filename, field_value, content_type = value
++                        form_data.add_field(
++                            name,
++                            field_value,
++                            filename='' if filename is None else filename,
++                            content_type=content_type,
++                        )
++                    else:
++                        form_data.add_field(name, value[1])
++                else:
++                    form_data.add_field(name, value, filename='')
++            kwargs['data'] = form_data
++
++        async with aiohttp.ClientSession(cookie_jar=self._cookie_jar) as session:
++            async with session.request(method, url, **kwargs) as response:
++                try:
++                    body = await response.json(content_type=None)
++                except (aiohttp.ContentTypeError, ValueError):
++                    body = await response.text()
++                return _AiohttpResponse(
++                    url=str(response.url),
++                    status=response.status,
++                    headers=response.headers,
++                    body=body,
++                    method=method,
++                )
+ 
+ 
+ class OpenLibrary:
+@@ -51,9 +150,8 @@
+     VALID_IDS = ['isbn_10', 'isbn_13', 'lccn', 'ocaid']
+     BACKOFF_KWARGS = {
+         'wait_gen': backoff.expo,
+-        'exception': requests.exceptions.RequestException,
+-        'giveup': lambda e: hasattr(e.response, 'status_code')
+-        and 400 <= e.response.status_code < 500,
++        'exception': aiohttp.ClientError,
++        'giveup': lambda e: 400 <= getattr(e, 'status', 0) < 500,
+         'max_tries': 5,
+     }
+ 
+@@ -62,14 +160,17 @@
+     WORKS_PAGINATION_OFFSET = 0
+ 
+     def __init__(self, credentials=None, base_url='https://openlibrary.org'):
+-        self.session = requests.Session()
++        self.session = _AiohttpSession(base_url)
+         self.base_url = base_url
+         credentials = credentials or Config().get_config().get('s3', None)
+         if credentials:
+             self.login(credentials)
+ 
++    def close(self):
++        return self.session.close()
++
+     def login(self, credentials):
+-        """Login to Open Library with given credentials, ensures the requests
++        """Login to Open Library with given credentials, ensures the HTTP
+         session has valid cookies for future requests.
+         """
+ 
+@@ -119,7 +220,7 @@
+         url = self._generate_url_from_olid(olid)
+         return self.session.put(url, data=data)
+ 
+-    def save_many(self, docs, comment) -> Response:
++    def save_many(self, docs, comment) -> Any:
+         """
+         Uses the Open Library save_many API endpoint to
+         write any number or combination of documents (Edition, Work, or Author)
+@@ -135,7 +236,7 @@
+             f'{self.base_url}/api/save_many', json.dumps(doc_json), headers=headers
+         )
+ 
+-    def delete_many(self, ol_ids: List[str], comment: str) -> Response:
++    def delete_many(self, ol_ids: List[str], comment: str) -> Any:
+         return self.save_many(
+             [self.Delete(ol_id) for ol_id in ol_ids],
+             comment=comment

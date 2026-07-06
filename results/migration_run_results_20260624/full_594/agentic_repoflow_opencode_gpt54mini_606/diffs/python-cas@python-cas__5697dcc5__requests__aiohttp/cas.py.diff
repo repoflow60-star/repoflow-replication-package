@@ -1,0 +1,198 @@
+--- a/cas.py
++++ b/cas.py
+@@ -1,8 +1,9 @@
++import asyncio
+ import datetime
+ import logging
+ from uuid import uuid4
+ 
+-import requests
++import aiohttp
+ from lxml import etree
+ from six.moves.urllib import parse as urllib_parse
+ 
+@@ -79,7 +80,17 @@
+         self.renew = renew
+         self.username_attribute = username_attribute
+         self.verify_ssl_certificate = verify_ssl_certificate
+-        self.session = session or requests.sessions.Session()
++        self.session = session
++
++    @staticmethod
++    def _response_text(content):
++        if isinstance(content, bytes):
++            return content.decode('utf-8', 'replace')
++        return content
++
++    async def _read_aiohttp(self, method, url, **kwargs):
++        async with aiohttp.request(method, url, **kwargs) as response:
++            return response.status, await response.read()
+ 
+     def verify_ticket(self, ticket):
+         """Verify ticket.
+@@ -140,10 +151,25 @@
+         Raises:
+             CASError: Non 200 http code or bad XML body.
+         """
+-        response = self.session.get(self.get_proxy_url(pgt), verify=self.verify_ssl_certificate)
+-        if response.status_code == 200:
++        if self.session is not None:
++            response = self.session.get(self.get_proxy_url(pgt), verify=self.verify_ssl_certificate)
++            try:
++                status_code = response.status_code
++                content = response.content
++            finally:
++                response.close()
++        else:
++            status_code, content = asyncio.run(
++                self._read_aiohttp(
++                    'GET',
++                    self.get_proxy_url(pgt),
++                    ssl=self.verify_ssl_certificate,
++                )
++            )
++
++        if status_code == 200:
+             from lxml import etree
+-            root = etree.fromstring(response.content)
++            root = etree.fromstring(content)
+             tickets = root.xpath(
+                 "//cas:proxyTicket",
+                 namespaces={"cas": "http://www.yale.edu/tp/cas"}
+@@ -156,7 +182,7 @@
+             )
+             if len(errors) == 1:
+                 raise CASError(errors[0].attrib['code'], errors[0].text)
+-        raise CASError("Bad http code %s" % response.status_code)
++        raise CASError("Bad http code %s" % status_code)
+ 
+ 
+ class CASClientV1(CASClientBase):
+@@ -172,20 +198,30 @@
+         params = [('ticket', ticket), ('service', self.service_url)]
+         url = (urllib_parse.urljoin(self.server_url, 'validate') + '?' +
+                urllib_parse.urlencode(params))
+-        page = self.session.get(
+-            url,
+-            stream=True,
+-            verify=self.verify_ssl_certificate
++        if self.session is not None:
++            page = self.session.get(
++                url,
++                stream=True,
++                verify=self.verify_ssl_certificate
++            )
++            try:
++                page_iterator = page.iter_lines(chunk_size=8192, decode_unicode=True)
++                verified = next(page_iterator).strip()
++                if verified == 'yes':
++                    return next(page_iterator).strip(), None, None
++                else:
++                    return None, None, None
++            finally:
++                page.close()
++
++        _, content = asyncio.run(
++            self._read_aiohttp('GET', url, ssl=self.verify_ssl_certificate)
+         )
+-        try:
+-            page_iterator = page.iter_lines(chunk_size=8192)
+-            verified = next(page_iterator).strip()
+-            if verified == 'yes':
+-                return next(page_iterator).strip(), None, None
+-            else:
+-                return None, None, None
+-        finally:
+-            page.close()
++        page_iterator = iter(self._response_text(content).splitlines())
++        verified = next(page_iterator).strip()
++        if verified == 'yes':
++            return next(page_iterator).strip(), None, None
++        return None, None, None
+ 
+ 
+ class CASClientV2(CASClientBase):
+@@ -212,15 +248,26 @@
+         if self.proxy_callback:
+             params.update({'pgtUrl': self.proxy_callback})
+         base_url = urllib_parse.urljoin(self.server_url, self.url_suffix)
+-        page = self.session.get(
+-            base_url,
+-            params=params,
+-            verify=self.verify_ssl_certificate
++        if self.session is not None:
++            page = self.session.get(
++                base_url,
++                params=params,
++                verify=self.verify_ssl_certificate
++            )
++            try:
++                return page.content
++            finally:
++                page.close()
++
++        _, content = asyncio.run(
++            self._read_aiohttp(
++                'GET',
++                base_url,
++                params=params,
++                ssl=self.verify_ssl_certificate,
++            )
+         )
+-        try:
+-            return page.content
+-        finally:
+-            page.close()
++        return content
+ 
+     @classmethod
+     def parse_attributes_xml_element(cls, element):
+@@ -338,7 +385,7 @@
+         try:
+             user = None
+             attributes = {}
+-            response = page.content
++            response = page.content if hasattr(page, 'content') else page
+             tree = ElementTree.fromstring(response)
+             # Find the authentication status
+             success = tree.find('.//' + SAML_1_0_PROTOCOL_NS + 'StatusCode')
+@@ -363,7 +410,8 @@
+                         attributes[at.attrib['AttributeName']] = values[0].text
+             return user, attributes, None
+         finally:
+-            page.close()
++            if hasattr(page, 'close'):
++                page.close()
+ 
+     def fetch_saml_validation(self, ticket):
+         """We do the SAML validation"""
+@@ -380,11 +428,24 @@
+         saml_validate_url = urllib_parse.urljoin(
+             self.server_url, 'samlValidate',
+         )
+-        return self.session.post(
+-            saml_validate_url,
+-            self.get_saml_assertion(ticket),
+-            params=params,
+-            headers=headers)
++        if self.session is not None:
++            return self.session.post(
++                saml_validate_url,
++                self.get_saml_assertion(ticket),
++                params=params,
++                headers=headers)
++
++        _, content = asyncio.run(
++            self._read_aiohttp(
++                'POST',
++                saml_validate_url,
++                data=self.get_saml_assertion(ticket),
++                params=params,
++                headers=headers,
++                ssl=self.verify_ssl_certificate,
++            )
++        )
++        return content
+ 
+     @classmethod
+     def get_saml_assertion(cls, ticket):

@@ -1,0 +1,103 @@
+--- a/modules/Application/PluginAdaptors/HTTPMixin.py
++++ b/modules/Application/PluginAdaptors/HTTPMixin.py
+@@ -1,6 +1,47 @@
+-import requests
+-from requests.exceptions import RequestException
+ from abc import ABC, abstractmethod
++import json
++import threading
++from urllib.parse import urlencode
++
++import treq
++from twisted.internet import reactor, threads
++
++
++_reactor_lock = threading.Lock()
++_reactor_thread: threading.Thread | None = None
++_reactor_ready = threading.Event()
++
++
++def _ensure_reactor() -> None:
++    global _reactor_thread
++    if reactor.running:
++        return
++    if _reactor_thread and _reactor_thread.is_alive():
++        return
++    with _reactor_lock:
++        if reactor.running:
++            return
++        if _reactor_thread and _reactor_thread.is_alive():
++            return
++
++        _reactor_ready.clear()
++
++        def _run() -> None:
++            reactor.callWhenRunning(_reactor_ready.set)
++            reactor.run(installSignalHandlers=False)
++
++        _reactor_thread = threading.Thread(target=_run, name='treq-reactor', daemon=True)
++        _reactor_thread.start()
++
++    if not _reactor_ready.wait(5):
++        raise RuntimeError('Failed to start the treq reactor thread')
++
++
++def _blocking_call(func, *args, **kwargs):
++    _ensure_reactor()
++    if threading.current_thread() is _reactor_thread:
++        raise RuntimeError('HTTPMixin.send() cannot run on the treq reactor thread')
++    return threads.blockingCallFromThread(reactor, func, *args, **kwargs)
+ 
+ 
+ class HTTPMixin(ABC):
+@@ -18,26 +59,35 @@
+                 raise Exception(f'Unsupported HTTP method {self._method()}')
+ 
+     def _get(self) -> dict:
+-        return self._process_response(requests.get(self._endpoint(), headers=self._headers(), auth=self._auth()))
++        return _blocking_call(self._request, 'GET')
+ 
+     def _post(self) -> dict:
++        headers = self._headers().copy()
+         if self._is_form_encoded():
+-            headers = self._headers()
+             headers['Content-Type'] = 'application/x-www-form-urlencoded'
+-            return self._process_response(
+-                requests.post(self._endpoint(), data=self._data(), headers=self._headers(), auth=self._auth()))
+-        return self._process_response(
+-            requests.post(self._endpoint(), json=self._data(), headers=self._headers(), auth=self._auth()))
++            body = urlencode(self._data()).encode('utf-8')
++        else:
++            headers['Content-Type'] = 'application/json'
++            body = json.dumps(self._data()).encode('utf-8')
++        return _blocking_call(self._request, 'POST', body, headers)
+ 
+-    @staticmethod
+-    def _process_response(response: requests.Response) -> dict:
+-        try:
+-            if 200 <= response.status_code < 500:
+-                return response.json()
+-            else:
+-                raise Exception(f"HTTP {response.status_code} error while calling {response.url}")
+-        except RequestException:
+-            raise Exception(f"Connection failed while calling {response.url}")
++    def _request(self, method: str, body: bytes | None = None, headers: dict | None = None):
++        endpoint = self._endpoint()
++
++        def _success(response):
++            if 200 <= response.code < 500:
++                return treq.json_content(response)
++            raise Exception(f'HTTP {response.code} error while calling {endpoint}')
++
++        def _failure(_failure):
++            raise Exception(f'Connection failed while calling {endpoint}')
++
++        if method == 'GET':
++            deferred = treq.get(endpoint, headers=headers or self._headers(), auth=self._auth())
++        else:
++            deferred = treq.post(endpoint, data=body, headers=headers or self._headers(), auth=self._auth())
++        deferred.addCallbacks(_success, _failure)
++        return deferred
+ 
+     @abstractmethod
+     def _method(self) -> str:

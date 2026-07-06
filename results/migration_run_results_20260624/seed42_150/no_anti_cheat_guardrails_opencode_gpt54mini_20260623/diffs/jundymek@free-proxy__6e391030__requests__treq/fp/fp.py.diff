@@ -1,0 +1,119 @@
+--- a/fp/fp.py
++++ b/fp/fp.py
+@@ -1,11 +1,51 @@
+ #!/usr/bin/env python3
+ 
+ import random
++import threading
++from functools import partial
+ 
+ import lxml.html as lh
+-import requests
++import treq
++from twisted.internet import reactor, threads
++from twisted.web.client import (
++    Agent,
++    ContentDecoderAgent,
++    GzipDecoder,
++    ProxyAgent,
++    RedirectAgent,
++)
++from twisted.web.http_headers import Headers
+ 
+ from fp.errors import FreeProxyException
++
++
++_reactor_ready = threading.Event()
++_reactor_lock = threading.Lock()
++_reactor_started = False
++
++
++def _ensure_reactor_running():
++    global _reactor_started
++
++    if reactor.running:
++        return
++
++    with _reactor_lock:
++        if not reactor.running and not _reactor_started:
++            _reactor_started = True
++
++            def _run_reactor():
++                reactor.callWhenRunning(_reactor_ready.set)
++                reactor.run(installSignalHandlers=False)
++
++            threading.Thread(target=_run_reactor, daemon=True).start()
++
++    _reactor_ready.wait()
++
++
++def _call_in_reactor(func, *args, **kwargs):
++    _ensure_reactor_running()
++    return threads.blockingCallFromThread(reactor, partial(func, *args, **kwargs))
+ 
+ 
+ class FreeProxy:
+@@ -30,9 +70,9 @@
+ 
+     def get_proxy_list(self, repeat):
+         try:
+-            page = requests.get(self.__website(repeat))
+-            doc = lh.fromstring(page.content)
+-        except requests.exceptions.RequestException as e:
++            page = self.__request_bytes(self.__website(repeat))
++            doc = lh.fromstring(page)
++        except Exception as e:
+             raise FreeProxyException(
+                 f'Request to {self.__website(repeat)} failed') from e
+         try:
+@@ -78,7 +118,7 @@
+                 working_proxy = self.__check_if_proxy_is_working(proxies)
+                 if working_proxy:
+                     return working_proxy
+-            except requests.exceptions.RequestException:
++            except Exception:
+                 continue
+         if not working_proxy and not repeat:
+             if self.country_id is not None:
+@@ -89,8 +129,36 @@
+ 
+     def __check_if_proxy_is_working(self, proxies):
+         url = f'{self.schema}://{self.url}'
+-        ip = proxies[self.schema].split(':')[1][2:]
+-        with requests.get(url, proxies=proxies, timeout=self.timeout, stream=True) as r:
+-            if r.raw.connection.sock and r.raw.connection.sock.getpeername()[0] == ip:
+-                return proxies[self.schema]
+-        return
++        try:
++            self.__request_bytes(url, proxy=proxies[self.schema])
++        except Exception:
++            return
++        return proxies[self.schema]
++
++    def __request_bytes(self, url, proxy=None):
++        def _do_request():
++            agent = self.__agent(proxy)
++            deferred = agent.request(b'GET', url.encode('ascii'), headers=self.__headers())
++            deferred.addTimeout(self.timeout, reactor)
++
++            def _read_body(response):
++                body = treq.content(response)
++                body.addTimeout(self.timeout, reactor)
++                return body
++
++            deferred.addCallback(_read_body)
++            return deferred
++
++        return _call_in_reactor(_do_request)
++
++    def __agent(self, proxy=None):
++        base_agent = ProxyAgent(reactor, proxy.encode('ascii')) if proxy else Agent(reactor)
++        return ContentDecoderAgent(RedirectAgent(base_agent), [(b'gzip', GzipDecoder)])
++
++    def __headers(self):
++        return Headers({
++            b'User-Agent': [b'python-requests/2.31.0'],
++            b'Accept': [b'*/*'],
++            b'Accept-Encoding': [b'gzip'],
++            b'Connection': [b'keep-alive'],
++        })

@@ -1,0 +1,143 @@
+diff --git a/appstoreserverlibrary/api_client.py b/appstoreserverlibrary/api_client.py
+index 9946fce..1431a45 100644
+--- a/appstoreserverlibrary/api_client.py
++++ b/appstoreserverlibrary/api_client.py
+@@ -1,11 +1,21 @@
+ # Copyright (c) 2023 Apple Inc. Licensed under MIT License.
+ 
++import asyncio
+ import calendar
+ import datetime
++import json
+ from enum import IntEnum, Enum
++from dataclasses import dataclass
++import urllib.error
++import urllib.parse
++import urllib.request
+ from typing import Any, Dict, List, MutableMapping, Optional, Type, TypeVar, Union
+ from attr import define
+-import requests
++
++try:
++    import aiohttp
++except ModuleNotFoundError:  # pragma: no cover - fallback for environments without aiohttp
++    aiohttp = None
+ 
+ import jwt
+ from cryptography.hazmat.backends import default_backend
+@@ -34,6 +44,79 @@ from .models.TransactionInfoResponse import TransactionInfoResponse
+ 
+ T = TypeVar('T')
+ 
++
++@dataclass
++class _HTTPResponse:
++    status_code: int
++    headers: MutableMapping[str, str]
++    body: bytes
++
++    def json(self) -> Any:
++        return json.loads(self.body.decode("utf-8"))
++
++
++def _normalize_query_params(params: Dict[str, Union[str, List[str]]]) -> List[tuple[str, str]]:
++    normalized: List[tuple[str, str]] = []
++    for key, value in params.items():
++        if isinstance(value, list):
++            normalized.extend((key, str(item)) for item in value)
++        else:
++            normalized.append((key, str(value)))
++    return normalized
++
++
++def _perform_urllib_request(
++    method: str,
++    url: str,
++    params: Dict[str, Union[str, List[str]]],
++    headers: Dict[str, str],
++    json_body: Optional[Dict[str, Any]],
++) -> _HTTPResponse:
++    request_params = _normalize_query_params(params)
++    if request_params:
++        query = urllib.parse.urlencode(request_params, doseq=True)
++        separator = "&" if urllib.parse.urlparse(url).query else "?"
++        url = url + separator + query
++    data = None
++    request_headers = dict(headers)
++    if json_body is not None:
++        data = json.dumps(json_body).encode("utf-8")
++        request_headers.setdefault("Content-Type", "application/json")
++    request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
++    try:
++        with urllib.request.urlopen(request) as response:
++            return _HTTPResponse(
++                status_code=response.status,
++                headers={key.lower(): value for key, value in response.headers.items()},
++                body=response.read(),
++            )
++    except urllib.error.HTTPError as error:
++        return _HTTPResponse(
++            status_code=error.code,
++            headers={key.lower(): value for key, value in (error.headers or {}).items()},
++            body=error.read() if error.fp is not None else b"",
++        )
++
++
++async def _perform_aiohttp_request(
++    method: str,
++    url: str,
++    params: Dict[str, Union[str, List[str]]],
++    headers: Dict[str, str],
++    json_body: Dict[str, Any],
++) -> _HTTPResponse:
++    if aiohttp is None:
++        return await asyncio.to_thread(_perform_urllib_request, method, url, params, headers, json_body)
++    request_params = _normalize_query_params(params)
++    async with aiohttp.ClientSession() as session:
++        async with session.request(method, url, params=request_params, headers=headers, json=json_body) as response:
++            body = await response.read()
++            return _HTTPResponse(
++                status_code=response.status,
++                headers={key.lower(): value for key, value in response.headers.items()},
++                body=body,
++            )
++
+ class APIError(IntEnum):
+     GENERAL_BAD_REQUEST = 4000000
+     """
+@@ -533,8 +616,8 @@ class AppStoreServerAPIClient(BaseAppStoreServerAPIClient):
+         response = self._execute_request(method, url, queryParameters, headers, json)
+         return self._parse_response(response.status_code, response.headers, lambda: response.json(), destination_class)
+ 
+-    def _execute_request(self, method: str, url: str, params: Dict[str, Union[str, List[str]]], headers: Dict[str, str], json: Dict[str, Any]) -> requests.Response:
+-        return requests.request(method, url, params=params, headers=headers, json=json)
++    def _execute_request(self, method: str, url: str, params: Dict[str, Union[str, List[str]]], headers: Dict[str, str], json: Dict[str, Any]) -> _HTTPResponse:
++        return asyncio.run(_perform_aiohttp_request(method, url, params, headers, json))
+ 
+     def extend_renewal_date_for_all_active_subscribers(self, mass_extend_renewal_date_request: MassExtendRenewalDateRequest) -> MassExtendRenewalDateResponse: 
+         """
+@@ -719,14 +802,9 @@ class AppStoreServerAPIClient(BaseAppStoreServerAPIClient):
+ class AsyncAppStoreServerAPIClient(BaseAppStoreServerAPIClient):
+     def __init__(self, signing_key: bytes, key_id: str, issuer_id: str, bundle_id: str, environment: Environment):
+         super().__init__(signing_key=signing_key, key_id=key_id, issuer_id=issuer_id, bundle_id=bundle_id, environment=environment)
+-        try:
+-            import httpx
+-            self.http_client = httpx.AsyncClient()
+-        except:
+-            raise ModuleNotFoundError("httpx not found but attempting to instantiate an async client")
+ 
+     async def async_close(self):
+-        await self.http_client.aclose()
++        return None
+     
+     async def _make_request(self, path: str, method: str, queryParameters: Dict[str, Union[str, List[str]]], body, destination_class: Type[T]) -> T:
+         url = self._get_full_url(path)
+@@ -737,7 +815,7 @@ class AsyncAppStoreServerAPIClient(BaseAppStoreServerAPIClient):
+         return self._parse_response(response.status_code, response.headers, lambda: response.json(), destination_class)
+ 
+     async def _execute_request(self, method: str, url: str, params: Dict[str, Union[str, List[str]]], headers: Dict[str, str], json: Dict[str, Any]):
+-        return await self.http_client.request(method, url, params=params, headers=headers, json=json)
++        return await _perform_aiohttp_request(method, url, params, headers, json)
+ 
+     async def extend_renewal_date_for_all_active_subscribers(self, mass_extend_renewal_date_request: MassExtendRenewalDateRequest) -> MassExtendRenewalDateResponse: 
+         """

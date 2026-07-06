@@ -1,0 +1,238 @@
+--- a/whatsapp_api_client_python/API.py
++++ b/whatsapp_api_client_python/API.py
+@@ -1,9 +1,15 @@
+-import json
++import json as json_module
+ import logging
+-from typing import Any, NoReturn, Optional
+-
+-from requests import Response, Session
+-from requests.adapters import HTTPAdapter, Retry
++from threading import Event, Lock, Thread
++from typing import Any, Dict, NoReturn, Optional, Tuple
++from urllib.parse import urlencode
++from uuid import uuid4
++
++from treq import content as treq_content
++from treq import request as treq_request
++from twisted.internet import defer, reactor, task
++from twisted.internet.threads import blockingCallFromThread
++from twisted.web.http_headers import Headers
+ 
+ from .response import Response as GreenAPIResponse
+ from .tools import (
+@@ -18,6 +24,178 @@
+     serviceMethods,
+     webhooks
+ )
++
++
++class _HTTPResponse:
++    def __init__(self, status_code: int, text: str):
++        self.status_code = status_code
++        self.text = text
++
++
++class Session:
++    _reactor_started = False
++    _reactor_lock = Lock()
++
++    def __init__(self):
++        self.headers: Dict[str, str] = {}
++        self._mounted: Dict[str, Any] = {}
++
++    def mount(self, prefix: str, adapter: Any) -> None:
++        self._mounted[prefix] = adapter
++
++    def request(
++            self,
++            method: str,
++            url: str,
++            json: Optional[dict] = None,
++            data: Any = None,
++            files: Optional[dict] = None,
++            timeout: Optional[float] = None,
++            headers: Optional[Dict[str, str]] = None,
++            **arguments: Any
++    ) -> _HTTPResponse:
++        self._ensure_reactor()
++
++        request_headers = dict(self.headers)
++        if headers:
++            request_headers.update(headers)
++
++        if files:
++            request_data, content_type = self.__encode_multipart(data, files)
++            request_headers["Content-Type"] = content_type
++        elif json is not None:
++            request_data = json_module.dumps(json).encode("utf-8")
++            request_headers.setdefault("Content-Type", "application/json")
++        else:
++            request_data, request_headers = self.__encode_body(data, request_headers)
++
++        @defer.inlineCallbacks
++        def _perform_request() -> Any:
++            for attempt in range(4):
++                try:
++                    response = yield treq_request(
++                        method,
++                        url,
++                        data=request_data,
++                        headers=Headers({
++                            key.encode("ascii"): [value.encode("utf-8")]
++                            for key, value in request_headers.items()
++                        }),
++                        timeout=timeout,
++                        **arguments
++                    )
++                    body = yield treq_content(response)
++                    text = body.decode("utf-8", errors="replace")
++
++                    if response.code == 429 and attempt < 3:
++                        yield task.deferLater(reactor, 2 ** attempt, lambda: None)
++                        continue
++
++                    defer.returnValue(_HTTPResponse(response.code, text))
++                except Exception:
++                    if attempt >= 3:
++                        raise
++
++                    yield task.deferLater(reactor, 2 ** attempt, lambda: None)
++
++        return blockingCallFromThread(reactor, _perform_request)
++
++    def _ensure_reactor(self) -> None:
++        if reactor.running or self._reactor_started:
++            return
++
++        with self._reactor_lock:
++            if reactor.running or self._reactor_started:
++                return
++
++            started = Event()
++
++            def _run() -> None:
++                reactor.callWhenRunning(started.set)
++                reactor.run(installSignalHandlers=False)
++
++            Thread(target=_run, daemon=True).start()
++            if not started.wait(5):
++                raise RuntimeError("Twisted reactor failed to start")
++            self._reactor_started = True
++
++    @staticmethod
++    def __encode_body(
++            data: Any,
++            headers: Dict[str, str]
++    ) -> Tuple[Any, Dict[str, str]]:
++        if data is None:
++            return None, headers
++
++        if isinstance(data, bytes):
++            return data, headers
++
++        if isinstance(data, str):
++            return data.encode("utf-8"), headers
++
++        if isinstance(data, dict):
++            headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
++            return urlencode(data, doseq=True).encode("utf-8"), headers
++
++        return str(data).encode("utf-8"), headers
++
++    @staticmethod
++    def __encode_multipart(
++            data: Any,
++            files: Dict[str, Any]
++    ) -> Tuple[bytes, str]:
++        boundary = f"----whatsapp-api-client-python-{uuid4().hex}"
++        body = bytearray()
++
++        def _append_field(name: str, value: Any) -> None:
++            body.extend(f"--{boundary}\r\n".encode("utf-8"))
++            body.extend(
++                (
++                    f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
++                    f"{value}\r\n"
++                ).encode("utf-8")
++            )
++
++        def _append_file(name: str, file_value: Any) -> None:
++            filename = name
++            content_type = "application/octet-stream"
++            file_obj = file_value
++
++            if isinstance(file_value, tuple):
++                filename = file_value[0]
++                file_obj = file_value[1]
++                if len(file_value) > 2 and file_value[2]:
++                    content_type = file_value[2]
++
++            try:
++                content = file_obj.read() if hasattr(file_obj, "read") else file_obj
++            finally:
++                if hasattr(file_obj, "close"):
++                    file_obj.close()
++
++            if isinstance(content, str):
++                content = content.encode("utf-8")
++
++            body.extend(f"--{boundary}\r\n".encode("utf-8"))
++            body.extend(
++                (
++                    f'Content-Disposition: form-data; name="{name}"; '
++                    f'filename="{filename}"\r\n'
++                    f"Content-Type: {content_type}\r\n\r\n"
++                ).encode("utf-8")
++            )
++            body.extend(content)
++            body.extend(b"\r\n")
++
++        if isinstance(data, dict):
++            for key, value in data.items():
++                _append_field(key, value)
++
++        for key, value in files.items():
++            _append_file(key, value)
++
++        body.extend(f"--{boundary}--\r\n".encode("utf-8"))
++        return bytes(body), f"multipart/form-data; boundary={boundary}"
+ 
+ 
+ class GreenApi:
+@@ -116,14 +294,14 @@
+ 
+         return GreenAPIResponse(response.status_code, response.text)
+ 
+-    def __handle_response(self, response: Response) -> Optional[NoReturn]:
++    def __handle_response(self, response: Any) -> Optional[NoReturn]:
+         status_code = response.status_code
+         if status_code != 200 or self.debug_mode:
+             try:
+-                data = json.dumps(
+-                    json.loads(response.text), ensure_ascii=False, indent=4
++                data = json_module.dumps(
++                    json_module.loads(response.text), ensure_ascii=False, indent=4
+                 )
+-            except json.JSONDecodeError:
++            except json_module.JSONDecodeError:
+                 data = response.text
+ 
+             if status_code != 200:
+@@ -161,16 +339,6 @@
+     def __prepare_session(self) -> None:
+         self.session.headers["Connection"] = "close"
+ 
+-        retry = Retry(
+-            total=3,
+-            backoff_factor=1.0,
+-            allowed_methods=None,
+-            status_forcelist=[429]
+-        )
+-
+-        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+-
+ 
+ class GreenAPI(GreenApi):
+     pass

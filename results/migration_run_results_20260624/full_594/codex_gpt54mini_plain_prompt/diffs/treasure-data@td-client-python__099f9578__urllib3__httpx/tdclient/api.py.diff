@@ -1,0 +1,279 @@
+diff --git a/tdclient/api.py b/tdclient/api.py
+index 043637e..413c435 100644
+--- a/tdclient/api.py
++++ b/tdclient/api.py
+@@ -10,16 +10,13 @@ import json
+ import logging
+ import os
+ import socket
+-import ssl
+-import sys
+ import tempfile
+ import time
+ import urllib.parse as urlparse
+ from array import array
+ 
++import httpx
+ import msgpack
+-import urllib3
+-import urllib3.util
+ 
+ from tdclient import errors, version
+ from tdclient.bulk_import_api import BulkImportAPI
+@@ -56,6 +53,115 @@ AlreadyExistsError = errors.AlreadyExistsError
+ NotFoundError = errors.NotFoundError
+ 
+ 
++class _HttpxResponseAdapter:
++    def __init__(self, response):
++        self._response = response
++        self._body = None
++        self._read_offset = 0
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, type, value, traceback):
++        self.close()
++
++    def __getattr__(self, name):
++        return getattr(self._response, name)
++
++    @property
++    def status(self):
++        return self._response.status_code
++
++    @property
++    def data(self):
++        return self._load_body()
++
++    def getheaders(self):
++        headers = self._response.headers
++        if hasattr(headers, "multi_items"):
++            return list(headers.multi_items())
++        return list(headers.items())
++
++    def _load_body(self):
++        if self._body is None:
++            self._body = self._response.read()
++        return self._body
++
++    def read(self, size=None):
++        body = self._load_body()
++        if size is None:
++            start = self._read_offset
++            self._read_offset = len(body)
++            return body[start:]
++
++        start = self._read_offset
++        end = min(len(body), start + size)
++        self._read_offset = end
++        return body[start:end]
++
++    def stream(self, size=None):
++        if self._body is not None:
++            chunk_size = 64 * 1024 if size is None else size
++            for start in range(self._read_offset, len(self._body), chunk_size):
++                yield self._body[start : start + chunk_size]
++            self._read_offset = len(self._body)
++            return
++
++        chunk_size = 64 * 1024 if size is None else size
++        chunks = []
++        for chunk in self._response.iter_bytes(chunk_size=chunk_size):
++            chunks.append(chunk)
++            yield chunk
++        self._body = b"".join(chunks)
++        self._read_offset = len(self._body)
++
++    def close(self):
++        self._response.close()
++
++
++class _HttpxClient(httpx.Client):
++    def __init__(self, *args, **kwargs):
++        kwargs.setdefault("trust_env", False)
++        proxy_url = kwargs.pop("proxy", None)
++        if proxy_url is not None:
++            kwargs["proxy"] = proxy_url
++        try:
++            super().__init__(*args, **kwargs)
++        except TypeError:
++            if proxy_url is None:
++                raise
++            kwargs.pop("proxy", None)
++            kwargs["proxies"] = proxy_url
++            super().__init__(*args, **kwargs)
++
++    def request(self, method, url, fields=None, body=None, headers=None, **kwargs):
++        kwargs.pop("decode_content", None)
++        kwargs.pop("preload_content", None)
++        request_kwargs = {"headers": headers}
++        if body is None:
++            if fields is not None:
++                if method.upper() in ("GET", "DELETE"):
++                    request_kwargs["params"] = fields
++                else:
++                    request_kwargs["data"] = fields
++        else:
++            if isinstance(body, bytearray):
++                body = bytes(body)
++            elif isinstance(body, array):
++                body = body.tobytes()
++            request_kwargs["content"] = body
++
++        request = super().build_request(method, url, **request_kwargs)
++        response = super().send(request, stream=True)
++        return _HttpxResponseAdapter(response)
++
++    def urlopen(self, method, url, body=None, headers=None, **kwargs):
++        return self.request(method, url, body=body, headers=headers, **kwargs)
++
++    def clear(self):
++        self.close()
++
++
+ class API(
+     BulkImportAPI,
+     ConnectorAPI,
+@@ -119,11 +225,16 @@ class API(
+             self._endpoint = self.DEFAULT_ENDPOINT
+ 
+         pool_options = dict(kwargs)
+-        if "ca_certs" not in pool_options and certifi:
+-            pool_options["ca_certs"] = certifi.where()
+-
+-        if pool_options.get("ca_certs") is not None:
+-            pool_options["cert_reqs"] = ssl.CERT_REQUIRED
++        verify = pool_options.pop("verify", None)
++        ca_certs = pool_options.pop("ca_certs", None)
++        pool_options.pop("cert_reqs", None)
++        if verify is None:
++            if ca_certs is not None:
++                verify = ca_certs
++            elif certifi:
++                verify = certifi.where()
++        if verify is not None:
++            pool_options["verify"] = verify
+ 
+         if "timeout" not in pool_options:
+             pool_options["timeout"] = 60
+@@ -144,23 +255,15 @@ class API(
+         return self._endpoint
+ 
+     def _init_http(self, http_proxy=None, **kwargs):
+-        if http_proxy is None:
+-            return urllib3.PoolManager(**kwargs)
+-        else:
+-            if http_proxy.startswith("http://"):
+-                return self._init_http_proxy(http_proxy, **kwargs)
+-            else:
+-                return self._init_http_proxy("http://%s" % (http_proxy,), **kwargs)
++        if http_proxy is not None and not http_proxy.startswith(("http://", "https://")):
++            http_proxy = "http://%s" % (http_proxy,)
++        if http_proxy is not None:
++            kwargs["proxy"] = http_proxy
++        return _HttpxClient(**kwargs)
+ 
+     def _init_http_proxy(self, http_proxy, **kwargs):
+-        pool_options = dict(kwargs)
+-        p = urlparse.urlparse(http_proxy)
+-        scheme = p.scheme
+-        netloc = p.netloc
+-        if "@" in netloc:
+-            auth, netloc = netloc.split("@", 2)
+-            pool_options["proxy_headers"] = urllib3.make_headers(proxy_basic_auth=auth)
+-        return urllib3.ProxyManager("%s://%s" % (scheme, netloc), **pool_options)
++        kwargs["proxy"] = http_proxy
++        return _HttpxClient(**kwargs)
+ 
+     def get(self, path, params=None, headers=None, **kwargs):
+         headers = {} if headers is None else dict(headers)
+@@ -203,14 +306,7 @@ class API(
+                         cumul_retry_delay,
+                         self._max_cumul_retry_delay,
+                     )
+-            except (
+-                urllib3.exceptions.TimeoutStateError,
+-                urllib3.exceptions.TimeoutError,
+-                urllib3.exceptions.PoolError,
+-                http.client.IncompleteRead,
+-                TimeoutError,
+-                socket.error,
+-            ):
++            except (httpx.TimeoutException, httpx.NetworkError, httpx.ProtocolError, http.client.IncompleteRead, TimeoutError, socket.error):
+                 pass
+ 
+             if cumul_retry_delay <= self._max_cumul_retry_delay:
+@@ -297,12 +393,7 @@ class API(
+                         cumul_retry_delay,
+                         self._max_cumul_retry_delay,
+                     )
+-            except (
+-                urllib3.exceptions.TimeoutStateError,
+-                urllib3.exceptions.TimeoutError,
+-                urllib3.exceptions.PoolError,
+-                socket.error,
+-            ):
++            except (httpx.TimeoutException, httpx.NetworkError, httpx.ProtocolError, socket.error):
+                 if not self._retry_post_requests:
+                     raise APIError("Retrying stopped by retry_post_requests == False")
+ 
+@@ -380,9 +471,9 @@ class API(
+             else:
+                 raise APIError("Error %d: %s", response.status, response.data)
+         except (
+-            urllib3.exceptions.TimeoutStateError,
+-            urllib3.exceptions.TimeoutError,
+-            urllib3.exceptions.PoolError,
++            httpx.TimeoutException,
++            httpx.NetworkError,
++            httpx.ProtocolError,
+             socket.error,
+         ):
+             raise APIError("Error: %s" % (repr(response)))
+@@ -435,12 +526,7 @@ class API(
+                         cumul_retry_delay,
+                         self._max_cumul_retry_delay,
+                     )
+-            except (
+-                urllib3.exceptions.TimeoutStateError,
+-                urllib3.exceptions.TimeoutError,
+-                urllib3.exceptions.PoolError,
+-                socket.error,
+-            ):
++            except (httpx.TimeoutException, httpx.NetworkError, httpx.ProtocolError, socket.error):
+                 pass
+ 
+             if cumul_retry_delay <= self._max_cumul_retry_delay:
+@@ -497,18 +583,9 @@ class API(
+         return (url, _headers)
+ 
+     def send_request(self, method, url, fields=None, body=None, headers=None, **kwargs):
+-        if body is None:
+-            return self.http.request(
+-                method, url, fields=fields, headers=headers, **kwargs
+-            )
+-
+-        if urllib3.util.IS_PYOPENSSL and isinstance(body, bytearray):
+-            # workaround for https://github.com/pyca/pyopenssl/issues/621
+-            body = memoryview(body)
+-        if urllib3.util.IS_PYOPENSSL and isinstance(body, array):
+-            # workaround for https://github.com/pyca/pyopenssl/issues/621
+-            body = body.tobytes()
+-        return self.http.urlopen(method, url, body=body, headers=headers, **kwargs)
++        return self.http.request(
++            method, url, fields=fields, body=body, headers=headers, **kwargs
++        )
+ 
+     def raise_error(self, msg, res, body):
+         status_code = res.status
+@@ -539,8 +616,6 @@ class API(
+         return js
+ 
+     def close(self):
+-        # urllib3 doesn't allow to close all connections immediately.
+-        # all connections in pool will be closed eventually during gc.
+         self.http.clear()
+ 
+     def _prepare_file(self, file_like, fmt, **kwargs):

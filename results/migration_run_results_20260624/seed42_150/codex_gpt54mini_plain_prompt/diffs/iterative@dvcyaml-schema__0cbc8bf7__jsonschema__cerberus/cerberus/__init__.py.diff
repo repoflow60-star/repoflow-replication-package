@@ -1,0 +1,374 @@
+diff --git /dev/null b/cerberus/__init__.py
+new file mode 100644
+index 0000000..83e03a1
+--- /dev/null
++++ b/cerberus/__init__.py
+@@ -0,0 +1,368 @@
++"""Minimal Cerberus-compatible validation helpers."""
++
++from __future__ import annotations
++
++from collections.abc import Mapping, Sequence
++from dataclasses import dataclass
++import re
++from typing import Any
++
++
++class ValidationError(Exception):
++    """Raised when validation fails."""
++
++
++def _is_sequence(value: Any) -> bool:
++    return isinstance(value, Sequence) and not isinstance(
++        value, (str, bytes, bytearray)
++    )
++
++
++def _freeze(value: Any) -> Any:
++    if isinstance(value, Mapping):
++        return tuple(sorted((key, _freeze(item)) for key, item in value.items()))
++    if _is_sequence(value):
++        return tuple(_freeze(item) for item in value)
++    if isinstance(value, set):
++        return tuple(sorted(_freeze(item) for item in value))
++    return value
++
++
++def _matches_type(value: Any, expected: str) -> bool:
++    if expected == "any":
++        return True
++    if expected == "string":
++        return isinstance(value, str)
++    if expected == "boolean":
++        return type(value) is bool
++    if expected == "integer":
++        return isinstance(value, int) and not isinstance(value, bool)
++    if expected == "number":
++        return isinstance(value, (int, float)) and not isinstance(
++            value, bool
++        )
++    if expected == "dict":
++        return isinstance(value, Mapping)
++    if expected == "list":
++        return _is_sequence(value)
++    if expected == "null":
++        return value is None
++    if expected == "set":
++        return isinstance(value, set)
++    return False
++
++
++@dataclass
++class _Failure:
++    path: str
++    message: str
++
++
++class Validator:
++    """Validate documents against a Cerberus-style schema."""
++
++    def __init__(
++        self,
++        schema: dict[str, Any] | None = None,
++        *,
++        allow_unknown: bool = False,
++    ) -> None:
++        self.schema = schema or {}
++        self.allow_unknown = allow_unknown
++        self.errors: list[dict[str, str]] = []
++
++    def validate(
++        self,
++        document: Any,
++        schema: dict[str, Any] | None = None,
++    ) -> bool:
++        self.errors = []
++        active_schema = schema or self.schema
++        failures: list[_Failure] = []
++        ok = self._validate_document(
++            document,
++            active_schema,
++            self.allow_unknown,
++            path=(),
++            failures=failures,
++        )
++        self.errors = [
++            {"path": failure.path, "message": failure.message}
++            for failure in failures
++        ]
++        return ok
++
++    def _validate_document(
++        self,
++        document: Any,
++        schema: dict[str, Any],
++        allow_unknown: bool,
++        path: tuple[str, ...],
++        failures: list[_Failure],
++    ) -> bool:
++        if not isinstance(document, Mapping):
++            failures.append(
++                _Failure(
++                    ".".join(path) or "<root>",
++                    "expected a mapping",
++                )
++            )
++            return False
++
++        ok = True
++        for field, rule in schema.items():
++            if field.startswith("__"):
++                continue
++            if field not in document:
++                if isinstance(rule, Mapping) and rule.get("required"):
++                    failures.append(
++                        _Failure(
++                            ".".join((*path, field)),
++                            "field is required",
++                        )
++                    )
++                    ok = False
++                continue
++            if not self._validate_value(
++                document[field],
++                rule,
++                path + (field,),
++                failures,
++            ):
++                ok = False
++
++        if not allow_unknown:
++            unknown_fields = set(document) - {
++                field for field in schema if not field.startswith("__")
++            }
++            if unknown_fields:
++                ok = False
++                for field in sorted(unknown_fields):
++                    failures.append(
++                        _Failure(
++                            ".".join((*path, field)),
++                            "unknown field",
++                        )
++                    )
++        return ok
++
++    def _validate_value(
++        self,
++        value: Any,
++        rule: Any,
++        path: tuple[str, ...],
++        failures: list[_Failure],
++    ) -> bool:
++        if not isinstance(rule, Mapping):
++            return True
++
++        if rule.get("nullable") and value is None:
++            return True
++
++        for key in ("oneof", "anyof", "allof"):
++            if key in rule:
++                return self._validate_combinator(
++                    value,
++                    key,
++                    rule[key],
++                    path,
++                    failures,
++                )
++
++        expected_type = rule.get("type")
++        if expected_type is not None:
++            expected_types = (
++                [expected_type]
++                if isinstance(expected_type, str)
++                else list(expected_type)
++            )
++            if not any(_matches_type(value, item) for item in expected_types):
++                failures.append(
++                    _Failure(
++                        ".".join(path) or "<root>",
++                        f"expected type {expected_type!r}",
++                    )
++                )
++                return False
++
++        if "allowed" in rule and value not in rule["allowed"]:
++            failures.append(
++                _Failure(
++                    ".".join(path) or "<root>",
++                    "value is not allowed",
++                )
++            )
++            return False
++
++        if "regex" in rule:
++            if not isinstance(value, str) or not re.fullmatch(
++                rule["regex"],
++                value,
++            ):
++                failures.append(
++                    _Failure(
++                        ".".join(path) or "<root>",
++                        "value does not match regex",
++                    )
++                )
++                return False
++
++        if "minlength" in rule:
++            if len(value) < rule["minlength"]:
++                failures.append(
++                    _Failure(
++                        ".".join(path) or "<root>",
++                        "value is too short",
++                    )
++                )
++                return False
++
++        if "maxlength" in rule:
++            if len(value) > rule["maxlength"]:
++                failures.append(
++                    _Failure(
++                        ".".join(path) or "<root>",
++                        "value is too long",
++                    )
++                )
++                return False
++
++        if "schema" in rule:
++            nested_schema = rule["schema"]
++            if isinstance(value, Mapping):
++                nested_allow_unknown = rule.get("allow_unknown", False)
++                return self._validate_document(
++                    value,
++                    nested_schema,
++                    nested_allow_unknown,
++                    path,
++                    failures,
++                )
++            if _is_sequence(value):
++                if not self._validate_sequence_items(
++                    value,
++                    nested_schema,
++                    path,
++                    failures,
++                ):
++                    return False
++            else:
++                failures.append(
++                    _Failure(
++                        ".".join(path) or "<root>",
++                        "expected a mapping or sequence",
++                    )
++                )
++                return False
++
++        if "keysrules" in rule:
++            if not isinstance(value, Mapping):
++                failures.append(
++                    _Failure(
++                        ".".join(path) or "<root>",
++                        "expected a mapping for keysrules",
++                    )
++                )
++                return False
++            for key in value:
++                if not self._validate_value(
++                    key,
++                    rule["keysrules"],
++                    path + ("<key>",),
++                    failures,
++                ):
++                    return False
++
++        if "valuesrules" in rule:
++            if not isinstance(value, Mapping):
++                failures.append(
++                    _Failure(
++                        ".".join(path) or "<root>",
++                        "expected a mapping for valuesrules",
++                    )
++                )
++                return False
++            for key, item in value.items():
++                if not self._validate_value(
++                    item,
++                    rule["valuesrules"],
++                    path + (str(key),),
++                    failures,
++                ):
++                    return False
++
++        if rule.get("unique") and _is_sequence(value):
++            frozen = [_freeze(item) for item in value]
++            if len(frozen) != len(set(frozen)):
++                failures.append(
++                    _Failure(
++                        ".".join(path) or "<root>",
++                        "list items must be unique",
++                    )
++                )
++                return False
++
++        return True
++
++    def _validate_sequence_items(
++        self,
++        value: Sequence[Any],
++        item_rule: Any,
++        path: tuple[str, ...],
++        failures: list[_Failure],
++    ) -> bool:
++        ok = True
++        for index, item in enumerate(value):
++            if not self._validate_value(
++                item,
++                item_rule,
++                path + (str(index),),
++                failures,
++            ):
++                ok = False
++        return ok
++
++    def _validate_combinator(
++        self,
++        value: Any,
++        operator: str,
++        alternatives: Sequence[Any],
++        path: tuple[str, ...],
++        failures: list[_Failure],
++    ) -> bool:
++        passes = 0
++        for alternative in alternatives:
++            trial_failures: list[_Failure] = []
++            if self._validate_value(
++                value,
++                alternative,
++                path,
++                trial_failures,
++            ):
++                passes += 1
++                continue
++        if operator == "oneof" and passes != 1:
++            failures.append(
++                _Failure(
++                    ".".join(path) or "<root>",
++                    "value does not satisfy exactly one option",
++                )
++            )
++            return False
++        if operator == "anyof" and passes < 1:
++            failures.append(
++                _Failure(
++                    ".".join(path) or "<root>",
++                    "value does not satisfy any option",
++                )
++            )
++            return False
++        if operator == "allof" and passes != len(alternatives):
++            failures.append(
++                _Failure(
++                    ".".join(path) or "<root>",
++                    "value does not satisfy all options",
++                )
++            )
++            return False
++        return True

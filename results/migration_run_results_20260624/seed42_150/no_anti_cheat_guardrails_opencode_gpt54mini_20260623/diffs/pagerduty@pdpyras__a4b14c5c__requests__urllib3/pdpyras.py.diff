@@ -1,0 +1,301 @@
+--- a/pdpyras.py
++++ b/pdpyras.py
+@@ -3,22 +3,24 @@
+ # See LICENSE for details.
+ 
+ # Standard libraries
++import json
+ import logging
+ import sys
+ import time
+ from copy import deepcopy
+-from datetime import datetime
++from datetime import datetime, timedelta
+ from random import random
+ from typing import Iterator, Union
+ from warnings import warn
+-
+-# Upstream components on which this client is based:
+-from requests import Response, Session
+-from requests import __version__ as REQUESTS_VERSION
++from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
++
++# HTTP client:
++import urllib3
++from urllib3._collections import HTTPHeaderDict
++from urllib3.response import HTTPResponse as Response
+ 
+ # HTTP client exceptions:
+ from urllib3.exceptions import HTTPError, PoolError
+-from requests.exceptions import RequestException
+ 
+ __version__ = '5.4.0'
+ 
+@@ -496,6 +498,153 @@
+             f"URL {url} does not start with the API base URL {base_url}"
+         )
+ 
++def append_query_params(url: str, params) -> str:
++    """Append query parameters to a URL without dropping existing ones."""
++    parts = urlsplit(url)
++    query = parse_qsl(parts.query, keep_blank_values=True)
++    if hasattr(params, 'items'):
++        query.extend(params.items())
++    else:
++        query.extend(params)
++    return urlunsplit(parts._replace(query=urlencode(query, doseq=True)))
++
++
++class _Request:
++    def __init__(self, method, url):
++        self.method = method
++        self.url = url
++
++
++class _ResponseProxy:
++    def __init__(self, response, method, url, status_code, headers, content,
++            elapsed, reason=None):
++        self._response = response
++        self.request = _Request(method, url)
++        self.url = url
++        self.status_code = status_code
++        self.status = status_code
++        self.ok = 200 <= status_code < 400
++        self.reason = reason
++        self.headers = headers
++        self.content = content
++        self.data = content
++        self.text = self._decode_content(content, headers)
++        self.elapsed = elapsed
++
++    def _decode_content(self, content, headers):
++        if isinstance(content, bytes):
++            content_bytes = content
++        elif isinstance(content, str):
++            content_bytes = content.encode('utf-8')
++        else:
++            try:
++                content_bytes = bytes(content)
++            except Exception:
++                content_bytes = str(content).encode('utf-8')
++        encoding = None
++        if headers is not None:
++            content_type = headers.get('content-type', '')
++            if 'charset=' in content_type:
++                encoding = content_type.split('charset=', 1)[1].split(';', 1)[0].strip().strip('"')
++        if encoding is None:
++            encoding = 'utf-8'
++        return content_bytes.decode(encoding, errors='replace')
++
++    def json(self):
++        return json.loads(self.text)
++
++    def __getattr__(self, name):
++        return getattr(self._response, name)
++
++
++class _RequestAdapter:
++    """Translate requests-style kwargs into urllib3 request calls."""
++
++    def __init__(self):
++        self.pool = urllib3.PoolManager()
++
++    def clear(self):
++        if hasattr(self.pool, 'clear'):
++            self.pool.clear()
++
++    def request(self, method, url, **kwargs):
++        req_kw = deepcopy(kwargs)
++        headers = req_kw.get('headers')
++        if headers is None:
++            headers = HTTPHeaderDict()
++        req_kw['headers'] = headers
++
++        params = req_kw.pop('params', None)
++        if params:
++            url = append_query_params(url, params)
++
++        body = None
++        if 'json' in req_kw:
++            body = json.dumps(req_kw.pop('json')).encode('utf-8')
++            if not any(k.lower() == 'content-type' for k in headers):
++                headers['Content-Type'] = 'application/json'
++        elif 'data' in req_kw:
++            body = req_kw.pop('data')
++            if hasattr(body, 'items') or isinstance(body, (list, tuple)):
++                body = urlencode(body, doseq=True).encode('utf-8')
++                if not any(k.lower() == 'content-type' for k in headers):
++                    headers['Content-Type'] = 'application/x-www-form-urlencoded'
++            elif isinstance(body, str):
++                body = body.encode('utf-8')
++        req_kw.pop('stream', None)
++        if body is not None:
++            req_kw['body'] = body
++
++        req_kw.setdefault('retries', False)
++        req_kw.setdefault('preload_content', True)
++        return self.pool.request(method, url, **req_kw)
++
++
++def _adapt_response(response, method, url, status, headers, body,
++        elapsed, response_url):
++    if body is None:
++        body = b''
++    if headers is None:
++        headers = HTTPHeaderDict()
++    if isinstance(body, bytes):
++        content = body
++    elif isinstance(body, str):
++        content = body.encode('utf-8')
++    else:
++        try:
++            content = bytes(body)
++        except Exception:
++            content = str(body).encode('utf-8')
++
++    try:
++        request = getattr(response, 'request', None)
++        if request is None:
++            response.request = _Request(method, response_url)
++        else:
++            if hasattr(request, 'method'):
++                request.method = method
++            if hasattr(request, 'url'):
++                request.url = response_url
++        response.url = response_url
++        response.status_code = status
++        response.status = status
++        response.ok = 200 <= status < 400
++        response.headers = headers
++        response.content = content
++        response.data = content
++        if not hasattr(response, 'text'):
++            response.text = _ResponseProxy(response, method, response_url,
++                status, headers, content, elapsed, reason=getattr(response, 'reason', None)).text
++        elif isinstance(response.text, bytes):
++            response.text = response.text.decode('utf-8', errors='replace')
++        response.elapsed = elapsed
++        if not hasattr(response, 'json'):
++            response.json = lambda: json.loads(response.text)
++        return response
++    except Exception:
++        return _ResponseProxy(response, method, response_url, status, headers,
++            content, elapsed, reason=getattr(response, 'reason', None))
++
+ #######################
+ ### ENTITY WRAPPING ###
+ #######################
+@@ -862,7 +1011,7 @@
+ ### CLASSES ###
+ ###############
+ 
+-class PDSession(Session):
++class PDSession:
+     """
+     Base class for making HTTP requests to PagerDuty APIs
+ 
+@@ -911,7 +1060,7 @@
+     """
+ 
+     parent = None
+-    """The ``super`` object (`requests.Session`_)"""
++    """The underlying urllib3 request adapter."""
+ 
+     permitted_methods = ()
+     """
+@@ -966,8 +1115,8 @@
+     url = ""
+ 
+     def __init__(self, api_key: str, debug=False):
+-        self.parent = super(PDSession, self)
+-        self.parent.__init__()
++        self.parent = _RequestAdapter()
++        self.headers = HTTPHeaderDict()
+         self.api_key = api_key
+         self.log = logging.getLogger(__name__)
+         self.print_debug = debug
+@@ -1100,7 +1249,7 @@
+             The path/URL to request. If it does not start with the base URL, the
+             base URL will be prepended.
+         :param **kwargs:
+-            Custom keyword arguments to pass to ``requests.Session.request``.
++            Custom keyword arguments to pass to the underlying HTTP client.
+         :type method: str
+         :type url: str
+         :returns:
+@@ -1123,7 +1272,9 @@
+         req_kw.update({
+             'headers': self.prepare_headers(method, user_headers=headers),
+             'stream': False,
+-            'timeout': self.timeout
++            'timeout': self.timeout,
++            'retries': False,
++            'preload_content': True,
+         })
+ 
+         # Special changes to user-supplied parameters, for convenience
+@@ -1133,9 +1284,31 @@
+         # Make the request (and repeat w/cooldown if the rate limit is reached):
+         while True:
+             try:
++                started = time.monotonic()
+                 response = self.parent.request(method, full_url, **req_kw)
++                elapsed = time.monotonic() - started
++                response_url = getattr(response, 'url', None)
++                if response_url is None and hasattr(response, 'geturl'):
++                    response_url = response.geturl()
++                if response_url is None and 'params' in req_kw and req_kw['params']:
++                    response_url = append_query_params(full_url, req_kw['params'])
++                if response_url is None:
++                    response_url = full_url
++                status = getattr(response, 'status', getattr(response, 'status_code', 0))
++                try:
++                    status = int(status)
++                except Exception:
++                    status = 0
++                body = getattr(response, 'data', None)
++                if body is None:
++                    body = getattr(response, 'content', None)
++                if body is None:
++                    body = getattr(response, 'text', b'')
++                response = _adapt_response(response, method, full_url, status,
++                    getattr(response, 'headers', None), body,
++                    timedelta(seconds=elapsed), response_url)
+                 self.postprocess(response)
+-            except (HTTPError, PoolError, RequestException) as e:
++            except (HTTPError, PoolError) as e:
+                 network_attempts += 1
+                 if network_attempts > self.max_network_attempts:
+                     error_msg = f"{endpoint}: Non-transient network " \
+@@ -1189,6 +1362,22 @@
+                 # All went according to plan.
+                 return response
+ 
++    def get(self, url, **kwargs) -> Response:
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, **kwargs) -> Response:
++        return self.request('POST', url, **kwargs)
++
++    def put(self, url, **kwargs) -> Response:
++        return self.request('PUT', url, **kwargs)
++
++    def delete(self, url, **kwargs) -> Response:
++        return self.request('DELETE', url, **kwargs)
++
++    def close(self):
++        if hasattr(self.parent, 'clear'):
++            self.parent.clear()
++
+     @property
+     def stagger_cooldown(self) -> float:
+         """
+@@ -1239,7 +1428,7 @@
+     def user_agent(self) -> str:
+         return 'pdpyras/%s python-requests/%s Python/%d.%d'%(
+             __version__,
+-            REQUESTS_VERSION,
++            urllib3.__version__,
+             sys.version_info.major,
+             sys.version_info.minor
+         )

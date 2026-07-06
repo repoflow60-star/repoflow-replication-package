@@ -1,0 +1,141 @@
+--- a/segment/analytics/request.py
++++ b/segment/analytics/request.py
+@@ -1,16 +1,116 @@
++import asyncio
+ from datetime import date, datetime
+ from io import BytesIO
+ from gzip import GzipFile
+ import logging
+ import json
++from threading import Thread
++from urllib.parse import urlsplit
++
++import aiohttp
+ from dateutil.tz import tzutc
+-from requests.auth import HTTPBasicAuth
+-from requests import sessions
+ 
+ from segment.analytics.version import VERSION
+ from segment.analytics.utils import remove_trailing_slash
+ 
+-_session = sessions.Session()
++
++
++class _AiohttpResponse(object):
++
++    def __init__(self, status_code, reason, text, headers, payload):
++        self.status_code = status_code
++        self.status = status_code
++        self.reason = reason or ''
++        self.text = text
++        self.headers = headers
++        self._payload = payload
++
++    def json(self):
++        if self._payload is not None:
++            return self._payload
++        return json.loads(self.text)
++
++
++def _normalize_proxy(proxy):
++    if not proxy:
++        return None
++    if '://' not in proxy:
++        return 'http://' + proxy
++    return proxy
++
++
++def _resolve_proxy(proxies, url):
++    if not proxies:
++        return None
++    if isinstance(proxies, dict):
++        scheme = urlsplit(url).scheme
++        proxy = proxies.get(scheme) or proxies.get('all') or proxies.get('http') or proxies.get('https')
++    else:
++        proxy = proxies
++    return _normalize_proxy(proxy)
++
++
++def _run_sync(coro):
++    try:
++        return asyncio.run(coro)
++    except RuntimeError as exc:
++        if 'asyncio.run() cannot be called from a running event loop' not in str(exc):
++            raise
++
++    result = {}
++    error = {}
++
++    def runner():
++        try:
++            result['value'] = asyncio.run(coro)
++        except Exception as exc:
++            error['value'] = exc
++
++    thread = Thread(target=runner)
++    thread.start()
++    thread.join()
++
++    if error:
++        raise error['value']
++    return result['value']
++
++
++async def _aiohttp_post(url, data, headers, timeout, proxies):
++    request_kwargs = {
++        'data': data,
++        'headers': headers,
++    }
++    if timeout is not None:
++        request_kwargs['timeout'] = aiohttp.ClientTimeout(total=timeout)
++
++    proxy = _resolve_proxy(proxies, url)
++    if proxy:
++        request_kwargs['proxy'] = proxy
++
++    async with aiohttp.ClientSession() as session:
++        async with session.post(url, **request_kwargs) as response:
++            text = await response.text()
++            payload = None
++            try:
++                payload = await response.json(content_type=None)
++            except Exception:
++                payload = None
++            return _AiohttpResponse(
++                response.status,
++                response.reason,
++                text,
++                response.headers,
++                payload,
++            )
++
++
++class _AiohttpSession(object):
++
++    def post(self, url, data=None, headers=None, timeout=None, proxies=None):
++        return _run_sync(_aiohttp_post(url, data, headers, timeout, proxies))
++
++
++_session = _AiohttpSession()
+ 
+ 
+ def post(write_key, host=None, gzip=False, timeout=15, proxies=None, oauth_manager=None, **kwargs):
+@@ -42,17 +142,9 @@
+             gz.write(data.encode('utf-8'))
+         data = buf.getvalue()
+ 
+-    kwargs = {
+-        "data": data,
+-        "headers": headers,
+-        "timeout": 15,
+-    }
+-
+-    if proxies:
+-        kwargs['proxies'] = proxies
+     res = None
+     try:
+-        res = _session.post(url, data=data, headers=headers, timeout=timeout)
++        res = _session.post(url, data=data, headers=headers, timeout=timeout, proxies=proxies)
+     except Exception as e:
+         log.error(e)
+         raise e

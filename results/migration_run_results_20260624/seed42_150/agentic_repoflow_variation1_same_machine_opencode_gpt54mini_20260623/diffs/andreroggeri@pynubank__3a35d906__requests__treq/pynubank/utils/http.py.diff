@@ -1,0 +1,172 @@
+--- a/pynubank/utils/http.py
++++ b/pynubank/utils/http.py
+@@ -1,7 +1,126 @@
+-from requests import Response
+-from requests_pkcs12 import get, post
++import json as json_module
++from threading import Event, Thread
++
++from treq import content, get, post
+ 
+ from pynubank import NuRequestException
++
++
++class _CaseInsensitiveHeaders(dict):
++
++    def __init__(self, headers=None):
++        super().__init__()
++        if headers:
++            for key, value in headers.items():
++                self[key] = value
++
++    def __setitem__(self, key, value):
++        super().__setitem__(key.lower(), value)
++
++    def __getitem__(self, key):
++        return super().__getitem__(key.lower())
++
++    def get(self, key, default=None):
++        return super().get(key.lower(), default)
++
++
++class _TreqResponse:
++
++    def __init__(self, url: str, status_code: int, headers: dict, body: bytes):
++        self.url = url
++        self.status_code = status_code
++        self.code = status_code
++        self.headers = _CaseInsensitiveHeaders(headers)
++        self._body = body or b''
++        self.content = self._body
++
++    def json(self):
++        if not self._body:
++            return {}
++
++        return json_module.loads(self._body.decode())
++
++
++_reactor = None
++_reactor_thread = None
++_reactor_started = Event()
++
++
++def _ensure_reactor():
++    global _reactor, _reactor_thread
++
++    if _reactor is not None:
++        return _reactor
++
++    from twisted.internet import reactor as twisted_reactor
++
++    _reactor = twisted_reactor
++    if _reactor.running:
++        return _reactor
++
++    if _reactor_thread is None:
++        def _run_reactor():
++            _reactor.callWhenRunning(_reactor_started.set)
++            _reactor.run(installSignalHandlers=False)
++
++        _reactor_thread = Thread(target=_run_reactor, daemon=True)
++        _reactor_thread.start()
++        _reactor_started.wait()
++
++    return _reactor
++
++
++def _wait_for_deferred(value):
++    if not hasattr(value, 'addCallbacks'):
++        return value
++
++    _ensure_reactor()
++
++    outcome = {}
++    done = Event()
++
++    def _success(result):
++        outcome['result'] = result
++        done.set()
++        return result
++
++    def _failure(failure):
++        outcome['failure'] = failure
++        done.set()
++        return failure
++
++    value.addCallbacks(_success, _failure)
++    done.wait()
++
++    if 'failure' in outcome:
++        outcome['failure'].raiseException()
++
++    return outcome['result']
++
++
++def _headers_to_dict(response) -> dict:
++    headers = {}
++
++    for name, values in response.headers.getAllRawHeaders():
++        if not values:
++            continue
++
++        key = name.decode() if isinstance(name, bytes) else name
++        value = values[0].decode() if isinstance(values[0], bytes) else values[0]
++        headers[key] = value
++
++    return headers
++
++
++def _normalize_response(url: str, response):
++    if hasattr(response, 'status_code') and hasattr(response, 'json'):
++        return response
++
++    if hasattr(response, 'status_code') and hasattr(response, 'content'):
++        return _TreqResponse(url, response.status_code, getattr(response, 'headers', {}), response.content)
++
++    body = _wait_for_deferred(content(response))
++    return _TreqResponse(url, response.code, _headers_to_dict(response), body)
+ 
+ 
+ class HttpClient:
+@@ -30,20 +149,33 @@
+     def _cert_args(self):
+         return {'pkcs12_data': self._cert, 'pkcs12_password': ''} if self._cert else {}
+ 
+-    def _handle_response(self, response: Response) -> dict:
+-        if response.status_code != 200:
++    def _handle_response(self, response) -> dict:
++        if getattr(response, 'status_code', getattr(response, 'code', None)) != 200:
+             raise NuRequestException(response)
+ 
+         return response.json()
+ 
+-    def raw_get(self, url: str) -> Response:
+-        return get(url, headers=self._headers, **self._cert_args)
++    def raw_get(self, url: str):
++        if self._cert:
++            from requests_pkcs12 import get as pkcs12_get
+ 
+-    def raw_post(self, url: str, json: dict) -> Response:
+-        return post(url, json=json, headers=self._headers, **self._cert_args)
++            return pkcs12_get(url, headers=self._headers, **self._cert_args)
++
++        response = _wait_for_deferred(get(url, headers=self._headers))
++        return _normalize_response(url, response)
++
++    def raw_post(self, url: str, json: dict):
++        if self._cert:
++            from requests_pkcs12 import post as pkcs12_post
++
++            return pkcs12_post(url, json=json, headers=self._headers, **self._cert_args)
++
++        payload = json_module.dumps(json).encode()
++        response = _wait_for_deferred(post(url, data=payload, headers=self._headers))
++        return _normalize_response(url, response)
+ 
+     def get(self, url: str) -> dict:
+         return self._handle_response(self.raw_get(url))
+ 
+     def post(self, url: str, json: dict) -> dict:
+-        return self._handle_response(post(url, json=json, headers=self._headers, **self._cert_args))
++        return self._handle_response(self.raw_post(url, json))

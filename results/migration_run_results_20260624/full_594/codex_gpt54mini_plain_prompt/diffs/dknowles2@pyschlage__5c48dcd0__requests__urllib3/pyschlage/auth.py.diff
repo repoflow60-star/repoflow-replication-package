@@ -1,0 +1,190 @@
+diff --git a/pyschlage/auth.py b/pyschlage/auth.py
+index fbd1336..5c65025 100644
+--- a/pyschlage/auth.py
++++ b/pyschlage/auth.py
+@@ -2,13 +2,17 @@
+ 
+ from __future__ import annotations
+ 
++from dataclasses import dataclass, field
+ from functools import wraps
+ from typing import Callable
++from urllib.parse import urlencode, urlsplit, urlunsplit
+ 
+ from botocore.exceptions import ClientError
+ import pycognito
+ from pycognito import utils
+-import requests
++from urllib3 import PoolManager
++from urllib3.exceptions import HTTPError as Urllib3HTTPError
++from urllib3.response import HTTPResponse
+ 
+ from .exceptions import NotAuthorizedError, UnknownError
+ 
+@@ -26,15 +30,83 @@ CLIENT_ID = "t5836cptp2s1il0u9lki03j5"
+ CLIENT_SECRET = "1kfmt18bgaig51in4j4v1j3jbe7ioqtjhle5o6knqc5dat0tpuvo"
+ USER_POOL_REGION = "us-west-2"
+ USER_POOL_ID = USER_POOL_REGION + "_2zhrVs9d4"
++_POOL = PoolManager()
++
++
++@dataclass
++class _AuthRequest:
++    """Minimal request object for pycognito's auth helper."""
++
++    headers: dict[str, str] = field(default_factory=dict)
++
++
++def _merge_query_params(url: str, params: object) -> str:
++    """Adds query parameters to a URL."""
++    if not params:
++        return url
++
++    split_url = urlsplit(url)
++    existing_query = split_url.query
++    if hasattr(params, "items"):
++        new_query = urlencode(params, doseq=True)
++    else:
++        new_query = urlencode(list(params), doseq=True)
++    query = "&".join(part for part in [existing_query, new_query] if part)
++    return urlunsplit(
++        (
++            split_url.scheme,
++            split_url.netloc,
++            split_url.path,
++            query,
++            split_url.fragment,
++        )
++    )
++
++
++def _serialize_body(
++    kwargs: dict[str, object],
++) -> tuple[bytes | str | None, str | None]:
++    """Serializes request payload kwargs into urllib3-friendly values."""
++    json_payload = kwargs.pop("json", None)
++    if json_payload is not None:
++        import json as _json
++
++        body = _json.dumps(json_payload).encode("utf-8")
++        return body, "application/json"
++
++    body = kwargs.pop("body", None)
++    if body is not None:
++        return body, None
++
++    data = kwargs.pop("data", None)
++    if data is None:
++        return None, None
++    if isinstance(data, (bytes, bytearray, str)):
++        return data, None
++    if hasattr(data, "items") or isinstance(data, (list, tuple)):
++        return urlencode(data, doseq=True).encode("utf-8"), "application/x-www-form-urlencoded"
++    return data, None  # type: ignore[return-value]
++
++
++def _http_error_message(resp: HTTPResponse) -> str:
++    """Extracts the best error message from a failed response."""
++    try:
++        payload = resp.json()
++    except ValueError:
++        return str(resp.reason)
++
++    if isinstance(payload, dict):
++        return str(payload.get("message", resp.reason))
++    return str(resp.reason)
+ 
+ 
+ def _translate_auth_errors(
+     # pylint: disable=invalid-name
+-    fn: Callable[..., requests.Response],
++    fn: Callable[..., HTTPResponse],
+     # pylint: enable=invalid-name
+-) -> Callable[..., requests.Response]:
++) -> Callable[..., HTTPResponse]:
+     @wraps(fn)
+-    def wrapper(*args, **kwargs) -> requests.Response:
++    def wrapper(*args, **kwargs) -> HTTPResponse:
+         try:
+             return fn(*args, **kwargs)
+         except ClientError as ex:
+@@ -50,20 +122,19 @@ def _translate_auth_errors(
+ 
+ def _translate_http_errors(
+     # pylint: disable=invalid-name
+-    fn: Callable[..., requests.Response],
++    fn: Callable[..., HTTPResponse],
+     # pylint: enable=invalid-name
+-) -> Callable[..., requests.Response]:
++) -> Callable[..., HTTPResponse]:
+     @wraps(fn)
+-    def wrapper(*args, **kwargs) -> requests.Response:
++    def wrapper(*args, **kwargs) -> HTTPResponse:
+         resp = fn(*args, **kwargs)
+         try:
+-            resp.raise_for_status()
++            status = getattr(resp, "status", getattr(resp, "status_code", None))
++            if status is not None and status >= 400:
++                raise Urllib3HTTPError(f"{status} {resp.reason}")
+             return resp
+-        except requests.HTTPError as ex:
+-            try:
+-                message = resp.json().get("message", resp.reason)
+-            except requests.JSONDecodeError:
+-                message = resp.reason
++        except Urllib3HTTPError as ex:
++            message = _http_error_message(resp)
+             raise UnknownError(message) from ex
+ 
+     return wrapper
+@@ -100,7 +171,7 @@ class Auth:
+         :raise pyschlage.exceptions.NotAuthorizedError: When authentication fails.
+         :raise pyschlage.exceptions.UnknownError: On other errors.
+         """
+-        self.auth(requests.Request())
++        self.auth(_AuthRequest())
+ 
+     @property
+     def user_id(self) -> str:
+@@ -117,15 +188,33 @@ class Auth:
+     @_translate_auth_errors
+     def request(
+         self, method: str, path: str, base_url: str = BASE_URL, **kwargs
+-    ) -> requests.Response:
++    ) -> HTTPResponse:
+         """Performs a request against the Schlage WiFi cloud service.
+ 
+         :meta private:
+         """
+-        kwargs["auth"] = self.auth
+-        if "headers" not in kwargs:
+-            kwargs["headers"] = {}
+-        kwargs["headers"]["X-Api-Key"] = API_KEY
+-        kwargs.setdefault("timeout", _DEFAULT_TIMEOUT)
+-        # pylint: disable=missing-timeout
+-        return requests.request(method, f"{base_url}/{path.lstrip('/')}", **kwargs)
++        headers = dict(kwargs.pop("headers", {}) or {})
++        kwargs.pop("auth", None)
++        auth_request = _AuthRequest(headers=headers)
++        self.auth(auth_request)
++        headers.update(auth_request.headers)
++        headers["X-Api-Key"] = API_KEY
++
++        url = f"{base_url}/{path.lstrip('/')}"
++        url = _merge_query_params(url, kwargs.pop("params", None))
++        body, content_type = _serialize_body(kwargs)
++        if content_type:
++            headers.setdefault("Content-Type", content_type)
++
++        request_kwargs = {
++            "headers": headers,
++            "timeout": kwargs.pop("timeout", _DEFAULT_TIMEOUT),
++            "retries": kwargs.pop("retries", False),
++        }
++        if body is not None:
++            request_kwargs["body"] = body
++
++        request_kwargs.update(kwargs)
++        # urllib3 handles the actual transport; kwargs other than the ones above
++        # are passed through for compatibility with the public API.
++        return _POOL.request(method.upper(), url, **request_kwargs)

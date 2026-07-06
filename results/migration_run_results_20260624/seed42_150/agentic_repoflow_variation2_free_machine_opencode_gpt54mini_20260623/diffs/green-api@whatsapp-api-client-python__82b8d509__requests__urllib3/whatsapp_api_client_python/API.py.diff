@@ -1,0 +1,217 @@
+--- a/whatsapp_api_client_python/API.py
++++ b/whatsapp_api_client_python/API.py
+@@ -1,9 +1,10 @@
+-import json
++import json as jsonlib
+ import logging
+ from typing import Any, NoReturn, Optional
+ 
+-from requests import Response, Session
+-from requests.adapters import HTTPAdapter, Retry
++from urllib3 import PoolManager
++from urllib3.response import HTTPResponse
++from urllib3.util import Retry
+ 
+ from .response import Response as GreenAPIResponse
+ from .tools import (
+@@ -81,11 +82,20 @@
+         try:
+             if not files:
+                 response = self.session.request(
+-                    method=method, url=url, json=payload, timeout=self.host_timeout
++                    method=method,
++                    url=url,
++                    json=payload,
++                    timeout=self.host_timeout,
++                    retries=self.retry,
+                 )
+             else:
+                 response = self.session.request(
+-                    method=method, url=url, data=payload, files=files, timeout=self.media_timeout
++                    method=method,
++                    url=url,
++                    data=payload,
++                    files=files,
++                    timeout=self.media_timeout,
++                    retries=self.retry,
+                 )
+         except Exception as error:
+             error_message = f"Request was failed with error: {error}."
+@@ -98,11 +108,14 @@
+ 
+         self.__handle_response(response)
+ 
+-        return GreenAPIResponse(response.status_code, response.text)
++        return GreenAPIResponse(self.__response_status(response), self.__response_text(response))
+ 
+     def raw_request(self, **arguments: Any) -> GreenAPIResponse:
+         try:
+-            response = self.session.request(**arguments)
++            request_arguments = dict(arguments)
++            if request_arguments.get("retries") is None:
++                request_arguments["retries"] = self.retry
++            response = self.session.request(**request_arguments)
+         except Exception as error:
+             error_message = f"Request was failed with error: {error}."
+ 
+@@ -114,17 +127,18 @@
+ 
+         self.__handle_response(response)
+ 
+-        return GreenAPIResponse(response.status_code, response.text)
+-
+-    def __handle_response(self, response: Response) -> Optional[NoReturn]:
+-        status_code = response.status_code
++        return GreenAPIResponse(self.__response_status(response), self.__response_text(response))
++
++    def __handle_response(self, response: HTTPResponse) -> Optional[NoReturn]:
++        status_code = self.__response_status(response)
+         if status_code != 200 or self.debug_mode:
+             try:
+-                data = json.dumps(
+-                    json.loads(response.text), ensure_ascii=False, indent=4
++                data = jsonlib.dumps(
++                    jsonlib.loads(self.__response_text(response)),
++                    ensure_ascii=False, indent=4
+                 )
+-            except json.JSONDecodeError:
+-                data = response.text
++            except jsonlib.JSONDecodeError:
++                data = self.__response_text(response)
+ 
+             if status_code != 200:
+                 error_message = (
+@@ -141,6 +155,32 @@
+             self.logger.log(
+                 logging.DEBUG, f"Request was successful with data: {data}"
+             )
++
++    def __response_status(self, response: HTTPResponse) -> Optional[int]:
++        status = getattr(response, "status", None)
++        if isinstance(status, int):
++            return status
++
++        status_code = getattr(response, "status_code", None)
++        if isinstance(status_code, int):
++            return status_code
++
++        return status if isinstance(status, int) else None
++
++    def __response_text(self, response: HTTPResponse) -> str:
++        data = getattr(response, "data", None)
++        if isinstance(data, (bytes, bytearray)):
++            return bytes(data).decode("utf-8", errors="replace")
++        if isinstance(data, str):
++            return data
++
++        text = getattr(response, "text", None)
++        if isinstance(text, (bytes, bytearray)):
++            return bytes(text).decode("utf-8", errors="replace")
++        if isinstance(text, str):
++            return text
++
++        return ""
+ 
+     def __prepare_logger(self) -> None:
+         handler = logging.StreamHandler()
+@@ -161,15 +201,96 @@
+     def __prepare_session(self) -> None:
+         self.session.headers["Connection"] = "close"
+ 
+-        retry = Retry(
++        self.retry = Retry(
+             total=3,
+             backoff_factor=1.0,
+             allowed_methods=None,
+             status_forcelist=[429]
+         )
+-
+-        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
++        self.session.retries = self.retry
++
++
++class Session:
++    def __init__(self):
++        self._pool = PoolManager(headers={"Connection": "close"})
++        self.headers = self._pool.headers
++        self.retries = None
++
++    def mount(self, *_args: Any, **_kwargs: Any) -> None:
++        return None
++
++    def request(
++            self,
++            method: str,
++            url: str,
++            json: Optional[dict] = None,
++            data: Any = None,
++            body: Any = None,
++            files: Optional[dict] = None,
++            timeout: Optional[float] = None,
++            retries: Optional[Retry] = None,
++            headers: Optional[dict] = None,
++            **kwargs: Any
++    ) -> HTTPResponse:
++        request_headers = dict(self.headers)
++        if headers:
++            request_headers.update(headers)
++
++        effective_retries = retries if retries is not None else self.retries
++
++        if json is not None:
++            request_headers.setdefault("Content-Type", "application/json")
++            return self._pool.request(
++                method=method,
++                url=url,
++                body=jsonlib.dumps(json).encode("utf-8"),
++                headers=request_headers,
++                timeout=timeout,
++                retries=effective_retries,
++                **kwargs,
++            )
++
++        if files:
++            fields = {}
++            if isinstance(data, dict):
++                fields.update(data)
++
++            fields.update(files)
++            return self._pool.request_encode_body(
++                method=method,
++                url=url,
++                fields=fields,
++                headers=request_headers,
++                timeout=timeout,
++                retries=effective_retries,
++                **kwargs,
++            )
++
++        if isinstance(data, dict):
++            return self._pool.request_encode_body(
++                method=method,
++                url=url,
++                fields=data,
++                encode_multipart=False,
++                headers=request_headers,
++                timeout=timeout,
++                retries=effective_retries,
++                **kwargs,
++            )
++
++        request_body = body if body is not None else data
++        if isinstance(request_body, str):
++            request_body = request_body.encode("utf-8")
++
++        return self._pool.request(
++            method=method,
++            url=url,
++            body=request_body,
++            headers=request_headers,
++            timeout=timeout,
++            retries=effective_retries,
++            **kwargs,
++        )
+ 
+ 
+ class GreenAPI(GreenApi):

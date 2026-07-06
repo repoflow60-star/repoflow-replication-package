@@ -1,0 +1,196 @@
+diff --git a/en16931/validex.py b/en16931/validex.py
+index f22d2bf..f22524c 100644
+--- a/en16931/validex.py
++++ b/en16931/validex.py
+@@ -6,14 +6,19 @@ use its API.
+ 
+ """
+ 
++import asyncio
+ import base64
+-import requests
++import threading
+ import time
+ 
+ URL = "https://api2.validex.net/api/validate"
+ 
+ 
+ def is_valid_at_validex(invoice, api_key, user_id):
++    return _run_sync(_is_valid_at_validex(invoice, api_key, user_id))
++
++
++async def _is_valid_at_validex(invoice, api_key, user_id):
+     """Validates an Invoice at open.validex.net
+ 
+     You need to create an user at validex.net to be able to
+@@ -35,58 +40,126 @@ def is_valid_at_validex(invoice, api_key, user_id):
+     payload = {
+         'userId': user_id,
+         'filename': "{}.xml".format(int(time.time())),
+-        'fileContents64': base64.b64encode(invoice.to_xml().encode('utf8')),
++        'fileContents64': base64.b64encode(
++            invoice.to_xml().encode('utf8')
++        ).decode('ascii'),
+     }
+     headers = {
+-        'content_type': 'json',
+-        'accept': 'json',
++        'Content-Type': 'application/json',
++        'Accept': 'application/json',
+         'Authorization': "apikey={}".format(api_key),
+     }
+-    response = requests.post(URL, json=payload, headers=headers, verify=False)
+-    if response.status_code == 200:
+-        result = response.json()
+-        if result.get('report') and result['report'].get('result') and\
+-                result['report']['result'] != 'fatal':
+-            # Warnings are not reported
+-            return True
+-        elif result.get('report') and result['report'].get('id'):
+-            raise ValueError(_get_validation_errors(result['report']['id']))
+-        else:
+-            raise RuntimeError(": ".join(response.json()['error'].values()))
+-    elif response.status_code == 401:
+-        raise RuntimeError("Unauthorized: invalid API_KEY")
+-    else:
+-        raise RuntimeError(": ".join(response.json()['error'].values()))
++    aiohttp = _load_aiohttp()
++    async with aiohttp.ClientSession() as session:
++        async with session.post(
++            URL,
++            json=payload,
++            headers=headers,
++            ssl=False,
++        ) as response:
++            result = await _response_json(response, aiohttp)
++            if response.status == 200:
++                report = result.get('report') or {}
++                if report.get('result') and report['result'] != 'fatal':
++                    # Warnings are not reported
++                    return True
++                elif report.get('id'):
++                    raise ValueError(
++                        await _get_validation_errors(session, report['id'], api_key)
++                    )
++                else:
++                    raise RuntimeError(_error_message(result))
++            elif response.status == 401:
++                raise RuntimeError("Unauthorized: invalid API_KEY")
++            else:
++                raise RuntimeError(_error_message(result))
+ 
+ 
+-def _get_validation_errors(report_id):
++async def _get_validation_errors(session, report_id, api_key):
++    aiohttp = _load_aiohttp()
+     headers = {
+-        'accept': 'json',
++        'Accept': 'application/json',
+         'Authorization': "apikey={}".format(api_key),
+     }
+-    response = requests.get(
++    async with session.get(
+         "{}/{}".format(URL.replace('validate', 'report'), report_id),
+         headers=headers,
+-        verify=False,
+-    )
+-    if response.status_code == 200:
+-        resp = response.json()
+-        errors = []
+-        validation_steps = []
+-        if resp['report'].get('validationSteps'):
+-            validation_steps.extend(resp['report']['validationSteps'])
+-        for step in validation_steps:
+-            if step.get('success') or not step.get('errors'):
+-                continue
+-            for error in step['errors']:
+-                if error.get('message'):
+-                    errors.add("{}: {}".format(step['description'], error['message']))
+-                elif error.get('text'):
+-                    errors.add("{}: {}".format(step['description'], error['text']))
+-                else:
+-                    errors.add(str(error))
+-        return ". ".join(errors)
+-    elif response.status_code == 401:
+-        raise RuntimeError("Unauthorized: invalid API_KEY")
+-    else:
+-        raise RuntimeError(": ".join(response.json()['error'].values()))
++        ssl=False,
++    ) as response:
++        if response.status == 200:
++            resp = await _response_json(response, aiohttp)
++            errors = []
++            validation_steps = []
++            if resp['report'].get('validationSteps'):
++                validation_steps.extend(resp['report']['validationSteps'])
++            for step in validation_steps:
++                if step.get('success') or not step.get('errors'):
++                    continue
++                for error in step['errors']:
++                    if error.get('message'):
++                        errors.append(
++                            "{}: {}".format(step['description'], error['message'])
++                        )
++                    elif error.get('text'):
++                        errors.append(
++                            "{}: {}".format(step['description'], error['text'])
++                        )
++                    else:
++                        errors.append(str(error))
++            return ". ".join(errors) if errors else "Validation failed without details"
++        elif response.status == 401:
++            raise RuntimeError("Unauthorized: invalid API_KEY")
++        else:
++            resp = await _response_json(response, aiohttp)
++            raise RuntimeError(_error_message(resp))
++
++
++async def _response_json(response, aiohttp):
++    try:
++        return await response.json(content_type=None)
++    except aiohttp.ContentTypeError:
++        return {'error': {'message': await response.text()}}
++
++
++def _error_message(payload):
++    error = payload.get('error') if isinstance(payload, dict) else None
++    if isinstance(error, dict):
++        values = [str(value) for value in error.values() if value]
++        if values:
++            return ": ".join(values)
++    if isinstance(payload, dict) and payload:
++        return ": ".join(str(value) for value in payload.values() if value)
++    return "Unexpected response from validex"
++
++
++def _run_sync(coro):
++    try:
++        asyncio.get_running_loop()
++    except RuntimeError:
++        return asyncio.run(coro)
++
++    result = {}
++    error = {}
++
++    def runner():
++        try:
++            result['value'] = asyncio.run(coro)
++        except Exception as exc:  # pragma: no cover - reraised in caller
++            error['exc'] = exc
++
++    thread = threading.Thread(target=runner, daemon=True)
++    thread.start()
++    thread.join()
++    if error:
++        raise error['exc']
++    return result.get('value')
++
++
++def _load_aiohttp():
++    try:
++        import aiohttp as module
++    except ModuleNotFoundError as exc:
++        raise RuntimeError(
++            "aiohttp is required for validex network operations"
++        ) from exc
++    return module

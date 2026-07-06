@@ -1,0 +1,189 @@
+diff --git /dev/null b/ldnlib/_requests_compat.py
+new file mode 100644
+index 0000000..c628028
+--- /dev/null
++++ b/ldnlib/_requests_compat.py
+@@ -0,0 +1,183 @@
++"""Compatibility layer that exposes a small `requests`-like API on top of httpx.
++
++The library still imports this module as `requests` so existing tests and
++callers that patch `requests.get`/`requests.post` keep working, while the
++actual transport implementation moves to httpx when available.
++"""
++
++from __future__ import annotations
++
++import base64
++import json
++import re
++from types import SimpleNamespace
++from urllib import error as urllib_error
++from urllib import request as urllib_request
++
++try:
++    import httpx
++except ImportError:  # pragma: no cover - exercised only when httpx is absent
++    httpx = None
++
++
++codes = SimpleNamespace(ok=200)
++
++
++def _normalize_headers(headers):
++    return dict(headers or {})
++
++
++def _parse_links(link_header):
++    links = {}
++    if not link_header:
++        return links
++
++    parts = re.split(r",\s*(?=<)", link_header)
++    for part in parts:
++        match = re.match(r"\s*<([^>]+)>\s*(.*)", part)
++        if not match:
++            continue
++
++        url, params = match.groups()
++        rel = None
++        for param in params.split(";"):
++            if "=" not in param:
++                continue
++            key, value = param.split("=", 1)
++            if key.strip().lower() == "rel":
++                rel = value.strip().strip('"\'')
++                break
++
++        if rel:
++            links[rel] = {"url": url}
++
++    return links
++
++
++class _ResponseAdapter:
++    def __init__(self, response):
++        self._response = response
++
++    def __getattr__(self, name):
++        return getattr(self._response, name)
++
++    @property
++    def links(self):
++        links = getattr(self._response, "links", None)
++        if links:
++            return links
++        headers = getattr(self._response, "headers", {})
++        return _parse_links(headers.get("link") or headers.get("Link"))
++
++    def raise_for_status(self):
++        return self._response.raise_for_status()
++
++
++class _FallbackResponse:
++    def __init__(self, status_code, headers, body):
++        self.status_code = status_code
++        self.headers = headers
++        self._body = body
++
++    @property
++    def text(self):
++        charset = "utf-8"
++        content_type = self.headers.get("content-type", "")
++        if "charset=" in content_type:
++            charset = content_type.split("charset=", 1)[1].split(";", 1)[0].strip()
++        return self._body.decode(charset, errors="replace")
++
++    @property
++    def links(self):
++        return _parse_links(self.headers.get("link"))
++
++    def json(self):
++        return json.loads(self.text)
++
++    def raise_for_status(self):
++        if 400 <= self.status_code:
++            raise urllib_error.HTTPError(
++                url=None,
++                code=self.status_code,
++                msg="HTTP error",
++                hdrs=self.headers,
++                fp=None,
++            )
++
++
++def _httpx_request(method, url, **kwargs):
++    headers = _normalize_headers(kwargs.pop("headers", None))
++    allow_redirects = kwargs.pop("allow_redirects", False)
++    timeout = kwargs.pop("timeout", None)
++    follow_redirects = kwargs.pop("follow_redirects", allow_redirects)
++
++    response = httpx.request(
++        method,
++        url,
++        headers=headers,
++        timeout=timeout,
++        follow_redirects=follow_redirects,
++        **kwargs,
++    )
++    return _ResponseAdapter(response)
++
++
++def _urllib_request(method, url, **kwargs):
++    headers = _normalize_headers(kwargs.pop("headers", None))
++    data = kwargs.pop("data", None)
++    timeout = kwargs.pop("timeout", None)
++    auth = kwargs.pop("auth", None)
++    kwargs.pop("allow_redirects", None)
++
++    if auth is not None:
++        username, password = auth
++        token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
++        headers["Authorization"] = f"Basic {token}"
++
++    if isinstance(data, str):
++        data = data.encode("utf-8")
++
++    request = urllib_request.Request(
++        url,
++        data=data,
++        headers=headers,
++        method=method.upper(),
++    )
++
++    try:
++        with urllib_request.urlopen(request, timeout=timeout) as response:
++            body = response.read()
++            headers = dict(response.headers.items())
++            status_code = response.getcode()
++    except urllib_error.HTTPError as error:
++        body = error.read() if hasattr(error, "read") else b""
++        headers = dict(error.headers.items()) if error.headers else {}
++        status_code = error.code
++
++    return _FallbackResponse(status_code, headers, body)
++
++
++def _request(method, url, **kwargs):
++    if httpx is not None:
++        return _httpx_request(method, url, **kwargs)
++    return _urllib_request(method, url, **kwargs)
++
++
++def get(url, **kwargs):
++    kwargs.setdefault("allow_redirects", True)
++    return _request("GET", url, **kwargs)
++
++
++def head(url, **kwargs):
++    kwargs.setdefault("allow_redirects", False)
++    return _request("HEAD", url, **kwargs)
++
++
++def options(url, **kwargs):
++    kwargs.setdefault("allow_redirects", False)
++    return _request("OPTIONS", url, **kwargs)
++
++
++def post(url, **kwargs):
++    kwargs.setdefault("allow_redirects", False)
++    return _request("POST", url, **kwargs)

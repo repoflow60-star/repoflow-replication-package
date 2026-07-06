@@ -1,0 +1,527 @@
+--- a/maproulette/api/maproulette_server.py
++++ b/maproulette/api/maproulette_server.py
+@@ -1,10 +1,111 @@
+-"""This module contains the basic methods that handle API calls to the MapRoulette API. It uses the requests library to
+-accomplish this."""
+-
+-import requests
++"""This module contains the basic methods that handle API calls to the MapRoulette API.
++
++It uses aiohttp for transport while keeping the public synchronous API.
++"""
++
++import asyncio
+ import json
++import ssl
+ import time
+-from .errors import HttpError, InvalidJsonError, ConnectionUnavailableError, UnauthorizedError, NotFoundError
++import types
++
++import aiohttp
++
++from .errors import ConnectionUnavailableError, HttpError, InvalidJsonError, NotFoundError, UnauthorizedError
++
++
++class _AiohttpResponse:
++    def __init__(self, status_code, text):
++        self.status = status_code
++        self.status_code = status_code
++        self.text = text
++
++    @property
++    def ok(self):
++        try:
++            return int(self.status_code) < 400
++        except (TypeError, ValueError):
++            return True
++
++    def json(self):
++        return json.loads(self.text)
++
++
++class _AiohttpSession:
++    def __init__(self):
++        self.headers = {}
++        self.verify = True
++        self.certs = None
++
++    def _ssl_context(self):
++        if not self.verify and not self.certs:
++            return False
++
++        context = ssl.create_default_context()
++        if not self.verify:
++            context.check_hostname = False
++            context.verify_mode = ssl.CERT_NONE
++
++        if self.certs:
++            if isinstance(self.certs, tuple):
++                context.load_cert_chain(*self.certs)
++            else:
++                context.load_cert_chain(self.certs)
++
++        return context
++
++    @staticmethod
++    def _form_data(body):
++        form_data = aiohttp.FormData()
++        for key, value in body.items():
++            if isinstance(value, tuple):
++                filename = value[0] if len(value) > 0 else None
++                content = value[1] if len(value) > 1 else None
++                content_type = value[2] if len(value) > 2 else None
++                headers = value[3] if len(value) > 3 else None
++                field_kwargs = {}
++                if filename is not None:
++                    field_kwargs["filename"] = filename
++                if content_type is not None:
++                    field_kwargs["content_type"] = content_type
++                if headers is not None:
++                    field_kwargs["headers"] = headers
++                form_data.add_field(key, content, **field_kwargs)
++            else:
++                form_data.add_field(key, value)
++        return form_data
++
++    async def _request(self, method, url, params=None, json_body=None, files=None):
++        request_kwargs = {
++            "params": params,
++            "ssl": self._ssl_context(),
++        }
++        if files is not None:
++            request_kwargs["data"] = self._form_data(files)
++        elif json_body is not None:
++            request_kwargs["json"] = json_body
++
++        async with aiohttp.ClientSession(headers=self.headers) as session:
++            async with session.request(method, url, **request_kwargs) as response:
++                return _AiohttpResponse(response.status, await response.text())
++
++    def _run_request(self, method, url, params=None, json_body=None, files=None):
++        return asyncio.run(self._request(method, url, params=params, json_body=json_body, files=files))
++
++    def get(self, url, params=None):
++        return self._run_request("GET", url, params=params)
++
++    def post(self, url, params=None, json=None):
++        return self._run_request("POST", url, params=params, json_body=json)
++
++    def put(self, url, params=None, json=None, files=None):
++        return self._run_request("PUT", url, params=params, json_body=json, files=files)
++
++    def delete(self, url, params=None):
++        return self._run_request("DELETE", url, params=params)
++
++
++requests = types.SimpleNamespace(Session=_AiohttpSession)
+ 
+ 
+ class MapRouletteServer:
+@@ -15,11 +116,54 @@
+         self.headers = configuration.headers
+         self.certs = configuration.certs
+         self.verify = configuration.verify
+-        if self.__check_health():
+-            self.session = requests.Session()
+-            self.session.headers = self.headers
+-            self.session.verify = self.verify
+-            self.session.cert = self.certs
++        self.session = _AiohttpSession()
++        self.session.headers = self.headers
++        self.session.verify = self.verify
++        self.session.cert = self.certs
++        self.session.certs = self.certs
++
++    @staticmethod
++    def _status_code(response):
++        return getattr(response, "status_code", getattr(response, "status", None))
++
++    @staticmethod
++    def _status_value(response):
++        status = MapRouletteServer._status_code(response)
++        try:
++            return int(status)
++        except (TypeError, ValueError):
++            return None
++
++    def _request(self, method, endpoint, params=None, body=None, use_form_data=False, use_base_url=False):
++        request_url = self.base_url + endpoint if use_base_url else self.url + endpoint
++        try:
++            if method == "GET":
++                return self.session.get(request_url, params=params)
++            if method == "POST":
++                return self.session.post(request_url, params=params, json=body)
++            if method == "PUT":
++                if use_form_data:
++                    return self.session.put(request_url, params=params, files=body)
++                return self.session.put(request_url, params=params, json=body)
++            if method == "DELETE":
++                return self.session.delete(request_url, params=params)
++        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
++            raise ConnectionUnavailableError(message=str(exc)) from None
++
++        raise ValueError(f"Unsupported method: {method}")
++
++    @staticmethod
++    def _response_payload(status, response_text):
++        try:
++            return {
++                "data": json.loads(response_text),
++                "status": status,
++            }
++        except (TypeError, ValueError):
++            return {
++                "data": response_text,
++                "status": status,
++            }
+ 
+     def __check_health(self, retries=3, delay=5):
+         """Checks health of connection to host by pinging the URL set in the configuration
+@@ -30,18 +174,14 @@
+         """
+         for i in range(retries):
+             try:
+-                response = requests.get(
+-                    self.base_url + '/ping',
+-                    headers=self.headers,
+-                    verify=self.verify,
+-                    cert=self.certs
+-                )
+-                if not response.ok:
++                response = self.session.get(self.base_url + '/ping')
++                status = self._status_value(response)
++                if status is not None and status >= 400:
+                     print(f"Unsuccessful connection. Retrying in {str(delay)} seconds")
+                     time.sleep(delay)
+                 else:
+                     return True
+-            except requests.exceptions.ConnectionError:
++            except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+                 print(f"Connection not available. Attempt {str(i+1)} out of {str(retries)}")
+                 time.sleep(delay)
+ 
+@@ -57,38 +197,22 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.get(
+-            self.url + endpoint,
+-            params=params
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 404:
+-                raise NotFoundError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(
+-                message=self.parse_response_message(e.response),
+-                status=e.response.status_code
+-            ) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
++        response = self._request("GET", endpoint, params=params)
++        status = self._status_value(response)
++        response_text = response.text
++        if status == 404:
++            raise NotFoundError(
++                message=self.parse_response_message(response_text),
++                status=self._status_code(response),
++                payload=response_text
++            ) from None
++        if status is not None and status >= 400:
++            raise HttpError(
++                message=self.parse_response_message(response_text),
++                status=self._status_code(response),
++                payload=response_text
++            ) from None
++        return self._response_payload(self._status_code(response), response_text)
+ 
+     def post(self, endpoint, body=None, params=None):
+         """Method that completes a POST request to the MapRoulette API
+@@ -99,41 +223,28 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.post(
+-            self.url + endpoint,
+-            params=params,
+-            json=body
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 400:
+-                raise InvalidJsonError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            elif e.response.status_code == 401:
+-                raise UnauthorizedError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(e) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
++        response = self._request("POST", endpoint, params=params, body=body)
++        status = self._status_value(response)
++        response_text = response.text
++        if status == 400:
++            raise InvalidJsonError(
++                message=self.parse_response_message(response_text),
++                status=self._status_code(response),
++                payload=response_text
++            ) from None
++        if status == 401:
++            raise UnauthorizedError(
++                message=self.parse_response_message(response_text),
++                status=self._status_code(response),
++                payload=response_text
++            ) from None
++        if status is not None and status >= 400:
++            raise HttpError(
++                message=self.parse_response_message(response_text),
++                status=self._status_code(response),
++                payload=response_text
++            ) from None
++        return self._response_payload(self._status_code(response), response_text)
+ 
+     def put(self, endpoint, body=None, params=None):
+         """Method that completes a PUT request to the MapRoulette API
+@@ -144,41 +255,28 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.put(
+-            self.url + endpoint,
+-            params=params,
+-            json=body
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 400:
+-                raise InvalidJsonError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            elif e.response.status_code == 401:
+-                raise UnauthorizedError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(e) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
++        response = self._request("PUT", endpoint, params=params, body=body)
++        status = self._status_value(response)
++        response_text = response.text
++        if status == 400:
++            raise InvalidJsonError(
++                message=self.parse_response_message(response_text),
++                status=self._status_code(response),
++                payload=response_text
++            ) from None
++        if status == 401:
++            raise UnauthorizedError(
++                message=self.parse_response_message(response_text),
++                status=self._status_code(response),
++                payload=response_text
++            ) from None
++        if status is not None and status >= 400:
++            raise HttpError(
++                message=self.parse_response_message(response_text),
++                status=self._status_code(response),
++                payload=response_text
++            ) from None
++        return self._response_payload(self._status_code(response), response_text)
+ 
+     def put_file(self, endpoint, body=None, params=None):
+         """Method that completes a multipart PUT request to the MapRoulette API
+@@ -189,41 +287,28 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.put(
+-            self.url + endpoint,
+-            params=params,
+-            files=body
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 400:
+-                raise InvalidJsonError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            elif e.response.status_code == 401:
+-                raise UnauthorizedError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(e) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
++        response = self._request("PUT", endpoint, params=params, body=body, use_form_data=True)
++        status = self._status_value(response)
++        response_text = response.text
++        if status == 400:
++            raise InvalidJsonError(
++                message=self.parse_response_message(response_text),
++                status=self._status_code(response),
++                payload=response_text
++            ) from None
++        if status == 401:
++            raise UnauthorizedError(
++                message=self.parse_response_message(response_text),
++                status=self._status_code(response),
++                payload=response_text
++            ) from None
++        if status is not None and status >= 400:
++            raise HttpError(
++                message=self.parse_response_message(response_text),
++                status=self._status_code(response),
++                payload=response_text
++            ) from None
++        return self._response_payload(self._status_code(response), response_text)
+ 
+     def delete(self, endpoint, params=None):
+         """Method that completes a DELETE request to the MapRoulette API
+@@ -233,40 +318,28 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.delete(
+-            self.url + endpoint,
+-            params=params
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 401:
+-                raise UnauthorizedError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            elif e.response.status_code == 404:
+-                raise NotFoundError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(e) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
++        response = self._request("DELETE", endpoint, params=params)
++        status = self._status_value(response)
++        response_text = response.text
++        if status == 401:
++            raise UnauthorizedError(
++                message=self.parse_response_message(response_text),
++                status=self._status_code(response),
++                payload=response_text
++            ) from None
++        if status == 404:
++            raise NotFoundError(
++                message=self.parse_response_message(response_text),
++                status=self._status_code(response),
++                payload=response_text
++            ) from None
++        if status is not None and status >= 400:
++            raise HttpError(
++                message=self.parse_response_message(response_text),
++                status=self._status_code(response),
++                payload=response_text
++            ) from None
++        return self._response_payload(self._status_code(response), response_text)
+ 
+     @staticmethod
+     def is_json(input_object):
+@@ -286,10 +359,11 @@
+     def parse_response_message(response):
+         """Method to determine the message body from a response object. Will return None if message cannot be parsed.
+ 
+-        :param response: the Requests response object
++        :param response: the response body or response-like object
+         :returns: the response message if parsable, otherwise None
+         """
+         try:
+-            return json.loads(response.text)['message']
+-        except (ValueError, KeyError):
++            response_text = response.text if hasattr(response, 'text') else response
++            return json.loads(response_text)['message']
++        except (ValueError, KeyError, TypeError):
+             return None

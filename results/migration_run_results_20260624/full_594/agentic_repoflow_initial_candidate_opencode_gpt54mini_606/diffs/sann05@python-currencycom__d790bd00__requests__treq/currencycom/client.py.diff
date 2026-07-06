@@ -1,0 +1,336 @@
+--- a/currencycom/client.py
++++ b/currencycom/client.py
+@@ -2,9 +2,11 @@
+ import hmac
+ from datetime import datetime, timedelta
+ from enum import Enum
+-
+-import requests
+-from requests.models import RequestEncodingMixin
++from urllib.parse import urlencode
++from threading import Event, Lock, Thread
++
++import treq
++from twisted.internet import reactor, threads
+ 
+ 
+ class CurrencyComConstants(object):
+@@ -89,6 +91,10 @@
+     Please find documentation by https://exchange.currency.com/api
+     Swagger UI: https://apitradedoc.currency.com/swagger-ui.html#/
+     """
++
++    _reactor_thread_lock = Lock()
++    _reactor_thread_started = False
++    _reactor_thread_ready = Event()
+ 
+     def __init__(self, api_key, api_secret):
+         self.api_key = api_key
+@@ -145,12 +151,18 @@
+ 
+     def _get_params_with_signature(self, **kwargs):
+         t = self._to_epoch_miliseconds(datetime.now())
+-        kwargs['timestamp'] = t
+-        # pylint: disable=no-member
+-        body = RequestEncodingMixin._encode_params(kwargs)
++        params = {key: value for key, value in kwargs.items() if value is not None}
++        params['timestamp'] = t
++        body = self._encode_params(params)
+         sign = hmac.new(self.api_secret, bytes(body, 'utf-8'),
+                         hashlib.sha256).hexdigest()
+-        return {'signature': sign, **kwargs}
++        return {'signature': sign, **params}
++
++    @staticmethod
++    def _encode_params(params):
++        return urlencode([
++            (key, value) for key, value in params.items() if value is not None
++        ], doseq=True)
+ 
+     def _get_header(self, **kwargs):
+         return {
+@@ -158,21 +170,59 @@
+             CurrencyComConstants.HEADER_API_KEY_NAME: self.api_key
+         }
+ 
++    @staticmethod
++    def _request_json(request_func, url, **kwargs):
++        def _run_request():
++            return request_func(url, **kwargs).addCallback(treq.json_content)
++
++        return Client._blocking_call(_run_request)
++
++    @classmethod
++    def _blocking_call(cls, func):
++        cls._ensure_reactor_thread()
++        return threads.blockingCallFromThread(reactor, func)
++
++    @classmethod
++    def _ensure_reactor_thread(cls):
++        if reactor.running:
++            return
++
++        with cls._reactor_thread_lock:
++            if reactor.running or cls._reactor_thread_started:
++                return
++
++            Thread(target=cls._run_reactor_thread, daemon=True).start()
++            cls._reactor_thread_ready.wait()
++            cls._reactor_thread_started = True
++
++    @staticmethod
++    def _run_reactor_thread():
++        reactor.callWhenRunning(Client._reactor_thread_ready.set)
++        reactor.run(installSignalHandlers=False)
++
+     def _get(self, url, **kwargs):
+-        return requests.get(url,
+-                            params=self._get_params_with_signature(**kwargs),
+-                            headers=self._get_header())
++        return self._request_json(
++            treq.get,
++            url,
++            params=self._get_params_with_signature(**kwargs),
++            headers=self._get_header(),
++        )
+ 
+     def _post(self, url, **kwargs):
+-        return requests.post(url,
+-                             params=self._get_params_with_signature(**kwargs),
+-                             headers=self._get_header())
++        return self._request_json(
++            treq.post,
++            url,
++            params=self._get_params_with_signature(**kwargs),
++            headers=self._get_header(),
++        )
+ 
+     def _delete(self, url, **kwargs):
+-        return requests.delete(url,
+-                               params=self._get_params_with_signature(
+-                                   **kwargs),
+-                               headers=self._get_header())
++        return self._request_json(
++            treq.delete,
++            url,
++            params=self._get_params_with_signature(**kwargs),
++            headers=self._get_header(),
++        )
+ 
+     def get_account_info(self,
+                          show_zero_balance: bool = False,
+@@ -216,10 +266,9 @@
+         }
+         """
+         self._validate_recv_window(recv_window)
+-        r = self._get(CurrencyComConstants.ACCOUNT_INFORMATION_ENDPOINT,
+-                      showZeroBalance=show_zero_balance,
+-                      recvWindow=recv_window)
+-        return r.json()
++        return self._get(CurrencyComConstants.ACCOUNT_INFORMATION_ENDPOINT,
++                         showZeroBalance=show_zero_balance,
++                         recvWindow=recv_window)
+ 
+     def get_agg_trades(self, symbol,
+                        start_time: datetime = None,
+@@ -269,10 +318,11 @@
+         if end_time:
+             params['endTime'] = self._to_epoch_miliseconds(end_time)
+ 
+-        r = requests.get(CurrencyComConstants.AGGREGATE_TRADE_LIST_ENDPOINT,
+-                         params=params)
+-
+-        return r.json()
++        return self._request_json(
++            treq.get,
++            CurrencyComConstants.AGGREGATE_TRADE_LIST_ENDPOINT,
++            params=params,
++        )
+ 
+     def close_trading_position(self, position_id, recv_window=None):
+         """
+@@ -299,12 +349,11 @@
+         """
+         self._validate_recv_window(recv_window)
+ 
+-        r = self._post(
++        return self._post(
+             CurrencyComConstants.CLOSE_TRADING_POSITION_ENDPOINT,
+             positionId=position_id,
+             recvWindow=recv_window
+         )
+-        return r.json()
+ 
+     def get_order_book(self, symbol, limit=100):
+         """
+@@ -332,9 +381,11 @@
+           }
+         """
+         self._validate_limit(limit)
+-        r = requests.get(CurrencyComConstants.ORDER_BOOK_ENDPOINT,
+-                         params={'symbol': symbol, 'limit': limit})
+-        return r.json()
++        return self._request_json(
++            treq.get,
++            CurrencyComConstants.ORDER_BOOK_ENDPOINT,
++            params={'symbol': symbol, 'limit': limit},
++        )
+ 
+     @staticmethod
+     def get_exchange_info():
+@@ -374,8 +425,10 @@
+           ]
+         }
+         """
+-        r = requests.get(CurrencyComConstants.EXCHANGE_INFORMATION_ENDPOINT)
+-        return r.json()
++        return Client._request_json(
++            treq.get,
++            CurrencyComConstants.EXCHANGE_INFORMATION_ENDPOINT,
++        )
+ 
+     def get_klines(self, symbol,
+                    interval: CandlesticksChartInervals,
+@@ -420,9 +473,11 @@
+             params['startTime'] = self._to_epoch_miliseconds(start_time)
+         if end_time:
+             params['endTime'] = self._to_epoch_miliseconds(end_time)
+-        r = requests.get(CurrencyComConstants.KLINES_DATA_ENDPOINT,
+-                         params=params)
+-        return r.json()
++        return self._request_json(
++            treq.get,
++            CurrencyComConstants.KLINES_DATA_ENDPOINT,
++            params=params,
++        )
+ 
+     def get_leverage_settings(self, symbol, recv_window=None):
+         """
+@@ -450,12 +505,11 @@
+         """
+         self._validate_recv_window(recv_window)
+ 
+-        r = self._get(
++        return self._get(
+             CurrencyComConstants.LEVERAGE_SETTINGS_ENDPOINT,
+             symbol=symbol,
+             recvWindow=recv_window
+         )
+-        return r.json()
+ 
+     def get_account_trade_list(self, symbol,
+                                start_time: datetime = None,
+@@ -508,10 +562,8 @@
+         if end_time:
+             params['endTime'] = self._to_epoch_miliseconds(end_time)
+ 
+-        r = self._get(CurrencyComConstants.ACCOUNT_TRADE_LIST_ENDPOINT,
+-                      **params)
+-
+-        return r.json()
++        return self._get(CurrencyComConstants.ACCOUNT_TRADE_LIST_ENDPOINT,
++                         **params)
+ 
+     def get_open_orders(self, symbol=None, recv_window=None):
+         """
+@@ -558,10 +610,9 @@
+ 
+         self._validate_recv_window(recv_window)
+ 
+-        r = self._get(CurrencyComConstants.CURRENT_OPEN_ORDERS_ENDPOINT,
+-                      symbol=symbol,
+-                      recvWindow=recv_window)
+-        return r.json()
++        return self._get(CurrencyComConstants.CURRENT_OPEN_ORDERS_ENDPOINT,
++                         symbol=symbol,
++                         recvWindow=recv_window)
+ 
+     def new_order(self,
+                   symbol,
+@@ -657,7 +708,7 @@
+ 
+         expire_timestamp_epoch = self._to_epoch_miliseconds(expire_timestamp)
+ 
+-        r = self._post(
++        return self._post(
+             CurrencyComConstants.ORDER_ENDPOINT,
+             accountId=account_id,
+             expireTimestamp=expire_timestamp_epoch,
+@@ -673,7 +724,6 @@
+             takeProfit=take_profit,
+             type=order_type.value,
+         )
+-        return r.json()
+ 
+     def cancel_order(self, symbol,
+                      order_id,
+@@ -706,13 +756,12 @@
+ 
+         self._validate_recv_window(recv_window)
+ 
+-        r = self._delete(
++        return self._delete(
+             CurrencyComConstants.ORDER_ENDPOINT,
+             symbol=symbol,
+             orderId=order_id,
+             recvWindow=recv_window
+         )
+-        return r.json()
+ 
+     @staticmethod
+     def get_24h_price_change(symbol=None):
+@@ -771,9 +820,11 @@
+           "count": 0
+         }
+         """
+-        r = requests.get(CurrencyComConstants.PRICE_CHANGE_24H_ENDPOINT,
+-                         params={'symbol': symbol} if symbol else {})
+-        return r.json()
++        return Client._request_json(
++            treq.get,
++            CurrencyComConstants.PRICE_CHANGE_24H_ENDPOINT,
++            params={'symbol': symbol} if symbol else {},
++        )
+ 
+     @staticmethod
+     def get_server_time():
+@@ -786,9 +837,10 @@
+           "serverTime": 1499827319559
+         }
+         """
+-        r = requests.get(CurrencyComConstants.SERVER_TIME_ENDPOINT)
+-
+-        return r.json()
++        return Client._request_json(
++            treq.get,
++            CurrencyComConstants.SERVER_TIME_ENDPOINT,
++        )
+ 
+     def list_leverage_trades(self, recv_window=None):
+         """
+@@ -830,11 +882,10 @@
+         }
+         """
+         self._validate_recv_window(recv_window)
+-        r = self._get(
++        return self._get(
+             CurrencyComConstants.TRADING_POSITIONS_ENDPOINT,
+             recvWindow=recv_window
+         )
+-        return r.json()
+ 
+     def update_trading_position(self,
+                                 position_id,
+@@ -854,11 +905,10 @@
+         }
+         """
+         self._validate_recv_window(recv_window)
+-        r = self._post(
++        return self._post(
+             CurrencyComConstants.UPDATE_TRADING_POSITION_ENDPOINT,
+             positionId=position_id,
+             guaranteedStopLoss=guaranteed_stop_loss,
+             stopLoss=stop_loss,
+             takeProfit=take_profit
+         )
+-        return r.json()

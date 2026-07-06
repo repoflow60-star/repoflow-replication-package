@@ -1,0 +1,562 @@
+--- a/census/core.py
++++ b/census/core.py
+@@ -8,8 +8,8 @@
+ 
+ 
+ def new_session(*args, **kwargs):
+-    import requests
+-    return requests.session(*args, **kwargs)
++    import aiohttp
++    return aiohttp.ClientSession(*args, **kwargs)
+ 
+ 
+ class APIKeyError(Exception):
+@@ -41,23 +41,23 @@
+ def supported_years(*years):
+     def inner(func):
+         @wraps(func)
+-        def wrapper(self, *args, **kwargs):
++        async def wrapper(self, *args, **kwargs):
+             year = kwargs.get('year', self.default_year)
+             _years = years if years else self.years
+             if int(year) not in _years:
+                 raise UnsupportedYearException(
+                     'Geography is not available in {}. Available years include {}'.format(year, _years))
+-            return func(self, *args, **kwargs)
++            return await func(self, *args, **kwargs)
+         return wrapper
+     return inner
+ 
+ 
+ def retry_on_transient_error(func):
+ 
+-    def wrapper(self, *args, **kwargs):
++    async def wrapper(self, *args, **kwargs):
+         for _ in range(max(self.retries - 1, 0)):
+             try:
+-                result = func(self, *args, **kwargs)
++                result = await func(self, *args, **kwargs)
+             except CensusException as e:
+                 if "There was an error while running your query.  We've logged the error and we'll correct it ASAP.  Sorry for the inconvenience." in str(e):
+                     pass
+@@ -66,7 +66,7 @@
+             else:
+                 return result
+         else:
+-            return func(self, *args, **kwargs)
++            return await func(self, *args, **kwargs)
+ 
+     return wrapper
+ 
+@@ -102,7 +102,7 @@
+             self.default_year = year
+         self.retries = retries
+ 
+-    def tables(self, year=None):
++    async def tables(self, year=None):
+         """
+         Returns a list of the data tables available from this source.
+         """
+@@ -112,13 +112,14 @@
+ 
+         # Query the table metadata as raw JSON
+         tables_url = self.groups_url % (year, self.dataset)
+-        resp = self.session.get(tables_url)
+-
+-        # Pass it out
+-        return resp.json()['groups']
+-
+-    @supported_years()
+-    def fields(self, year=None, flat=False):
++        async with self.session.get(tables_url) as resp:
++            resp = resp
++
++            # Pass it out
++            return (await resp.json())['groups']
++
++    @supported_years()
++    async def fields(self, year=None, flat=False):
+         if year is None:
+             year = self.default_year
+ 
+@@ -126,8 +127,9 @@
+ 
+         fields_url = self.definitions_url % (year, self.dataset)
+ 
+-        resp = self.session.get(fields_url)
+-        obj = resp.json()
++        async with self.session.get(fields_url) as resp:
++            resp = resp
++            obj = await resp.json()
+ 
+         if flat:
+ 
+@@ -146,7 +148,7 @@
+ 
+         return data
+ 
+-    def get(self, fields, geo, year=None, **kwargs):
++    async def get(self, fields, geo, year=None, **kwargs):
+         """
+         The API only accepts up to 50 fields on each query.
+         Chunk requests, and use the unique GEO_ID to match up the chunks
+@@ -154,14 +156,14 @@
+         GEO_ID is not reliably present in pre-2010 requests.
+         """
+         sort_by_geoid = len(fields) > 49 and (not year or year > 2009)
+-        all_results = (self.query(forty_nine_fields, geo, year, sort_by_geoid=sort_by_geoid, **kwargs)
++        all_results = (await self.query(forty_nine_fields, geo, year, sort_by_geoid=sort_by_geoid, **kwargs)
+                        for forty_nine_fields in chunks(fields, 49))
+         merged_results = [merge(result) for result in zip(*all_results)]
+ 
+         return merged_results
+ 
+     @retry_on_transient_error
+-    def query(self, fields, geo, year=None, sort_by_geoid=False, **kwargs):
++    async def query(self, fields, geo, year=None, sort_by_geoid=False, **kwargs):
+         if year is None:
+             year = self.default_year
+ 
+@@ -183,80 +185,80 @@
+         if 'in' in geo:
+             params['in'] = geo['in']
+ 
+-        resp = self.session.get(url, params=params)
+-
+-        if resp.status_code == 200:
+-            try:
+-                data = resp.json()
+-            except ValueError as ex:
+-                if '<title>Invalid Key</title>' in resp.text:
+-                    raise APIKeyError(' '.join(resp.text.splitlines()))
+-                else:
+-                    raise ex
+-
+-            headers = data.pop(0)
+-            types = [self._field_type(header, year) for header in headers]
+-            results = [{header: (cast(item) if item is not None else None)
+-                        for header, cast, item
+-                        in zip(headers, types, d)}
+-                       for d in data]
+-            if sort_by_geoid:
+-                if 'GEO_ID' in fields:
+-                    results = sorted(results, key=lambda x: x['GEO_ID'])
+-                else:
+-                    results = sorted(results, key=lambda x: x.pop('GEO_ID'))
+-            return results
+-
+-        elif resp.status_code == 204:
+-            return []
+-
+-        else:
+-            raise CensusException(resp.text)
++        async with self.session.get(url, params=params) as resp:
++
++            if resp.status == 200:
++                try:
++                    data = await resp.json()
++                except ValueError as ex:
++                    if '<title>Invalid Key</title>' in await resp.text():
++                        raise APIKeyError(' '.join((await resp.text()).splitlines()))
++                    else:
++                        raise ex
++
++                headers = data.pop(0)
++                types = [self._field_type(header, year) for header in headers]
++                results = [{header: (cast(item) if item is not None else None)
++                            for header, cast, item
++                            in zip(headers, types, d)}
++                           for d in data]
++                if sort_by_geoid:
++                    if 'GEO_ID' in fields:
++                        results = sorted(results, key=lambda x: x['GEO_ID'])
++                    else:
++                        results = sorted(results, key=lambda x: x.pop('GEO_ID'))
++                return results
++
++            elif resp.status == 204:
++                return []
++
++            else:
++                raise CensusException(await resp.text())
+ 
+     @lru_cache(maxsize=1024)
+-    def _field_type(self, field, year):
++    async def _field_type(self, field, year):
+         url = self.definition_url % (year, self.dataset, field)
+-        resp = self.session.get(url)
+-
+-        types = {"fips-for": str,
+-                 "fips-in": str,
+-                 "int": float_or_str,
+-                 "long": float_or_str,
+-                 "float": float,
+-                 "string": str}
+-
+-        if resp.status_code == 200:
+-            predicate_type = resp.json().get("predicateType", "string")
+-            return types[predicate_type]
+-        else:
+-            return str
+-
+-    @supported_years()
+-    def us(self, fields, **kwargs):
+-        return self.get(fields, geo={'for': 'us:1'}, **kwargs)
+-
+-    @supported_years()
+-    def state(self, fields, state_fips, **kwargs):
+-        return self.get(fields, geo={
++        async with self.session.get(url) as resp:
++
++            types = {"fips-for": str,
++                     "fips-in": str,
++                     "int": float_or_str,
++                     "long": float_or_str,
++                     "float": float,
++                     "string": str}
++
++            if resp.status == 200:
++                predicate_type = (await resp.json()).get("predicateType", "string")
++                return types[predicate_type]
++            else:
++                return str
++
++    @supported_years()
++    async def us(self, fields, **kwargs):
++        return await self.get(fields, geo={'for': 'us:1'}, **kwargs)
++
++    @supported_years()
++    async def state(self, fields, state_fips, **kwargs):
++        return await self.get(fields, geo={
+             'for': 'state:{}'.format(state_fips),
+         }, **kwargs)
+ 
+     @supported_years()
+-    def state_county(self, fields, state_fips, county_fips, **kwargs):
+-        return self.get(fields, geo={
++    async def state_county(self, fields, state_fips, county_fips, **kwargs):
++        return await self.get(fields, geo={
+             'for': 'county:{}'.format(county_fips),
+             'in': 'state:{}'.format(state_fips),
+         }, **kwargs)
+ 
+     @supported_years()
+-    def state_place(self, fields, state_fips, place, **kwargs):
+-        return self.get(fields, geo={
++    async def state_place(self, fields, state_fips, place, **kwargs):
++        return await self.get(fields, geo={
+             'for': 'place:{}'.format(place),
+             'in': 'state:{}'.format(state_fips),
+         }, **kwargs)
+ 
+     @supported_years()
+-    def state_district(self, fields, state_fips, district, **kwargs):
++    async def state_district(self, fields, state_fips, district, **kwargs):
+         warnings.warn(
+             "state_district refers to congressional districts; use state_congressional_district instead",
+             DeprecationWarning
+@@ -265,37 +267,37 @@
+         # throwaway, but we can't pass it in twice.
+         kwargs.pop('congressional_district', None)
+ 
+-        return self.state_congressional_district(fields, state_fips, district, **kwargs)
+-
+-    @supported_years()
+-    def state_congressional_district(self, fields, state_fips, congressional_district, **kwargs):
+-        return self.get(fields, geo={
++        return await self.state_congressional_district(fields, state_fips, district, **kwargs)
++
++    @supported_years()
++    async def state_congressional_district(self, fields, state_fips, congressional_district, **kwargs):
++        return await self.get(fields, geo={
+             'for': 'congressional district:{}'.format(congressional_district),
+             'in': 'state:{}'.format(state_fips),
+         }, **kwargs)
+ 
+     @supported_years()
+-    def state_legislative_district_upper(self, fields, state_fips, legislative_district, **kwargs):
+-        return self.get(fields, geo={
++    async def state_legislative_district_upper(self, fields, state_fips, legislative_district, **kwargs):
++        return await self.get(fields, geo={
+             'for': 'state legislative district (upper chamber):{}'.format(str(legislative_district).zfill(3)),
+             'in': 'state:{}'.format(state_fips),
+         }, **kwargs)
+ 
+     @supported_years()
+-    def state_legislative_district_lower(self, fields, state_fips, legislative_district, **kwargs):
+-        return self.get(fields, geo={
++    async def state_legislative_district_lower(self, fields, state_fips, legislative_district, **kwargs):
++        return await self.get(fields, geo={
+             'for': 'state legislative district (lower chamber):{}'.format(str(legislative_district).zfill(3)),
+             'in': 'state:{}'.format(state_fips),
+         }, **kwargs)
+     @supported_years()
+-    def combined_statistical_area(self, fields, csa, **kwargs):
+-        return self.get(fields, geo={
++    async def combined_statistical_area(self, fields, csa, **kwargs):
++        return await self.get(fields, geo={
+             'for': 'combined statistical area:{}'.format(str(csa)),
+         }, **kwargs)
+     
+     @supported_years()
+-    def msa(self, fields, msa, **kwargs):
+-        return self.get(fields, geo={
++    async def msa(self, fields, msa, **kwargs):
++        return await self.get(fields, geo={
+             'for': ('metropolitan statistical area/' +
+                 'micropolitan statistical area:{}'.format(msa)), 
+         }, **kwargs)
+@@ -315,14 +317,14 @@
+             self.definition_url = super(ACSClient, self).definition_url
+             self.groups_url = super(ACSClient, self).groups_url
+ 
+-    def tables(self, *args, **kwargs):
++    async def tables(self, *args, **kwargs):
+         self._switch_endpoints(kwargs.get('year', self.default_year))
+-        return super(ACSClient, self).tables(*args, **kwargs)
+-
+-    def get(self, *args, **kwargs):
++        return await super(ACSClient, self).tables(*args, **kwargs)
++
++    async def get(self, *args, **kwargs):
+         self._switch_endpoints(kwargs.get('year', self.default_year))
+ 
+-        return super(ACSClient, self).get(*args, **kwargs)
++        return await super(ACSClient, self).get(*args, **kwargs)
+ 
+ 
+ class ACS5Client(ACSClient):
+@@ -333,23 +335,23 @@
+     years = (2022, 2021, 2020, 2019, 2018, 2017, 2016, 2015, 2014, 2013, 2012, 2011, 2010, 2009)
+ 
+     @supported_years()
+-    def state_county_subdivision(self, fields, state_fips,
++    async def state_county_subdivision(self, fields, state_fips,
+                                  county_fips, subdiv_fips, **kwargs):
+-        return self.get(fields, geo={
++        return await self.get(fields, geo={
+             'for': 'county subdivision:{}'.format(subdiv_fips),
+             'in': 'state:{} county:{}'.format(state_fips, county_fips),
+         }, **kwargs)
+ 
+     @supported_years()
+-    def state_county_tract(self, fields, state_fips,
++    async def state_county_tract(self, fields, state_fips,
+                            county_fips, tract, **kwargs):
+-        return self.get(fields, geo={
++        return await self.get(fields, geo={
+             'for': 'tract:{}'.format(tract),
+             'in': 'state:{} county:{}'.format(state_fips, county_fips),
+         }, **kwargs)
+ 
+     @supported_years()
+-    def state_county_blockgroup(self, fields, state_fips, county_fips,
++    async def state_county_blockgroup(self, fields, state_fips, county_fips,
+                                 blockgroup, tract=None, **kwargs):
+         geo = {
+             'for': 'block group:{}'.format(blockgroup),
+@@ -357,10 +359,10 @@
+         }
+         if tract:
+             geo['in'] += ' tract:{}'.format(tract)
+-        return self.get(fields, geo=geo, **kwargs)
++        return await self.get(fields, geo=geo, **kwargs)
+ 
+     @supported_years(2022, 2021, 2020, 2019, 2018, 2017, 2016, 2015, 2014, 2013, 2012, 2011)
+-    def zipcode(self, fields, zcta, **kwargs):
++    async def zipcode(self, fields, zcta, **kwargs):
+         warnings.warn(
+             "zipcode has been deprecated; use state_zipcode instead",
+             DeprecationWarning
+@@ -368,10 +370,10 @@
+ 
+         state_fips = kwargs.pop('state_fips')
+ 
+-        return self.state_zipcode(fields, state_fips, zcta, **kwargs)
++        return await self.state_zipcode(fields, state_fips, zcta, **kwargs)
+ 
+     @supported_years(2022, 2021, 2020, 2019, 2018, 2017, 2016, 2015, 2014, 2013, 2012, 2011)
+-    def state_zipcode(self, fields, state_fips, zcta, **kwargs):
++    async def state_zipcode(self, fields, state_fips, zcta, **kwargs):
+         year = kwargs.get('year', self.default_year)
+         geo = {
+             'for': 'zip code tabulation area:{}'.format(zcta),
+@@ -381,7 +383,7 @@
+             geo["in"] = 'state:{}'.format(state_fips)
+         else:
+             geo["regionin"] = 'state:{}'.format(state_fips)
+-        return self.get(fields, geo, **kwargs)
++        return await self.get(fields, geo, **kwargs)
+ 
+ 
+ class ACS5DpClient(ACS5Client):
+@@ -407,9 +409,9 @@
+     years = (2013, 2012)
+ 
+     @supported_years()
+-    def state_county_subdivision(self, fields, state_fips,
++    async def state_county_subdivision(self, fields, state_fips,
+                                  county_fips, subdiv_fips, **kwargs):
+-        return self.get(fields, geo={
++        return await self.get(fields, geo={
+             'for': 'county subdivision:{}'.format(subdiv_fips),
+             'in': 'state:{} county:{}'.format(state_fips, county_fips),
+         }, **kwargs)
+@@ -428,9 +430,9 @@
+     years = (2022, 2021, 2019, 2018, 2017, 2016, 2015, 2014, 2013, 2012, 2011, 2010, 2009, 2008, 2007, 2006, 2005)
+ 
+     @supported_years()
+-    def state_county_subdivision(self, fields, state_fips,
++    async def state_county_subdivision(self, fields, state_fips,
+                                  county_fips, subdiv_fips, **kwargs):
+-        return self.get(fields, geo={
++        return await self.get(fields, geo={
+             'for': 'county subdivision:{}'.format(subdiv_fips),
+             'in': 'state:{} county:{}'.format(state_fips, county_fips),
+         }, **kwargs)
+@@ -457,33 +459,33 @@
+         self.definition_url = 'https://api.census.gov/data/%s/dec/%s/variables/%s.json'
+         self.groups_url = 'https://api.census.gov/data/%s/dec/%s/groups.json'
+ 
+-    def tables(self, *args, **kwargs):
++    async def tables(self, *args, **kwargs):
+         self._switch_endpoints(kwargs.get('year', self.default_year))
+-        return super(SF1Client, self).tables(*args, **kwargs)
+-
+-    def get(self, *args, **kwargs):
++        return await super(SF1Client, self).tables(*args, **kwargs)
++
++    async def get(self, *args, **kwargs):
+         self._switch_endpoints(kwargs.get('year', self.default_year))
+ 
+-        return super(SF1Client, self).get(*args, **kwargs)
+-
+-    @supported_years()
+-    def state_county_subdivision(self, fields, state_fips,
++        return await super(SF1Client, self).get(*args, **kwargs)
++
++    @supported_years()
++    async def state_county_subdivision(self, fields, state_fips,
+                                  county_fips, subdiv_fips, **kwargs):
+-        return self.get(fields, geo={
++        return await self.get(fields, geo={
+             'for': 'county subdivision:{}'.format(subdiv_fips),
+             'in': 'state:{} county:{}'.format(state_fips, county_fips),
+         }, **kwargs)
+ 
+     @supported_years()
+-    def state_county_tract(self, fields, state_fips,
++    async def state_county_tract(self, fields, state_fips,
+                            county_fips, tract, **kwargs):
+-        return self.get(fields, geo={
++        return await self.get(fields, geo={
+             'for': 'tract:{}'.format(tract),
+             'in': 'state:{} county:{}'.format(state_fips, county_fips),
+         }, **kwargs)
+ 
+     @supported_years()
+-    def state_county_blockgroup(self, fields, state_fips, county_fips,
++    async def state_county_blockgroup(self, fields, state_fips, county_fips,
+                                 blockgroup, tract=None, **kwargs):
+         geo = {
+             'for': 'block group:{}'.format(blockgroup),
+@@ -491,35 +493,35 @@
+         }
+         if tract:
+             geo['in'] += ' tract:{}'.format(tract)
+-        return self.get(fields, geo=geo, **kwargs)
++        return await self.get(fields, geo=geo, **kwargs)
+ 
+     @supported_years(2010)
+-    def state_msa(self, fields, state_fips, msa, **kwargs):
+-        return self.get(fields, geo={
++    async def state_msa(self, fields, state_fips, msa, **kwargs):
++        return await self.get(fields, geo={
+             'for': ('metropolitan statistical area/' +
+                     'micropolitan statistical area (or part):{}'.format(msa)),
+             'in': 'state:{}'.format(state_fips),
+         }, **kwargs)
+ 
+     @supported_years(2010)
+-    def state_csa(self, fields, state_fips, csa, **kwargs):
+-        return self.get(fields, geo={
++    async def state_csa(self, fields, state_fips, csa, **kwargs):
++        return await self.get(fields, geo={
+             'for': 'combined statistical area (or part):{}'.format(csa),
+             'in': 'state:{}'.format(state_fips),
+         }, **kwargs)
+ 
+     @supported_years(2010)
+-    def state_district_place(self, fields, state_fips,
++    async def state_district_place(self, fields, state_fips,
+                              district, place, **kwargs):
+-        return self.get(fields, geo={
++        return await self.get(fields, geo={
+             'for': 'place/remainder (or part):{}'.format(place),
+             'in': 'state:{} congressional district:{}'.format(
+                 state_fips, district),
+         }, **kwargs)
+ 
+     @supported_years(2010)
+-    def state_zipcode(self, fields, state_fips, zcta, **kwargs):
+-        return self.get(fields, geo={
++    async def state_zipcode(self, fields, state_fips, zcta, **kwargs):
++        return await self.get(fields, geo={
+             'for': 'zip code tabulation area (or part):{}'.format(zcta),
+             'in': 'state:{}'.format(state_fips),
+         }, **kwargs)
+@@ -539,33 +541,33 @@
+         self.definition_url = 'https://api.census.gov/data/%s/dec/%s/variables/%s.json'
+         self.groups_url = 'https://api.census.gov/data/%s/dec/%s/groups.json'
+ 
+-    def tables(self, *args, **kwargs):
++    async def tables(self, *args, **kwargs):
+         self._switch_endpoints(kwargs.get('year', self.default_year))
+-        return super(PLClient, self).tables(*args, **kwargs)
+-
+-    def get(self, *args, **kwargs):
++        return await super(PLClient, self).tables(*args, **kwargs)
++
++    async def get(self, *args, **kwargs):
+         self._switch_endpoints(kwargs.get('year', self.default_year))
+ 
+-        return super(PLClient, self).get(*args, **kwargs)
+-
+-    @supported_years()
+-    def state_county_subdivision(self, fields, state_fips,
++        return await super(PLClient, self).get(*args, **kwargs)
++
++    @supported_years()
++    async def state_county_subdivision(self, fields, state_fips,
+                                  county_fips, subdiv_fips, **kwargs):
+-        return self.get(fields, geo={
++        return await self.get(fields, geo={
+             'for': 'county subdivision:{}'.format(subdiv_fips),
+             'in': 'state:{} county:{}'.format(state_fips, county_fips),
+         }, **kwargs)
+ 
+     @supported_years()
+-    def state_county_tract(self, fields, state_fips,
++    async def state_county_tract(self, fields, state_fips,
+                            county_fips, tract, **kwargs):
+-        return self.get(fields, geo={
++        return await self.get(fields, geo={
+             'for': 'tract:{}'.format(tract),
+             'in': 'state:{} county:{}'.format(state_fips, county_fips),
+         }, **kwargs)
+ 
+     @supported_years()
+-    def state_county_blockgroup(self, fields, state_fips, county_fips,
++    async def state_county_blockgroup(self, fields, state_fips, county_fips,
+                                 blockgroup, tract=None, **kwargs):
+         geo = {
+             'for': 'block group:{}'.format(blockgroup),
+@@ -573,7 +575,7 @@
+         }
+         if tract:
+             geo['in'] += ' tract:{}'.format(tract)
+-        return self.get(fields, geo=geo, **kwargs)
++        return await self.get(fields, geo=geo, **kwargs)
+ 
+ 
+ class Census(object):

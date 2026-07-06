@@ -1,0 +1,169 @@
+--- a/cronitor/monitor.py
++++ b/cronitor/monitor.py
+@@ -3,29 +3,133 @@
+ import logging
+ import json
+ import os
+-import requests
++import threading
+ from yaml.loader import SafeLoader
+ 
+ 
+ import cronitor
+-from urllib3.util.retry import Retry
+-from requests.adapters import HTTPAdapter
++import treq
++from twisted.internet import reactor
+ 
+ logger = logging.getLogger(__name__)
+ 
+-# https://stackoverflow.com/questions/49121365/implementing-retry-for-requests-in-python
++_reactor_lock = threading.Lock()
++_reactor_thread = None
++
++
++def _ensure_reactor_running():
++    global _reactor_thread
++    if reactor.running:
++        return
++
++    with _reactor_lock:
++        if reactor.running or _reactor_thread is not None:
++            return
++
++        def _run():
++            reactor.run(installSignalHandlers=False)
++
++        _reactor_thread = threading.Thread(target=_run, name='cronitor-treq-reactor', daemon=True)
++        _reactor_thread.start()
++
++    while not reactor.running:
++        time.sleep(0.01)
++
++
++def _wait_for_deferred(deferred, timeout=None):
++    done = threading.Event()
++    outcome = {}
++
++    def _success(value):
++        outcome['value'] = value
++        done.set()
++        return value
++
++    def _failure(error):
++        outcome['error'] = error.value if hasattr(error, 'value') else error
++        done.set()
++        return error
++
++    deferred.addCallbacks(_success, _failure)
++    if not done.wait(timeout):
++        deferred.cancel()
++        raise TimeoutError('request timed out')
++
++    if 'error' in outcome:
++        raise outcome['error']
++
++    return outcome.get('value')
++
++
++def _strip_none(values):
++    if not values:
++        return values
++    return {key: value for key, value in values.items() if value is not None}
++
++
++class _TreqResponse(object):
++    def __init__(self, response):
++        self._response = response
++        self.status_code = response.code
++        self._text = None
++        self._json = None
++
++    @property
++    def text(self):
++        if self._text is None:
++            body = _wait_for_deferred(treq.content(self._response))
++            self._text = body.decode('utf-8') if isinstance(body, bytes) else str(body)
++        return self._text
++
++    def json(self):
++        if self._json is None:
++            self._json = json.loads(self.text)
++        return self._json
++
++
++class _TreqSession(object):
++    def __init__(self, retries=0, backoff_factor=0.0):
++        self.retries = retries
++        self.backoff_factor = backoff_factor
++
++    def request(self, method, url, **kwargs):
++        timeout = kwargs.pop('timeout', None)
++        params = kwargs.get('params')
++        if params is not None:
++            kwargs['params'] = _strip_none(params)
++
++        headers = kwargs.get('headers')
++        if headers is not None:
++            kwargs['headers'] = _strip_none(headers)
++
++        data = kwargs.get('data')
++        if isinstance(data, str):
++            kwargs['data'] = data.encode('utf-8')
++
++        attempts = 0
++        while True:
++            try:
++                _ensure_reactor_running()
++                response = _wait_for_deferred(treq.request(method.upper(), url, **kwargs), timeout=timeout)
++                return _TreqResponse(response)
++            except Exception:
++                attempts += 1
++                if attempts > self.retries:
++                    raise
++                time.sleep(self.backoff_factor * (2 ** (attempts - 1)))
++
++    def get(self, url, **kwargs):
++        return self.request('GET', url, **kwargs)
++
++    def put(self, url, **kwargs):
++        return self.request('PUT', url, **kwargs)
++
++    def delete(self, url, **kwargs):
++        return self.request('DELETE', url, **kwargs)
++
++
+ def retry_session(retries, session=None, backoff_factor=0.3):
+-    session = session or requests.Session()
+-    retry = Retry(
+-        total=retries,
+-        read=retries,
+-        connect=retries,
+-        backoff_factor=backoff_factor,
+-    )
+-    adapter = HTTPAdapter(max_retries=retry)
+-    session.mount('http://', adapter)
+-    session.mount('https://', adapter)
+-    return session
++    return session or _TreqSession(retries=retries, backoff_factor=backoff_factor)
+ 
+ JSON = 'json'
+ YAML = 'yaml'
+@@ -135,7 +239,7 @@
+         self._data = Struct(**data)
+ 
+     def delete(self):
+-        resp = requests.delete(
++        resp = self._req.delete(
+                     self._monitor_api_url(self.key),
+                     auth=(self.api_key, ''),
+                     headers=self._headers,
+@@ -172,7 +276,7 @@
+         if not self.api_key:
+             raise cronitor.AuthenticationError('No api_key detected. Set cronitor.api_key or initialize Monitor with kwarg.')
+ 
+-        resp = requests.get(self._monitor_api_url(self.key),
++        resp = self._req.get(self._monitor_api_url(self.key),
+                             timeout=10,
+                             auth=(self.api_key, ''),
+                             headers=dict(self._headers, **{'Content-Type': 'application/json', 'Cronitor-Version': self.api_verion}))

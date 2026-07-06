@@ -1,0 +1,230 @@
+diff --git /dev/null b/mako/template.py
+new file mode 100644
+index 0000000..7f8a4da
+--- /dev/null
++++ b/mako/template.py
+@@ -0,0 +1,224 @@
++import ast
++import re
++from pathlib import Path
++
++from .exceptions import TemplateError, TemplateSyntaxError
++
++
++_EXPR_PATTERN = re.compile(r'(\$\{([^}]*)\}|\{\{([^}]*)\}\})')
++_BLOCK_PATTERN = re.compile(r'^\s*\{%\s*(.*?)\s*%\}\s*$')
++
++
++class _UndefinedValue(object):
++    def __init__(self, name, strict=False):
++        self.name = name
++        self.strict = strict
++
++    def _error(self):
++        raise TemplateError("'{0}' is undefined".format(self.name))
++
++    def _coerce(self):
++        if self.strict:
++            self._error()
++        return ''
++
++    def __str__(self):
++        return self._coerce()
++
++    def __repr__(self):
++        return self._coerce()
++
++    def __bool__(self):
++        return False
++
++    def __iter__(self):
++        self._error()
++
++    def __getattr__(self, item):
++        return _UndefinedValue('{0}.{1}'.format(self.name, item), strict=self.strict)
++
++    def __call__(self, *args, **kwargs):
++        self._error()
++
++    def _binary(self, *args, **kwargs):
++        self._error()
++
++    __add__ = __radd__ = __sub__ = __rsub__ = _binary
++    __mul__ = __rmul__ = __truediv__ = __rtruediv__ = _binary
++    __floordiv__ = __rfloordiv__ = __mod__ = __rmod__ = _binary
++    __pow__ = __rpow__ = _binary
++
++
++class _EvalContext(dict):
++    def __init__(self, data, strict=False):
++        super().__init__(data)
++        self.strict = strict
++
++    def __getitem__(self, key):
++        if key in self.keys():
++            return super().__getitem__(key)
++        return _UndefinedValue(key, strict=self.strict)
++
++
++def _split_pipeline(expr):
++    parts = []
++    current = []
++    depth = 0
++    quote = None
++    for char in expr:
++        if quote:
++            current.append(char)
++            if char == quote:
++                quote = None
++            elif char == '\\':
++                continue
++            continue
++        if char in ('"', "'"):
++            quote = char
++        elif char in '([{':
++            depth += 1
++        elif char in ')]}':
++            depth -= 1
++        elif char == '|' and depth == 0:
++            parts.append(''.join(current).strip())
++            current = []
++            continue
++        current.append(char)
++    if current:
++        parts.append(''.join(current).strip())
++    return parts
++
++
++def _split_args(arg_string, context, strict):
++    arg_string = arg_string.strip()
++    if not arg_string:
++        return []
++    expr = ast.parse('__f({0})'.format(arg_string), mode='eval').body
++    result = []
++    for node in expr.args:
++        code = compile(ast.Expression(node), '<template>', 'eval')
++        result.append(eval(code, {'__builtins__': {}}, _EvalContext(context, strict=strict)))
++    for keyword in expr.keywords:
++        code = compile(ast.Expression(keyword.value), '<template>', 'eval')
++        result.append((keyword.arg, eval(code, {'__builtins__': {}}, _EvalContext(context, strict=strict))))
++    return result
++
++
++def _filter_join(value, separator=','):
++    return separator.join(str(item) for item in value)
++
++
++def _filter_lower(value):
++    return str(value).lower()
++
++
++def _filter_upper(value):
++    return str(value).upper()
++
++
++def _get_builtin_filters():
++    return {
++        'join': _filter_join,
++        'lower': _filter_lower,
++        'upper': _filter_upper,
++    }
++
++
++def _resolve_filter(name, helpers):
++    if name in helpers:
++        return helpers[name]
++    builtin = _get_builtin_filters()
++    if name in builtin:
++        return builtin[name]
++    raise TemplateError("unknown filter '{0}'".format(name))
++
++
++def _evaluate_expression(expr, context, helpers, strict=False):
++    pipeline = _split_pipeline(expr)
++    base = pipeline[0]
++    code = compile(ast.parse(base, mode='eval'), '<template>', 'eval')
++    value = eval(code, {'__builtins__': {}}, _EvalContext(context, strict=strict))
++    for filter_expr in pipeline[1:]:
++        match = re.match(r'([A-Za-z_][\w.]*)\s*(?:\((.*)\))?$', filter_expr)
++        if not match:
++            raise TemplateSyntaxError("Invalid filter expression", filename=None, lineno=None)
++        name, args = match.group(1), match.group(2) or ''
++        callback = _resolve_filter(name, helpers)
++        parsed_args = _split_args(args, context, strict)
++        positional = []
++        keywords = {}
++        for item in parsed_args:
++            if isinstance(item, tuple):
++                keywords[item[0]] = item[1]
++            else:
++                positional.append(item)
++        value = callback(value, *positional, **keywords)
++    return value
++
++
++def _replace_expressions(text, context, helpers, filename, lineno, strict=False):
++    def repl(match):
++        expr = match.group(2) or match.group(3) or ''
++        try:
++            return str(_evaluate_expression(expr, context, helpers, strict=strict))
++        except TemplateError as exc:
++            if exc.filename is None:
++                exc.filename = filename
++            if exc.lineno is None:
++                exc.lineno = lineno
++            raise
++        except NameError as exc:
++            name = str(exc)
++            match = re.search(r"name '([^']+)' is not defined", name)
++            identifier = match.group(1) if match else expr.strip()
++            raise TemplateError("'{0}' is undefined".format(identifier), filename=filename, lineno=lineno)
++    return _EXPR_PATTERN.sub(repl, text)
++
++
++def _render_legacy(source, context, helpers, filename=None, strict=False):
++    lines = source.splitlines(True)
++    output = []
++    for lineno, line in enumerate(lines, 1):
++        stripped = line.lstrip()
++        block = _BLOCK_PATTERN.match(line)
++        if block:
++            tag = block.group(1).strip()
++            keyword = tag.split(None, 1)[0] if tag else ''
++            if keyword not in {'if', 'for', 'with', 'else', 'elif', 'endif', 'endfor', 'endwith'}:
++                raise TemplateSyntaxError("Encountered unknown tag '{0}'.".format(keyword), filename=filename, lineno=lineno)
++            raise TemplateSyntaxError("Legacy control blocks are not supported by the compatibility renderer.", filename=filename, lineno=lineno)
++        if stripped.startswith('{%'):
++            tag = stripped[2:].split('%}', 1)[0].strip()
++            keyword = tag.split(None, 1)[0] if tag else ''
++            raise TemplateSyntaxError("Encountered unknown tag '{0}'.".format(keyword), filename=filename, lineno=lineno)
++        output.append(_replace_expressions(line, context, helpers, filename, lineno, strict=strict))
++    return ''.join(output)
++
++
++class Template(object):
++    def __init__(self, text=None, filename=None, lookup=None, strict_undefined=False, **kwargs):
++        self.filename = filename
++        self.lookup = lookup
++        self.strict_undefined = strict_undefined
++        self.source = text
++        if self.source is None and filename:
++            self.source = Path(filename).read_text(encoding='utf-8')
++
++    def render(self, *args, **kwargs):
++        context = {}
++        if args:
++            if len(args) == 1 and isinstance(args[0], dict):
++                context.update(args[0])
++            else:
++                raise TypeError('render accepts at most one positional dict argument')
++        context.update(kwargs)
++        helpers = context.pop('_helpers', {})
++        if '_helpers' in context:
++            helpers = context.pop('_helpers')
++        return _render_legacy(
++            self.source or '',
++            context,
++            helpers or {},
++            filename=self.filename,
++            strict=self.strict_undefined,
++        )

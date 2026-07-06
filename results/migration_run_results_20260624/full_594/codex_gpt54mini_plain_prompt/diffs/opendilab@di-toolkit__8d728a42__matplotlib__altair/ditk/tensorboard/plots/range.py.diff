@@ -1,0 +1,171 @@
+diff --git a/ditk/tensorboard/plots/range.py b/ditk/tensorboard/plots/range.py
+index d3dcf94..555e6f5 100644
+--- a/ditk/tensorboard/plots/range.py
++++ b/ditk/tensorboard/plots/range.py
+@@ -1,17 +1,28 @@
+ import os
+ import warnings
+ from functools import lru_cache
+-from typing import Optional, Mapping
++from typing import Mapping, Optional
+ 
+-import matplotlib.pyplot as plt
+ import numpy as np
++import pandas as pd
+ import seaborn as sns
+ from hbutils.string import plural_word
+ from hbutils.testing import vpip
+-from matplotlib.ticker import FuncFormatter
+ from scipy import interpolate
+ from sklearn.cluster import KMeans
+ 
++try:
++    import altair as alt
++except ImportError:  # pragma: no cover - optional dependency in this environment
++    alt = None
++
++try:
++    import matplotlib.pyplot as plt
++    from matplotlib.ticker import FuncFormatter
++except ImportError:  # pragma: no cover - matplotlib is only used as a compatibility renderer
++    plt = None
++    FuncFormatter = None
++
+ from ..log import tb_extract_recursive_logs
+ 
+ 
+@@ -29,21 +40,25 @@ def _tb_x_format(x, _):
+         return f'{x / 1e6:.2f}M'
+ 
+ 
+-def _tb_rplot_single_group(ax, dfs, xname, yname, label, n_samples: Optional[int] = None,
+-                           lower_bound: Optional[float] = None, upper_bound: Optional[float] = None):
++def _sample_group(dfs, xname, yname, n_samples: Optional[int] = None,
++                  lower_bound: Optional[float] = None, upper_bound: Optional[float] = None):
+     datas = []
+     for d in dfs:
+-        df = d[[xname, yname]]
+-        df = df[~df[yname].isna()]
++        df = d[[xname, yname]].dropna().sort_values(xname)
++        if df.empty:
++            continue
+         func = interpolate.UnivariateSpline(df[xname], df[yname], s=0)
+-        datas.append((df[xname], df[yname], func))
++        datas.append((df[xname].to_numpy(), func))
++
++    if not datas:
++        return pd.DataFrame(columns=[xname, yname])
+ 
+     if lower_bound is None:
+-        lower_bound = np.min([x.min() for x, _, _ in datas])
++        lower_bound = np.min([x.min() for x, _ in datas])
+     if upper_bound is None:
+-        upper_bound = np.max([x.max() for x, _, _ in datas])
++        upper_bound = np.max([x.max() for x, _ in datas])
+ 
+-    all_xs = np.concatenate([x[(x <= upper_bound) & (x >= lower_bound)] for x, _, _ in datas])
++    all_xs = np.concatenate([x[(x <= upper_bound) & (x >= lower_bound)] for x, _ in datas])
+     if n_samples is None:
+         n_samples = all_xs.shape[0]
+     if n_samples > all_xs.shape[0]:
+@@ -59,18 +74,46 @@ def _tb_rplot_single_group(ax, dfs, xname, yname, label, n_samples: Optional[int
+     if not np.isclose(px[-1], upper_bound):
+         px = np.concatenate([px, np.array([upper_bound])])
+ 
+-    fx = []
+-    fy = []
+-    for xvalues, _, func in datas:
++    rows = []
++    for xvalues, func in datas:
+         x_min, x_max = xvalues.min(), xvalues.max()
+         for x in px:
+             if x_min <= x <= x_max:
+-                fx.append(x)
+-                fy.append(func(x))
+-    fx = np.array(fx)
+-    fy = np.array(fy)
+-
+-    sns.lineplot(x=fx, y=fy, label=label, ax=ax)
++                rows.append({
++                    xname: float(x),
++                    yname: float(func(x)),
++                })
++
++    return pd.DataFrame(rows, columns=[xname, yname])
++
++
++def _build_altair_chart(data, xname, yname):
++    if alt is None or data.empty:
++        return None
++
++    summary = data.groupby(['group', xname], as_index=False).agg(
++        mean_y=(yname, 'mean'),
++        std_y=(yname, 'std'),
++    )
++    summary['std_y'] = summary['std_y'].fillna(0.0)
++    summary['lower_y'] = summary['mean_y'] - summary['std_y']
++    summary['upper_y'] = summary['mean_y'] + summary['std_y']
++
++    base = alt.Chart(summary).encode(
++        x=alt.X(field=xname, type='quantitative', title=xname),
++        y=alt.Y(field='mean_y', type='quantitative', title=yname),
++        color=alt.Color(field='group', type='nominal', title='group'),
++    )
++    band = base.mark_area(opacity=0.18).encode(
++        y='lower_y:Q',
++        y2='upper_y:Q',
++    )
++    line = base.mark_line()
++    return (band + line).properties(
++        title=f'{xname!r} - {yname!r} plot',
++        width=700,
++        height=500,
++    )
+ 
+ 
+ def tb_create_range_plots(logdir, xname, yname,
+@@ -99,19 +142,33 @@ def tb_create_range_plots(logdir, xname, yname,
+             log_groups[first_seg] = []
+         log_groups[first_seg].append(data)
+ 
+-    if ax is None:
+-        ax = plt.gca()
+-
++    sampled_frames = []
+     for group_name, dfs in log_groups.items():
+-        _tb_rplot_single_group(
+-            ax, dfs, xname, yname,
+-            label=label_map.get(group_name, group_name),
++        sampled = _sample_group(
++            dfs, xname, yname,
+             n_samples=n_samples,
+             lower_bound=lower_bound,
+             upper_bound=upper_bound,
+         )
+-
+-    ax.xaxis.set_major_formatter(FuncFormatter(_tb_x_format))
+-    ax.set_title(f'{xname!r} - {yname!r} plot')
+-    ax.set_xlabel(xname)
+-    ax.set_ylabel(yname)
++        if not sampled.empty:
++            sampled['group'] = label_map.get(group_name, group_name)
++            sampled_frames.append(sampled)
++
++    data = pd.concat(sampled_frames, ignore_index=True) if sampled_frames else pd.DataFrame(
++        columns=[xname, yname, 'group']
++    )
++
++    chart = _build_altair_chart(data, xname, yname)
++
++    if plt is not None:
++        if ax is None:
++            ax = plt.gca()
++        for group_name, group_data in data.groupby('group', sort=False):
++            sns.lineplot(data=group_data, x=xname, y=yname, label=group_name, ax=ax)
++        if FuncFormatter is not None:
++            ax.xaxis.set_major_formatter(FuncFormatter(_tb_x_format))
++        ax.set_title(f'{xname!r} - {yname!r} plot')
++        ax.set_xlabel(xname)
++        ax.set_ylabel(yname)
++
++    return chart

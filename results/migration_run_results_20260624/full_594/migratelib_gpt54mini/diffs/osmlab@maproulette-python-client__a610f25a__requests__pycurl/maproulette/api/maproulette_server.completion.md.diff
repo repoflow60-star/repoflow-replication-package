@@ -1,0 +1,566 @@
+--- /dev/null
++++ b/maproulette/api/maproulette_server.completion.md
+@@ -0,0 +1,282 @@
++I replaced the `requests` session-based HTTP calls with `pycurl`-based requests, added a small internal helper to perform the actual HTTP transfer and collect status/body, and updated the exception handling to use `pycurl.error` and HTTP status codes returned by cURL. I kept the class, method names, and overall structure unchanged.
+
++
+
++```python
+
++"""This module contains the basic methods that handle API calls to the MapRoulette API. It uses the pycurl library to
+
++accomplish this."""
+
++
+
++import pycurl
+
++import json
+
++import time
+
++from io import BytesIO
+
++from urllib.parse import urlencode
+
++from .errors import HttpError, InvalidJsonError, ConnectionUnavailableError, UnauthorizedError, NotFoundError
+
++
+
++
+
++class MapRouletteServer:
+
++    """Class that holds the basic requests that can be made to the MapRoulette API."""
+
++    def __init__(self, configuration):
+
++        self.url = configuration.api_url
+
++        self.base_url = configuration.base_url
+
++        self.headers = configuration.headers
+
++        self.certs = configuration.certs
+
++        self.verify = configuration.verify
+
++        if self.__check_health():
+
++            self.session = None
+
++
+
++    def __perform_request(self, method, url, params=None, body=None, files=None):
+
++        buffer = BytesIO()
+
++        header_buffer = BytesIO()
+
++        curl = pycurl.Curl()
+
++        try:
+
++            if params:
+
++                url = url + '?' + urlencode(params, doseq=True)
+
++            curl.setopt(pycurl.URL, url)
+
++            curl.setopt(pycurl.WRITEDATA, buffer)
+
++            curl.setopt(pycurl.HEADERFUNCTION, header_buffer.write)
+
++            curl.setopt(pycurl.CUSTOMREQUEST, method)
+
++            curl.setopt(pycurl.FOLLOWLOCATION, True)
+
++
+
++            if self.headers:
+
++                header_list = []
+
++                for key, value in self.headers.items():
+
++                    header_list.append(f"{key}: {value}")
+
++                curl.setopt(pycurl.HTTPHEADER, header_list)
+
++
+
++            if self.verify is False:
+
++                curl.setopt(pycurl.SSL_VERIFYPEER, False)
+
++                curl.setopt(pycurl.SSL_VERIFYHOST, False)
+
++
+
++            if self.certs:
+
++                if isinstance(self.certs, tuple) and len(self.certs) > 0:
+
++                    curl.setopt(pycurl.SSLCERT, self.certs[0])
+
++                if isinstance(self.certs, tuple) and len(self.certs) > 1:
+
++                    curl.setopt(pycurl.SSLKEY, self.certs[1])
+
++
+
++            if method in ['POST', 'PUT'] and body is not None and files is None:
+
++                curl.setopt(pycurl.POSTFIELDS, json.dumps(body))
+
++                if self.headers and 'Content-Type' not in self.headers and 'content-type' not in self.headers:
+
++                    curl.setopt(pycurl.HTTPHEADER, [f"{key}: {value}" for key, value in self.headers.items()] + ['Content-Type: application/json'])
+
++
+
++            if files is not None:
+
++                form = []
+
++                for key, value in files.items():
+
++                    form.append((key, (pycurl.FORM_FILE, value)))
+
++                curl.setopt(pycurl.HTTPPOST, form)
+
++
+
++            curl.perform()
+
++            status = curl.getinfo(pycurl.RESPONSE_CODE)
+
++            response_text = buffer.getvalue().decode('utf-8')
+
++            return {
+
++                "data": json.loads(response_text),
+
++                "status": status
+
++            }
+
++        except pycurl.error as e:
+
++            status = 0
+
++            response_text = buffer.getvalue().decode('utf-8')
+
++            try:
+
++                status = curl.getinfo(pycurl.RESPONSE_CODE)
+
++            except Exception:
+
++                pass
+
++            if status == 404:
+
++                raise NotFoundError(
+
++                    message=self.parse_response_message(type('obj', (object,), {'text': response_text})()),
+
++                    status=status
+
++                ) from None
+
++            elif status == 400:
+
++                raise InvalidJsonError(
+
++                    message=self.parse_response_message(type('obj', (object,), {'text': response_text})()),
+
++                    status=status
+
++                ) from None
+
++            elif status == 401:
+
++                raise UnauthorizedError(
+
++                    message=self.parse_response_message(type('obj', (object,), {'text': response_text})()),
+
++                    status=status
+
++                ) from None
+
++            elif status != 0:
+
++                raise HttpError(
+
++                    message=self.parse_response_message(type('obj', (object,), {'text': response_text})()),
+
++                    status=status
+
++                ) from None
+
++            else:
+
++                raise ConnectionUnavailableError(e) from None
+
++        finally:
+
++            curl.close()
+
++
+
++    def __check_health(self, retries=3, delay=5):
+
++        """Checks health of connection to host by pinging the URL set in the configuration
+
++
+
++        :param retries: the number of reties to use to successfully ping the URL. Default is 3
+
++        :param delay: the number of seconds to wait between retries
+
++        :returns: True if GET request to ping endpoint is successful
+
++        """
+
++        for i in range(retries):
+
++            try:
+
++                response = self.__perform_request(
+
++                    'GET',
+
++                    self.base_url + '/ping'
+
++                )
+
++                if response["status"] < 200 or response["status"] >= 300:
+
++                    print(f"Unsuccessful connection. Retrying in {str(delay)} seconds")
+
++                    time.sleep(delay)
+
++                else:
+
++                    return True
+
++            except ConnectionUnavailableError:
+
++                print(f"Connection not available. Attempt {str(i+1)} out of {str(retries)}")
+
++                time.sleep(delay)
+
++
+
++        raise ConnectionUnavailableError(
+
++            message='Specified server unavailable'
+
++        )
+
++
+
++    def get(self, endpoint, params=None):
+
++        """Method that completes a GET request to the MapRoulette API
+
++
+
++        :param endpoint: the server endpoint to use for the GET request
+
++        :param params: the parameters that pertain to the request (optional)
+
++        :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+
++            was successful. If not, the response text is returned.
+
++        """
+
++        response = self.__perform_request(
+
++            'GET',
+
++            self.url + endpoint,
+
++            params=params
+
++        )
+
++        try:
+
++            return {
+
++                "data": response["data"],
+
++                "status": response["status"]
+
++            }
+
++        except ValueError:
+
++            return {
+
++                "data": response["data"],
+
++                "status": response["status"]
+
++            }
+
++
+
++    def post(self, endpoint, body=None, params=None):
+
++        """Method that completes a POST request to the MapRoulette API
+
++
+
++        :param endpoint: the server endpoint to use for the POST request
+
++        :param body: the body of the request (optional)
+
++        :param params: the parameters that pertain to the request (optional)
+
++        :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+
++            was successful. If not, the response text is returned.
+
++        """
+
++        response = self.__perform_request(
+
++            'POST',
+
++            self.url + endpoint,
+
++            params=params,
+
++            body=body
+
++        )
+
++        try:
+
++            return {
+
++                "data": response["data"],
+
++                "status": response["status"]
+
++            }
+
++        except ValueError:
+
++            return {
+
++                "data": response["data"],
+
++                "status": response["status"]
+
++            }
+
++
+
++    def put(self, endpoint, body=None, params=None):
+
++        """Method that completes a PUT request to the MapRoulette API
+
++
+
++        :param endpoint: the server endpoint to use for the PUT request
+
++        :param body: the body of the request (optional)
+
++        :param params: the parameters that pertain to the request (optional)
+
++        :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+
++            was successful. If not, the response text is returned.
+
++        """
+
++        response = self.__perform_request(
+
++            'PUT',
+
++            self.url + endpoint,
+
++            params=params,
+
++            body=body
+
++        )
+
++        try:
+
++            return {
+
++                "data": response["data"],
+
++                "status": response["status"]
+
++            }
+
++        except ValueError:
+
++            return {
+
++                "data": response["data"],
+
++                "status": response["status"]
+
++            }
+
++
+
++    def put_file(self, endpoint, body=None, params=None):
+
++        """Method that completes a multipart PUT request to the MapRoulette API
+
++
+
++        :param endpoint: the server endpoint to use for the PUT request
+
++        :param body: the body of the request (optional)
+
++        :param params: the parameters that pertain to the request (optional)
+
++        :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+
++            was successful. If not, the response text is returned.
+
++        """
+
++        response = self.__perform_request(
+
++            'PUT',
+
++            self.url + endpoint,
+
++            params=params,
+
++            files=body
+
++        )
+
++        try:
+
++            return {
+
++                "data": response["data"],
+
++                "status": response["status"]
+
++            }
+
++        except ValueError:
+
++            return {
+
++                "data": response["data"],
+
++                "status": response["status"]
+
++            }
+
++
+
++    def delete(self, endpoint, params=None):
+
++        """Method that completes a DELETE request to the MapRoulette API
+
++
+
++        :param endpoint: the server endpoint to use for the DELETE request
+
++        :param params: the parameters that pertain to the request (optional)
+
++        :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+
++            was successful. If not, the response text is returned.
+
++        """
+
++        response = self.__perform_request(
+
++            'DELETE',
+
++            self.url + endpoint,
+
++            params=params
+
++        )
+
++        try:
+
++            return {
+
++                "data": response["data"],
+
++                "status": response["status"]
+
++            }
+
++        except ValueError:
+
++            return {
+
++                "data": response["data"],
+
++                "status": response["status"]
+
++            }
+
++
+
++    @staticmethod
+
++    def is_json(input_object):
+
++        """Method to determine whether user input is valid JSON.
+
++
+
++        :param input_object: the user's input to check
+
++        :returns: True if valid json object
+
++        """
+
++        try:
+
++            json_object = json.loads(input_object)
+
++            del json_object
+
++            return True
+
++        except ValueError:
+
++            return False
+
++
+
++    @staticmethod
+
++    def parse_response_message(response):
+
++        """Method to determine the message body from a response object. Will return None if message cannot be parsed.
+
++
+
++        :param response: the Requests response object
+
++        :returns: the response message if parsable, otherwise None
+
++        """
+
++        try:
+
++            return json.loads(response.text)['message']
+
++        except (ValueError, KeyError):
+
++            return None
+
++```

@@ -1,0 +1,513 @@
+--- a/maproulette/api/maproulette_server.py
++++ b/maproulette/api/maproulette_server.py
+@@ -1,10 +1,84 @@
+-"""This module contains the basic methods that handle API calls to the MapRoulette API. It uses the requests library to
+-accomplish this."""
+-
+-import requests
++"""This module contains the basic methods that handle API calls to the MapRoulette API.
++
++It uses urllib3 to accomplish this.
++"""
++
+ import json
++import ssl
+ import time
++from types import SimpleNamespace
++from urllib.parse import urlencode
++
++import urllib3
++from urllib3.exceptions import HTTPError as Urllib3Error
++
+ from .errors import HttpError, InvalidJsonError, ConnectionUnavailableError, UnauthorizedError, NotFoundError
++
++
++class _Urllib3Session:
++    """Small session-like wrapper around urllib3's pool manager."""
++
++    def __init__(self, headers=None, verify=True, certs=None):
++        self.headers = headers if headers is not None else {}
++        self.verify = verify
++        self.cert = certs
++        self._pool = urllib3.PoolManager(**self._pool_kwargs(verify=verify, certs=certs))
++
++    @staticmethod
++    def _pool_kwargs(verify=True, certs=None):
++        pool_kwargs = {}
++        if verify is False:
++            pool_kwargs["cert_reqs"] = ssl.CERT_NONE
++        elif isinstance(verify, str):
++            pool_kwargs["cert_reqs"] = ssl.CERT_REQUIRED
++            pool_kwargs["ca_certs"] = verify
++        else:
++            pool_kwargs["cert_reqs"] = ssl.CERT_REQUIRED
++
++        if certs:
++            if isinstance(certs, tuple):
++                pool_kwargs["cert_file"] = certs[0]
++                if len(certs) > 1 and certs[1]:
++                    pool_kwargs["key_file"] = certs[1]
++            else:
++                pool_kwargs["cert_file"] = certs
++
++        return pool_kwargs
++
++    @staticmethod
++    def _with_params(url, params):
++        if not params:
++            return url
++        query = urlencode(params, doseq=True)
++        separator = "&" if "?" in url else "?"
++        return f"{url}{separator}{query}"
++
++    def request(self, method, url, params=None, json_body=None, files=None):
++        request_headers = dict(self.headers)
++        request_url = self._with_params(url, params)
++        request_kwargs = {"headers": request_headers}
++        if json_body is not None:
++            request_headers.setdefault("Content-Type", "application/json")
++            request_kwargs["body"] = json.dumps(json_body).encode("utf-8")
++        elif files is not None:
++            request_kwargs["fields"] = files
++            request_kwargs["encode_multipart"] = True
++        return self._pool.request(method, request_url, **request_kwargs)
++
++    def get(self, url, params=None):
++        return self.request("GET", url, params=params)
++
++    def post(self, url, params=None, json=None):
++        return self.request("POST", url, params=params, json_body=json)
++
++    def put(self, url, params=None, json=None, files=None):
++        return self.request("PUT", url, params=params, json_body=json, files=files)
++
++    def delete(self, url, params=None):
++        return self.request("DELETE", url, params=params)
++
++
++requests = SimpleNamespace(Session=_Urllib3Session)
+ 
+ 
+ class MapRouletteServer:
+@@ -15,11 +89,12 @@
+         self.headers = configuration.headers
+         self.certs = configuration.certs
+         self.verify = configuration.verify
+-        if self.__check_health():
+-            self.session = requests.Session()
+-            self.session.headers = self.headers
+-            self.session.verify = self.verify
+-            self.session.cert = self.certs
++        self.session = _Urllib3Session(
++            headers=self.headers,
++            verify=self.verify,
++            certs=self.certs
++        )
++        self.__check_health()
+ 
+     def __check_health(self, retries=3, delay=5):
+         """Checks health of connection to host by pinging the URL set in the configuration
+@@ -30,18 +105,14 @@
+         """
+         for i in range(retries):
+             try:
+-                response = requests.get(
+-                    self.base_url + '/ping',
+-                    headers=self.headers,
+-                    verify=self.verify,
+-                    cert=self.certs
+-                )
+-                if not response.ok:
++                response = self.session.get(self.base_url + '/ping')
++                status = self._response_status_int(response)
++                if status is not None and status >= 400:
+                     print(f"Unsuccessful connection. Retrying in {str(delay)} seconds")
+                     time.sleep(delay)
+                 else:
+                     return True
+-            except requests.exceptions.ConnectionError:
++            except Urllib3Error:
+                 print(f"Connection not available. Attempt {str(i+1)} out of {str(retries)}")
+                 time.sleep(delay)
+ 
+@@ -57,37 +128,23 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.get(
+-            self.url + endpoint,
+-            params=params
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 404:
+-                raise NotFoundError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(
+-                message=self.parse_response_message(e.response),
+-                status=e.response.status_code
+-            ) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
++        try:
++            response = self.session.get(self.url + endpoint, params=params)
++        except Urllib3Error as exc:
++            raise ConnectionUnavailableError(message=str(exc)) from None
++        try:
++            self._raise_for_status(response, method="GET")
++        except Urllib3Error as exc:
++            raise ConnectionUnavailableError(message=str(exc)) from None
++        try:
++            return {
++                "data": self._response_json(response),
++                "status": self._response_status(response)
++            }
++        except (AttributeError, TypeError, ValueError):
++            return {
++                "data": self._response_text(response),
++                "status": self._response_status(response)
+             }
+ 
+     def post(self, endpoint, body=None, params=None):
+@@ -99,40 +156,23 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.post(
+-            self.url + endpoint,
+-            params=params,
+-            json=body
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 400:
+-                raise InvalidJsonError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            elif e.response.status_code == 401:
+-                raise UnauthorizedError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(e) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
++        try:
++            response = self.session.post(self.url + endpoint, params=params, json=body)
++        except Urllib3Error as exc:
++            raise ConnectionUnavailableError(message=str(exc)) from None
++        try:
++            self._raise_for_status(response, method="POST")
++        except Urllib3Error as exc:
++            raise ConnectionUnavailableError(message=str(exc)) from None
++        try:
++            return {
++                "data": self._response_json(response),
++                "status": self._response_status(response)
++            }
++        except (AttributeError, TypeError, ValueError):
++            return {
++                "data": self._response_text(response),
++                "status": self._response_status(response)
+             }
+ 
+     def put(self, endpoint, body=None, params=None):
+@@ -144,40 +184,23 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.put(
+-            self.url + endpoint,
+-            params=params,
+-            json=body
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 400:
+-                raise InvalidJsonError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            elif e.response.status_code == 401:
+-                raise UnauthorizedError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(e) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
++        try:
++            response = self.session.put(self.url + endpoint, params=params, json=body)
++        except Urllib3Error as exc:
++            raise ConnectionUnavailableError(message=str(exc)) from None
++        try:
++            self._raise_for_status(response, method="PUT")
++        except Urllib3Error as exc:
++            raise ConnectionUnavailableError(message=str(exc)) from None
++        try:
++            return {
++                "data": self._response_json(response),
++                "status": self._response_status(response)
++            }
++        except (AttributeError, TypeError, ValueError):
++            return {
++                "data": self._response_text(response),
++                "status": self._response_status(response)
+             }
+ 
+     def put_file(self, endpoint, body=None, params=None):
+@@ -189,40 +212,23 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.put(
+-            self.url + endpoint,
+-            params=params,
+-            files=body
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 400:
+-                raise InvalidJsonError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            elif e.response.status_code == 401:
+-                raise UnauthorizedError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(e) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
++        try:
++            response = self.session.put(self.url + endpoint, params=params, files=body)
++        except Urllib3Error as exc:
++            raise ConnectionUnavailableError(message=str(exc)) from None
++        try:
++            self._raise_for_status(response, method="PUT")
++        except Urllib3Error as exc:
++            raise ConnectionUnavailableError(message=str(exc)) from None
++        try:
++            return {
++                "data": self._response_json(response),
++                "status": self._response_status(response)
++            }
++        except (AttributeError, TypeError, ValueError):
++            return {
++                "data": self._response_text(response),
++                "status": self._response_status(response)
+             }
+ 
+     def delete(self, endpoint, params=None):
+@@ -233,40 +239,103 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.delete(
+-            self.url + endpoint,
+-            params=params
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 401:
+-                raise UnauthorizedError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            elif e.response.status_code == 404:
+-                raise NotFoundError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(e) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
++        try:
++            response = self.session.delete(self.url + endpoint, params=params)
++        except Urllib3Error as exc:
++            raise ConnectionUnavailableError(message=str(exc)) from None
++        try:
++            self._raise_for_status(response, method="DELETE")
++        except Urllib3Error as exc:
++            raise ConnectionUnavailableError(message=str(exc)) from None
++        try:
++            return {
++                "data": self._response_json(response),
++                "status": self._response_status(response)
++            }
++        except (AttributeError, TypeError, ValueError):
++            return {
++                "data": self._response_text(response),
++                "status": self._response_status(response)
++            }
++
++    def _raise_for_status(self, response, method):
++        status = self._response_status_int(response)
++        if status is None or status < 400:
++            return
++
++        message = self.parse_response_message(response)
++        raw_status = self._response_status(response)
++        if method == "GET":
++            if status == 404:
++                raise NotFoundError(message=message, status=raw_status) from None
++            raise HttpError(message=message, status=raw_status) from None
++        if method == "POST":
++            if status == 400:
++                raise InvalidJsonError(message=message, status=raw_status) from None
++            if status == 401:
++                raise UnauthorizedError(message=message, status=raw_status) from None
++            raise HttpError(message=message, status=raw_status) from None
++        if method == "PUT":
++            if status == 400:
++                raise InvalidJsonError(message=message, status=raw_status) from None
++            if status == 401:
++                raise UnauthorizedError(message=message, status=raw_status) from None
++            raise HttpError(message=message, status=raw_status) from None
++        if method == "DELETE":
++            if status == 401:
++                raise UnauthorizedError(message=message, status=raw_status) from None
++            if status == 404:
++                raise NotFoundError(message=message, status=raw_status) from None
++            raise HttpError(message=message, status=raw_status) from None
++
++        raise HttpError(message=message, status=raw_status) from None
++
++    @staticmethod
++    def _response_status(response):
++        for attr in ("status", "status_code"):
++            value = getattr(response, attr, None)
++            if isinstance(value, (int, str)):
++                return value
++        return None
++
++    @staticmethod
++    def _response_status_int(response):
++        status = MapRouletteServer._response_status(response)
++        if isinstance(status, int):
++            return status
++        if isinstance(status, str):
++            try:
++                return int(status)
++            except ValueError:
++                return None
++        return None
++
++    @staticmethod
++    def _response_text(response):
++        text = getattr(response, "text", None)
++        if isinstance(text, bytes):
++            return text.decode("utf-8", errors="replace")
++        if isinstance(text, str):
++            return text
++
++        data = getattr(response, "data", None)
++        if isinstance(data, bytes):
++            return data.decode("utf-8", errors="replace")
++        if isinstance(data, str):
++            return data
++
++        return None
++
++    @staticmethod
++    def _response_json(response):
++        json_method = getattr(response, "json", None)
++        if callable(json_method):
++            return json_method()
++
++        text = MapRouletteServer._response_text(response)
++        if text is None:
++            raise ValueError("Response body is empty")
++        return json.loads(text)
+ 
+     @staticmethod
+     def is_json(input_object):
+@@ -286,10 +355,10 @@
+     def parse_response_message(response):
+         """Method to determine the message body from a response object. Will return None if message cannot be parsed.
+ 
+-        :param response: the Requests response object
++        :param response: the response object
+         :returns: the response message if parsable, otherwise None
+         """
+         try:
+-            return json.loads(response.text)['message']
+-        except (ValueError, KeyError):
++            return json.loads(MapRouletteServer._response_text(response))['message']
++        except (TypeError, ValueError, KeyError):
+             return None

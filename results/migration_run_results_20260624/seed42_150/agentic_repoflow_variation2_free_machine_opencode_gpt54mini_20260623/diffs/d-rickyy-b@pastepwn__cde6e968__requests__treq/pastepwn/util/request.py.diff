@@ -1,0 +1,140 @@
+--- a/pastepwn/util/request.py
++++ b/pastepwn/util/request.py
+@@ -1,14 +1,21 @@
+ import logging
+-from threading import Lock
++from threading import Event, Lock, Thread
++from urllib.parse import urlencode, urlsplit
++from urllib.request import getproxies
+ 
+-from requests import Session, utils
+-from requests.exceptions import Timeout
++import treq
++from twisted.internet import reactor
++from twisted.internet.threads import blockingCallFromThread
++from twisted.web.client import ProxyAgent, URI
++from twisted.web.http_headers import Headers
+ 
+ 
+ class Request:
+     _instance = None
+     _initialized = False
+     _lock = Lock()
++    _reactor_thread = None
++    _reactor_ready = Event()
+ 
+     def __new__(cls, *args, **kwargs):
+         # override method to implement singleton
+@@ -22,28 +29,103 @@
+     def __init__(self, proxies=None, headers=None):
+         if not self._initialized:
+             self.logger = logging.getLogger(__name__)
+-            self.session = Session()
+             self.proxies = proxies
+             self.headers = headers
+             self.logger.info("Using the following custom proxies: %s", proxies)
+-            system_proxies = utils.get_environ_proxies("https://example.com")
++            system_proxies = getproxies()
+             self.logger.info("Using the following system proxies: %s", system_proxies)
++            self._ensure_reactor_thread()
+             Request._initialized = True
+ 
+-    def _request_wrapper(self, data, timeout, *args, **kwargs):
++    @classmethod
++    def _ensure_reactor_thread(cls):
++        if reactor.running or cls._reactor_thread is not None:
++            return
++
++        def run_reactor():
++            reactor.callWhenRunning(cls._reactor_ready.set)
++            reactor.run(installSignalHandlers=False)
++
++        cls._reactor_thread = Thread(target=run_reactor, name="PastePwnReactor", daemon=True)
++        cls._reactor_thread.start()
++        cls._reactor_ready.wait()
++
++    def _build_headers(self, data):
+         headers = {"User-Agent": "pastepwn (https://github.com/d-Rickyy-b/pastepwn)"}
+ 
+         if self.headers is not None:
+             headers.update(self.headers)
+ 
++        body = data
++        if isinstance(data, dict):
++            body = urlencode(data, doseq=True)
++            headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
++        elif isinstance(data, str):
++            body = data
++        elif isinstance(data, (bytes, bytearray)):
++            body = bytes(data)
++
++        twisted_headers = Headers(
++            {
++                str(key).encode("utf-8"): [str(value).encode("utf-8")]
++                for key, value in headers.items()
++            }
++        )
++
++        if isinstance(body, str):
++            body = body.encode("utf-8")
++
++        return twisted_headers, body
++
++    def _build_agent(self, url):
++        if not self.proxies:
++            return None
++
++        parsed_url = urlsplit(url)
++        proxy_url = None
++        if isinstance(self.proxies, dict):
++            proxy_url = self.proxies.get(parsed_url.scheme) or self.proxies.get("https") or self.proxies.get("http")
++
++        if proxy_url is None:
++            return None
++
++        return ProxyAgent(reactor, URI.fromBytes(str(proxy_url).encode("utf-8")))
++
++    def _perform_request(self, method, url, data, timeout):
++        headers, body = self._build_headers(data)
++
++        def issue_request():
++            request_kwargs = {"headers": headers}
++            if body is not None:
++                request_kwargs["data"] = body
++
++            agent = self._build_agent(url)
++            if agent is not None:
++                request_kwargs["agent"] = agent
++
++            deferred = treq.request(method, url, **request_kwargs)
++            deferred.addTimeout(timeout, reactor)
++            deferred.addCallback(treq.content)
++            deferred.addCallback(lambda content: content.decode("utf-8"))
++            return deferred
++
++        return blockingCallFromThread(reactor, issue_request)
++
++    def _request_wrapper(self, data, timeout, *args, **kwargs):
+         try:
+-            response = self.session.request(*args, headers=headers, proxies=self.proxies, data=data, timeout=timeout, **kwargs)
+-        except Timeout:
+-            url = kwargs.get("url")
+-            self.logger.warning("Timeout while requesting %s!", url)
+-            return ""
++            response = self._perform_request(*args, data=data, timeout=timeout, **kwargs)
++        except Exception as exc:
++            from twisted.internet.defer import TimeoutError as DeferredTimeoutError
++            from twisted.internet.error import TimeoutError as ReactorTimeoutError
+ 
+-        return response.content.decode("utf-8")
++            if isinstance(exc, (DeferredTimeoutError, ReactorTimeoutError)):
++                url = kwargs.get("url")
++                self.logger.warning("Timeout while requesting %s!", url)
++                return ""
++
++            raise
++
++        return response
+ 
+     def get(self, url, data=None, timeout=5):
+         return self._request_wrapper(method="GET", url=url, data=data, timeout=timeout)

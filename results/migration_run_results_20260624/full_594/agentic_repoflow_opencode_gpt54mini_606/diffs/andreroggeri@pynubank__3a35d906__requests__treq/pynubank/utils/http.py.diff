@@ -1,0 +1,174 @@
+--- a/pynubank/utils/http.py
++++ b/pynubank/utils/http.py
+@@ -1,7 +1,144 @@
+-from requests import Response
+-from requests_pkcs12 import get, post
++import json
++from io import BytesIO
++from dataclasses import dataclass
++from threading import Event, Lock, Thread, current_thread
++from typing import Any, Dict, Optional
++
++from cryptography.hazmat.primitives import serialization
++from cryptography.hazmat.primitives.serialization import pkcs12 as cryptography_pkcs12
++from OpenSSL import crypto
++from treq import content
++from twisted.internet import reactor
++from twisted.internet import ssl
++from twisted.internet.threads import blockingCallFromThread
++from twisted.web.client import Agent, FileBodyProducer
++from twisted.web.http_headers import Headers
+ 
+ from pynubank import NuRequestException
++
++
++@dataclass
++class _HttpResponse:
++    status_code: int
++    url: str
++    headers: Dict[str, str]
++    _body: bytes
++
++    def json(self):
++        return json.loads(self._body.decode())
++
++
++_reactor_thread: Optional[Thread] = None
++_reactor_ready = Event()
++_reactor_lock = Lock()
++
++
++def _cert_context_factory(pkcs12_data: bytes, pkcs12_password: str = ''):
++    private_key, certificate, _ = cryptography_pkcs12.load_key_and_certificates(
++        pkcs12_data,
++        password=pkcs12_password.encode() if pkcs12_password else None,
++    )
++    key_pem = private_key.private_bytes(
++        serialization.Encoding.PEM,
++        serialization.PrivateFormat.TraditionalOpenSSL,
++        serialization.NoEncryption(),
++    )
++    cert_pem = certificate.public_bytes(serialization.Encoding.PEM)
++
++    return ssl.CertificateOptions(
++        privateKey=crypto.load_privatekey(crypto.FILETYPE_PEM, key_pem),
++        certificate=crypto.load_certificate(crypto.FILETYPE_PEM, cert_pem),
++    )
++
++
++def _http_client(pkcs12_data: Optional[bytes] = None, pkcs12_password: str = ''):
++    if not pkcs12_data:
++        return Agent(reactor)
++
++    return Agent(reactor, contextFactory=_cert_context_factory(pkcs12_data, pkcs12_password))
++
++
++def _ensure_reactor():
++    global _reactor_thread
++
++    if reactor.running:
++        return
++
++    with _reactor_lock:
++        if _reactor_thread and _reactor_thread.is_alive():
++            return
++
++        _reactor_ready.clear()
++
++        def _run():
++            reactor.callWhenRunning(_reactor_ready.set)
++            reactor.run(installSignalHandlers=False)
++
++        _reactor_thread = Thread(target=_run, daemon=True)
++        _reactor_thread.start()
++
++    _reactor_ready.wait()
++
++
++def _normalize_headers(response_headers) -> Dict[str, str]:
++    headers = {}
++    for name, values in response_headers.getAllRawHeaders():
++        if not values:
++            continue
++
++        key = name.decode() if isinstance(name, bytes) else name
++        value = values[-1].decode() if isinstance(values[-1], bytes) else values[-1]
++        headers[key] = value
++
++    return headers
++
++
++def _wrap_response(response, url: str):
++    def _build(body: bytes):
++        return _HttpResponse(
++            status_code=response.code,
++            url=url,
++            headers=_normalize_headers(response.headers),
++            _body=body,
++        )
++
++    return content(response).addCallback(_build)
++
++
++def _request(method: str, url: str, headers: Dict[str, str], json_body: Dict[str, Any] = None,
++             pkcs12_data: Optional[bytes] = None, pkcs12_password: str = ''):
++    def _perform_request():
++        client = _http_client(pkcs12_data, pkcs12_password)
++        request_headers = Headers({
++            name.encode() if isinstance(name, str) else name: [value.encode() if isinstance(value, str) else value]
++            for name, value in headers.items()
++        })
++
++        if method == 'get':
++            response = client.request(b'GET', url.encode(), headers=request_headers)
++        else:
++            body = None if json_body is None else json.dumps(json_body).encode()
++            body_producer = None if body is None else FileBodyProducer(BytesIO(body))
++            response = client.request(b'POST', url.encode(), headers=request_headers, bodyProducer=body_producer)
++
++        return response.addCallback(_wrap_response, url)
++
++    if current_thread() == _reactor_thread:
++        return _perform_request()
++
++    _ensure_reactor()
++    return blockingCallFromThread(reactor, _perform_request)
++
++
++def get(url: str, headers: Dict[str, str] = None, pkcs12_data: bytes = None, pkcs12_password: str = ''):
++    return _request('get', url, {} if headers is None else headers, pkcs12_data=pkcs12_data,
++                    pkcs12_password=pkcs12_password)
++
++
++def post(url: str, json: Dict[str, Any] = None, headers: Dict[str, str] = None, pkcs12_data: bytes = None,
++         pkcs12_password: str = ''):
++    return _request('post', url, {} if headers is None else headers, json_body=json, pkcs12_data=pkcs12_data,
++                    pkcs12_password=pkcs12_password)
+ 
+ 
+ class HttpClient:
+@@ -30,20 +167,20 @@
+     def _cert_args(self):
+         return {'pkcs12_data': self._cert, 'pkcs12_password': ''} if self._cert else {}
+ 
+-    def _handle_response(self, response: Response) -> dict:
++    def _handle_response(self, response: Any) -> dict:
+         if response.status_code != 200:
+             raise NuRequestException(response)
+ 
+         return response.json()
+ 
+-    def raw_get(self, url: str) -> Response:
++    def raw_get(self, url: str):
+         return get(url, headers=self._headers, **self._cert_args)
+ 
+-    def raw_post(self, url: str, json: dict) -> Response:
++    def raw_post(self, url: str, json: dict):
+         return post(url, json=json, headers=self._headers, **self._cert_args)
+ 
+     def get(self, url: str) -> dict:
+         return self._handle_response(self.raw_get(url))
+ 
+     def post(self, url: str, json: dict) -> dict:
+-        return self._handle_response(post(url, json=json, headers=self._headers, **self._cert_args))
++        return self._handle_response(self.raw_post(url, json))

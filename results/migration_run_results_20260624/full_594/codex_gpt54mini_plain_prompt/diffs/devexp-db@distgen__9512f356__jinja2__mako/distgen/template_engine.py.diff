@@ -1,0 +1,333 @@
+diff --git /dev/null b/distgen/template_engine.py
+new file mode 100644
+index 0000000..2546654
+--- /dev/null
++++ b/distgen/template_engine.py
+@@ -0,0 +1,327 @@
++"""Mako template helpers and a compatibility layer for legacy templates."""
++
++from __future__ import annotations
++
++import re
++
++from mako.exceptions import TemplateLookupException
++from mako.lookup import TemplateLookup
++from mako.template import Template
++
++
++class _UndefinedValue:
++    """Falsey placeholder used for missing template values."""
++
++    def __bool__(self):
++        return False
++
++    def __len__(self):
++        return 0
++
++    def __iter__(self):
++        return iter(())
++
++    def __getattr__(self, name):
++        return self
++
++    def __getitem__(self, key):
++        return self
++
++    def __call__(self, *args, **kwargs):
++        return self
++
++    def __str__(self):
++        return ""
++
++    def __repr__(self):
++        return "Undefined"
++
++
++UNDEFINED = _UndefinedValue()
++
++
++class TemplateData(dict):
++    """Dictionary wrapper that also exposes keys as attributes."""
++
++    def __getattr__(self, name):
++        if name in self:
++            return wrap_value(dict.__getitem__(self, name))
++        return UNDEFINED
++
++    def __getitem__(self, key):
++        return wrap_value(dict.__getitem__(self, key))
++
++    def get(self, key, default=None):
++        if key in self:
++            return wrap_value(dict.__getitem__(self, key))
++        return default
++
++
++def wrap_value(value):
++    """Recursively wrap dictionaries so Mako templates can use dot access."""
++    if isinstance(value, TemplateData):
++        return value
++    if isinstance(value, dict):
++        return TemplateData({k: wrap_value(v) for k, v in value.items()})
++    if isinstance(value, list):
++        return [wrap_value(v) for v in value]
++    if isinstance(value, tuple):
++        return tuple(wrap_value(v) for v in value)
++    return value
++
++
++def defined_path(root, path=None):
++    """Return True when a dotted path exists on the wrapped template object."""
++    current = root
++    if current is UNDEFINED:
++        return False
++    if not path:
++        return current is not UNDEFINED
++
++    for part in path.split('.'):
++        if current is UNDEFINED:
++            return False
++        if isinstance(current, TemplateData):
++            if part not in current:
++                return False
++            current = dict.__getitem__(current, part)
++        elif isinstance(current, dict):
++            if part not in current:
++                return False
++            current = current[part]
++        else:
++            if not hasattr(current, part):
++                return False
++            current = getattr(current, part)
++    return current is not UNDEFINED
++
++
++def _split_top_level(expr, delimiter='|'):
++    parts = []
++    buf = []
++    depth = 0
++    quote = None
++    escape = False
++
++    for ch in expr:
++        if escape:
++            buf.append(ch)
++            escape = False
++            continue
++        if quote:
++            buf.append(ch)
++            if ch == '\\':
++                escape = True
++            elif ch == quote:
++                quote = None
++            continue
++        if ch in ('"', "'"):
++            buf.append(ch)
++            quote = ch
++            continue
++        if ch in '([{':
++            depth += 1
++        elif ch in ')]}':
++            depth = max(0, depth - 1)
++        elif ch == delimiter and depth == 0:
++            parts.append(''.join(buf).strip())
++            buf = []
++            continue
++        buf.append(ch)
++
++    parts.append(''.join(buf).strip())
++    return parts
++
++
++def _translate_filters(expr):
++    parts = _split_top_level(expr)
++    base = parts[0]
++    for filt in parts[1:]:
++        if filt == 'dictsort':
++            base = f"sorted({base}.items())"
++            continue
++        if filt.startswith('join(') and filt.endswith(')'):
++            arg = filt[len('join('):-1].strip()
++            base = f"{arg}.join({base})"
++            continue
++        if filt.startswith('replace(') and filt.endswith(')'):
++            arg = filt[len('replace('):-1].strip()
++            base = f"{base}.replace({arg})"
++            continue
++        base = f"{base} | {filt}"
++    return base
++
++
++_DEFINED_TEST_RE = re.compile(
++    r'(?P<expr>[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s+is\s+defined'
++)
++
++
++def _translate_defined_tests(expr):
++    def repl(match):
++        path = match.group('expr').split('.')
++        root = path[0]
++        rest = '.'.join(path[1:])
++        if rest:
++            return f"defined_path({root}, '{rest}')"
++        return f"defined_path({root})"
++
++    return _DEFINED_TEST_RE.sub(repl, expr)
++
++
++def translate_expression(expr):
++    expr = _translate_defined_tests(expr.strip())
++    return _translate_filters(expr)
++
++
++def _mako_attr(expr):
++    expr = expr.strip()
++    if (expr.startswith('"') and expr.endswith('"')) or \
++       (expr.startswith("'") and expr.endswith("'")):
++        return expr[1:-1]
++    return f"${{{expr}}}"
++
++
++def translate_statement(statement):
++    statement = statement.strip()
++    statement = _translate_defined_tests(statement)
++
++    if statement.startswith('extends '):
++        return f'<%inherit file="{_mako_attr(statement[len("extends "):])}"/>'
++
++    if statement.startswith('import '):
++        m = re.match(
++            r'import\s+(?P<path>.+?)\s+as\s+(?P<name>[A-Za-z_]\w*)(?:\s+with\s+context)?$',
++            statement,
++        )
++        if m:
++            return (
++                f'<%namespace name="{m.group("name")}" '
++                f'file="{_mako_attr(m.group("path"))}"/>'
++            )
++
++    if statement.startswith('macro '):
++        return f'<%def name="{statement[len("macro "):].strip()}">'
++
++    if statement == 'endmacro':
++        return '</%def>'
++
++    if statement.startswith('block '):
++        return f'<%block name="{statement[len("block "):].strip()}">'
++
++    if statement == 'endblock':
++        return '</%block>'
++
++    if statement.startswith('if '):
++        return f'% if {statement[len("if "):]}:'
++
++    if statement.startswith('elif '):
++        return f'% elif {statement[len("elif "):]}:'
++
++    if statement == 'else':
++        return '% else:'
++
++    if statement == 'endif':
++        return '% endif'
++
++    if statement.startswith('for '):
++        return f'% for {statement[len("for "):]}:'
++
++    if statement == 'endfor':
++        return '% endfor'
++
++    if statement.startswith('set '):
++        return f'% {statement[len("set "):]}'
++
++    return statement
++
++
++_TAG_RE = re.compile(r'(\{\{[-]?.*?[-]?\}\}|\{%-?.*?-?%\})', re.DOTALL)
++
++
++def translate_template_text(text, trim_whitespace=True):
++    """Translate a legacy template snippet into Mako syntax."""
++    out = []
++    last = 0
++    strip_next_ws = False
++
++    for match in _TAG_RE.finditer(text):
++        chunk = text[last:match.start()]
++        if strip_next_ws:
++            chunk = chunk.lstrip()
++            strip_next_ws = False
++        out.append(chunk)
++        token = match.group(0)
++
++        if token.startswith('{{'):
++            expr = token[2:-2]
++            if trim_whitespace and expr.startswith('-'):
++                expr = expr[1:]
++                if out:
++                    out[-1] = out[-1].rstrip()
++            if trim_whitespace and expr.endswith('-'):
++                expr = expr[:-1]
++                strip_next_ws = True
++            out.append('${' + translate_expression(expr) + '}')
++        else:
++            stmt = token[2:-2]
++            if trim_whitespace and stmt.startswith('-'):
++                stmt = stmt[1:]
++                if out:
++                    out[-1] = out[-1].rstrip()
++            if trim_whitespace and stmt.endswith('-'):
++                stmt = stmt[:-1]
++                strip_next_ws = True
++            out.append(translate_statement(stmt))
++
++        last = match.end()
++
++    tail = text[last:]
++    if strip_next_ws:
++        tail = tail.lstrip()
++    out.append(tail)
++    return ''.join(out)
++
++
++class MakoTemplateEnvironment:
++    """Small adapter that mimics the subset of templating used by distgen."""
++
++    def __init__(self, template_dirs, **template_kwargs):
++        self.keep_block_whitespaces = bool(
++            template_kwargs.pop('keep_block_whitespaces', False)
++        )
++        self.lookup = TemplateLookup(
++            directories=template_dirs,
++            **template_kwargs,
++        )
++
++    @staticmethod
++    def is_template_text(template):
++        return bool(_TAG_RE.search(template) or '${' in template)
++
++    def render_text(self, template, **kwargs):
++        return Template(
++            translate_template_text(
++                template,
++                trim_whitespace=not self.keep_block_whitespaces,
++            ),
++            lookup=self.lookup,
++        ).render(**kwargs)
++
++    def get_template(self, template):
++        if isinstance(template, str) and self.is_template_text(template):
++            return Template(
++                translate_template_text(
++                    template,
++                    trim_whitespace=not self.keep_block_whitespaces,
++                ),
++                lookup=self.lookup,
++            )
++
++        try:
++            return self.lookup.get_template(template)
++        except TemplateLookupException:
++            return Template(
++                filename=template,
++                lookup=self.lookup,
++            )

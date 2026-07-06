@@ -1,0 +1,182 @@
+diff --git a/wikipediaapi/__init__.py b/wikipediaapi/__init__.py
+index 5522182..49ec73c 100644
+--- a/wikipediaapi/__init__.py
++++ b/wikipediaapi/__init__.py
+@@ -8,14 +8,20 @@ cases.
+ 
+ __version__ = (0, 7, 1)
+ 
++import io
++import json
+ from collections import defaultdict
+ from enum import IntEnum
+ import logging
+ import re
+ from typing import Any, Optional, Union
+ from urllib import parse
++from urllib import error, request
+ 
+-import requests
++try:
++    import pycurl
++except ImportError:  # pragma: no cover - fallback for environments without pycurl
++    pycurl = None
+ 
+ USER_AGENT = (
+     "Wikipedia-API/"
+@@ -30,6 +36,17 @@ log = logging.getLogger(__name__)
+ PagesDict = dict[str, "WikipediaPage"]
+ 
+ 
++class _SessionCompat:
++    """Minimal session-like object kept for compatibility with old tests."""
++
++    def __init__(self, headers: dict[str, Any]) -> None:
++        self.headers = headers
++
++    def close(self) -> None:
++        """Matches the small session API used by __del__."""
++        return None
++
++
+ class ExtractFormat(IntEnum):
+     """Represents extraction format."""
+ 
+@@ -140,7 +157,7 @@ class Wikipedia:
+         """
+         Constructs Wikipedia object for extracting information Wikipedia.
+ 
+-        :param user_agent: HTTP User-Agent used in requests
++        :param user_agent: HTTP User-Agent used by the client
+                 https://meta.wikimedia.org/wiki/User-Agent_policy
+         :param language: Language mutation of Wikipedia -
+                 http://meta.wikimedia.org/wiki/List_of_Wikipedias
+@@ -148,7 +165,7 @@ class Wikipedia:
+                 :class:`ExtractFormat` object.
+         :param headers:  Headers sent as part of HTTP request
+         :param kwargs: Optional parameters used in -
+-                http://docs.python-requests.org/en/master/api/#requests.request
++                https://curl.se/libcurl/c/
+ 
+         Examples:
+ 
+@@ -188,8 +205,7 @@ class Wikipedia:
+             self.extract_format,
+         )
+ 
+-        self._session = requests.Session()
+-        self._session.headers.update(default_headers)
++        self._session = _SessionCompat(default_headers)
+         self._request_kwargs = kwargs
+ 
+     def __del__(self) -> None:
+@@ -520,14 +536,101 @@ class Wikipedia:
+     def _query(self, page: "WikipediaPage", params: dict[str, Any]):
+         """Queries Wikimedia API to fetch content."""
+         base_url = "https://" + page.language + ".wikipedia.org/w/api.php"
+-        log.info(
+-            "Request URL: %s",
+-            base_url + "?" + "&".join([k + "=" + str(v) for k, v in params.items()]),
+-        )
+-        params["format"] = "json"
+-        params["redirects"] = 1
+-        r = self._session.get(base_url, params=params, **self._request_kwargs)
+-        return r.json()
++        request_params = dict(params)
++        request_params["format"] = "json"
++        request_params["redirects"] = 1
++        query = parse.urlencode(request_params, doseq=True)
++        url = base_url + "?" + query
++        log.info("Request URL: %s", url)
++
++        if pycurl is not None:
++            return self._query_pycurl(url)
++
++        return self._query_urllib(url)
++
++    def _query_pycurl(self, url: str) -> dict[str, Any]:
++        """Executes a GET request using pycurl."""
++        buffer = io.BytesIO()
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.WRITEDATA, buffer)
++            curl.setopt(pycurl.FOLLOWLOCATION, 1)
++            curl.setopt(pycurl.MAXREDIRS, 10)
++            curl.setopt(pycurl.HTTPGET, 1)
++            curl.setopt(pycurl.ACCEPT_ENCODING, "")
++
++            header_lines = [f"{k}: {v}" for k, v in self._session.headers.items()]
++            if header_lines:
++                curl.setopt(pycurl.HTTPHEADER, header_lines)
++
++            timeout = self._request_kwargs.get("timeout")
++            if timeout is not None:
++                curl.setopt(pycurl.TIMEOUT_MS, int(float(timeout) * 1000))
++
++            if not self._request_kwargs.get("verify", True):
++                curl.setopt(pycurl.SSL_VERIFYPEER, 0)
++                curl.setopt(pycurl.SSL_VERIFYHOST, 0)
++
++            proxies = self._request_kwargs.get("proxies")
++            if proxies:
++                self._configure_proxy(curl, proxies)
++
++            curl.perform()
++            body = buffer.getvalue().decode("utf-8")
++            return json.loads(body)
++        finally:
++            curl.close()
++
++    def _configure_proxy(self, curl, proxies: dict[str, str]) -> None:
++        """Applies proxy settings from HTTP client kwargs."""
++        proxy_url = proxies.get("https") or proxies.get("http")
++        if not proxy_url:
++            return
++
++        parsed = parse.urlparse(proxy_url)
++        proxy_host = parsed.hostname or parsed.path
++        if not proxy_host:
++            return
++        if parsed.port is not None:
++            proxy_host = f"{proxy_host}:{parsed.port}"
++
++        curl.setopt(pycurl.PROXY, proxy_host)
++
++        if parsed.username or parsed.password:
++            curl.setopt(
++                pycurl.PROXYUSERPWD,
++                f"{parsed.username or ''}:{parsed.password or ''}",
++            )
++
++        if parsed.scheme in {"http", "https", ""}:
++            curl.setopt(pycurl.PROXYTYPE, pycurl.PROXYTYPE_HTTP)
++            curl.setopt(pycurl.HTTPPROXYTUNNEL, 1)
++        elif parsed.scheme == "socks5":
++            curl.setopt(pycurl.PROXYTYPE, pycurl.PROXYTYPE_SOCKS5)
++        elif parsed.scheme == "socks4":
++            curl.setopt(pycurl.PROXYTYPE, pycurl.PROXYTYPE_SOCKS4)
++
++    def _query_urllib(self, url: str) -> dict[str, Any]:
++        """Fallback GET implementation used when pycurl is unavailable."""
++        headers = dict(self._session.headers)
++        req = request.Request(url, headers=headers, method="GET")
++        timeout = self._request_kwargs.get("timeout")
++        proxies = self._request_kwargs.get("proxies")
++
++        handlers = []
++        if proxies:
++            handlers.append(request.ProxyHandler(proxies))
++
++        opener = request.build_opener(*handlers)
++        try:
++            with opener.open(req, timeout=timeout) as resp:
++                encoding = resp.headers.get_content_charset() or "utf-8"
++                body = resp.read().decode(encoding)
++        except error.URLError as exc:  # pragma: no cover - network failure path
++            raise exc
++
++        return json.loads(body)
+ 
+     def _build_extracts(self, extract, page: "WikipediaPage") -> str:
+         """Constructs summary of given page."""

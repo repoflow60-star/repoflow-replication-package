@@ -1,0 +1,225 @@
+--- a/certbot_dns_infomaniak/dns_infomaniak.py
++++ b/certbot_dns_infomaniak/dns_infomaniak.py
+@@ -5,9 +5,11 @@
+ """DNS Authenticator for Infomaniak"""
+ import json
+ import logging
++from io import BytesIO
++from urllib.parse import urlencode, urlsplit
++
+ import idna
+-
+-import requests
++import pycurl
+ 
+ from certbot import errors
+ from certbot.plugins import dns_common
+@@ -86,8 +88,106 @@
+         :param str token: oauth2 token to consume Infomaniak API
+         """
+         self.token = token
+-        self.session = requests.Session()
++        self.session = _SessionCompatibility()
+         self.session.headers.update({"Authorization": "Bearer {token}".format(token=self.token)})
++
++    def _request_via_adapter(self, adapter, method, url, payload=None):
++        headers = dict(self.session.headers)
++        body = None
++
++        if payload is not None:
++            if method == "GET":
++                separator = "&" if "?" in url else "?"
++                url = "{url}{sep}{query}".format(
++                    url=url,
++                    sep=separator,
++                    query=urlencode(payload, doseq=True),
++                )
++            elif method == "POST":
++                headers["Content-Type"] = "application/json"
++                body = json.dumps(payload)
++
++        logger.debug("%s %s", method, url)
++        request = _AdapterRequest(method, url, headers=headers, body=body)
++        response = adapter.send(request, stream=False, timeout=None, verify=True, cert=None, proxies=None)
++        content = getattr(response, "content", None)
++        if content is None:
++            content = getattr(response, "text", "").encode("utf-8")
++        elif isinstance(content, str):
++            content = content.encode("utf-8")
++        try:
++            result = json.loads(content.decode("utf-8"))
++        except json.decoder.JSONDecodeError as exc:
++            raise errors.PluginError("no JSON in API response") from exc
++
++        return self._handle_result(result)
++
++    def _request_via_pycurl(self, method, url, payload=None):
++        full_url = url
++        if payload is not None and method == "GET":
++            separator = "&" if "?" in full_url else "?"
++            full_url = "{url}{sep}{query}".format(
++                url=full_url,
++                sep=separator,
++                query=urlencode(payload, doseq=True),
++            )
++
++        logger.debug("%s %s", method, full_url)
++
++        response = BytesIO()
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, full_url)
++            curl.setopt(pycurl.WRITEDATA, response)
++            curl.setopt(pycurl.NOSIGNAL, 1)
++            curl.setopt(
++                pycurl.HTTPHEADER,
++                [
++                    "Authorization: Bearer {token}".format(token=self.token),
++                ],
++            )
++
++            if method == "POST":
++                curl.setopt(pycurl.POSTFIELDS, json.dumps(payload))
++                curl.setopt(
++                    pycurl.HTTPHEADER,
++                    [
++                        "Authorization: Bearer {token}".format(token=self.token),
++                        "Content-Type: application/json",
++                    ],
++                )
++            elif method == "DELETE":
++                curl.setopt(pycurl.CUSTOMREQUEST, "DELETE")
++
++            curl.perform()
++        finally:
++            curl.close()
++
++        try:
++            result = json.loads(response.getvalue().decode("utf-8"))
++        except json.decoder.JSONDecodeError as exc:
++            raise errors.PluginError("no JSON in API response") from exc
++
++        return self._handle_result(result)
++
++    def _handle_result(self, result):
++        if result["result"] == "success":
++            return result["data"]
++        if result["error"]["code"] == "not_authorized":
++            raise errors.PluginError("cannot authenticate")
++        raise errors.PluginError(
++            "error in API request: {} / {}".format(
++                result["error"]["code"], result["error"]["description"]
++            )
++        )
++
++    def _request(self, method, url, payload=None):
++        full_url = self.baseUrl + url
++        scheme = urlsplit(full_url).scheme
++        adapter = self.session.adapter_for(full_url)
++        if adapter is not None and scheme not in ("http", "https"):
++            return self._request_via_adapter(adapter, method, full_url, payload)
++        return self._request_via_pycurl(method, full_url, payload)
+ 
+     def _get_request(self, url, payload=None):
+         """Performs a GET request against API
+@@ -95,22 +195,7 @@
+         :param str url: relative url
+         :param dict payload : body of request
+         """
+-        url = self.baseUrl + url
+-        logger.debug("GET %s", url)
+-        with self.session.get(url, params=payload) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            if result["error"]["code"] == "not_authorized":
+-                raise errors.PluginError("cannot authenticate")
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++        return self._request("GET", url, payload)
+ 
+     def _post_request(self, url, payload):
+         """Performs a POST request
+@@ -118,42 +203,14 @@
+         :param str url: relative url
+         :param dict payload : body of request
+         """
+-        url = self.baseUrl + url
+-        headers = {"Content-Type": "application/json"}
+-        json_data = json.dumps(payload)
+-        logger.debug("POST %s", url)
+-        with self.session.post(url, data=json_data, headers=headers) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++        return self._request("POST", url, payload)
+ 
+     def _delete_request(self, url):
+         """Performs a POST request
+ 
+         :param str url: relative url
+         """
+-        url = self.baseUrl + url
+-        logger.debug("DELETE %s", url)
+-        with self.session.delete(url) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++        return self._request("DELETE", url)
+ 
+     def _get_records(self, domain, domain_id, record):
+         """Find record matching arguments
+@@ -247,3 +304,31 @@
+ 
+         self._delete_request("/1/domain/{domain_id}/dns/record/{record_id}".format(
+             domain_id=domain_id, record_id=record_id))
++
++
++class _AdapterRequest:
++    def __init__(self, method, url, headers=None, body=None):
++        self.method = method
++        self.url = url
++        self.headers = headers or {}
++        self.body = body
++        parsed = urlsplit(url)
++        self.scheme = parsed.scheme
++        self.hostname = parsed.hostname
++        self.netloc = parsed.netloc
++        self.path_url = parsed.path or "/"
++        if parsed.query:
++            self.path_url = "{path}?{query}".format(path=self.path_url, query=parsed.query)
++
++
++class _SessionCompatibility:
++    def __init__(self):
++        self.headers = {}
++        self._adapters = {}
++
++    def mount(self, prefix, adapter):
++        self._adapters[prefix] = adapter
++
++    def adapter_for(self, url):
++        scheme = urlsplit(url).scheme
++        return self._adapters.get(scheme)

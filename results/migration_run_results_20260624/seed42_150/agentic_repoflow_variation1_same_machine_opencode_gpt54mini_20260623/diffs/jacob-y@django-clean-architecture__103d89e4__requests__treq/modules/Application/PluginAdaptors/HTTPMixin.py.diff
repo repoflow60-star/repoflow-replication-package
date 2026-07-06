@@ -1,0 +1,119 @@
+--- a/modules/Application/PluginAdaptors/HTTPMixin.py
++++ b/modules/Application/PluginAdaptors/HTTPMixin.py
+@@ -1,6 +1,21 @@
+-import requests
+-from requests.exceptions import RequestException
++import asyncio
++import base64
++import json
+ from abc import ABC, abstractmethod
++from urllib.parse import urlencode
++
++import treq
++from twisted.internet import asyncioreactor
++
++
++_EVENT_LOOP = asyncio.new_event_loop()
++asyncio.set_event_loop(_EVENT_LOOP)
++try:
++    asyncioreactor.install(_EVENT_LOOP)
++except Exception:
++    pass
++finally:
++    asyncio.set_event_loop(None)
+ 
+ 
+ class HTTPMixin(ABC):
+@@ -9,35 +24,73 @@
+     """
+ 
+     def send(self) -> dict:
++        return _EVENT_LOOP.run_until_complete(self._send_async())
++
++    async def _send_async(self) -> dict:
+         match self._method():
+             case 'GET':
+-                return self._get()
++                return await self._get()
+             case 'POST':
+-                return self._post()
++                return await self._post()
+             case _:
+                 raise Exception(f'Unsupported HTTP method {self._method()}')
+ 
+-    def _get(self) -> dict:
+-        return self._process_response(requests.get(self._endpoint(), headers=self._headers(), auth=self._auth()))
++    async def _get(self) -> dict:
++        endpoint = self._endpoint()
++        try:
++            response = await self._deferred_to_future(treq.get(endpoint, headers=self._request_headers()))
++        except Exception as exc:
++            raise Exception(f'Connection failed while calling {endpoint}') from exc
++        return await self._process_response(endpoint, response)
+ 
+-    def _post(self) -> dict:
++    async def _post(self) -> dict:
++        endpoint = self._endpoint()
++        data = self._data()
+         if self._is_form_encoded():
+-            headers = self._headers()
+-            headers['Content-Type'] = 'application/x-www-form-urlencoded'
+-            return self._process_response(
+-                requests.post(self._endpoint(), data=self._data(), headers=self._headers(), auth=self._auth()))
+-        return self._process_response(
+-            requests.post(self._endpoint(), json=self._data(), headers=self._headers(), auth=self._auth()))
++            body = self._encode_form(data)
++            headers = self._request_headers(content_type='application/x-www-form-urlencoded')
++        else:
++            body = self._encode_json(data)
++            headers = self._request_headers(content_type='application/json')
++
++        try:
++            response = await self._deferred_to_future(treq.post(endpoint, data=body, headers=headers))
++        except Exception as exc:
++            raise Exception(f'Connection failed while calling {endpoint}') from exc
++        return await self._process_response(endpoint, response)
+ 
+     @staticmethod
+-    def _process_response(response: requests.Response) -> dict:
+-        try:
+-            if 200 <= response.status_code < 500:
+-                return response.json()
+-            else:
+-                raise Exception(f"HTTP {response.status_code} error while calling {response.url}")
+-        except RequestException:
+-            raise Exception(f"Connection failed while calling {response.url}")
++    async def _process_response(endpoint: str, response) -> dict:
++        if 200 <= response.code < 500:
++            return await HTTPMixin._deferred_to_future(treq.json_content(response))
++        raise Exception(f'HTTP {response.code} error while calling {endpoint}')
++
++    def _request_headers(self, content_type: str | None = None) -> dict:
++        headers = dict(self._headers())
++        auth = self._auth()
++        if auth is not None:
++            headers['Authorization'] = self._basic_auth_header(auth)
++        if content_type is not None:
++            if content_type == 'application/x-www-form-urlencoded' or 'Content-Type' not in headers:
++                headers['Content-Type'] = content_type
++        return headers
++
++    @staticmethod
++    def _basic_auth_header(auth: tuple[str, str]) -> str:
++        encoded = base64.b64encode(f'{auth[0]}:{auth[1]}'.encode()).decode()
++        return f'Basic {encoded}'
++
++    @staticmethod
++    def _encode_form(data: dict) -> bytes:
++        return urlencode(data).encode()
++
++    @staticmethod
++    def _encode_json(data: dict) -> bytes:
++        return json.dumps(data).encode()
++
++    @staticmethod
++    def _deferred_to_future(deferred):
++        return deferred.asFuture(asyncio.get_running_loop())
+ 
+     @abstractmethod
+     def _method(self) -> str:

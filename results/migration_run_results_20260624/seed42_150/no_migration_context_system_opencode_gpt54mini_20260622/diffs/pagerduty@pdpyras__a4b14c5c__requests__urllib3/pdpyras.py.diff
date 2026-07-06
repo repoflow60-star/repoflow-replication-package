@@ -1,0 +1,420 @@
+--- a/pdpyras.py
++++ b/pdpyras.py
+@@ -3,24 +3,98 @@
+ # See LICENSE for details.
+ 
+ # Standard libraries
++import json
+ import logging
+ import sys
+ import time
+ from copy import deepcopy
+-from datetime import datetime
++from datetime import datetime, timedelta
+ from random import random
++from types import SimpleNamespace
+ from typing import Iterator, Union
+ from warnings import warn
++from urllib.parse import urlencode, urlsplit, urlunsplit
+ 
+ # Upstream components on which this client is based:
+-from requests import Response, Session
+-from requests import __version__ as REQUESTS_VERSION
++import urllib3
++from urllib3 import __version__ as URLLIB3_VERSION
+ 
+ # HTTP client exceptions:
+ from urllib3.exceptions import HTTPError, PoolError
+-from requests.exceptions import RequestException
+ 
+ __version__ = '5.4.0'
++
++
++class PDResponse:
++    """Response adapter for urllib3 responses."""
++
++    def __init__(self, response, method, url, elapsed_seconds,
++            request_headers=None, request_body=None):
++        self._response = response
++        self.request = SimpleNamespace(
++            method=method,
++            url=url,
++            headers=request_headers or {},
++            body=request_body,
++        )
++        self.elapsed = timedelta(seconds=elapsed_seconds)
++
++    def __getattr__(self, name):
++        return getattr(self._response, name)
++
++    def __bool__(self):
++        return self.ok
++
++    def __repr__(self):
++        return f"<Response [{self.status_code}]>"
++
++    @property
++    def status_code(self):
++        return self._response.status
++
++    @property
++    def ok(self):
++        return bool(self.status_code) and self.status_code < 400
++
++    @property
++    def headers(self):
++        return self._response.headers
++
++    @property
++    def text(self):
++        body = self.data
++        if not body:
++            return ''
++        return body.decode('utf-8', errors='replace')
++
++    @property
++    def content(self):
++        return self.data
++
++    @property
++    def url(self):
++        geturl = getattr(self._response, 'geturl', None)
++        if callable(geturl):
++            return geturl()
++        return self.request.url
++
++    @property
++    def raw(self):
++        return self._response
++
++    @property
++    def data(self):
++        return self._response.data or b''
++
++    def json(self):
++        return json.loads(self.text)
++
++    def raise_for_status(self):
++        if not self.ok:
++            raise PDHTTPError(http_error_message(self), self)
++
++
++Response = PDResponse
+ 
+ #######################
+ ### CLIENT DEFAULTS ###
+@@ -624,7 +698,7 @@
+     Makes methods return the full response body object after decoding from JSON.
+ 
+     Intended for use on functions that take a URL positional argument followed
+-    by keyword arguments and return a `requests.Response`_ object.
++    by keyword arguments and return a response object.
+     """
+     doc = method.__doc__
+     def call(self, url, **kw):
+@@ -680,7 +754,7 @@
+     the ``json`` keyword argument will be normalized to include the wrapper.
+ 
+     Methods using this decorator will raise a :class:`PDHTTPError` with its
+-    ``response`` property being being the `requests.Response`_ object in the
++    ``response`` property being being the response object in the
+     case of any error (as of version 4.2 this is subclassed as
+     :class:`PDHTTPError`), so that the implementer can access it by catching the
+     exception, and thus design their own custom logic around different types of
+@@ -688,8 +762,8 @@
+ 
+     :param method: Method being decorated. Must take one positional argument
+         after ``self`` that is the URL/path to the resource, followed by keyword
+-        any number of keyword arguments, and must return an object of class
+-        `requests.Response`_, and be named after the HTTP method but with "r"
++        any number of keyword arguments, and must return a response object, and
++        be named after the HTTP method but with "r"
+         prepended.
+     :returns: A callable object; the reformed method
+     """
+@@ -862,11 +936,11 @@
+ ### CLASSES ###
+ ###############
+ 
+-class PDSession(Session):
++class PDSession:
+     """
+     Base class for making HTTP requests to PagerDuty APIs
+ 
+-    This is an opinionated wrapper of `requests.Session`_, with a few additional
++    This is an opinionated wrapper of urllib3.PoolManager, with a few additional
+     features:
+ 
+     - The client will reattempt the request with auto-increasing cooldown/retry
+@@ -911,7 +985,7 @@
+     """
+ 
+     parent = None
+-    """The ``super`` object (`requests.Session`_)"""
++    """The underlying urllib3 connection manager."""
+ 
+     permitted_methods = ()
+     """
+@@ -937,7 +1011,7 @@
+       encountered first), and then return the final response.
+ 
+     The default behavior is to retry without limit on status 429, raise an
+-    exception on a 401, and return the `requests.Response`_ object in any other case
++    exception on a 401, and return the response object in any other case
+     (assuming a HTTP response was received from the server).
+     """
+ 
+@@ -959,19 +1033,33 @@
+ 
+     timeout = TIMEOUT
+     """
+-    This is the value sent to `Requests`_ as the ``timeout`` parameter that
++    This is the value sent to urllib3 as the ``timeout`` parameter that
+     determines the TCP read timeout.
+     """
+ 
+     url = ""
+ 
+     def __init__(self, api_key: str, debug=False):
+-        self.parent = super(PDSession, self)
+-        self.parent.__init__()
++        self.parent = urllib3.PoolManager()
++        self.headers = {}
+         self.api_key = api_key
+         self.log = logging.getLogger(__name__)
+         self.print_debug = debug
+         self.retry = {}
++
++    def close(self):
++        clear = getattr(self.parent, 'clear', None)
++        if callable(clear):
++            clear()
++        elif hasattr(self.parent, 'pools'):
++            self.parent.pools.clear()
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc, tb):
++        self.close()
++        return False
+ 
+     def after_set_api_key(self):
+         """
+@@ -997,6 +1085,15 @@
+         self._api_key = api_key
+         self.headers.update(self.auth_header)
+         self.after_set_api_key()
++
++    @property
++    def user_agent(self) -> str:
++        return 'pdpyras/%s python-urllib3/%s Python/%d.%d'%(
++            __version__,
++            URLLIB3_VERSION,
++            sys.version_info.major,
++            sys.version_info.minor
++        )
+ 
+     @property
+     def auth_header(self) -> dict:
+@@ -1100,11 +1197,11 @@
+             The path/URL to request. If it does not start with the base URL, the
+             base URL will be prepended.
+         :param **kwargs:
+-            Custom keyword arguments to pass to ``requests.Session.request``.
++            Custom keyword arguments to pass to ``urllib3.PoolManager.request``.
+         :type method: str
+         :type url: str
+         :returns:
+-            The `requests.Response`_ object corresponding to the HTTP response
++            The response object corresponding to the HTTP response
+         """
+         sleep_timer = self.sleep_timer
+         network_attempts = 0
+@@ -1114,28 +1211,68 @@
+             m_str = ', '.join(self.permitted_methods)
+             raise PDClientError(f"Method {method} not supported by this API. " \
+                 f"Permitted methods: {m_str}")
+-        req_kw = deepcopy(kwargs)
+         full_url = self.normalize_url(url)
+         endpoint = "%s %s"%(method.upper(), full_url)
+ 
+         # Add in any headers specified in keyword arguments:
+         headers = kwargs.get('headers', {})
++        req_headers = self.prepare_headers(method, user_headers=headers)
++        req_kw = deepcopy(kwargs)
+         req_kw.update({
+-            'headers': self.prepare_headers(method, user_headers=headers),
+-            'stream': False,
+-            'timeout': self.timeout
++            'headers': req_headers,
++            'timeout': self.timeout,
++            'preload_content': True,
++            'retries': False,
+         })
+ 
+         # Special changes to user-supplied parameters, for convenience
+-        if 'params' in kwargs and kwargs['params']:
+-            req_kw['params'] = self.normalize_params(kwargs['params'])
++        if 'allow_redirects' in req_kw:
++            req_kw['redirect'] = req_kw.pop('allow_redirects')
++        params = req_kw.pop('params', None)
++        if params:
++            params = self.normalize_params(params)
++            query = urlencode(params, doseq=True)
++            if query:
++                parts = list(urlsplit(full_url))
++                parts[3] = '&'.join(filter(None, [parts[3], query]))
++                full_url = urlunsplit(parts)
++        data_body = req_kw.pop('data', None)
++        json_body = req_kw.pop('json', None)
++        if json_body is not None:
++            req_kw['body'] = json.dumps(json_body).encode('utf-8')
++            req_kw['headers'].setdefault('Content-Type', 'application/json')
++        elif data_body is not None:
++            if hasattr(data_body, 'items') or isinstance(data_body, (list, tuple)):
++                req_kw['body'] = urlencode(data_body, doseq=True).encode('utf-8')
++                req_kw['headers'].setdefault(
++                    'Content-Type',
++                    'application/x-www-form-urlencoded',
++                )
++            elif isinstance(data_body, str):
++                req_kw['body'] = data_body.encode('utf-8')
++            else:
++                req_kw['body'] = data_body
++        req_kw.pop('stream', None)
+ 
+         # Make the request (and repeat w/cooldown if the rate limit is reached):
+         while True:
+             try:
+-                response = self.parent.request(method, full_url, **req_kw)
++                start = time.monotonic()
++                raw_response = self.parent.request(method, full_url, **req_kw)
++                elapsed = time.monotonic() - start
++                if not hasattr(raw_response, 'status_code'):
++                    response = PDResponse(
++                        raw_response,
++                        method,
++                        full_url,
++                        elapsed,
++                        request_headers=req_headers,
++                        request_body=req_kw.get('body'),
++                    )
++                else:
++                    response = raw_response
+                 self.postprocess(response)
+-            except (HTTPError, PoolError, RequestException) as e:
++            except (HTTPError, PoolError) as e:
+                 network_attempts += 1
+                 if network_attempts > self.max_network_attempts:
+                     error_msg = f"{endpoint}: Non-transient network " \
+@@ -1189,6 +1326,20 @@
+                 # All went according to plan.
+                 return response
+ 
++    def delete(self, url, **kwargs):
++        return self.request('DELETE', url, **kwargs)
++
++    def get(self, url, **kwargs):
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, **kwargs):
++        kwargs.setdefault('data', None)
++        return self.request('POST', url, **kwargs)
++
++    def put(self, url, **kwargs):
++        kwargs.setdefault('data', None)
++        return self.request('PUT', url, **kwargs)
++
+     @property
+     def stagger_cooldown(self) -> float:
+         """
+@@ -1237,9 +1388,9 @@
+ 
+     @property
+     def user_agent(self) -> str:
+-        return 'pdpyras/%s python-requests/%s Python/%d.%d'%(
++        return 'pdpyras/%s python-urllib3/%s Python/%d.%d'%(
+             __version__,
+-            REQUESTS_VERSION,
++            URLLIB3_VERSION,
+             sys.version_info.major,
+             sys.version_info.minor
+         )
+@@ -1357,7 +1508,7 @@
+ 
+     def post(self, *args, **kw) -> Response:
+         """
+-        Override of ``requests.Session.post``
++        Override of ``urllib3.PoolManager.request``
+ 
+         Adds the ``routing_key`` parameter to the body before sending.
+         """
+@@ -1540,7 +1691,7 @@
+     PagerDuty REST API v2 session object class.
+ 
+     Implements the most generic and oft-implemented aspects of PagerDuty's REST
+-    API v2 as an opinionated wrapper of `requests.Session`_.
++    API v2 as an opinionated wrapper of urllib3.PoolManager.
+ 
+     Inherits from :class:`PDSession`.
+ 
+@@ -2000,11 +2151,11 @@
+         Records performance information / request metadata about the API call.
+ 
+         :param response:
+-            The `requests.Response`_ object returned by the request method
++            The response object returned by the request method
+         :param suffix:
+             Optional suffix to append to the key
+         :type method: str
+-        :type response: `requests.Response`_
++        :type response: response object
+         :type suffix: str or None
+         """
+         method = response.request.method.upper()
+@@ -2058,7 +2209,7 @@
+             representing an API resource that contains an item with key ``self``
+             whose value is the URL of the resource.
+         :param **kw:
+-            Custom keyword arguments to pass to ``requests.Session.delete``
++            Custom keyword arguments to pass to ``urllib3.PoolManager.request``
+         :type resource: str or dict
+         """
+         return self.delete(resource, **kw)
+@@ -2077,7 +2228,7 @@
+             representing an API resource that contains an item with key ``self``
+             whose value is the URL of the resource.
+         :param **kw:
+-            Custom keyword arguments to pass to ``requests.Session.get``
++            Custom keyword arguments to pass to ``urllib3.PoolManager.request``
+         :returns:
+             Dictionary representation of the requested object
+         :type resource: str or dict
+@@ -2095,7 +2246,7 @@
+             The path/URL to which to send the POST request, which should be an
+             index endpoint.
+         :param **kw:
+-            Custom keyword arguments to pass to ``requests.Session.post``
++            Custom keyword arguments to pass to ``urllib3.PoolManager.request``
+         :returns:
+             Dictionary representation of the created object
+         :type path: str
+@@ -2115,7 +2266,7 @@
+             representing an API resource that contains an item with key ``self``
+             whose value is the URL of the resource.
+         :param **kw:
+-            Custom keyword arguments to pass to ``requests.Session.put``
++            Custom keyword arguments to pass to ``urllib3.PoolManager.request``
+         :returns:
+             Dictionary representation of the updated object
+         """
+@@ -2186,7 +2337,7 @@
+ 
+     This class was created to make it easier to more cleanly handle errors by
+     way of a class that is guaranteed to have its ``response`` be a valid
+-    `requests.Response`_ object.
++    response object.
+ 
+     Whereas, the more generic :class:`PDClientError` could also be used
+     to denote such things as non-transient network errors wherein no response

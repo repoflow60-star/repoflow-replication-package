@@ -1,0 +1,152 @@
+diff --git /dev/null b/appstoreserverlibrary/_http.py
+new file mode 100644
+index 0000000..3ad960f
+--- /dev/null
++++ b/appstoreserverlibrary/_http.py
+@@ -0,0 +1,146 @@
++# Copyright (c) 2023 Apple Inc. Licensed under MIT License.
++
++import json
++import threading
++import time
++from typing import Any, Dict, List, Optional, Union
++from urllib.parse import urlencode
++
++try:
++    import treq
++    from twisted.internet import defer, reactor
++    from twisted.internet.threads import blockingCallFromThread
++
++    _HAS_TREQ = True
++except ModuleNotFoundError:
++    treq = None
++    defer = None
++    reactor = None
++    blockingCallFromThread = None
++    _HAS_TREQ = False
++
++try:
++    import requests
++except ModuleNotFoundError:
++    requests = None
++
++
++_reactor_lock = threading.Lock()
++_reactor_started = False
++
++
++class HttpResponse:
++    def __init__(self, status_code: int, headers: Dict[str, str], content: bytes):
++        self.status_code = status_code
++        self.headers = headers
++        self.content = content
++
++    def json(self):
++        return json.loads(self.content.decode("utf-8"))
++
++
++def _to_text(value: Any) -> str:
++    if isinstance(value, bytes):
++        return value.decode("utf-8")
++    return str(value)
++
++
++def _append_query_params(url: str, params: Optional[Dict[str, Union[str, List[str]]]]) -> str:
++    if not params:
++        return url
++
++    query_items = []
++    for key, value in params.items():
++        if isinstance(value, list):
++            for single_value in value:
++                query_items.append((key, single_value))
++        else:
++            query_items.append((key, value))
++
++    query_string = urlencode(query_items, doseq=True)
++    separator = "&" if "?" in url else "?"
++    return url + separator + query_string
++
++
++def _headers_to_dict(raw_headers) -> Dict[str, str]:
++    if raw_headers is None:
++        return {}
++
++    headers: Dict[str, str] = {}
++    try:
++        for name, values in raw_headers.getAllRawHeaders():
++            if not values:
++                continue
++            headers[_to_text(name).lower()] = _to_text(values[0])
++        return headers
++    except Exception:
++        try:
++            return {_to_text(name).lower(): _to_text(value) for name, value in raw_headers.items()}
++        except Exception:
++            return {}
++
++
++def _ensure_reactor_running():
++    global _reactor_started
++
++    if reactor is None or reactor.running:
++        return
++
++    with _reactor_lock:
++        if _reactor_started or reactor.running:
++            return
++
++        thread = threading.Thread(
++            target=reactor.run,
++            kwargs={"installSignalHandlers": False},
++            daemon=True,
++        )
++        thread.start()
++        _reactor_started = True
++
++    while not reactor.running:
++        time.sleep(0.01)
++
++
++def _normalize_body(headers: Dict[str, str], json_body: Optional[Dict[str, Any]], data: Optional[bytes]):
++    if json_body is not None:
++        body = json.dumps(json_body).encode("utf-8")
++        if not any(key.lower() == "content-type" for key in headers):
++            headers = dict(headers)
++            headers["Content-Type"] = "application/json"
++        return headers, body
++
++    return headers, data
++
++
++def perform_request(
++    method: str,
++    url: str,
++    params: Optional[Dict[str, Union[str, List[str]]]] = None,
++    headers: Optional[Dict[str, str]] = None,
++    json_body: Optional[Dict[str, Any]] = None,
++    data: Optional[bytes] = None,
++):
++    headers = dict(headers or {})
++    headers, body = _normalize_body(headers, json_body, data)
++    final_url = _append_query_params(url, params)
++
++    if _HAS_TREQ:
++        _ensure_reactor_running()
++
++        @defer.inlineCallbacks
++        def _run_request():
++            response = yield treq.request(method, final_url, headers=headers, data=body)
++            content = yield treq.content(response)
++            return HttpResponse(
++                getattr(response, "code", getattr(response, "status", 0)),
++                _headers_to_dict(getattr(response, "headers", None)),
++                content,
++            )
++
++        return blockingCallFromThread(reactor, _run_request)
++
++    if requests is None:
++        raise ModuleNotFoundError("treq is not available and requests is not installed")
++
++    return requests.request(method, final_url, headers=headers, data=body)

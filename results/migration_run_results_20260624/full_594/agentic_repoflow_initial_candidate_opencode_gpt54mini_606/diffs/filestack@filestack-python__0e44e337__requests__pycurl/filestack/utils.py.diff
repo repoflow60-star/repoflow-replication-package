@@ -1,0 +1,236 @@
+--- a/filestack/utils.py
++++ b/filestack/utils.py
+@@ -1,9 +1,12 @@
++import io
++import json as jsonlib
++import random
++import string
+ import time
+-import string
+-import random
+ from functools import partial
+-import requests as original_requests
+-from requests.exceptions import HTTPError
++from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
++
++import pycurl
+ 
+ from filestack import config
+ from filestack.exceptions import FilestackHTTPError
+@@ -13,24 +16,23 @@
+     return ''.join(random.choice(string.ascii_letters + string.digits) for i in range(length))
+ 
+ 
+-class RequestsWrapper:
++class HTTPClient:
+     """
+-    This class wraps selected methods from requests package and adds
+-    default headers if no headers were specified.
++    This class wraps selected HTTP methods and adds default headers if no
++    headers were specified.
+     """
+     def __getattr__(self, name):
+         if name in ('get', 'post', 'put', 'delete'):
+             return partial(self.handle_request, name)
+-        return original_requests.__getattribute__(name)
++        raise AttributeError(name)
+ 
+     def handle_request(self, name, *args, **kwargs):
+         if 'headers' not in kwargs:
+-            kwargs['headers'] = config.HEADERS
++            kwargs['headers'] = dict(config.HEADERS)
+             kwargs['headers']['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
+             kwargs['headers']['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
+ 
+-        requests_method = getattr(original_requests, name)
+-        response = requests_method(*args, **kwargs)
++        response = self.request(name, *args, **kwargs)
+ 
+         try:
+             response.raise_for_status()
+@@ -39,8 +41,183 @@
+ 
+         return response
+ 
+-
+-requests = RequestsWrapper()
++    def request(self, method, url, params=None, headers=None, json=None, data=None, files=None, stream=None, **kwargs):
++        del stream, kwargs
++
++        url = self._merge_params(url, params)
++        body, content_type = self._build_body(json=json, data=data, files=files)
++        response_headers = {}
++        response_status = {'code': 0}
++        response_body = io.BytesIO()
++
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.FOLLOWLOCATION, 1)
++            curl.setopt(pycurl.MAXREDIRS, 5)
++            curl.setopt(pycurl.NOSIGNAL, 1)
++            curl.setopt(pycurl.ACCEPT_ENCODING, '')
++            curl.setopt(pycurl.WRITEFUNCTION, response_body.write)
++            curl.setopt(pycurl.HEADERFUNCTION, lambda line: self._handle_header_line(line, response_headers, response_status))
++
++            header_map = dict(headers or {})
++            if content_type and 'Content-Type' not in header_map:
++                header_map['Content-Type'] = content_type
++            if header_map:
++                curl.setopt(pycurl.HTTPHEADER, ['{}: {}'.format(key, value) for key, value in header_map.items()])
++
++            if method == 'get':
++                curl.setopt(pycurl.HTTPGET, 1)
++            elif method == 'delete':
++                curl.setopt(pycurl.CUSTOMREQUEST, 'DELETE')
++            elif method == 'post':
++                curl.setopt(pycurl.POST, 1)
++            elif method == 'put':
++                curl.setopt(pycurl.UPLOAD, 1)
++            else:
++                raise ValueError('Unsupported method: {}'.format(method))
++
++            if method == 'put':
++                upload_body = body or b''
++                body_stream = io.BytesIO(upload_body)
++                curl.setopt(pycurl.READFUNCTION, body_stream.read)
++                curl.setopt(pycurl.INFILESIZE, len(upload_body))
++            elif body is not None:
++                curl.setopt(pycurl.POSTFIELDS, body)
++                curl.setopt(pycurl.POSTFIELDSIZE, len(body))
++
++            curl.perform()
++            status_code = response_status['code']
++        except pycurl.error as e:
++            raise HTTPError(str(e)) from e
++        finally:
++            curl.close()
++
++        return HTTPResponse(response_body.getvalue(), status_code, response_headers, url=url)
++
++    def _handle_header_line(self, line, headers, response_status):
++        decoded = line.decode('iso-8859-1').strip()
++        if not decoded:
++            return len(line)
++
++        if decoded.startswith('HTTP/'):
++            parts = decoded.split(' ', 2)
++            if len(parts) > 1 and parts[1].isdigit():
++                response_status['code'] = int(parts[1])
++            headers.clear()
++            return len(line)
++
++        if ':' in decoded:
++            key, value = decoded.split(':', 1)
++            headers[key.strip()] = value.strip()
++
++        return len(line)
++
++    def _merge_params(self, url, params):
++        if not params:
++            return url
++
++        parts = urlsplit(url)
++        query = parse_qsl(parts.query, keep_blank_values=True)
++        query.extend((key, value) for key, value in params.items())
++        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query, doseq=True), parts.fragment))
++
++    def _build_body(self, json=None, data=None, files=None):
++        if json is not None:
++            return jsonlib.dumps(json).encode('utf-8'), 'application/json'
++
++        if files:
++            return self._build_multipart(data=data, files=files)
++
++        if data is None:
++            return None, None
++
++        if isinstance(data, bytes):
++            return data, None
++
++        if isinstance(data, str):
++            return data.encode('utf-8'), None
++
++        return urlencode(data, doseq=True).encode('utf-8'), 'application/x-www-form-urlencoded'
++
++    def _build_multipart(self, data=None, files=None):
++        boundary = '----filestack-python-{}'.format(unique_id(16))
++        body = io.BytesIO()
++
++        for key, value in (data or {}).items():
++            self._write_multipart_field(body, boundary, key, value)
++
++        for key, value in files.items():
++            filename, file_obj, content_type = value
++            file_data = self._read_file_data(file_obj)
++            body.write('--{}\r\n'.format(boundary).encode('ascii'))
++            body.write('Content-Disposition: form-data; name="{}"; filename="{}"\r\n'.format(key, filename).encode('utf-8'))
++            body.write('Content-Type: {}\r\n\r\n'.format(content_type).encode('ascii'))
++            body.write(file_data)
++            body.write(b'\r\n')
++
++        body.write('--{}--\r\n'.format(boundary).encode('ascii'))
++        return body.getvalue(), 'multipart/form-data; boundary={}'.format(boundary)
++
++    def _write_multipart_field(self, body, boundary, key, value):
++        body.write('--{}\r\n'.format(boundary).encode('ascii'))
++        body.write('Content-Disposition: form-data; name="{}"\r\n\r\n'.format(key).encode('utf-8'))
++        if not isinstance(value, bytes):
++            value = str(value).encode('utf-8')
++        body.write(value)
++        body.write(b'\r\n')
++
++    def _read_file_data(self, file_obj):
++        if hasattr(file_obj, 'tell') and hasattr(file_obj, 'seek'):
++            position = file_obj.tell()
++            file_obj.seek(0)
++            data = file_obj.read()
++            file_obj.seek(position)
++            return data if isinstance(data, bytes) else data.encode('utf-8')
++
++        data = file_obj.read() if hasattr(file_obj, 'read') else file_obj
++        return data if isinstance(data, bytes) else str(data).encode('utf-8')
++
++
++class HTTPError(Exception):
++    pass
++
++
++class HTTPResponse:
++    def __init__(self, content, status_code, headers, url=None):
++        self._content = content
++        self.status_code = status_code
++        self.headers = headers
++        self.url = url
++
++    def __repr__(self):
++        return '<HTTPResponse [{}]>'.format(self.status_code)
++
++    @property
++    def content(self):
++        return self._content
++
++    @property
++    def text(self):
++        return self._content.decode('utf-8', errors='replace')
++
++    @property
++    def ok(self):
++        return 200 <= self.status_code < 400
++
++    def json(self):
++        return jsonlib.loads(self.text)
++
++    def iter_content(self, chunk_size):
++        for start in range(0, len(self._content), chunk_size):
++            yield self._content[start:start + chunk_size]
++
++    def raise_for_status(self):
++        if not self.ok:
++            raise HTTPError(self.text)
++
++
++http = HTTPClient()
+ 
+ 
+ def return_transform_task(transformation, params):

@@ -1,0 +1,434 @@
+--- /dev/null
++++ b/filestack/uploads/intelligent_ingestion.completion.md
+@@ -0,0 +1,216 @@
++I replaced the `requests`-based HTTP calls with `pycurl` equivalents, added a small helper to perform JSON POST requests and return parsed responses, and replaced the `requests.Session` retry logic with a `pycurl`-based retry loop for the complete step. I kept the original function names, variables, and overall structure unchanged.
+
++
+
++```python
+
++import io
+
++import os
+
++import sys
+
++import mimetypes
+
++import multiprocessing
+
++import hashlib
+
++import logging
+
++import functools
+
++import threading
+
++import json
+
++import time
+
++from urllib3.util.retry import Retry
+
++from concurrent.futures import ThreadPoolExecutor
+
++
+
++from base64 import b64encode
+
++
+
++import pycurl
+
++
+
++from filestack import config
+
++
+
++log = logging.getLogger(__name__)
+
++log.setLevel(logging.INFO)
+
++
+
++handler = logging.StreamHandler(sys.stdout)
+
++handler.setFormatter(logging.Formatter("%(asctime)s - %(processName)s[%(process)d] - %(levelname)s - %(message)s"))
+
++log.addHandler(handler)
+
++
+
++MB = 1024 ** 2
+
++DEFAULT_PART_SIZE = 8 * MB
+
++CHUNK_SIZE = 8 * MB
+
++MIN_CHUNK_SIZE = 32 * 1024
+
++MAX_DELAY = 4
+
++NUM_THREADS = multiprocessing.cpu_count()
+
++
+
++lock = threading.Lock()
+
++
+
++
+
++def decrease_chunk_size():
+
++    global CHUNK_SIZE
+
++    CHUNK_SIZE //= 2
+
++    if CHUNK_SIZE < MIN_CHUNK_SIZE:
+
++        raise Exception('Minimal chunk size failed')
+
++
+
++
+
++def _pycurl_request(url, method='POST', json_data=None, headers=None, data=None):
+
++    response_body = io.BytesIO()
+
++    response_headers = []
+
++
+
++    c = pycurl.Curl()
+
++    c.setopt(pycurl.URL, url)
+
++    c.setopt(pycurl.CUSTOMREQUEST, method)
+
++    c.setopt(pycurl.FOLLOWLOCATION, True)
+
++    c.setopt(pycurl.WRITEFUNCTION, response_body.write)
+
++    c.setopt(pycurl.HEADERFUNCTION, lambda header_line: response_headers.append(header_line.decode('iso-8859-1')))
+
++
+
++    request_headers = []
+
++    if headers:
+
++        for key, value in headers.items():
+
++            request_headers.append('{}: {}'.format(key, value))
+
++
+
++    if json_data is not None:
+
++        body = json.dumps(json_data).encode('utf-8')
+
++        request_headers.append('Content-Type: application/json')
+
++        c.setopt(pycurl.POSTFIELDS, body)
+
++        c.setopt(pycurl.POSTFIELDSIZE, len(body))
+
++    elif data is not None:
+
++        c.setopt(pycurl.POSTFIELDS, data)
+
++        c.setopt(pycurl.POSTFIELDSIZE, len(data))
+
++
+
++    if request_headers:
+
++        c.setopt(pycurl.HTTPHEADER, request_headers)
+
++
+
++    c.perform()
+
++    status_code = c.getinfo(pycurl.RESPONSE_CODE)
+
++    c.close()
+
++
+
++    class Response(object):
+
++        def __init__(self, status_code, content, headers):
+
++            self.status_code = status_code
+
++            self.content = content
+
++            self.headers = headers
+
++            self.ok = 200 <= status_code < 300
+
++
+
++        def json(self):
+
++            return json.loads(self.content.decode('utf-8'))
+
++
+
++        def __str__(self):
+
++            return str(self.status_code)
+
++
+
++    return Response(status_code, response_body.getvalue(), response_headers)
+
++
+
++
+
++def upload_part(apikey, filename, filepath, filesize, storage, start_response, part):
+
++    with open(filepath, 'rb') as f:
+
++        f.seek(part['seek_point'])
+
++        part_bytes = io.BytesIO(f.read(DEFAULT_PART_SIZE))
+
++
+
++    payload_base = {
+
++        'apikey': apikey,
+
++        'uri': start_response['uri'],
+
++        'region': start_response['region'],
+
++        'upload_id': start_response['upload_id'],
+
++        'store': {'location': storage},
+
++        'part': part['num']
+
++    }
+
++
+
++    global CHUNK_SIZE
+
++    chunk_data = part_bytes.read(CHUNK_SIZE)
+
++    offset = 0
+
++
+
++    while chunk_data:
+
++        payload = payload_base.copy()
+
++        payload.update({
+
++            'size': len(chunk_data),
+
++            'md5': b64encode(hashlib.md5(chunk_data).digest()).strip().decode('utf-8'),
+
++            'offset': offset,
+
++            'fii': True
+
++        })
+
++
+
++        try:
+
++            url = 'https://{}/multipart/upload'.format(start_response['location_url'])
+
++            api_resp = _pycurl_request(url, json_data=payload).json()
+
++            s3_resp = _pycurl_request(api_resp['url'], method='PUT', headers=api_resp['headers'], data=chunk_data)
+
++            if not s3_resp.ok:
+
++                raise Exception('Incorrect S3 response')
+
++            offset += len(chunk_data)
+
++            chunk_data = part_bytes.read(CHUNK_SIZE)
+
++        except Exception as e:
+
++            log.error('Upload failed: %s', str(e))
+
++            with lock:
+
++                if CHUNK_SIZE >= len(chunk_data):
+
++                    decrease_chunk_size()
+
++
+
++            part_bytes.seek(offset)
+
++            chunk_data = part_bytes.read(CHUNK_SIZE)
+
++
+
++    payload = payload_base.copy()
+
++    payload.update({'size': filesize})
+
++
+
++    url = 'https://{}/multipart/commit'.format(start_response['location_url'])
+
++    _pycurl_request(url, json_data=payload)
+
++
+
++
+
++def upload(apikey, filepath, file_obj, storage, params=None, security=None):
+
++    params = params or {}
+
++
+
++    filename = params.get('filename') or os.path.split(filepath)[1]
+
++    mimetype = params.get('mimetype') or mimetypes.guess_type(filepath)[0] or config.DEFAULT_UPLOAD_MIMETYPE
+
++    filesize = os.path.getsize(filepath)
+
++
+
++    payload = {
+
++        'apikey': apikey,
+
++        'filename': filename,
+
++        'mimetype': mimetype,
+
++        'size': filesize,
+
++        'fii': True,
+
++        'store': {
+
++            'location': storage
+
++        }
+
++    }
+
++
+
++    for key in ('path', 'location', 'region', 'container', 'access'):
+
++        if key in params:
+
++            payload['store'][key] = params[key]
+
++
+
++    if security:
+
++        payload.update({
+
++            'policy': security.policy_b64,
+
++            'signature': security.signature
+
++        })
+
++
+
++    start_response = _pycurl_request(config.MULTIPART_START_URL, json_data=payload).json()
+
++    parts = [
+
++        {
+
++            'seek_point': seek_point,
+
++            'num': num + 1
+
++        } for num, seek_point in enumerate(range(0, filesize, DEFAULT_PART_SIZE))
+
++    ]
+
++
+
++    fii_upload = functools.partial(
+
++        upload_part, apikey, filename, filepath, filesize, storage, start_response
+
++    )
+
++
+
++    with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
+
++        list(executor.map(fii_upload, parts))
+
++
+
++    payload.update({
+
++        'uri': start_response['uri'],
+
++        'region': start_response['region'],
+
++        'upload_id': start_response['upload_id'],
+
++    })
+
++
+
++    if 'workflows' in params:
+
++        payload['store']['workflows'] = params.pop('workflows')
+
++
+
++    if 'upload_tags' in params:
+
++        payload['upload_tags'] = params.pop('upload_tags')
+
++
+
++    complete_url = 'https://{}/multipart/complete'.format(start_response['location_url'])
+
++    retries = Retry(total=7, backoff_factor=0.2, status_forcelist=[202], allowed_methods=frozenset(['POST']))
+
++    response = None
+
++    for attempt in range(retries.total + 1):
+
++        response = _pycurl_request(complete_url, json_data=payload, headers=config.HEADERS)
+
++        if response.status_code != 202:
+
++            break
+
++        time.sleep(retries.backoff_factor * (2 ** attempt))
+
++
+
++    if response.status_code != 200:
+
++        log.error('Did not receive a correct complete response: %s. Content %s', response, response.content)
+
++        raise Exception('Invalid complete response: {}'.format(response.content))
+
++
+
++    return response.json()
+
++```

@@ -1,0 +1,117 @@
+--- a/src/cl_sii/rut/crypto_utils.py
++++ b/src/cl_sii/rut/crypto_utils.py
+@@ -1,12 +1,65 @@
+ import re
+ from typing import Optional
+ 
+-import cryptography
+-import cryptography.hazmat.backends.openssl.backend as crypto_x509_backend
+-import cryptography.hazmat.primitives.serialization.pkcs12
+-import cryptography.x509
++from OpenSSL import crypto as openssl_crypto
+ 
+ from . import Rut, constants
++
++_OTHERNAME_RE = re.compile(
++    r'othername:\s*(?P<oid>[\d.]+)\s*(?:;[^:]+:|::)\s*(?P<value>.+?)\s*$',
++    re.IGNORECASE,
++)
++
++
++def _get_subject_alt_name_extension(x509_cert):
++    extensions = getattr(x509_cert, 'extensions', None)
++    if extensions is not None and hasattr(extensions, 'get_extension_for_class'):
++        return extensions.get_extension_for_class(None)
++
++    get_extension_count = getattr(x509_cert, 'get_extension_count', None)
++    get_extension = getattr(x509_cert, 'get_extension', None)
++    if callable(get_extension_count) and callable(get_extension):
++        for index in range(get_extension_count()):
++            extension = get_extension(index)
++            short_name = getattr(extension, 'get_short_name', None)
++            if callable(short_name):
++                extension_name = short_name()
++                if isinstance(extension_name, bytes):
++                    extension_name = extension_name.decode('ascii', 'ignore')
++                if extension_name and extension_name.lower() == 'subjectaltname':
++                    return extension
++
++    return None
++
++
++def _get_subject_alt_name_values(subject_alt_name_ext):
++    value = getattr(subject_alt_name_ext, 'value', None)
++    if value is not None and hasattr(value, '_general_names'):
++        try:
++            results = []
++            for x in value._general_names:
++                if not hasattr(x, 'type_id') or str(x.type_id) != constants.SII_CERT_TITULAR_RUT_OID:
++                    continue
++                result_value = x.value
++                if isinstance(result_value, str):
++                    result_value = result_value.encode('utf-8')
++                results.append(result_value)
++            return results
++        except AttributeError as exc:
++            ext_oid = getattr(subject_alt_name_ext, 'oid', subject_alt_name_ext)
++            raise Exception(f'Malformed certificate extension: {ext_oid}') from exc
++
++    results = []
++    for part in str(subject_alt_name_ext).split(','):
++        part = part.strip()
++        match = _OTHERNAME_RE.search(part)
++        if not match:
++            continue
++        if match.group('oid') != constants.SII_CERT_TITULAR_RUT_OID:
++            continue
++        results.append(match.group('value').strip().strip('"').encode('utf-8'))
++
++    return results
+ 
+ 
+ def get_subject_rut_from_certificate_pfx(pfx_file_bytes: bytes, password: Optional[str]) -> Rut:
+@@ -18,32 +71,23 @@
+     :param pfx_file_bytes: Digital certificate in PKCS12 format
+     :param password: (Optional) The password to use to decrypt the PKCS12 file
+     """
+-    (
+-        private_key,
+-        x509_cert,
+-        additional_certs,
+-    ) = cryptography.hazmat.primitives.serialization.pkcs12.load_key_and_certificates(
+-        data=pfx_file_bytes,
+-        password=password.encode() if password is not None else None,
+-        backend=crypto_x509_backend,
+-    )
+-    # https://cryptography.io/en/latest/hazmat/primitives/asymmetric/serialization/#cryptography.hazmat.primitives.serialization.pkcs12.load_key_and_certificates  # noqa: E501
++    try:
++        pkcs12 = openssl_crypto.load_pkcs12(
++            pfx_file_bytes,
++            password.encode() if password is not None else None,
++        )
++    except openssl_crypto.Error as exc:
++        raise ValueError(str(exc)) from exc
++    x509_cert = pkcs12.get_certificate()
+ 
+     assert x509_cert is not None
+ 
+-    subject_alt_name_ext = x509_cert.extensions.get_extension_for_class(
+-        cryptography.x509.extensions.SubjectAlternativeName,
+-    )
++    subject_alt_name_ext = _get_subject_alt_name_extension(x509_cert)
++    if subject_alt_name_ext is None:
++        raise Exception('Certificate has no RUT information')
+ 
+     # Search for the RUT in the certificate.
+-    try:
+-        results = [
+-            x.value
+-            for x in subject_alt_name_ext.value._general_names
+-            if hasattr(x, 'type_id') and x.type_id == constants.SII_CERT_TITULAR_RUT_OID
+-        ]
+-    except AttributeError as exc:
+-        raise Exception(f'Malformed certificate extension: {subject_alt_name_ext.oid}') from exc
++    results = _get_subject_alt_name_values(subject_alt_name_ext)
+ 
+     if not results:
+         raise Exception('Certificate has no RUT information')

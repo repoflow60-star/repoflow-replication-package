@@ -1,0 +1,260 @@
+--- a/pyschlage/auth.py
++++ b/pyschlage/auth.py
+@@ -3,12 +3,16 @@
+ from __future__ import annotations
+ 
+ from functools import wraps
+-from typing import Callable
++import json
++from typing import Any, Callable
++from urllib.parse import urlencode
+ 
+ from botocore.exceptions import ClientError
+ import pycognito
+ from pycognito import utils
+-import requests
++import urllib3
++from urllib3.response import BaseHTTPResponse
++from urllib3.util import Timeout
+ 
+ from .exceptions import NotAuthorizedError, UnknownError
+ 
+@@ -28,13 +32,66 @@
+ USER_POOL_ID = USER_POOL_REGION + "_2zhrVs9d4"
+ 
+ 
++class _AuthRequest:
++    def __init__(
++        self,
++        headers: dict[str, str] | None = None,
++        method: str | None = None,
++        url: str | None = None,
++        body: Any = None,
++    ) -> None:
++        self.headers = dict(headers or {})
++        self.method = method
++        self.url = url
++        self.body = body
++        self.hooks: dict[str, list[Callable[..., Any]]] = {}
++
++    def register_hook(self, event: str, hook: Callable[..., Any]) -> None:
++        self.hooks.setdefault(event, []).append(hook)
++
++
++class Response:
++    def __init__(self, response: BaseHTTPResponse, url: str) -> None:
++        self._response = response
++        self.url = url
++
++    @property
++    def status_code(self) -> int:
++        return self._response.status
++
++    @property
++    def reason(self) -> str:
++        return self._response.reason or ""
++
++    @property
++    def text(self) -> str:
++        data = self._response.data
++        if data is None:
++            return ""
++        if isinstance(data, bytes):
++            return data.decode("utf-8", errors="replace")
++        return data
++
++    def json(self) -> Any:
++        return json.loads(self.text)
++
++    def raise_for_status(self) -> None:
++        if self.status_code >= 400:
++            raise urllib3.exceptions.HTTPError(
++                f"{self.status_code} Server Error: {self.reason} for url: {self.url}"
++            )
++
++    def __getattr__(self, name: str) -> Any:
++        return getattr(self._response, name)
++
++
+ def _translate_auth_errors(
+     # pylint: disable=invalid-name
+-    fn: Callable[..., requests.Response],
++    fn: Callable[..., Any],
+     # pylint: enable=invalid-name
+-) -> Callable[..., requests.Response]:
++) -> Callable[..., Any]:
+     @wraps(fn)
+-    def wrapper(*args, **kwargs) -> requests.Response:
++    def wrapper(*args, **kwargs) -> Any:
+         try:
+             return fn(*args, **kwargs)
+         except ClientError as ex:
+@@ -50,19 +107,19 @@
+ 
+ def _translate_http_errors(
+     # pylint: disable=invalid-name
+-    fn: Callable[..., requests.Response],
++    fn: Callable[..., Response],
+     # pylint: enable=invalid-name
+-) -> Callable[..., requests.Response]:
++) -> Callable[..., Response]:
+     @wraps(fn)
+-    def wrapper(*args, **kwargs) -> requests.Response:
++    def wrapper(*args, **kwargs) -> Response:
+         resp = fn(*args, **kwargs)
+         try:
+             resp.raise_for_status()
+             return resp
+-        except requests.HTTPError as ex:
++        except urllib3.exceptions.HTTPError as ex:
+             try:
+                 message = resp.json().get("message", resp.reason)
+-            except requests.JSONDecodeError:
++            except json.JSONDecodeError:
+                 message = resp.reason
+             raise UnknownError(message) from ex
+ 
+@@ -91,7 +148,25 @@
+             password=password,
+             cognito=self.cognito,
+         )
++        self._http = urllib3.PoolManager()
+         self._user_id: str | None = None
++
++    def _headers(
++        self,
++        headers: dict[str, str] | None = None,
++        method: str | None = None,
++        url: str | None = None,
++        body: Any = None,
++    ) -> dict[str, str]:
++        request = _AuthRequest(
++            headers=headers,
++            method=method.upper() if method else None,
++            url=url,
++            body=body,
++        )
++        request = self.auth(request) or request
++        request.headers["X-Api-Key"] = API_KEY
++        return request.headers
+ 
+     @_translate_auth_errors
+     def authenticate(self):
+@@ -100,7 +175,7 @@
+         :raise pyschlage.exceptions.NotAuthorizedError: When authentication fails.
+         :raise pyschlage.exceptions.UnknownError: On other errors.
+         """
+-        self.auth(requests.Request())
++        self.auth(_AuthRequest())
+ 
+     @property
+     def user_id(self) -> str:
+@@ -117,15 +192,100 @@
+     @_translate_auth_errors
+     def request(
+         self, method: str, path: str, base_url: str = BASE_URL, **kwargs
+-    ) -> requests.Response:
++    ) -> Response:
+         """Performs a request against the Schlage WiFi cloud service.
+ 
+         :meta private:
+         """
+-        kwargs["auth"] = self.auth
+-        if "headers" not in kwargs:
+-            kwargs["headers"] = {}
+-        kwargs["headers"]["X-Api-Key"] = API_KEY
+-        kwargs.setdefault("timeout", _DEFAULT_TIMEOUT)
+-        # pylint: disable=missing-timeout
+-        return requests.request(method, f"{base_url}/{path.lstrip('/')}", **kwargs)
++        if not isinstance(base_url, str):
++            if isinstance(base_url, (dict, list, tuple)):
++                kwargs.setdefault("json", base_url)
++            else:
++                kwargs.setdefault("body", base_url)
++            base_url = BASE_URL
++
++        method = method.upper()
++        url = f"{base_url}/{path.lstrip('/')}"
++
++        params = kwargs.pop("params", None)
++        if params:
++            url = f"{url}?{urlencode(params, doseq=True)}"
++
++        raw_headers = kwargs.pop("headers", None)
++        payload = kwargs.pop("json", None)
++        body = kwargs.pop("body", None)
++        data = kwargs.pop("data", None)
++        kwargs.pop("auth", None)
++
++        if payload is not None:
++            body = json.dumps(payload).encode("utf-8")
++        elif body is None and data is not None:
++            if isinstance(data, dict):
++                body = urlencode(data, doseq=True).encode("utf-8")
++            else:
++                body = data
++
++        headers = self._headers(raw_headers, method=method, url=url, body=body)
++        if payload is not None:
++            headers.setdefault("Content-Type", "application/json")
++        elif body is not None and isinstance(data, dict):
++            headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
++
++        timeout = kwargs.pop("timeout", _DEFAULT_TIMEOUT)
++        if isinstance(timeout, Timeout):
++            request_timeout = timeout
++        elif isinstance(timeout, tuple):
++            request_timeout = Timeout(connect=timeout[0], read=timeout[1])
++        else:
++            request_timeout = Timeout(total=timeout)
++
++        if "allow_redirects" in kwargs:
++            kwargs["redirect"] = kwargs.pop("allow_redirects")
++
++        if "stream" in kwargs:
++            kwargs["preload_content"] = not kwargs.pop("stream")
++
++        verify = kwargs.pop("verify", None)
++        if verify is False:
++            kwargs["cert_reqs"] = "CERT_NONE"
++        elif isinstance(verify, str):
++            kwargs["ca_certs"] = verify
++
++        cert = kwargs.pop("cert", None)
++        if isinstance(cert, tuple):
++            kwargs["cert_file"], kwargs["key_file"] = cert
++        elif isinstance(cert, str):
++            kwargs["cert_file"] = cert
++
++        allowed_kwargs = {
++            key: value
++            for key, value in kwargs.items()
++            if key
++            in {
++                "assert_same_host",
++                "body_pos",
++                "ca_certs",
++                "cert_file",
++                "cert_reqs",
++                "chunked",
++                "decode_content",
++                "enforce_content_length",
++                "fields",
++                "key_file",
++                "pool_timeout",
++                "preload_content",
++                "redirect",
++                "release_conn",
++                "retries",
++            }
++        }
++
++        response = self._http.request(
++            method,
++            url,
++            body=body,
++            headers=headers,
++            timeout=request_timeout,
++            **allowed_kwargs,
++        )
++        return Response(response, url)

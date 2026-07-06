@@ -1,0 +1,261 @@
+--- a/git_pw/api.py
++++ b/git_pw/api.py
+@@ -3,6 +3,7 @@
+ """
+ 
+ from functools import update_wrapper
++import json
+ import logging
+ import os.path
+ import re
+@@ -11,7 +12,8 @@
+ import typing as ty
+ 
+ import click
+-import requests
++import urllib3
++from urllib3.util import make_headers
+ 
+ import git_pw
+ from git_pw import config
+@@ -22,30 +24,40 @@
+ Filters = ty.List[ty.Tuple[str, str]]
+ 
+ 
+-class HTTPTokenAuth(requests.auth.AuthBase):
+-    """Attaches HTTP Token Authentication to the given Request object."""
+-
+-    def __init__(self, token: str):
+-        self.token = token
+-
+-    def __call__(
+-        self,
+-        r: requests.PreparedRequest,
+-    ) -> requests.PreparedRequest:
+-        r.headers['Authorization'] = self._token_auth_str(self.token)
+-        return r
+-
+-    @staticmethod
+-    def _token_auth_str(token: str) -> str:
+-        """Return a Token auth string."""
+-        return 'Token {}'.format(token.strip())
+-
+-
+-def _get_auth(optional: bool = False) -> ty.Optional[requests.auth.AuthBase]:
++HTTP = urllib3.PoolManager()
++
++
++class _ResponseAdapter:
++    def __init__(self, response: urllib3.response.HTTPResponse):
++        self._response = response
++        self.headers = response.headers
++        self.status_code = response.status
++
++    @property
++    def content(self) -> bytes:
++        return self._response.data
++
++    def json(self) -> ty.Any:
++        return json.loads(self.content.decode('utf-8'))
++
++    def iter_content(self, chunk_size: int):
++        yield from self._response.stream(chunk_size)
++
++    def close(self) -> None:
++        self._response.close()
++
++
++class _RequestError(urllib3.exceptions.HTTPError):
++    def __init__(self, message: str, response: ty.Optional[_ResponseAdapter] = None):
++        super().__init__(message)
++        self.response = response
++
++
++def _get_auth(optional: bool = False) -> ty.Optional[ty.Dict[str, str]]:
+     if CONF.token:
+-        return HTTPTokenAuth(CONF.token)
++        return {'Authorization': 'Token {}'.format(CONF.token.strip())}
+     elif CONF.username and CONF.password:
+-        return requests.auth.HTTPBasicAuth(CONF.username, CONF.password)
++        return make_headers(basic_auth='{}:{}'.format(CONF.username, CONF.password))
+     elif not optional:
+         LOG.error('Authentication information missing')
+         LOG.error(
+@@ -56,10 +68,16 @@
+     return None
+ 
+ 
+-def _get_headers() -> ty.Dict[str, str]:
+-    return {
++def _get_headers(optional: bool = False) -> ty.Dict[str, str]:
++    headers = {
+         'User-Agent': 'git-pw ({})'.format(git_pw.__version__),
+     }
++
++    auth = _get_auth(optional=optional)
++    if auth:
++        headers.update(auth)
++
++    return headers
+ 
+ 
+ def _get_server() -> str:
+@@ -107,11 +125,12 @@
+ 
+ def _handle_error(
+     operation: str,
+-    exc: requests.exceptions.RequestException,
++    exc: urllib3.exceptions.HTTPError,
+ ) -> None:
+-    if exc.response is not None and exc.response.content:
++    response = getattr(exc, 'response', None)
++    if response is not None and response.content:
+         # server errors should always be reported
+-        if exc.response.status_code in range(500, 512):  # 5xx Server Error
++        if response.status_code in range(500, 512):  # 5xx Server Error
+             LOG.error(
+                 'Server error. Please report this issue to '
+                 'https://github.com/getpatchwork/patchwork'
+@@ -119,10 +138,10 @@
+             raise
+ 
+         # we make the assumption that all responses will be JSON encoded
+-        if exc.response.status_code == 404:
++        if response.status_code == 404:
+             LOG.error('Resource not found')
+         else:
+-            LOG.error(exc.response.json())
++            LOG.error(response.json())
+     else:
+         LOG.error(
+             'Failed to %s resource. Is your configuration '
+@@ -140,23 +159,23 @@
+     url: str,
+     params: ty.Optional[Filters] = None,
+     stream: bool = False,
+-) -> requests.Response:
++) -> _ResponseAdapter:
+     """Make GET request and handle errors."""
+     LOG.debug('GET %s', url)
+ 
+     try:
+-        # TODO(stephenfin): We only use a subset of the types possible for
+-        # 'params' (namely a list of tuples) but it doesn't seem possible to
+-        # indicate this
+-        rsp = requests.get(
+-            url,
+-            auth=_get_auth(optional=True),
+-            headers=_get_headers(),
+-            stream=stream,
+-            params=params,
+-        )  # type: ignore
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++        rsp = _ResponseAdapter(
++            HTTP.request(
++                'GET',
++                url,
++                headers=_get_headers(optional=True),
++                fields=params,
++                preload_content=not stream,
++            )
++        )
++        if rsp.status_code >= 400:
++            raise _RequestError('GET request failed', response=rsp)
++    except urllib3.exceptions.HTTPError as exc:
+         _handle_error('fetch', exc)
+ 
+     LOG.debug('Got response')
+@@ -167,16 +186,23 @@
+ def _post(
+     url: str,
+     data: ty.List[ty.Tuple[str, ty.Any]],
+-) -> requests.Response:
++) -> _ResponseAdapter:
+     """Make POST request and handle errors."""
+     LOG.debug('POST %s, data=%r', url, data)
+ 
+     try:
+-        rsp = requests.post(
+-            url, auth=_get_auth(), headers=_get_headers(), data=data
+-        )
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++        rsp = _ResponseAdapter(
++            HTTP.request(
++                'POST',
++                url,
++                headers=_get_headers(),
++                fields=data,
++                encode_multipart=False,
++            )
++        )
++        if rsp.status_code >= 400:
++            raise _RequestError('POST request failed', response=rsp)
++    except urllib3.exceptions.HTTPError as exc:
+         _handle_error('create', exc)
+ 
+     LOG.debug('Got response')
+@@ -187,19 +213,23 @@
+ def _patch(
+     url: str,
+     data: ty.List[ty.Tuple[str, ty.Any]],
+-) -> requests.Response:
++) -> _ResponseAdapter:
+     """Make PATCH request and handle errors."""
+     LOG.debug('PATCH %s, data=%r', url, data)
+ 
+     try:
+-        rsp = requests.patch(
+-            url,
+-            auth=_get_auth(),
+-            headers=_get_headers(),
+-            data=data,
+-        )
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++        rsp = _ResponseAdapter(
++            HTTP.request(
++                'PATCH',
++                url,
++                headers=_get_headers(),
++                fields=data,
++                encode_multipart=False,
++            )
++        )
++        if rsp.status_code >= 400:
++            raise _RequestError('PATCH request failed', response=rsp)
++    except urllib3.exceptions.HTTPError as exc:
+         _handle_error('update', exc)
+ 
+     LOG.debug('Got response')
+@@ -207,14 +237,17 @@
+     return rsp
+ 
+ 
+-def _delete(url: str) -> requests.Response:
++def _delete(url: str) -> _ResponseAdapter:
+     """Make DELETE request and handle errors."""
+     LOG.debug('DELETE %s', url)
+ 
+     try:
+-        rsp = requests.delete(url, auth=_get_auth(), headers=_get_headers())
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++        rsp = _ResponseAdapter(
++            HTTP.request('DELETE', url, headers=_get_headers())
++        )
++        if rsp.status_code >= 400:
++            raise _RequestError('DELETE request failed', response=rsp)
++    except urllib3.exceptions.HTTPError as exc:
+         _handle_error('delete', exc)
+ 
+     LOG.debug('Got response')
+@@ -288,6 +321,7 @@
+         for block in rsp.iter_content(1024):
+             output_file.write(block)
+     finally:
++        rsp.close()
+         output_file.close()
+ 
+     return output_path

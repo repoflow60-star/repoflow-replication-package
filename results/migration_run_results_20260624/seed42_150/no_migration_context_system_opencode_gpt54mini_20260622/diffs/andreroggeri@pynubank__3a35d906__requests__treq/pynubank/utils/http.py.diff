@@ -1,0 +1,146 @@
+--- a/pynubank/utils/http.py
++++ b/pynubank/utils/http.py
+@@ -1,7 +1,98 @@
+-from requests import Response
+-from requests_pkcs12 import get, post
++import asyncio
++import json as json_module
++from dataclasses import dataclass
++from urllib.parse import urlparse
+ 
+-from pynubank import NuRequestException
++import treq
++from OpenSSL import crypto
++from twisted.internet import asyncioreactor, ssl
++from twisted.web.client import Agent
++from twisted.web.http_headers import Headers
++from treq.client import HTTPClient as TreqClient
++
++from pynubank.exception import NuRequestException
++
++
++_LOOP = None
++
++
++def _get_loop():
++    global _LOOP
++
++    if _LOOP is None:
++        loop = asyncio.new_event_loop()
++        asyncio.set_event_loop(loop)
++        try:
++            asyncioreactor.install(loop)
++        except Exception:
++            pass
++        _LOOP = loop
++
++    return _LOOP
++
++
++@dataclass
++class HttpResponse:
++    url: str
++    status_code: int
++    headers: dict
++    _body: bytes = b''
++
++    def json(self):
++        return json_module.loads(self._body.decode())
++
++
++def _response_headers(headers) -> dict:
++    response_headers = {}
++    raw_headers = getattr(headers, 'getAllRawHeaders', None)
++    if raw_headers is None:
++        return response_headers
++
++    for name, values in raw_headers() or []:
++        key = name.decode() if isinstance(name, bytes) else str(name)
++        value = ', '.join(
++            value.decode() if isinstance(value, bytes) else str(value)
++            for value in values
++        )
++        response_headers[key] = value
++        if key.lower() == 'www-authenticate':
++            response_headers['WWW-Authenticate'] = value
++
++    return response_headers
++
++
++def _agent_for_url(url: str, cert: bytes = None, password: str = ''):
++    _get_loop()
++    hostname = urlparse(url).hostname
++    if cert:
++        pkcs12 = crypto.load_pkcs12(cert, password.encode())
++        client_cert = ssl.PrivateCertificate.loadPEM(
++            crypto.dump_certificate(crypto.FILETYPE_PEM, pkcs12.get_certificate()) +
++            crypto.dump_privatekey(crypto.FILETYPE_PEM, pkcs12.get_privatekey())
++        )
++        context_factory = ssl.optionsForClientTLS(hostname, clientCertificate=client_cert)
++    else:
++        context_factory = ssl.optionsForClientTLS(hostname)
++
++    from twisted.internet import reactor
++
++    return Agent(reactor, contextFactory=context_factory)
++
++
++async def _request(method: str, url: str, headers: dict = None, json: dict = None,
++                   pkcs12_data: bytes = None, pkcs12_password: str = '') -> HttpResponse:
++    headers_obj = Headers({key.encode(): [value.encode()] for key, value in (headers or {}).items()})
++    data = None if json is None else json_module.dumps(json).encode()
++    client = TreqClient(_agent_for_url(url, pkcs12_data, pkcs12_password))
++    response = await client.request(method, url, headers=headers_obj, data=data)
++    body = await treq.content(response)
++
++    return HttpResponse(
++        url=url,
++        status_code=response.code,
++        headers=_response_headers(response.headers),
++        _body=body,
++    )
+ 
+ 
+ class HttpClient:
+@@ -26,24 +117,31 @@
+     def get_header(self, name: str):
+         return self._headers.get(name)
+ 
+-    @property
+-    def _cert_args(self):
+-        return {'pkcs12_data': self._cert, 'pkcs12_password': ''} if self._cert else {}
+-
+-    def _handle_response(self, response: Response) -> dict:
++    def _handle_response(self, response) -> dict:
+         if response.status_code != 200:
+             raise NuRequestException(response)
+ 
+         return response.json()
+ 
+-    def raw_get(self, url: str) -> Response:
+-        return get(url, headers=self._headers, **self._cert_args)
++    def raw_get(self, url: str) -> HttpResponse:
++        return get(url, headers=self._headers, pkcs12_data=self._cert)
+ 
+-    def raw_post(self, url: str, json: dict) -> Response:
+-        return post(url, json=json, headers=self._headers, **self._cert_args)
++    def raw_post(self, url: str, json: dict) -> HttpResponse:
++        return post(url, json=json, headers=self._headers, pkcs12_data=self._cert)
+ 
+     def get(self, url: str) -> dict:
+         return self._handle_response(self.raw_get(url))
+ 
+     def post(self, url: str, json: dict) -> dict:
+-        return self._handle_response(post(url, json=json, headers=self._headers, **self._cert_args))
++        return self._handle_response(self.raw_post(url, json))
++
++
++def get(url: str, headers: dict = None, pkcs12_data: bytes = None, pkcs12_password: str = '') -> HttpResponse:
++    return _get_loop().run_until_complete(_request('GET', url, headers=headers, pkcs12_data=pkcs12_data,
++                                                   pkcs12_password=pkcs12_password))
++
++
++def post(url: str, json: dict, headers: dict = None, pkcs12_data: bytes = None,
++         pkcs12_password: str = '') -> HttpResponse:
++    return _get_loop().run_until_complete(_request('POST', url, headers=headers, json=json, pkcs12_data=pkcs12_data,
++                                                   pkcs12_password=pkcs12_password))

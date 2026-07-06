@@ -1,0 +1,193 @@
+diff --git a/bigcommerce/connection.py b/bigcommerce/connection.py
+index 96fc6a4..f8c837d 100644
+--- a/bigcommerce/connection.py
++++ b/bigcommerce/connection.py
+@@ -4,6 +4,7 @@ Connection Module
+ Handles put and get operations to the Bigcommerce REST API
+ """
+ import base64
++import asyncio
+ import hashlib
+ import hmac
+ 
+@@ -13,18 +14,134 @@ except ImportError:
+     from urllib.parse import urlencode
+ 
+ import logging
+-import requests
+ import jwt
+ 
+ from json import dumps, loads
+ from math import ceil
+ from time import sleep
++from urllib.error import HTTPError, URLError
++from urllib.parse import urlencode as urllib_urlencode
++from urllib.request import Request, urlopen
+ 
+ from bigcommerce.exception import *
+ 
++try:
++    import aiohttp
++except ImportError:  # pragma: no cover - fallback for environments without aiohttp
++    aiohttp = None
++
+ log = logging.getLogger("bigcommerce.connection")
+ 
+ 
++class _ResponseAdapter(object):
++    def __init__(self, status_code, reason, headers, content):
++        self.status_code = status_code
++        self.reason = reason
++        self.headers = headers
++        self.content = content
++
++    def json(self):
++        return loads(self.content.decode())
++
++
++class _SessionAdapter(object):
++    def __init__(self, auth=None, headers=None):
++        self.auth = auth
++        self.headers = dict(headers or {})
++
++    @staticmethod
++    def _basic_auth_header(auth):
++        if not auth:
++            return None
++        user, password = auth
++        token = base64.b64encode(("%s:%s" % (user, password)).encode()).decode()
++        return "Basic %s" % token
++
++    @staticmethod
++    def _normalize_headers(headers):
++        return dict(headers or {})
++
++    @staticmethod
++    def _encode_body(data, headers):
++        if data is None:
++            return None
++        if isinstance(data, (bytes, bytearray)):
++            return bytes(data)
++        if isinstance(data, str):
++            return data.encode()
++
++        content_type = headers.get("Content-Type", "")
++        if isinstance(data, dict):
++            if content_type.startswith("application/x-www-form-urlencoded"):
++                return urllib_urlencode(data).encode()
++            return dumps(data).encode()
++
++        return str(data).encode()
++
++    @staticmethod
++    def _run_async(coro):
++        try:
++            loop = asyncio.get_event_loop()
++        except RuntimeError:
++            loop = asyncio.new_event_loop()
++            asyncio.set_event_loop(loop)
++
++        if loop.is_running():
++            new_loop = asyncio.new_event_loop()
++            try:
++                return new_loop.run_until_complete(coro)
++            finally:
++                new_loop.close()
++
++        return loop.run_until_complete(coro)
++
++    def _request_with_aiohttp(self, method, url, data=None, timeout=None, headers=None):
++        headers = self._normalize_headers(headers)
++        merged_headers = dict(self.headers)
++        merged_headers.update(headers)
++        body = self._encode_body(data, merged_headers)
++        auth = self.auth
++        if aiohttp and auth and not isinstance(auth, aiohttp.BasicAuth):
++            auth = aiohttp.BasicAuth(*auth)
++
++        async def _do_request():
++            client_timeout = aiohttp.ClientTimeout(total=timeout) if timeout else None
++            async with aiohttp.ClientSession(headers=merged_headers, auth=auth, timeout=client_timeout) as session:
++                async with session.request(method, url, data=body) as response:
++                    content = await response.read()
++                    return _ResponseAdapter(response.status, response.reason, dict(response.headers), content)
++
++        return self._run_async(_do_request())
++
++    def _request_with_urllib(self, method, url, data=None, timeout=None, headers=None):
++        headers = self._normalize_headers(headers)
++        merged_headers = dict(self.headers)
++        merged_headers.update(headers)
++        body = self._encode_body(data, merged_headers)
++        if body is not None and "Content-Length" not in merged_headers:
++            merged_headers["Content-Length"] = str(len(body))
++
++        auth_header = self._basic_auth_header(self.auth)
++        if auth_header and "Authorization" not in merged_headers:
++            merged_headers["Authorization"] = auth_header
++
++        request = Request(url, data=body, headers=merged_headers, method=method)
++        try:
++            with urlopen(request, timeout=timeout) as response:
++                content = response.read()
++                return _ResponseAdapter(response.status, response.reason, dict(response.headers), content)
++        except HTTPError as exc:
++            content = exc.read()
++            return _ResponseAdapter(exc.code, exc.reason, dict(exc.headers), content)
++        except URLError:
++            raise
++
++    def request(self, method, url, data=None, timeout=None, headers=None):
++        if aiohttp is not None:
++            return self._request_with_aiohttp(method, url, data=data, timeout=timeout, headers=headers)
++        return self._request_with_urllib(method, url, data=data, timeout=timeout, headers=headers)
++
++
+ class Connection(object):
+     """
+     Connection class manages the connection to the Bigcommerce REST API.
+@@ -39,9 +156,7 @@ class Connection(object):
+         log.info("API Host: %s/%s" % (self.host, self.api_path))
+ 
+         # set up the session
+-        self._session = requests.Session()
+-        self._session.auth = auth
+-        self._session.headers = {"Accept": "application/json"}
++        self._session = _SessionAdapter(auth=auth, headers={"Accept": "application/json"})
+ 
+         self._last_response = None  # for debugging
+ 
+@@ -158,8 +273,7 @@ class Connection(object):
+             try:
+                 result = res.json()
+             except Exception as e:  # json might be invalid, or store might be down
+-                e.message += " (_handle_response failed to decode JSON: " + str(res.content) + ")"
+-                raise  # TODO better exception
++                raise Exception("%s (_handle_response failed to decode JSON: %s)" % (e, res.content)) from e
+         elif res.status_code == 204 and not suppress_empty:
+             raise EmptyResponseWarning("%d %s @ %s: %s" % (res.status_code, res.reason, url, res.content), res)
+         elif res.status_code >= 500:
+@@ -196,9 +310,8 @@ class OAuthConnection(Connection):
+         self.timeout = 7.0  # can attach to session?
+         self.rate_limiting_management = rate_limiting_management
+ 
+-        self._session = requests.Session()
+-        self._session.headers = {"Accept": "application/json",
+-                                 "Accept-Encoding": "gzip"}
++        self._session = _SessionAdapter(headers={"Accept": "application/json",
++                                                 "Accept-Encoding": "gzip"})
+         if access_token and store_hash:
+             self._session.headers.update(self._oauth_headers(client_id, access_token))
+ 
+@@ -300,9 +413,8 @@ class GraphQLConnection(OAuthConnection):
+         self.timeout = 7.0  # can attach to session?
+         self.rate_limiting_management = rate_limiting_management
+ 
+-        self._session = requests.Session()
+-        self._session.headers = {"Accept": "application/json",
+-                                 "Accept-Encoding": "gzip"}
++        self._session = _SessionAdapter(headers={"Accept": "application/json",
++                                                 "Accept-Encoding": "gzip"})
+         if access_token and store_hash:
+             self._session.headers.update(self._oauth_headers(client_id, access_token))
+ 

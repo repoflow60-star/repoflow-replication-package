@@ -1,0 +1,107 @@
+diff --git /dev/null b/tinychat/llms/http.py
+new file mode 100644
+index 0000000..f33628f
+--- /dev/null
++++ b/tinychat/llms/http.py
+@@ -0,0 +1,101 @@
++import asyncio
++import queue
++import threading
++from dataclasses import dataclass
++from typing import Generator
++
++import aiohttp
++
++
++@dataclass(frozen=True)
++class SSEEvent:
++    event: str | None
++    data: str
++
++
++_STREAM_DONE = object()
++
++
++def stream_post_lines(
++    url: str, headers: dict[str, str], payload: dict
++) -> Generator[bytes, None, None]:
++    """
++    Stream response lines from an aiohttp POST request.
++
++    The request runs in a background thread so callers can consume the stream
++    synchronously, which keeps the UI code unchanged.
++    """
++
++    line_queue: queue.Queue[object] = queue.Queue()
++
++    async def _run_request() -> None:
++        timeout = aiohttp.ClientTimeout(total=None)
++        async with aiohttp.ClientSession(timeout=timeout) as session:
++            async with session.post(url, headers=headers, json=payload) as response:
++                if response.status != 200:
++                    body = await response.text()
++                    raise ValueError(
++                        "Server responded with an error. "
++                        f"Status Code: {response.status}. Body: {body}"
++                    )
++
++                while True:
++                    line = await response.content.readline()
++                    if not line:
++                        break
++                    line_queue.put(line)
++
++    def _worker() -> None:
++        try:
++            asyncio.run(_run_request())
++        except Exception as exc:
++            line_queue.put(exc)
++        finally:
++            line_queue.put(_STREAM_DONE)
++
++    threading.Thread(target=_worker, daemon=True).start()
++
++    while True:
++        item = line_queue.get()
++        if item is _STREAM_DONE:
++            break
++        if isinstance(item, Exception):
++            raise item
++        yield item  # type: ignore[misc]
++
++
++def iter_sse_events(lines: Generator[bytes, None, None]) -> Generator[SSEEvent, None, None]:
++    """
++    Parse an SSE byte stream into event objects.
++
++    This keeps the client code close to the previous sseclient-based logic while
++    using aiohttp for transport.
++    """
++
++    event_name: str | None = None
++    data_lines: list[str] = []
++
++    for raw_line in lines:
++        line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
++        if not line:
++            if data_lines:
++                yield SSEEvent(event=event_name, data="\n".join(data_lines))
++            event_name = None
++            data_lines = []
++            continue
++
++        if line.startswith(":"):
++            continue
++
++        field, separator, value = line.partition(":")
++        if not separator:
++            continue
++
++        value = value.lstrip()
++        if field == "event":
++            event_name = value or None
++        elif field == "data":
++            data_lines.append(value)
++
++    if data_lines:
++        yield SSEEvent(event=event_name, data="\n".join(data_lines))

@@ -1,0 +1,200 @@
+--- a/pdpyras.py
++++ b/pdpyras.py
+@@ -11,16 +11,43 @@
+ from random import random
+ from typing import Iterator, Union
+ from warnings import warn
++from pkg_resources import get_distribution
+ 
+ # Upstream components on which this client is based:
+-from requests import Response, Session
+-from requests import __version__ as REQUESTS_VERSION
++from httpx import Client, Response
++
++# Preserve the historical public name while migrating the implementation.
++Session = Client
+ 
+ # HTTP client exceptions:
+-from urllib3.exceptions import HTTPError, PoolError
+-from requests.exceptions import RequestException
++from httpx import HTTPError
++
++PoolError = HTTPError
++RequestException = HTTPError
++
++REQUESTS_VERSION = get_distribution('requests').version
+ 
+ __version__ = '5.4.0'
++
++
++def canonical_header_dict(headers) -> dict:
++    """Return a plain dict with the header names used by the public API."""
++    normalized = {}
++    for key, value in dict(headers).items():
++        lowered = key.lower()
++        if lowered == 'accept':
++            normalized['Accept'] = value
++        elif lowered == 'authorization':
++            normalized['Authorization'] = value
++        elif lowered == 'content-type':
++            normalized['Content-Type'] = value
++        elif lowered == 'from':
++            normalized['From'] = value
++        elif lowered == 'user-agent':
++            normalized['User-Agent'] = value
++        else:
++            normalized[key] = value
++    return normalized
+ 
+ #######################
+ ### CLIENT DEFAULTS ###
+@@ -407,6 +434,7 @@
+     :returns:
+         The canonical REST API v2 path corresponding to a URL.
+     """
++    url = str(url)
+     full_url = normalize_url(base_url, url)
+     # Starting with / after hostname before the query string:
+     url_path = full_url.replace(base_url.rstrip('/'), '').split('?')[0]
+@@ -487,6 +515,7 @@
+         "https://api.pagerduty.com"
+     :returns: The full API endpoint URL
+     """
++    url = str(url)
+     if url.startswith(base_url):
+         return url
+     elif not (url.startswith('http://') or url.startswith('https://')):
+@@ -862,11 +891,11 @@
+ ### CLASSES ###
+ ###############
+ 
+-class PDSession(Session):
++class PDSession(Client):
+     """
+     Base class for making HTTP requests to PagerDuty APIs
+ 
+-    This is an opinionated wrapper of `requests.Session`_, with a few additional
++    This is an opinionated wrapper of `httpx.Client`_, with a few additional
+     features:
+ 
+     - The client will reattempt the request with auto-increasing cooldown/retry
+@@ -911,7 +940,7 @@
+     """
+ 
+     parent = None
+-    """The ``super`` object (`requests.Session`_)"""
++    """The ``super`` object (`httpx.Client`_)"""
+ 
+     permitted_methods = ()
+     """
+@@ -967,7 +996,7 @@
+ 
+     def __init__(self, api_key: str, debug=False):
+         self.parent = super(PDSession, self)
+-        self.parent.__init__()
++        self.parent.__init__(follow_redirects=True)
+         self.api_key = api_key
+         self.log = logging.getLogger(__name__)
+         self.print_debug = debug
+@@ -1054,10 +1083,27 @@
+         :returns:
+             The final list of headers to use in the request
+         """
+-        headers = deepcopy(self.headers)
++        headers = canonical_header_dict(self.headers)
+         if user_headers:
+             headers.update(user_headers)
+         return headers
++
++    def delete(self, url, **kwargs) -> Response:
++        return self.request('delete', url, **kwargs)
++
++    def get(self, url, params=None, **kwargs) -> Response:
++        kwargs['params'] = params
++        kwargs.setdefault('allow_redirects', True)
++        return self.request('get', url, **kwargs)
++
++    def post(self, url, data=None, json=None, **kwargs) -> Response:
++        kwargs['data'] = data
++        kwargs['json'] = json
++        return self.request('post', url, **kwargs)
++
++    def put(self, url, data=None, **kwargs) -> Response:
++        kwargs['data'] = data
++        return self.request('put', url, **kwargs)
+ 
+     @property
+     def print_debug(self) -> bool:
+@@ -1119,7 +1165,13 @@
+         endpoint = "%s %s"%(method.upper(), full_url)
+ 
+         # Add in any headers specified in keyword arguments:
+-        headers = kwargs.get('headers', {})
++        headers = kwargs.get('headers') or {}
++        follow_redirects_present = 'follow_redirects' in req_kw
++        follow_redirects = req_kw.pop('follow_redirects', None)
++        if method == 'GET' and follow_redirects_present:
++            if follow_redirects is None:
++                follow_redirects = True
++            req_kw['allow_redirects'] = follow_redirects
+         req_kw.update({
+             'headers': self.prepare_headers(method, user_headers=headers),
+             'stream': False,
+@@ -1130,10 +1182,21 @@
+         if 'params' in kwargs and kwargs['params']:
+             req_kw['params'] = self.normalize_params(kwargs['params'])
+ 
++        def send_request():
++            try:
++                return self.parent.request(method, full_url, **req_kw)
++            except TypeError:
++                fallback_kw = deepcopy(req_kw)
++                allow_redirects = fallback_kw.pop('allow_redirects', None)
++                fallback_kw.pop('stream', None)
++                if allow_redirects is not None:
++                    fallback_kw['follow_redirects'] = allow_redirects
++                return self.parent.request(method, full_url, **fallback_kw)
++
+         # Make the request (and repeat w/cooldown if the rate limit is reached):
+         while True:
+             try:
+-                response = self.parent.request(method, full_url, **req_kw)
++                response = send_request()
+                 self.postprocess(response)
+             except (HTTPError, PoolError, RequestException) as e:
+                 network_attempts += 1
+@@ -1292,13 +1355,13 @@
+         :returns:
+             The final list of headers to use in the request
+         """
+-        headers = {}
+-        headers.update(self.headers)
++        headers = canonical_header_dict(self.headers)
+         headers.update({
+             'Content-Type': 'application/json',
+             'User-Agent': self.user_agent,
+         })
+-        headers.update(user_headers)
++        if user_headers:
++            headers.update(user_headers)
+         return headers
+ 
+     def resolve(self, dedup_key) -> str:
+@@ -1463,7 +1526,7 @@
+         :returns:
+             The final list of headers to use in the request
+         """
+-        headers = deepcopy(self.headers)
++        headers = canonical_header_dict(self.headers)
+         headers.update({
+             'Content-Type': 'application/json',
+             'User-Agent': self.user_agent,
+@@ -2037,7 +2100,7 @@
+                 status, request_id, request_date)
+ 
+     def prepare_headers(self, method, user_headers={}) -> dict:
+-        headers = deepcopy(self.headers)
++        headers = canonical_header_dict(self.headers)
+         headers['User-Agent'] = self.user_agent
+         if self.default_from is not None:
+             headers['From'] = self.default_from

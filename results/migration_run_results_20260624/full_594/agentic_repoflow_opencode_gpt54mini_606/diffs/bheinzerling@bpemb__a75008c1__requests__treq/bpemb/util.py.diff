@@ -1,0 +1,145 @@
+--- a/bpemb/util.py
++++ b/bpemb/util.py
+@@ -1,5 +1,39 @@
+ from pathlib import Path
+ from typing import IO
++import threading
++
++
++_download_reactor = None
++_download_reactor_lock = threading.Lock()
++
++
++class _InsecurePolicyForHTTPS:
++    def getContext(self, hostname=None, port=None):
++        from twisted.internet import ssl
++
++        return ssl.CertificateOptions(verify=False).getContext()
++
++
++def _get_download_reactor():
++    global _download_reactor
++    with _download_reactor_lock:
++        if _download_reactor is None:
++            from twisted.internet import selectreactor
++
++            reactor = selectreactor.SelectReactor()
++            started = threading.Event()
++
++            def _run():
++                started.set()
++                reactor.run(installSignalHandlers=False)
++
++            thread = threading.Thread(target=_run, daemon=True)
++            thread.start()
++            started.wait()
++            while not reactor.running:
++                threading.Event().wait(0.01)
++            _download_reactor = reactor
++    return _download_reactor
+ 
+ 
+ def sentencepiece_load(file):
+@@ -12,32 +46,79 @@
+ 
+ # source: https://github.com/allenai/allennlp/blob/master/allennlp/common/file_utils.py#L147  # NOQA
+ def http_get_temp(url: str, temp_file: IO) -> None:
+-    import requests
+-    import warnings
+-    from urllib3.exceptions import InsecureRequestWarning
++    import treq
++    from twisted.web.client import Agent
+ 
+-    # temporary fix for dealing with this SSL certificate issue:
+-    # https://github.com/bheinzerling/bpemb/issues/63
+-    with warnings.catch_warnings():
+-        warnings.simplefilter("ignore", InsecureRequestWarning)
+-        req = requests.get(url, stream=True, verify=False)
++    reactor = _get_download_reactor()
++    progress = None
++    result = {}
++    failure = {}
++    done = threading.Event()
+ 
+-    req.raise_for_status()
+-    content_length = req.headers.get('Content-Length')
+-    total = int(content_length) if content_length is not None else None
+-    try:
+-        from tqdm import tqdm
+-        progress = tqdm(unit="B", total=total)
+-    except ImportError:
+-        progress = None
+-    for chunk in req.iter_content(chunk_size=1024):
+-        if chunk:  # filter out keep-alive new chunks
++    def _write(chunk):
++        if progress is not None:
++            progress.update(len(chunk))
++        temp_file.write(chunk)
++
++    def _headers_to_dict(headers):
++        normalized = {}
++        for name, values in headers.getAllRawHeaders():
++            key = name.decode("ascii") if isinstance(name, bytes) else name
++            value = values[0]
++            normalized[key] = value.decode("ascii") if isinstance(value, bytes) else value
++        return normalized
++
++    def _handle_response(response):
++        nonlocal progress
++        content_length = response.headers.getRawHeaders("Content-Length")
++        total = int(content_length[0]) if content_length else None
++        try:
++            from tqdm import tqdm
++
++            progress = tqdm(unit="B", total=total)
++        except ImportError:
++            progress = None
++
++        def _close(value):
+             if progress is not None:
+-                progress.update(len(chunk))
+-            temp_file.write(chunk)
+-    if progress is not None:
+-        progress.close()
+-    return req.headers
++                progress.close()
++            return value
++
++        d = treq.collect(response, _write)
++        d.addBoth(_close)
++        d.addCallback(lambda _: _headers_to_dict(response.headers))
++        return d
++
++    def _store_headers(headers):
++        result["headers"] = headers
++        done.set()
++        return headers
++
++    def _store_failure(err):
++        failure["err"] = err
++        done.set()
++        return err
++
++    def _run_request():
++        try:
++            agent = Agent(reactor, contextFactory=_InsecurePolicyForHTTPS())
++            d = agent.request(b"GET", url.encode("utf-8"))
++            d.addCallback(_handle_response)
++            d.addCallbacks(_store_headers, _store_failure)
++        except Exception as exc:
++            failure["err"] = exc
++            done.set()
++
++    reactor.callFromThread(_run_request)
++
++    done.wait()
++
++    if failure:
++        err = failure["err"]
++        if hasattr(err, "raiseException"):
++            err.raiseException()
++        raise err
++    return result["headers"]
+ 
+ 
+ # source: https://github.com/allenai/allennlp/blob/master/allennlp/common/file_utils.py#L147  # NOQA

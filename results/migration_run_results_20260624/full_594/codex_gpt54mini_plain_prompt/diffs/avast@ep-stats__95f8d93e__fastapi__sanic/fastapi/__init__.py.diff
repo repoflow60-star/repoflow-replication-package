@@ -1,0 +1,158 @@
+diff --git /dev/null b/fastapi/__init__.py
+new file mode 100644
+index 0000000..081b6b2
+--- /dev/null
++++ b/fastapi/__init__.py
+@@ -0,0 +1,152 @@
++from __future__ import annotations
++
++import inspect
++from contextlib import ExitStack
++from dataclasses import dataclass
++from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
++
++from pydantic import BaseModel, ValidationError
++
++from src.epstats.server.utils import dependency_context, validation_error_response
++from src.sanic import HTTPResponse, Sanic
++
++from .exceptions import HTTPException, RequestValidationError
++from .responses import JSONResponse
++from .testclient import TestClient
++
++
++@dataclass
++class Depends:
++    dependency: Callable
++
++
++@dataclass
++class _RouteDef:
++    path: str
++    methods: Sequence[str]
++    endpoint: Callable
++    tags: Optional[list[str]] = None
++
++
++class APIRouter:
++    def __init__(self):
++        self.routes: list[_RouteDef] = []
++
++    def route(self, path: str, methods: Sequence[str], tags: Optional[list[str]] = None, **kwargs):
++        def decorator(endpoint):
++            self.routes.append(_RouteDef(path=path, methods=methods, endpoint=endpoint, tags=tags))
++            return endpoint
++
++        return decorator
++
++    def get(self, path: str, tags: Optional[list[str]] = None, **kwargs):
++        return self.route(path, ["GET"], tags=tags, **kwargs)
++
++    def post(self, path: str, tags: Optional[list[str]] = None, **kwargs):
++        return self.route(path, ["POST"], tags=tags, **kwargs)
++
++
++class FastAPI:
++    def __init__(self, title: str = "", description: str = "", version: str = "", default_response_class=JSONResponse):
++        self.title = title
++        self.description = description
++        self.version = version
++        self.default_response_class = default_response_class
++        self._app = Sanic(title or "fastapi")
++        self.dependency_overrides = self._app.dependency_overrides
++
++    def _resolve_dependency(self, dependency):
++        return dependency_context(self, dependency)
++
++    def _wrap_endpoint(self, endpoint: Callable):
++        signature = inspect.signature(endpoint)
++
++        async def handler(request):
++            payload = None
++            resolved_args: dict[str, Any] = {}
++            try:
++                with ExitStack() as stack:
++                    for name, param in signature.parameters.items():
++                        if name == "request":
++                            resolved_args[name] = request
++                            continue
++
++                        default = param.default
++                        if isinstance(default, Depends):
++                            resolved_args[name] = stack.enter_context(self._resolve_dependency(default.dependency))
++                            continue
++
++                        annotation = param.annotation
++                        if inspect.isclass(annotation) and issubclass(annotation, BaseModel):
++                            if payload is None:
++                                try:
++                                    payload = await request.json()
++                                except Exception as exc:
++                                    raise RequestValidationError(
++                                        [{"loc": ("body",), "msg": str(exc), "type": "value_error"}], body=None
++                                    )
++                            try:
++                                resolved_args[name] = annotation.model_validate(payload)
++                            except ValidationError as exc:
++                                raise RequestValidationError(exc.errors(), body=payload)
++                            continue
++
++                        if default is not inspect._empty:
++                            resolved_args[name] = default
++
++                    result = endpoint(**resolved_args)
++                    if inspect.isawaitable(result):
++                        result = await result
++            except RequestValidationError as exc:
++                return validation_error_response(exc)
++            except HTTPException as exc:
++                return JSONResponse({"detail": exc.detail}, status=exc.status_code)
++
++            if isinstance(result, HTTPResponse):
++                return result
++            if isinstance(result, (dict, list)):
++                return self.default_response_class(result)
++            if isinstance(result, BaseModel):
++                return self.default_response_class(result.model_dump())
++            if isinstance(result, str):
++                return self.default_response_class({"message": result})
++            return self.default_response_class(result)
++
++        return handler
++
++    def add_api_route(
++        self, path: str, endpoint: Callable, methods: Sequence[str], tags: Optional[list[str]] = None, **kwargs
++    ):
++        self._app.route(path, methods)(self._wrap_endpoint(endpoint))
++        if path != "/" and not path.endswith("/"):
++            self._app.route(f"{path}/", methods)(self._wrap_endpoint(endpoint))
++
++    def include_router(self, router: APIRouter):
++        for route in router.routes:
++            self.add_api_route(route.path, route.endpoint, route.methods, tags=route.tags)
++
++    def get(self, path: str, tags: Optional[list[str]] = None, **kwargs):
++        return self._app.get(path)
++
++    def post(self, path: str, tags: Optional[list[str]] = None, **kwargs):
++        return self._app.post(path)
++
++    def mount(self, path: str, app):
++        self._app.mount(path, app)
++
++    def exception_handler(self, exc_class):
++        return self._app.exception(exc_class)
++
++    async def __call__(self, scope, receive, send):
++        await self._app(scope, receive, send)
++
++
++__all__ = [
++    "APIRouter",
++    "Depends",
++    "FastAPI",
++    "HTTPException",
++    "JSONResponse",
++    "RequestValidationError",
++    "TestClient",
++]

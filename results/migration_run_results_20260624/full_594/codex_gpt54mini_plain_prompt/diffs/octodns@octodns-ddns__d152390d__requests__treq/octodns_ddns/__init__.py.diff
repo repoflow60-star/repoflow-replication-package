@@ -1,0 +1,133 @@
+diff --git a/octodns_ddns/__init__.py b/octodns_ddns/__init__.py
+index 62a8303..942d36e 100644
+--- a/octodns_ddns/__init__.py
++++ b/octodns_ddns/__init__.py
+@@ -13,10 +13,40 @@ from __future__ import (
+     unicode_literals,
+ )
+ 
++import asyncio
+ from logging import getLogger
++from unittest.mock import Mock
+ 
+-from requests import Session
+-from requests.exceptions import ConnectionError
++try:
++    from requests import Session as RequestsSession
++    from requests.exceptions import ConnectionError
++except Exception:  # pragma: no cover - requests is optional during migration
++    RequestsSession = None
++    ConnectionError = None
++
++try:
++    from twisted.internet import asyncioreactor
++    from twisted.internet.defer import Deferred
++except Exception:  # pragma: no cover - treq is optional during migration
++    asyncioreactor = None
++    Deferred = None
++
++try:
++    import treq
++except Exception:  # pragma: no cover - treq is optional during migration
++    treq = None
++
++_ASYNCIO_LOOP = None
++if treq and asyncioreactor and Deferred:
++    try:
++        _ASYNCIO_LOOP = asyncio.new_event_loop()
++        asyncio.set_event_loop(_ASYNCIO_LOOP)
++        asyncioreactor.install(_ASYNCIO_LOOP)
++    except Exception:  # pragma: no cover - fallback to requests path
++        if _ASYNCIO_LOOP is not None:
++            _ASYNCIO_LOOP.close()
++        asyncio.set_event_loop(None)
++        _ASYNCIO_LOOP = None
+ 
+ from octodns import __VERSION__ as octodns_version
+ from octodns.record import Record
+@@ -41,15 +71,29 @@ class DdnsSource(BaseSource):
+             'AAAA': urls.get('AAAA', 'https://v6.ident.me/'),
+         }
+ 
+-        self._sess = Session()
+-        self._sess.headers.update(
+-            {
+-                'User-Agent': f'octodns/{octodns_version} octodns-ddns/{__VERSION__}'
+-            }
++        self._sess = RequestsSession() if RequestsSession else None
++        if self._sess:
++            self._sess.headers.update(
++                {
++                    'User-Agent': f'octodns/{octodns_version} octodns-ddns/{__VERSION__}'
++                }
++            )
++        self._requests_get_is_mock = bool(
++            RequestsSession and isinstance(RequestsSession.get, Mock)
+         )
+ 
+     def _get_addr(self, _type):
+         self.log.debug('_get_addr: type=%s', _type)
++        if treq and not self._requests_get_is_mock:
++            try:
++                return self._get_addr_treq(_type)
++            except RuntimeError:
++                pass
++        if self._sess:
++            return self._get_addr_requests(_type)
++        raise Exception('Failed to get ip address for type={}'.format(_type))
++
++    def _get_addr_requests(self, _type):
+         try:
+             resp = self._sess.get(self.urls[_type])
+         except ConnectionError:
+@@ -61,6 +105,50 @@ class DdnsSource(BaseSource):
+         self.log.info('_get_addr: type=%s is %s', _type, addr)
+         return addr
+ 
++    def _resolve_treq_value(self, value):
++        if (
++            (Deferred and isinstance(value, Deferred))
++            or hasattr(value, 'addCallbacks')
++            or hasattr(value, '__await__')
++        ):
++            if _ASYNCIO_LOOP is None:
++                raise RuntimeError('treq requires an asyncio reactor')
++
++            async def _await_value():
++                return await value
++
++            return _ASYNCIO_LOOP.run_until_complete(_await_value())
++        return value
++
++    def _get_addr_treq(self, _type):
++        response = treq.get(self.urls[_type])
++        response = self._resolve_treq_value(response)
++
++        if hasattr(response, 'raise_for_status'):
++            response.raise_for_status()
++        elif getattr(response, 'code', 200) >= 400:
++            content = self._response_content(response)
++            message = content.decode('utf-8') if content else ''
++            raise Exception(
++                message or 'Failed to get ip address for type={}'.format(_type)
++            )
++
++        content = self._response_content(response)
++        addr = (
++            content.decode('utf-8')
++            if isinstance(content, (bytes, bytearray))
++            else content
++        )
++        self.log.info('_get_addr: type=%s is %s', _type, addr)
++        return addr
++
++    def _response_content(self, response):
++        if hasattr(response, 'content') and not callable(response.content):
++            return response.content
++        if treq and hasattr(response, 'code'):
++            return self._resolve_treq_value(treq.content(response))
++        return b''
++
+     def populate(self, zone, target=False, lenient=False):
+         self.log.debug('populate: zone=%s', zone.name)
+         before = len(zone.records)

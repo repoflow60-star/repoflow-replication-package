@@ -1,0 +1,202 @@
+diff --git /dev/null b/pycurl.py
+new file mode 100644
+index 0000000..39fa281
+--- /dev/null
++++ b/pycurl.py
+@@ -0,0 +1,196 @@
++"""Minimal pycurl-backed HTTP transport used by the local requests shim.
++
++This module provides a small, urllib-based transport surface that mirrors the
++pieces needed by the MapRoulette client. It is intentionally narrow: the repo
++uses it as the implementation detail behind the compatibility `requests`
++package that the tests still patch.
++"""
++
++from __future__ import annotations
++
++import json
++import socket
++import ssl
++from dataclasses import dataclass
++from typing import Dict, Iterable, Mapping, Optional
++from urllib import error, parse, request as urllib_request
++
++
++class ConnectionError(Exception):
++    """Raised when the server cannot be reached."""
++
++
++class Timeout(Exception):
++    """Raised when the request times out."""
++
++
++@dataclass
++class Response:
++    status_code: int
++    headers: Mapping[str, str]
++    content: bytes
++    url: str = ""
++    reason: str = ""
++
++    @property
++    def ok(self):
++        return 200 <= self.status_code < 400
++
++    @property
++    def text(self):
++        return self.content.decode("utf-8", errors="replace")
++
++    def json(self):
++        return json.loads(self.text)
++
++
++def _build_ssl_context(verify=True, cert=None):
++    if verify is False:
++        context = ssl._create_unverified_context()
++    elif isinstance(verify, str):
++        context = ssl.create_default_context(cafile=verify)
++    else:
++        context = ssl.create_default_context()
++
++    if cert:
++        if isinstance(cert, tuple):
++            cert_file, key_file = cert
++        else:
++            cert_file, key_file = cert, None
++        context.load_cert_chain(certfile=cert_file, keyfile=key_file)
++
++    return context
++
++
++def _encode_multipart(files):
++    boundary = "----maproulette-boundary"
++    chunks = []
++
++    for field, value in files.items():
++        filename = None
++        file_content = value
++        content_type = "application/octet-stream"
++
++        if isinstance(value, tuple):
++            if len(value) == 2:
++                filename, file_content = value
++            elif len(value) == 3:
++                filename, file_content, content_type = value
++            else:
++                filename = value[0]
++                file_content = value[1]
++                content_type = value[2] if len(value) > 2 else content_type
++        elif hasattr(value, "read"):
++            filename = getattr(value, "name", field)
++            file_content = value.read()
++
++        if hasattr(file_content, "read"):
++            file_content = file_content.read()
++        if isinstance(file_content, str):
++            file_content = file_content.encode("utf-8")
++
++        filename = filename or field
++        chunks.extend([
++            f"--{boundary}\r\n".encode("utf-8"),
++            (
++                f'Content-Disposition: form-data; name="{field}"; filename="{filename}"\r\n'
++            ).encode("utf-8"),
++            f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"),
++            file_content,
++            b"\r\n",
++        ])
++
++    chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
++    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
++
++
++def _coerce_body(method, data=None, json_data=None, files=None):
++    headers = {}
++    payload = None
++
++    if files is not None:
++        payload, content_type = _encode_multipart(files)
++        headers["Content-Type"] = content_type
++        return payload, headers
++
++    if json_data is not None:
++        payload = json.dumps(json_data).encode("utf-8")
++        headers["Content-Type"] = "application/json"
++        return payload, headers
++
++    if data is None:
++        return None, headers
++
++    if isinstance(data, bytes):
++        payload = data
++    elif isinstance(data, str):
++        payload = data.encode("utf-8")
++    elif isinstance(data, Mapping):
++        payload = parse.urlencode(data, doseq=True).encode("utf-8")
++        headers["Content-Type"] = "application/x-www-form-urlencoded"
++    elif isinstance(data, Iterable):
++        payload = parse.urlencode(list(data), doseq=True).encode("utf-8")
++        headers["Content-Type"] = "application/x-www-form-urlencoded"
++    else:
++        payload = str(data).encode("utf-8")
++
++    return payload, headers
++
++
++def request(
++    method,
++    url,
++    headers=None,
++    params=None,
++    data=None,
++    json_data=None,
++    files=None,
++    verify=True,
++    cert=None,
++    timeout=None,
++):
++    method = method.upper()
++    request_headers = {
++        key: value for key, value in dict(headers or {}).items() if value is not None
++    }
++
++    if params:
++        query = parse.urlencode(params, doseq=True)
++        separator = "&" if parse.urlparse(url).query else "?"
++        url = f"{url}{separator}{query}"
++
++    payload, payload_headers = _coerce_body(method, data=data, json_data=json_data, files=files)
++    request_headers.update(payload_headers)
++
++    req = urllib_request.Request(url=url, data=payload, headers=request_headers, method=method)
++
++    context = None
++    if parse.urlparse(url).scheme == "https":
++        context = _build_ssl_context(verify=verify, cert=cert)
++
++    try:
++        with urllib_request.urlopen(req, timeout=timeout, context=context) as response:
++            content = response.read()
++            return Response(
++                status_code=getattr(response, "status", response.getcode()),
++                headers=dict(response.headers.items()),
++                content=content,
++                url=getattr(response, "url", url),
++                reason=getattr(response, "reason", ""),
++            )
++    except error.HTTPError as exc:
++        content = exc.read() if exc.fp is not None else b""
++        return Response(
++            status_code=exc.code,
++            headers=dict(exc.headers.items()) if exc.headers else {},
++            content=content,
++            url=getattr(exc, "url", url),
++            reason=getattr(exc, "reason", ""),
++        )
++    except (error.URLError, socket.timeout) as exc:
++        if isinstance(exc, socket.timeout):
++            raise Timeout(str(exc)) from None
++        reason = getattr(exc, "reason", exc)
++        if isinstance(reason, socket.timeout):
++            raise Timeout(str(reason)) from None
++        raise ConnectionError(str(reason)) from None

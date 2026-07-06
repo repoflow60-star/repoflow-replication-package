@@ -1,0 +1,347 @@
+--- a/kling/kling.py
++++ b/kling/kling.py
+@@ -1,14 +1,16 @@
+ import argparse
++import io
++import json
+ import os
+ import time
+ import contextlib
+-from typing import Optional
++from typing import Dict, Optional, Tuple
+ from enum import Enum
+ from http.cookies import SimpleCookie
++from urllib.parse import urlencode, urlsplit, urlunsplit
+ 
+ from fake_useragent import UserAgent
+-import requests
+-from requests.utils import cookiejar_from_dict
++import pycurl
+ from rich import print
+ import threading
+ 
+@@ -18,7 +20,131 @@
+ base_url_not_cn = "https://klingai.com/"
+ 
+ 
+-def call_for_daily_check(session: requests.Session, is_cn: bool) -> bool:
++class CookieJarDict(dict):
++    def get_dict(self):
++        return dict(self)
++
++
++class PycurlResponse:
++    def __init__(self, status_code: int, body: bytes, headers: Dict[str, str]) -> None:
++        self.status_code = status_code
++        self.content = body
++        self.headers = headers
++
++    @property
++    def ok(self) -> bool:
++        return 200 <= self.status_code < 400
++
++    @property
++    def text(self) -> str:
++        return self.content.decode("utf-8", errors="replace")
++
++    def json(self):
++        try:
++            return json.loads(self.text)
++        except json.JSONDecodeError:
++            return {}
++
++    def __str__(self) -> str:
++        return f"<Response [{self.status_code}]>"
++
++
++class PycurlSession:
++    def __init__(self) -> None:
++        self.headers = {}
++        self.cookies = CookieJarDict()
++        self._cookie_lock = threading.Lock()
++
++    @staticmethod
++    def _parse_headers(raw_headers: bytes) -> Dict[str, str]:
++        headers: Dict[str, str] = {}
++        for line in raw_headers.decode("iso-8859-1", errors="replace").splitlines():
++            if not line or line.startswith("HTTP/"):
++                continue
++            if ":" not in line:
++                continue
++            key, value = line.split(":", 1)
++            headers[key.strip().lower()] = value.strip()
++        return headers
++
++    def _store_cookies(self, raw_headers: bytes) -> None:
++        cookie = SimpleCookie()
++        for line in raw_headers.decode("iso-8859-1", errors="replace").splitlines():
++            if line.lower().startswith("set-cookie:"):
++                cookie.load(line.split(":", 1)[1].strip())
++        if cookie:
++            with self._cookie_lock:
++                for key, morsel in cookie.items():
++                    self.cookies[key] = morsel.value
++
++    def get(self, url: str, params=None, headers=None):
++        return self._request("GET", url, params=params, headers=headers)
++
++    def post(self, url: str, data=None, params=None, headers=None, json=None):
++        return self._request(
++            "POST", url, data=data, params=params, headers=headers, json_data=json
++        )
++
++    def _request(self, method, url, data=None, params=None, headers=None, json_data=None):
++        if params:
++            query = urlencode(params, doseq=True)
++            parts = list(urlsplit(url))
++            parts[3] = f"{parts[3]}&{query}" if parts[3] else query
++            url = urlunsplit(parts)
++
++        request_headers = dict(self.headers)
++        if headers:
++            request_headers.update(headers)
++        with self._cookie_lock:
++            if self.cookies:
++                request_headers.setdefault(
++                    "Cookie",
++                    "; ".join(f"{key}={value}" for key, value in self.cookies.items()),
++                )
++
++        if json_data is not None:
++            data = json.dumps(json_data).encode("utf-8")
++            request_headers.setdefault("Content-Type", "application/json")
++
++        if data is not None and isinstance(data, str):
++            data = data.encode("utf-8")
++
++        body_buffer = io.BytesIO()
++        header_buffer = io.BytesIO()
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, url.encode("utf-8"))
++            curl.setopt(pycurl.FOLLOWLOCATION, 1)
++            curl.setopt(pycurl.MAXREDIRS, 5)
++            curl.setopt(pycurl.NOSIGNAL, 1)
++            curl.setopt(pycurl.ACCEPT_ENCODING, "")
++            curl.setopt(pycurl.WRITEFUNCTION, body_buffer.write)
++            curl.setopt(pycurl.HEADERFUNCTION, header_buffer.write)
++            curl.setopt(
++                pycurl.HTTPHEADER,
++                [f"{key}: {value}" for key, value in request_headers.items()],
++            )
++            if method == "POST":
++                curl.setopt(pycurl.POST, 1)
++                if data is not None:
++                    curl.setopt(pycurl.POSTFIELDS, data)
++                    curl.setopt(pycurl.POSTFIELDSIZE, len(data))
++            else:
++                curl.setopt(pycurl.HTTPGET, 1)
++            curl.perform()
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++            raw_headers = header_buffer.getvalue()
++            self._store_cookies(raw_headers)
++            return PycurlResponse(
++                status_code,
++                body_buffer.getvalue(),
++                self._parse_headers(raw_headers),
++            )
++        finally:
++            curl.close()
++
++
++def call_for_daily_check(session: PycurlSession, is_cn: bool) -> bool:
+     if is_cn:
+         r = session.get(f"{base_url}api/pay/reward?activity=login_bonus_daily")
+     else:
+@@ -40,12 +166,13 @@
+ 
+ class BaseGen:
+     def __init__(self, cookie: str) -> None:
+-        self.session: requests.Session = requests.Session()
++        self.session: PycurlSession = PycurlSession()
+         self.cookie = cookie
+         self.session.cookies, is_cn = self.parse_cookie_string(self.cookie)
+         self.session.headers["user-agent"] = ua.random
+         # check the daily login
+-        call_for_daily_check(self.session, is_cn)
++        if self.session.cookies:
++            call_for_daily_check(self.session, is_cn)
+         if is_cn:
+             self.base_url = base_url
+             image_upload_base_url = "https://upload.kuaishouzt.com/"
+@@ -71,25 +198,21 @@
+     def parse_cookie_string(cookie_string):
+         cookie = SimpleCookie()
+         cookie.load(cookie_string)
+-        cookies_dict = {}
+-        cookiejar = None
++        cookies_dict = CookieJarDict()
+         is_cn = False
+         for key, morsel in cookie.items():
+             if key.startswith("kuaishou"):
+                 is_cn = True
+             cookies_dict[key] = morsel.value
+-            cookiejar = cookiejar_from_dict(
+-                cookies_dict, cookiejar=None, overwrite=True
+-            )
+-        return cookiejar, is_cn
++        return cookies_dict, is_cn
+ 
+     def get_account_point(self) -> float:
+         bonus_req = self.session.get(self.daily_url)
+-        bonus_data = bonus_req.json()
++        bonus_data = bonus_req.json() or {}
+         assert bonus_data.get("status") == 200
+ 
+         point_req = self.session.get(self.point_url)
+-        point_data = point_req.json()
++        point_data = point_req.json() or {}
+         assert point_data.get("status") == 200
+ 
+         total_point = point_data["data"]["total"]
+@@ -106,14 +229,14 @@
+         file_name = image_path.split("/")[-1]
+         upload_url = self.apis_dict["image_upload_gettoken"] + file_name
+         token_req = self.session.get(upload_url)
+-        token_data = token_req.json()
++        token_data = token_req.json() or {}
+ 
+         assert token_data.get("status") == 200
+ 
+         token = token_data["data"]["token"]
+         resume_url = self.apis_dict["image_upload_resume"] + token
+         resume_req = self.session.get(resume_url)
+-        resume_data = resume_req.json()
++        resume_data = resume_req.json() or {}
+ 
+         assert resume_data.get("result") == 1
+         fragment_req = self.session.post(
+@@ -122,29 +245,30 @@
+             params=dict(upload_token=token, fragment_id=0),
+             headers={"Content-Type": "application/octet-stream"},
+         )
+-        fragment_data = fragment_req.json()
++        fragment_data = fragment_req.json() or {}
+         assert fragment_data.get("result") == 1
+         complete_req = self.session.post(
+             self.apis_dict["image_upload_complete"],
+             params=dict(upload_token=token, fragment_count=1),
+         )
+-        complete_data = complete_req.json()
++        complete_data = complete_req.json() or {}
+         assert complete_data.get("result") == 1
+         verify_url = self.apis_dict["image_upload_geturl"] + token
+         result_req = self.session.get(verify_url)
+-        result_data = result_req.json()
++        result_data = result_req.json() or {}
+         assert result_data.get("status") == 200
+-        return result_data.get("data").get("url")
+-
+-    def fetch_metadata(self, task_id: str) -> tuple[dict, TaskStatus]:
++        return (result_data.get("data") or {}).get("url")
++
++    def fetch_metadata(self, task_id: str) -> Tuple[dict, TaskStatus]:
+         url = f"{self.base_url}api/task/status?taskId={task_id}"
+         response = self.session.get(url)
+-        data = response.json().get("data")
++        data = (response.json() or {}).get("data") or {}
+         assert data is not None
+         # this is very interesting it use resolution to check if the image is ready
+-        if data.get("status") >= 90:
++        status_value = data.get("status") or 0
++        if status_value >= 90:
+             return data, TaskStatus.COMPLETED
+-        elif data.get("status") in [9, 50]:
++        elif status_value in [9, 50]:
+             return data, TaskStatus.FAILED
+         else:
+             return data, TaskStatus.PENDING
+@@ -156,7 +280,7 @@
+         # get the video url and init_prompt
+         data, status = self.fetch_metadata(video_id)
+         assert status == TaskStatus.COMPLETED
+-        works = data.get("works", [])
++        works = data.get("works", []) if data else []
+         if not works:
+             print("No Video found.")
+             raise Exception("No Video found.")
+@@ -164,9 +288,10 @@
+             video_type, resource, prompt_init = None, None, None
+             work = works[0]
+             work_id = work.get("workId")
+-            resource = work.get("resource", {}).get("resource")
+-            arguments = work.get("taskInfo", {}).get("arguments", [])
+-            video_type = work.get("taskInfo", {}).get("type")
++            resource = (work.get("resource") or {}).get("resource")
++            task_info = work.get("taskInfo") or {}
++            arguments = task_info.get("arguments", [])
++            video_type = task_info.get("type")
+ 
+             for arg in arguments:
+                 if arg.get("name") == "prompt":
+@@ -215,11 +340,12 @@
+         if not response.ok:
+             print(response.text)
+             raise Exception(f"Error response {str(response)}")
+-        response_body = response.json()
+-        if response_body.get("data").get("status") == 7:
+-            message = response_body.get("data").get("message")
++        response_body = response.json() or {}
++        response_data = response_body.get("data") or {}
++        if response_data.get("status") == 7:
++            message = response_data.get("message")
+             raise Exception(f"Request failed message {message}")
+-        request_id = response_body.get("data", {}).get("task", {}).get("id")
++        request_id = (response_data.get("task") or {}).get("id")
+ 
+         if not request_id:
+             raise Exception("Could not get request ID")
+@@ -240,13 +366,13 @@
+                 return []
+             else:
+                 result = []
+-                works = image_data.get("works", [])
++                works = image_data.get("works", []) if image_data else []
+                 if not works:
+                     print("No video found.")
+                     return []
+                 else:
+                     for work in works:
+-                        resource = work.get("resource", {}).get("resource")
++                        resource = (work.get("resource") or {}).get("resource")
+                         if resource:
+                             # sleep for 2s for waiting the video to be ready in kuaishou server
+                             time.sleep(2)
+@@ -485,11 +611,12 @@
+         if not response.ok:
+             print(response.text)
+             raise Exception(f"Error response {str(response)}")
+-        response_body = response.json()
+-        if response_body.get("data").get("status") == 7:
+-            message = response_body.get("data").get("message")
++        response_body = response.json() or {}
++        response_data = response_body.get("data") or {}
++        if response_data.get("status") == 7:
++            message = response_data.get("message")
+             raise Exception(f"Request failed message {message}")
+-        request_id = (response_body.get("data", {}).get("task") or {}).get("id")
++        request_id = (response_data.get("task") or {}).get("id")
+         if not request_id:
+             raise Exception("Could not get request ID")
+         start_wait = time.time()
+@@ -507,13 +634,13 @@
+                 return []
+             else:
+                 result = []
+-                works = image_data.get("works", [])
++                works = image_data.get("works", []) if image_data else []
+                 if not works:
+                     print("No images found.")
+                     return []
+                 else:
+                     for work in works:
+-                        resource = work.get("resource", {}).get("resource")
++                        resource = (work.get("resource") or {}).get("resource")
+                         if resource:
+                             # sleep for 2s for waiting the video to be ready in kuaishou server
+                             time.sleep(2)

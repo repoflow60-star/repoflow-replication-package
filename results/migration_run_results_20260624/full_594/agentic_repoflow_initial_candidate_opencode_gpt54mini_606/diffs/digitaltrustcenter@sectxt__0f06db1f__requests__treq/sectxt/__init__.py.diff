@@ -1,0 +1,209 @@
+--- a/sectxt/__init__.py
++++ b/sectxt/__init__.py
+@@ -6,6 +6,7 @@
+ import langcodes
+ import re
+ import sys
++import threading
+ from email.message import Message
+ import validators
+ from collections import defaultdict
+@@ -15,6 +16,9 @@
+ from pgpy_dtc import PGPMessage
+ from pgpy_dtc.errors import PGPError
+ from dateutil.relativedelta import relativedelta
++import treq
++from twisted.internet import reactor
++from twisted.internet.threads import blockingCallFromThread
+ 
+ if sys.version_info < (3, 8):
+     from typing_extensions import TypedDict
+@@ -22,11 +26,8 @@
+     from typing import TypedDict
+ 
+ import dateutil.parser
+-import requests
+ 
+ __version__ = "0.9.6"
+-
+-s = requests.Session()
+ 
+ 
+ class ErrorDict(TypedDict):
+@@ -48,6 +49,137 @@
+ 
+ 
+ PREFERRED_LANGUAGES = "preferred-languages"
++
++_REACTOR_THREAD_STARTED = threading.Event()
++_REACTOR_THREAD_LOCK = threading.Lock()
++
++
++def _ensure_reactor_thread() -> None:
++    if reactor.running:
++        _REACTOR_THREAD_STARTED.set()
++        return
++    with _REACTOR_THREAD_LOCK:
++        if reactor.running:
++            _REACTOR_THREAD_STARTED.set()
++            return
++        if not _REACTOR_THREAD_STARTED.is_set():
++            def _run_reactor() -> None:
++                reactor.callWhenRunning(_REACTOR_THREAD_STARTED.set)
++                reactor.run(installSignalHandlers=False)
++
++            thread = threading.Thread(target=_run_reactor, daemon=True)
++            thread.start()
++    _REACTOR_THREAD_STARTED.wait()
++
++
++def _call_treq(func, *args, **kwargs):
++    _ensure_reactor_thread()
++    return blockingCallFromThread(reactor, func, *args, **kwargs)
++
++
++def _normalize_headers(headers) -> dict:
++    normalized = {}
++    if headers is None:
++        return normalized
++    if hasattr(headers, "getAllRawHeaders"):
++        for name, values in headers.getAllRawHeaders() or []:
++            if not values:
++                continue
++            header_name = name.decode("latin-1") if isinstance(name, bytes) else str(name)
++            header_value = values[0]
++            normalized[header_name.lower()] = (
++                header_value.decode("latin-1") if isinstance(header_value, bytes) else str(header_value)
++            )
++        return normalized
++    for name, value in headers.items():
++        header_name = name.decode("latin-1") if isinstance(name, bytes) else str(name)
++        if isinstance(value, (list, tuple)):
++            value = value[0] if value else ""
++        normalized[header_name.lower()] = value.decode("latin-1") if isinstance(value, bytes) else str(value)
++    return normalized
++
++
++def _response_history(response):
++    history = getattr(response, "history", None)
++    if history is not None:
++        return [_HistoryEntry(item) for item in history]
++    previous = getattr(response, "previous_response", None)
++    if previous is None:
++        return []
++    chain = []
++    while previous is not None:
++        chain.insert(0, _HistoryEntry(previous))
++        previous = getattr(previous, "previous_response", None)
++    return chain
++
++
++def _response_url(response, fallback_url: str) -> str:
++    url = getattr(response, "url", None)
++    if url:
++        return url
++    request = getattr(response, "request", None)
++    if request is not None:
++        request_url = getattr(request, "absoluteURI", None)
++        if request_url:
++            return request_url
++    return fallback_url
++
++
++def _is_ssl_error(exc: Exception) -> bool:
++    name = exc.__class__.__name__.lower()
++    module = exc.__class__.__module__.lower()
++    message = str(exc).lower()
++    return (
++        "ssl" in name
++        or "ssl" in module
++        or "cert" in name
++        or "cert" in module
++        or "certificate" in message
++        or "ssl" in message
++    )
++
++
++class _FetchedResponse:
++    def __init__(self, response, content: bytes, fallback_url: str):
++        self._response = response
++        self.status_code = getattr(response, "status_code", getattr(response, "code", None))
++        self.history = _response_history(response)
++        self.url = _response_url(response, fallback_url)
++        self.headers = _normalize_headers(getattr(response, "headers", None))
++        self.content = content
++
++    def __getattr__(self, name):
++        return getattr(self._response, name)
++
++
++class _HistoryEntry:
++    def __init__(self, response):
++        self._response = response
++        self.url = _response_url(response, "")
++
++    def __getattr__(self, name):
++        return getattr(self._response, name)
++
++
++def _fetch_url(url: str, verify: bool = True) -> _FetchedResponse:
++    headers = {
++        'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
++                      'Gecko/20100101 Firefox/12.0'
++    }
++    kwargs = {
++        "headers": headers,
++        "timeout": 5,
++    }
++    if not verify:
++        kwargs["verify"] = False
++    try:
++        response = _call_treq(treq.get, url, **kwargs)
++    except TypeError:
++        if verify:
++            raise
++        response = _call_treq(treq.get, url, headers=headers, timeout=5)
++    content = _call_treq(treq.content, response)
++    return _FetchedResponse(response, content, url)
+ 
+ 
+ class Parser:
+@@ -557,32 +689,19 @@
+                 for path in [".well-known/security.txt", "security.txt"]:
+                     url = urlunsplit((scheme, self._loc, path, None, None))
+                     try:
+-                        resp = requests.get(
+-                            url,
+-                            headers={
+-                                'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                              'Gecko/20100101 Firefox/12.0'},
+-                            timeout=5
+-                        )
+-                    except requests.exceptions.SSLError:
++                        resp = _fetch_url(url)
++                    except Exception as exc:
++                        if not _is_ssl_error(exc):
++                            continue
+                         if not any(d["code"] == "invalid_cert" for d in self._errors):
+                             self._add_error(
+                                 "invalid_cert",
+                                 "security.txt must be served with a valid TLS certificate.",
+                             )
+                         try:
+-                            resp = requests.get(
+-                                url,
+-                                headers={
+-                                    'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                                  'Gecko/20100101 Firefox/12.0'},
+-                                timeout=5,
+-                                verify=False
+-                            )
+-                        except:
++                            resp = _fetch_url(url, verify=False)
++                        except Exception:
+                             continue
+-                    except:
+-                        continue
+                     if resp.status_code == 200:
+                         if resp.history:
+                             if not resp.url.endswith(path):

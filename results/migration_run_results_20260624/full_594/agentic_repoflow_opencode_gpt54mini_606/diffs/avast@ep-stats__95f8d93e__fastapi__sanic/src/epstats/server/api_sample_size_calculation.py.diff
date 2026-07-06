@@ -1,0 +1,112 @@
+--- a/src/epstats/server/api_sample_size_calculation.py
++++ b/src/epstats/server/api_sample_size_calculation.py
+@@ -1,48 +1,84 @@
+ import asyncio
++from contextlib import contextmanager
+ import logging
+-from concurrent.futures import ThreadPoolExecutor
+ 
+-from fastapi import APIRouter, Depends, HTTPException
++from pydantic import ValidationError
++from sanic import Blueprint
+ 
+ from ..toolkit.statistics import Statistics
++from .json_response import data_science_json_response
+ from .req import SampleSizeCalculationData
+ from .res import SampleSizeCalculationResult
+ 
+ _logger = logging.getLogger("epstats")
+ 
+ 
+-def get_sample_size_calculation_router(get_executor_pool) -> APIRouter:
++def get_sample_size_calculation_router(get_executor_pool) -> Blueprint:
++    @contextmanager
++    def _provided_dependency(request, provider):
++        dependency_provider = request.app.dependency_overrides.get(provider, provider)
++        dependency = dependency_provider()
++        if hasattr(dependency, "__enter__"):
++            with dependency as value:
++                yield value
++            return
++        if hasattr(dependency, "__next__"):
++            try:
++                yield next(dependency)
++            finally:
++                close = getattr(dependency, "close", None)
++                if close is not None:
++                    close()
++            return
++        yield dependency
++
++    def _validation_error_response(exc: ValidationError):
++        detail = []
++        for error in exc.errors():
++            normalized = dict(error)
++            loc = tuple(normalized.get("loc", ()))
++            if not loc or loc[0] != "body":
++                normalized["loc"] = ("body", *loc)
++            detail.append(normalized)
++        return data_science_json_response({"detail": detail}, status=422)
++
+     def _sample_size_calculation(data: SampleSizeCalculationData):
+-        try:
+-            if data.std is None:
+-                f = Statistics.required_sample_size_per_variant_bernoulli
+-            else:
+-                f = Statistics.required_sample_size_per_variant
++        if data.std is None:
++            f = Statistics.required_sample_size_per_variant_bernoulli
++        else:
++            f = Statistics.required_sample_size_per_variant
+ 
+-            sample_size_per_variant = f(**data.dict())
++        sample_size_per_variant = f(**data.model_dump())
+ 
+-            _logger.info((f"Calculation finished, sample_size_per_variant = {sample_size_per_variant}."))
+-            return SampleSizeCalculationResult(sample_size_per_variant=sample_size_per_variant)
+-        except Exception as e:
+-            _logger.error(f"Cannot calculate the sample size because of: '{e}'")
+-            _logger.exception(e)
+-            raise HTTPException(
+-                status_code=500,
+-                detail=f"Cannot calculate the sample size because of: '{e}'",
+-            )
++        _logger.info((f"Calculation finished, sample_size_per_variant = {sample_size_per_variant}."))
++        return SampleSizeCalculationResult(sample_size_per_variant=sample_size_per_variant)
+ 
+-    router = APIRouter()
++    router = Blueprint("sample_size_calculation", url_prefix="")
+ 
+-    @router.post("/sample-size-calculation", response_model=SampleSizeCalculationResult)
++    @router.post("/sample-size-calculation", name="sample_size_calculation")
+     async def sample_size_calculation(
+-        data: SampleSizeCalculationData,
+-        evaluation_pool: ThreadPoolExecutor = Depends(get_executor_pool),
++        request,
+     ):
+         """
+         Calculates sample size based on `data`.
+         """
+-        _logger.info(f"Calling the sample size calculation with {data.json()}")
+-        loop = asyncio.get_event_loop()
+-        return await loop.run_in_executor(evaluation_pool, _sample_size_calculation, data)
++        try:
++            data = SampleSizeCalculationData.model_validate(request.json)
++        except ValidationError as exc:
++            return _validation_error_response(exc)
++
++        _logger.info("Calling the sample size calculation with %s", data.model_dump_json())
++        try:
++            with _provided_dependency(request, get_executor_pool) as evaluation_pool:
++                loop = asyncio.get_running_loop()
++                result = await loop.run_in_executor(evaluation_pool, _sample_size_calculation, data)
++        except Exception as exc:
++            _logger.error(f"Cannot calculate the sample size because of: '{exc}'")
++            _logger.exception(exc)
++            return data_science_json_response(
++                {"detail": f"Cannot calculate the sample size because of: '{exc}'"}, status=500
++            )
++
++        return data_science_json_response(result.model_dump(mode="json"))
+ 
+     return router

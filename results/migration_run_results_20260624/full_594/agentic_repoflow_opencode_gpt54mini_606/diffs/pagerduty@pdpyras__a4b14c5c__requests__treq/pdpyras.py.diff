@@ -1,0 +1,270 @@
+--- a/pdpyras.py
++++ b/pdpyras.py
+@@ -3,22 +3,240 @@
+ # See LICENSE for details.
+ 
+ # Standard libraries
++import json as json_module
+ import logging
++import threading
+ import sys
+ import time
+ from copy import deepcopy
+-from datetime import datetime
++from datetime import datetime, timedelta
+ from random import random
++from types import SimpleNamespace
+ from typing import Iterator, Union
++from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+ from warnings import warn
+ 
+-# Upstream components on which this client is based:
+-from requests import Response, Session
+-from requests import __version__ as REQUESTS_VERSION
+-
+-# HTTP client exceptions:
+-from urllib3.exceptions import HTTPError, PoolError
+-from requests.exceptions import RequestException
++# Upstream component on which this client is based:
++import treq
++from twisted.internet import defer
++from twisted.internet.threads import blockingCallFromThread
++
++# Keep the legacy user-agent format for compatibility.
++REQUESTS_VERSION = '2.34.2'
++
++
++class Session:
++    def __init__(self, *args, **kwargs):
++        self.headers = {}
++
++    def request(self, method, url, **kwargs):
++        reactor = _ensure_reactor_running()
++        return blockingCallFromThread(
++            reactor,
++            _perform_treq_request,
++            method,
++            url,
++            **kwargs,
++        )
++
++    def get(self, url, **kwargs):
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, **kwargs):
++        return self.request('POST', url, **kwargs)
++
++    def put(self, url, **kwargs):
++        return self.request('PUT', url, **kwargs)
++
++    def delete(self, url, **kwargs):
++        return self.request('DELETE', url, **kwargs)
++
++    def close(self):
++        pass
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc, tb):
++        self.close()
++
++
++class CaseInsensitiveDict(dict):
++    def __init__(self, *args, **kwargs):
++        super().__init__()
++        if args or kwargs:
++            self.update(*args, **kwargs)
++
++    @staticmethod
++    def _key(key):
++        return str(key).lower()
++
++    def __setitem__(self, key, value):
++        super().__setitem__(self._key(key), value)
++
++    def __getitem__(self, key):
++        return super().__getitem__(self._key(key))
++
++    def __contains__(self, key):
++        return super().__contains__(self._key(key))
++
++    def get(self, key, default=None):
++        return super().get(self._key(key), default)
++
++    def update(self, *args, **kwargs):
++        for key, value in dict(*args, **kwargs).items():
++            super().__setitem__(self._key(key), value)
++
++
++class Response:
++    def __init__(self, status_code=0, headers=None, content=b'', request=None,
++            elapsed=None, encoding=None):
++        self.status_code = status_code
++        self.headers = CaseInsensitiveDict(headers or {})
++        if content is None:
++            content = b''
++        if isinstance(content, str):
++            content = content.encode('utf-8')
++        self._content = content if isinstance(content, bytes) else bytes(content)
++        self.request = request or SimpleNamespace(method='', url='', headers={})
++        self.url = self.request.url
++        self.elapsed = elapsed or timedelta(0)
++        self.encoding = encoding or _response_encoding(self.headers)
++
++    @property
++    def ok(self):
++        return 200 <= self.status_code < 400
++
++    def __bool__(self):
++        return self.ok
++
++    @property
++    def content(self):
++        return self._content
++
++    @property
++    def text(self):
++        return self._content.decode(self.encoding or 'utf-8', errors='replace')
++
++    def json(self):
++        return json_module.loads(self.text)
++
++
++_TREQ_REACTOR_THREAD = None
++_TREQ_REACTOR_READY = threading.Event()
++
++
++def _get_reactor():
++    from twisted.internet import reactor
++    return reactor
++
++
++def _ensure_reactor_running():
++    global _TREQ_REACTOR_THREAD
++    reactor = _get_reactor()
++    if reactor.running:
++        return reactor
++    if _TREQ_REACTOR_THREAD is None or not _TREQ_REACTOR_THREAD.is_alive():
++        _TREQ_REACTOR_READY.clear()
++
++        def _run():
++            reactor.callWhenRunning(_TREQ_REACTOR_READY.set)
++            reactor.run(installSignalHandlers=False)
++
++        _TREQ_REACTOR_THREAD = threading.Thread(target=_run, daemon=True)
++        _TREQ_REACTOR_THREAD.start()
++    _TREQ_REACTOR_READY.wait()
++    return reactor
++
++
++def _response_encoding(headers):
++    content_type = headers.get('content-type', '')
++    if 'charset=' in content_type:
++        return content_type.split('charset=', 1)[1].split(';', 1)[0].strip().strip('"')
++    return 'utf-8'
++
++
++def _header_text(value):
++    if isinstance(value, bytes):
++        return value.decode('latin-1')
++    return str(value)
++
++
++def _normalize_response_headers(headers):
++    normalized = {}
++    if hasattr(headers, 'getAllRawHeaders'):
++        raw_headers = headers.getAllRawHeaders() or []
++        for key, values in raw_headers:
++            normalized[_header_text(key).lower()] = ', '.join(
++                _header_text(value) for value in values
++            )
++    elif hasattr(headers, 'items'):
++        for key, value in headers.items():
++            normalized[_header_text(key).lower()] = _header_text(value)
++    return normalized
++
++
++def _merge_query_params(url, params):
++    if not params:
++        return url
++    parts = urlsplit(url)
++    query_params = parse_qsl(parts.query, keep_blank_values=True)
++    if isinstance(params, dict):
++        query_params.extend(params.items())
++    else:
++        query_params.extend(list(params))
++    return urlunsplit((
++        parts.scheme,
++        parts.netloc,
++        parts.path,
++        urlencode(query_params, doseq=True),
++        parts.fragment,
++    ))
++
++
++@defer.inlineCallbacks
++def _perform_treq_request(method, url, **kwargs):
++    start = time.perf_counter()
++    kwargs.pop('stream', None)
++    allow_redirects = kwargs.pop('allow_redirects', None)
++    kwargs.pop('verify', None)
++    kwargs.pop('cert', None)
++    if allow_redirects is not None and 'browser_like_redirects' not in kwargs:
++        kwargs['browser_like_redirects'] = allow_redirects
++    headers = kwargs.get('headers')
++    if headers is not None:
++        kwargs['headers'] = deepcopy(headers)
++    params = kwargs.pop('params', None)
++    if params:
++        url = _merge_query_params(url, params)
++    json_body = kwargs.pop('json', None)
++    if json_body is not None:
++        kwargs['data'] = json_module.dumps(json_body).encode('utf-8')
++        headers = kwargs.get('headers')
++        if headers is None:
++            headers = {}
++            kwargs['headers'] = headers
++        headers.setdefault('Content-Type', 'application/json')
++    treq_kw = {}
++    for key in ('headers', 'timeout', 'auth',
++            'browser_like_redirects', 'unbuffered', 'data'):
++        if key in kwargs:
++            treq_kw[key] = {} if key == 'headers' and kwargs[key] is None else kwargs[key]
++    treq_kw.setdefault('browser_like_redirects', True)
++    response = yield treq.request(method, url, **treq_kw)
++    content = yield treq.content(response)
++    elapsed = timedelta(seconds=time.perf_counter() - start)
++    defer.returnValue(Response(
++        status_code=int(getattr(response, 'code', 0) or 0),
++        headers=_normalize_response_headers(getattr(response, 'headers', {})),
++        content=content,
++        request=SimpleNamespace(
++            method=method.upper(),
++            url=url,
++            headers=deepcopy(treq_kw.get('headers', {})),
++        ),
++        elapsed=elapsed,
++    ))
+ 
+ __version__ = '5.4.0'
+ 
+@@ -1134,8 +1352,7 @@
+         while True:
+             try:
+                 response = self.parent.request(method, full_url, **req_kw)
+-                self.postprocess(response)
+-            except (HTTPError, PoolError, RequestException) as e:
++            except Exception as e:
+                 network_attempts += 1
+                 if network_attempts > self.max_network_attempts:
+                     error_msg = f"{endpoint}: Non-transient network " \
+@@ -1148,6 +1365,8 @@
+                     endpoint, e.__class__.__name__, sleep_timer)
+                 time.sleep(sleep_timer)
+                 continue
++
++            self.postprocess(response)
+ 
+             status = response.status_code
+             retry_logic = self.retry.get(status, 0)

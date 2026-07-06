@@ -1,0 +1,191 @@
+--- a/filestack/utils.py
++++ b/filestack/utils.py
+@@ -1,9 +1,11 @@
++import json
+ import time
+ import string
+ import random
+-from functools import partial
+-import requests as original_requests
+-from requests.exceptions import HTTPError
++from urllib.parse import urlencode, urlsplit, urlunsplit
++
++import urllib3
++from urllib3.filepost import encode_multipart_formdata
+ 
+ from filestack import config
+ from filestack.exceptions import FilestackHTTPError
+@@ -13,34 +15,154 @@
+     return ''.join(random.choice(string.ascii_letters + string.digits) for i in range(length))
+ 
+ 
+-class RequestsWrapper:
++class HTTPResponseWrapper:
++    def __init__(self, response):
++        self._response = response
++        self.status_code = response.status
++        self.headers = response.headers
++        self.ok = 200 <= response.status < 400
++
++    @property
++    def content(self):
++        content = self._response.data
++        self._response.release_conn()
++        return content
++
++    @property
++    def text(self):
++        content = self.content
++        if isinstance(content, bytes):
++            return content.decode('utf-8', errors='replace')
++        return content
++
++    def json(self):
++        content = self.content
++        if isinstance(content, bytes):
++            content = content.decode('utf-8')
++        return json.loads(content)
++
++    def iter_content(self, chunk_size):
++        try:
++            for chunk in self._response.stream(chunk_size, decode_content=True):
++                if chunk:
++                    yield chunk
++        finally:
++            self._response.release_conn()
++
++
++class HTTPClient:
+     """
+-    This class wraps selected methods from requests package and adds
++    This class wraps selected HTTP methods and adds
+     default headers if no headers were specified.
+     """
+-    def __getattr__(self, name):
+-        if name in ('get', 'post', 'put', 'delete'):
+-            return partial(self.handle_request, name)
+-        return original_requests.__getattribute__(name)
++    def __init__(self):
++        self._pool = urllib3.PoolManager()
+ 
+-    def handle_request(self, name, *args, **kwargs):
+-        if 'headers' not in kwargs:
+-            kwargs['headers'] = config.HEADERS
+-            kwargs['headers']['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
+-            kwargs['headers']['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
++    def get(self, *args, **kwargs):
++        return self.handle_request('GET', *args, **kwargs)
+ 
+-        requests_method = getattr(original_requests, name)
+-        response = requests_method(*args, **kwargs)
++    def post(self, *args, **kwargs):
++        return self.handle_request('POST', *args, **kwargs)
+ 
+-        try:
+-            response.raise_for_status()
+-        except HTTPError as e:
+-            raise FilestackHTTPError(response.text) from e
++    def put(self, *args, **kwargs):
++        return self.handle_request('PUT', *args, **kwargs)
+ 
+-        return response
++    def delete(self, *args, **kwargs):
++        return self.handle_request('DELETE', *args, **kwargs)
++
++    def request(self, method, *args, **kwargs):
++        return self.handle_request(method.upper(), *args, **kwargs)
++
++    def handle_request(self, method, *args, **kwargs):
++        if not args:
++            raise TypeError('request url is required')
++
++        url = args[0]
++        headers = kwargs.pop('headers', None)
++        if headers is None:
++            headers = config.HEADERS.copy()
++            headers['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
++            headers['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
++        else:
++            headers = dict(headers)
++
++        params = kwargs.pop('params', None)
++        if params:
++            parts = list(urlsplit(url))
++            query = urlencode(params, doseq=True)
++            parts[3] = '{}&{}'.format(parts[3], query) if parts[3] else query
++            url = urlunsplit(parts)
++
++        stream = kwargs.pop('stream', False)
++        retries = kwargs.pop('retries', None)
++        timeout = kwargs.pop('timeout', None)
++
++        body = self._prepare_body(kwargs, headers)
++        request_kwargs = {
++            'body': body,
++            'headers': headers,
++            'preload_content': not stream,
++        }
++        if retries is not None:
++            request_kwargs['retries'] = retries
++        if timeout is not None:
++            request_kwargs['timeout'] = timeout
++
++        response = self._pool.request(method, url, **request_kwargs)
++
++        if response.status >= 400:
++            raise FilestackHTTPError(self._response_text(response))
++
++        return HTTPResponseWrapper(response)
++
++    def _prepare_body(self, kwargs, headers):
++        json_payload = kwargs.pop('json', None)
++        if json_payload is not None:
++            headers.setdefault('Content-Type', 'application/json')
++            return json.dumps(json_payload).encode('utf-8')
++
++        files = kwargs.pop('files', None)
++        data = kwargs.pop('data', None)
++        if files is not None:
++            fields = []
++            if data is not None:
++                fields.extend(data.items() if hasattr(data, 'items') else data)
++            file_items = files.items() if hasattr(files, 'items') else files
++            for key, value in file_items:
++                if isinstance(value, tuple):
++                    file_name = value[0]
++                    file_data = value[1]
++                    content_type = value[2] if len(value) > 2 else None
++                    if hasattr(file_data, 'read'):
++                        file_data = file_data.read()
++                    value = (file_name, file_data, content_type) if content_type else (file_name, file_data)
++                elif hasattr(value, 'read'):
++                    value = value.read()
++                fields.append((key, value))
++            body, content_type = encode_multipart_formdata(fields)
++            headers.setdefault('Content-Type', content_type)
++            return body
++
++        if data is not None:
++            if isinstance(data, (bytes, bytearray)):
++                return data
++            if hasattr(data, 'read'):
++                return data.read()
++            headers.setdefault('Content-Type', 'application/x-www-form-urlencoded')
++            return urlencode(data, doseq=True).encode('utf-8')
++
++        return None
++
++    @staticmethod
++    def _response_text(response):
++        content = response.data
++        response.release_conn()
++        if isinstance(content, bytes):
++            return content.decode('utf-8', errors='replace')
++        return str(content)
+ 
+ 
+-requests = RequestsWrapper()
++http_client = HTTPClient()
+ 
+ 
+ def return_transform_task(transformation, params):

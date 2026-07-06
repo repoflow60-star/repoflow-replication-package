@@ -1,0 +1,704 @@
+--- a/src/coguard_cli/api_connection.py
++++ b/src/coguard_cli/api_connection.py
+@@ -3,17 +3,26 @@
+ logic, so that it is modularized.
+ """
+ 
++import asyncio
+ import logging
++import os
+ import tempfile
+-import os
+ from typing import Dict, Optional
+ import urllib.parse
+-import requests
++
++import aiohttp
+ 
+ from coguard_cli.auth.token import Token
+ from coguard_cli.util import replace_special_chars_with_underscore
+ from coguard_cli.print_colors import COLOR_TERMINATION, \
+     COLOR_RED
++
++
++def _normalize_url(url: str) -> str:
++    if url.startswith(("http://", "https://")):
++        return url
++    return f"http://{url}"
++
+ 
+ def run_report(
+         auth_token: Token,
+@@ -26,22 +35,29 @@
+     """
+     scan_identifier_sanitized = \
+         replace_special_chars_with_underscore(scan_identifier, True)
+-    resp = requests.put(
+-        (
+-            f"{coguard_api_url}/cluster/run-report/"
+-            f"{urllib.parse.quote_plus(scan_identifier_sanitized)}?"
+-            f"organizationName={urllib.parse.quote_plus(organization)}"
+-        ),
+-        headers={
+-            "Authorization": f'Bearer {auth_token.get_token()}',
+-            "Content-Type": "application/json"
+-        },
+-        timeout=1600
+-    )
+-    if resp.status_code != 204:
+-        logging.error("Could not run a report on the specified cluster")
+-        return False
+-    return True
++    bearer_token = f'Bearer {auth_token.get_token()}'
++
++    async def _run_report() -> bool:
++        timeout = aiohttp.ClientTimeout(total=1600)
++        async with aiohttp.ClientSession(timeout=timeout) as session:
++            async with session.put(
++                _normalize_url(
++                    f"{coguard_api_url}/cluster/run-report/"
++                    f"{urllib.parse.quote_plus(scan_identifier_sanitized)}?"
++                    f"organizationName={urllib.parse.quote_plus(organization)}"
++                ),
++                headers={
++                    "Authorization": bearer_token,
++                    "Content-Type": "application/json"
++                }
++            ) as resp:
++                if resp.status != 204:
++                    logging.error("Could not run a report on the specified cluster")
++                    return False
++                return True
++
++    return asyncio.run(_run_report())
++
+ 
+ def get_latest_report(
+         auth_token: Token,
+@@ -58,42 +74,46 @@
+         scan_identifier_sanitized = urllib.parse.quote_plus(
+             replace_special_chars_with_underscore(scan_identifier, True)
+         )
+-        resp = requests.get(
+-            (
+-                f"{coguard_api_url}/cluster/reports/list?"
+-                f"clusterName={scan_identifier_sanitized}&"
+-                f"organizationName={urllib.parse.quote_plus(organization)}"
+-            ),
+-            headers={
+-                "Authorization": f'Bearer {auth_token.get_token()}',
+-                "Content-Type": "application/json"
+-            },
+-            timeout=300
++        request_url = _normalize_url(
++            f"{coguard_api_url}/cluster/reports/list?"
++            f"clusterName={scan_identifier_sanitized}&"
++            f"organizationName={urllib.parse.quote_plus(organization)}"
+         )
+     else:
+         scan_identifier_sanitized = urllib.parse.quote_plus(
+             replace_special_chars_with_underscore(scan_identifier, True)
+         )
+-        resp = requests.get(
+-            (
+-                 f"{coguard_api_url}/coguard-cli/reports/list?"
+-                 f"clusterName={scan_identifier_sanitized}&"
+-                 f"userName={urllib.parse.quote_plus(username)}"
+-            ),
+-            headers={
+-                "Authorization": f'Bearer {auth_token.get_token()}',
+-                "Content-Type": "application/json"
+-            },
+-            timeout=300
+-        )
+-    if resp.status_code != 200:
+-        logging.error("Could not retrieve the latest report for cluster %s",
+-                      scan_identifier)
+-        return None
+-    lst = resp.json()
+-    if not lst:
+-        return None
+-    return lst[-1]
++        request_url = _normalize_url(
++            f"{coguard_api_url}/coguard-cli/reports/list?"
++            f"clusterName={scan_identifier_sanitized}&"
++            f"userName={urllib.parse.quote_plus(username)}"
++        )
++    bearer_token = f'Bearer {auth_token.get_token()}'
++
++    async def _get_latest_report() -> Optional[str]:
++        timeout = aiohttp.ClientTimeout(total=300)
++        async with aiohttp.ClientSession(timeout=timeout) as session:
++            async with session.get(
++                request_url,
++                headers={
++                    "Authorization": bearer_token,
++                    "Content-Type": "application/json"
++                }
++            ) as resp:
++                if resp.status != 200:
++                    logging.error("Could not retrieve the latest report for cluster %s",
++                                  scan_identifier)
++                    return None
++                try:
++                    lst = await resp.json()
++                except (aiohttp.ContentTypeError, ValueError):
++                    return None
++                if not isinstance(lst, list) or not lst:
++                    return None
++                return lst[-1]
++
++    return asyncio.run(_get_latest_report())
++
+ 
+ def send_zip_file_for_scanning(
+         zip_file: str,
+@@ -118,76 +138,151 @@
+               scanning.
+     """
+     with open(zip_file, 'rb') as file_to_send:
+-        if organization:
+-            resp_upload = requests.post(
+-                (
+-                    f"{coguard_api_url}/cluster/"
+-                    f"upload-cluster-zip?organizationName={urllib.parse.quote_plus(organization)}&"
+-                    f"overwrite=true&compliance={urllib.parse.quote_plus(ruleset)}"
+-                ),
+-                headers={
+-                    "Authorization": f'Bearer {auth_token.get_token()}',
+-                    "Content-Type": "application/octet-stream"
+-                },
+-                data=file_to_send.read(),
+-                timeout=300)
+-            if resp_upload.status_code != 204:
+-                logging.error("There was an issue uploading the zip file")
+-                logging.debug("Reason %s", resp_upload.reason)
++        file_data = file_to_send.read()
++
++    bearer_token = f'Bearer {auth_token.get_token()}'
++
++    async def _run_report_async(
++            session: aiohttp.ClientSession,
++            scan_identifier: str,
++            organization: str,
++            bearer_token: str,
++    ) -> bool:
++        scan_identifier_sanitized = replace_special_chars_with_underscore(scan_identifier, True)
++        async with session.put(
++            _normalize_url(
++                f"{coguard_api_url}/cluster/run-report/"
++                f"{urllib.parse.quote_plus(scan_identifier_sanitized)}?"
++                f"organizationName={urllib.parse.quote_plus(organization)}"
++            ),
++            headers={
++                "Authorization": bearer_token,
++                "Content-Type": "application/json"
++            }
++        ) as resp:
++            if resp.status != 204:
++                logging.error("Could not run a report on the specified cluster")
++                return False
++            return True
++
++    async def _get_latest_report_async(
++            session: aiohttp.ClientSession,
++            scan_identifier: str,
++            organization: str,
++            bearer_token: str,
++    ) -> Optional[str]:
++        scan_identifier_sanitized = urllib.parse.quote_plus(
++            replace_special_chars_with_underscore(scan_identifier, True)
++        )
++        async with session.get(
++            _normalize_url(
++                f"{coguard_api_url}/cluster/reports/list?"
++                f"clusterName={scan_identifier_sanitized}&"
++                f"organizationName={urllib.parse.quote_plus(organization)}"
++            ),
++            headers={
++                "Authorization": bearer_token,
++                "Content-Type": "application/json"
++            }
++        ) as resp:
++            if resp.status != 200:
++                logging.error("Could not retrieve the latest report for cluster %s",
++                              scan_identifier)
+                 return None
+-            logging.debug("We successfully uploaded the cluster. Now running the report.")
+-            run_report_result = run_report(
+-                auth_token,
+-                coguard_api_url,
+-                scan_identifier,
+-                organization
+-            )
+-            if not run_report_result:
++            try:
++                lst = await resp.json()
++            except (aiohttp.ContentTypeError, ValueError):
+                 return None
+-            latest_report = get_latest_report(
+-                auth_token,
+-                coguard_api_url,
+-                scan_identifier,
+-                organization,
+-                user_name
+-            )
+-            logging.debug("The latest report is %s", latest_report)
+-            if not latest_report:
++            if not isinstance(lst, list) or not lst:
+                 return None
+-            scan_identifier_sanitized = urllib.parse.quote_plus(
+-                replace_special_chars_with_underscore(scan_identifier, True),
+-            )
+-            resp = requests.get(
+-                (
+-                    f"{coguard_api_url}/cluster/report?"
+-                    f"clusterName={scan_identifier_sanitized}&"
+-                    f"organizationName={urllib.parse.quote_plus(organization)}&"
+-                    f"reportName={urllib.parse.quote_plus(latest_report)}"
+-                ),
+-                headers={
+-                    "Authorization": f'Bearer {auth_token.get_token()}',
+-                    "Content-Type": "application/json"
+-                },
+-                timeout=300
+-            )
+-        else:
+-            resp = requests.post(
+-                (
++            return lst[-1]
++
++    async def _send_zip() -> Optional[Dict]:
++        timeout = aiohttp.ClientTimeout(total=300)
++        async with aiohttp.ClientSession(timeout=timeout) as session:
++            if organization:
++                async with session.post(
++                    _normalize_url(
++                        f"{coguard_api_url}/cluster/"
++                        f"upload-cluster-zip?organizationName={urllib.parse.quote_plus(organization)}&"
++                        f"overwrite=true&compliance={urllib.parse.quote_plus(ruleset)}"
++                    ),
++                    headers={
++                        "Authorization": bearer_token,
++                        "Content-Type": "application/octet-stream"
++                    },
++                    data=file_data
++                ) as resp_upload:
++                    if resp_upload.status != 204:
++                        logging.error("There was an issue uploading the zip file")
++                        logging.debug("Reason %s", resp_upload.reason)
++                        return None
++                logging.debug("We successfully uploaded the cluster. Now running the report.")
++                run_report_result = await _run_report_async(
++                    session,
++                    scan_identifier,
++                    organization,
++                    bearer_token,
++                )
++                if not run_report_result:
++                    return None
++                latest_report = await _get_latest_report_async(
++                    session,
++                    scan_identifier,
++                    organization,
++                    bearer_token,
++                )
++                logging.debug("The latest report is %s", latest_report)
++                if not latest_report:
++                    return None
++                scan_identifier_sanitized = urllib.parse.quote_plus(
++                    replace_special_chars_with_underscore(scan_identifier, True),
++                )
++                async with session.get(
++                    _normalize_url(
++                        f"{coguard_api_url}/cluster/report?"
++                        f"clusterName={scan_identifier_sanitized}&"
++                        f"organizationName={urllib.parse.quote_plus(organization)}&"
++                        f"reportName={urllib.parse.quote_plus(latest_report)}"
++                    ),
++                    headers={
++                        "Authorization": bearer_token,
++                        "Content-Type": "application/json"
++                    }
++                ) as resp:
++                    if resp.status != 200:
++                        logging.error("There was an error in the API call: %s",
++                                      resp.reason)
++                        return None
++                    try:
++                        result = await resp.json()
++                    except (aiohttp.ContentTypeError, ValueError):
++                        return None
++                    return result if isinstance(result, dict) else None
++            async with session.post(
++                _normalize_url(
+                     f"{coguard_api_url}/coguard-cli/"
+                     f"upload-cluster-zip?userName={urllib.parse.quote_plus(user_name)}&"
+                     f"compliance={urllib.parse.quote_plus(ruleset)}"
+                 ),
+                 headers={
+-                    "Authorization": f'Bearer {auth_token.get_token()}',
++                    "Authorization": bearer_token,
+                     "Content-Type": "application/octet-stream"
+                 },
+-                data=file_to_send.read(),
+-                timeout=300)
+-    if resp.status_code != 200:
+-        logging.error("There was an error in the API call: %s",
+-                      resp.reason)
+-        return None
+-    return resp.json()
++                data=file_data
++            ) as resp:
++                if resp.status != 200:
++                    logging.error("There was an error in the API call: %s",
++                                  resp.reason)
++                    return None
++                try:
++                    result = await resp.json()
++                except (aiohttp.ContentTypeError, ValueError):
++                    return None
++                return result if isinstance(result, dict) else None
++
++    return asyncio.run(_send_zip())
++
+ 
+ def send_zip_file_for_fixing(
+         zip_file: str,
+@@ -209,32 +304,44 @@
+               scanning.
+     """
+     with open(zip_file, 'rb') as file_to_send:
+-        resp_upload = requests.post(
+-            (
+-                f"{coguard_api_url}/cluster/"
+-                f"fix-cluster-zip?organizationName={urllib.parse.quote_plus(organization)}"
+-            ),
+-            headers={
+-                "Authorization": f'Bearer {auth_token.get_token()}',
+-                "Content-Type": "application/octet-stream"
+-            },
+-            data=file_to_send.read(),
+-            timeout=1800)
+-        if resp_upload.status_code != 200:
+-            logging.debug("There was an issue uploading the zip file")
+-            logging.debug("Reason %s", resp_upload.reason)
+-            if resp_upload.status_code == 403:
+-                print(
+-                    f"{COLOR_RED}Your account has the fixing feature "
+-                    f"not enabled.{COLOR_TERMINATION}"
+-                )
+-            return None
+-        (file_handle, temp_zip) = tempfile.mkstemp(
+-            prefix="coguard_cli_zip_to_fix", suffix=".zip"
+-        )
+-        os.close(file_handle)
+-        with open(temp_zip, 'wb') as zip_to_write:
+-            zip_to_write.write(resp_upload.content)
++        file_data = file_to_send.read()
++
++    bearer_token = f'Bearer {auth_token.get_token()}'
++
++    async def _upload_fix_zip() -> Optional[bytes]:
++        timeout = aiohttp.ClientTimeout(total=1800)
++        async with aiohttp.ClientSession(timeout=timeout) as session:
++            async with session.post(
++                _normalize_url(
++                    f"{coguard_api_url}/cluster/"
++                    f"fix-cluster-zip?organizationName={urllib.parse.quote_plus(organization)}"
++                ),
++                headers={
++                    "Authorization": bearer_token,
++                    "Content-Type": "application/octet-stream"
++                },
++                data=file_data
++            ) as resp_upload:
++                if resp_upload.status != 200:
++                    logging.debug("There was an issue uploading the zip file")
++                    logging.debug("Reason %s", resp_upload.reason)
++                    if resp_upload.status == 403:
++                        print(
++                            f"{COLOR_RED}Your account has the fixing feature "
++                            f"not enabled.{COLOR_TERMINATION}"
++                        )
++                    return None
++                return await resp_upload.read()
++
++    resp_upload_content = asyncio.run(_upload_fix_zip())
++    if resp_upload_content is None:
++        return None
++    (file_handle, temp_zip) = tempfile.mkstemp(
++        prefix="coguard_cli_zip_to_fix", suffix=".zip"
++    )
++    os.close(file_handle)
++    with open(temp_zip, 'wb') as zip_to_write:
++        zip_to_write.write(resp_upload_content)
+     return temp_zip
+ 
+ 
+@@ -249,14 +356,22 @@
+     :param coguard_url: The url to contact the coguard API.
+     :returns: Either None, or a boolean which is True if the user exists.
+     """
+-    resp = requests.get(
+-        f"{coguard_url}/registration/does-user-exist?userName={urllib.parse.quote_plus(user_name)}",
+-        timeout=300)
+-    if resp.status_code != 200:
+-        logging.error("There was an error checking for the existence of a certain user: %s",
+-                      resp.reason)
+-        return None
+-    return resp.text.lower() == 'true'
++    async def _check_user_exists() -> Optional[bool]:
++        timeout = aiohttp.ClientTimeout(total=300)
++        async with aiohttp.ClientSession(timeout=timeout) as session:
++            async with session.get(
++                _normalize_url(
++                    f"{coguard_url}/registration/does-user-exist?userName={urllib.parse.quote_plus(user_name)}"
++                )
++            ) as resp:
++                if resp.status != 200:
++                    logging.error("There was an error checking for the existence of a certain user: %s",
++                                  resp.reason)
++                    return None
++                return (await resp.text()).lower() == 'true'
++
++    return asyncio.run(_check_user_exists())
++
+ 
+ def sign_up_for_coguard(
+         user_name: str,
+@@ -271,17 +386,22 @@
+     :returns: Either None if an error occurred, or a boolean indicating that
+               the sign-up was successful.
+     """
+-    resp = requests.post(
+-        f"{coguard_url}/registration/register-user",
+-        headers={"content-type": "application/json"},
+-        json={"userName": user_name, "password": password},
+-        timeout=300
+-    )
+-    if resp.status_code != 204:
+-        logging.error("There was an error signing the user up: %s",
+-                      resp.reason)
+-        return None
+-    return resp.text.lower() == 'true'
++    async def _sign_up() -> Optional[bool]:
++        timeout = aiohttp.ClientTimeout(total=300)
++        async with aiohttp.ClientSession(timeout=timeout) as session:
++            async with session.post(
++                _normalize_url(f"{coguard_url}/registration/register-user"),
++                headers={"content-type": "application/json"},
++                json={"userName": user_name, "password": password}
++            ) as resp:
++                if resp.status != 204:
++                    logging.error("There was an error signing the user up: %s",
++                                  resp.reason)
++                    return None
++                return (await resp.text()).lower() == 'true'
++
++    return asyncio.run(_sign_up())
++
+ 
+ def mention_referrer(
+         user_name: str,
+@@ -294,14 +414,19 @@
+     :param referrer: The name of the referrer
+     :param coguard_url: The url of coguard to send the request to.
+     """
+-    resp = requests.post(
+-        f"{coguard_url}/registration/referrer-capture",
+-        headers={"content-type": "application/json"},
+-        json={"userName": user_name, "referrer": referrer},
+-        timeout=300
+-    )
+-    if resp.status_code != 204:
+-        logging.error("Could not capture referrer. Please send this error to info@coguard.io")
++    async def _mention_referrer() -> None:
++        timeout = aiohttp.ClientTimeout(total=300)
++        async with aiohttp.ClientSession(timeout=timeout) as session:
++            async with session.post(
++                _normalize_url(f"{coguard_url}/registration/referrer-capture"),
++                headers={"content-type": "application/json"},
++                json={"userName": user_name, "referrer": referrer}
++            ) as resp:
++                if resp.status != 204:
++                    logging.error("Could not capture referrer. Please send this error to info@coguard.io")
++
++    asyncio.run(_mention_referrer())
++
+ 
+ def get_fixable_rule_list(
+         token: Token,
+@@ -312,36 +437,38 @@
+     The call to the endpoint to determine a list of fixable rule identifiers.
+     """
+     if organization:
+-        resp = requests.get(
+-            (
+-                f"{coguard_api_url}/cluster/get-fixable-list?"
+-                f"organizationName={urllib.parse.quote_plus(organization)}"
+-            ),
+-            headers={
+-                "Authorization": f'Bearer {token.get_token()}'
+-            },
+-            timeout=300
+-        )
+-        if resp.status_code != 200:
+-            logging.error("There was an issue getting the fixable list. ")
+-            logging.debug("Reason %s", resp.reason)
+-            return []
+-        return resp.json()
+-    resp = requests.get(
+-        (
++        request_url = _normalize_url(
++            f"{coguard_api_url}/cluster/get-fixable-list?"
++            f"organizationName={urllib.parse.quote_plus(organization)}"
++        )
++    else:
++        request_url = _normalize_url(
+             f"{coguard_api_url}/coguard-cli/get-fixable-list?"
+             f"userName={urllib.parse.quote_plus(user_name)}"
+-        ),
+-        headers={
+-            "Authorization": f'Bearer {token.get_token()}'
+-        },
+-        timeout=300
+-    )
+-    if resp.status_code != 200:
+-        logging.error("There was an issue getting the fixable list. ")
+-        logging.debug("Reason %s", resp.reason)
+-        return []
+-    return resp.json()
++        )
++    bearer_token = f'Bearer {token.get_token()}'
++
++    async def _get_fixable_rule_list() -> list:
++        timeout = aiohttp.ClientTimeout(total=300)
++        async with aiohttp.ClientSession(timeout=timeout) as session:
++            async with session.get(
++                request_url,
++                headers={
++                    "Authorization": bearer_token
++                }
++            ) as resp:
++                if resp.status != 200:
++                    logging.error("There was an issue getting the fixable list. ")
++                    logging.debug("Reason %s", resp.reason)
++                    return []
++                try:
++                    result = await resp.json()
++                except (aiohttp.ContentTypeError, ValueError):
++                    return []
++                return result if isinstance(result, list) else []
++
++    return asyncio.run(_get_fixable_rule_list())
++
+ 
+ def download_report(
+         token,
+@@ -350,62 +477,57 @@
+         username,
+         cluster_name,
+         report_name,
+-        location = ''
+-):
++        location=''):
+     """
+     The call to download the latest report from the server.
+     """
+     location_act = f"{cluster_name}_{report_name}_report.zip" if not location else location
+     if organization:
+-        with requests.get(
+-                (
+-                    f"{coguard_api_url}/cluster/report-audit-zip?organizationName={organization}&"
+-                    f"clusterName={urllib.parse.quote_plus(cluster_name)}&"
+-                    f"reportName={urllib.parse.quote_plus(report_name)}"
+-                ),
++        request_url = _normalize_url(
++            f"{coguard_api_url}/cluster/report-audit-zip?organizationName={organization}&"
++            f"clusterName={urllib.parse.quote_plus(cluster_name)}&"
++            f"reportName={urllib.parse.quote_plus(report_name)}"
++        )
++    else:
++        request_url = _normalize_url(
++            f"{coguard_api_url}/coguard-cli/report-audit-zip?userName={username}&"
++            f"clusterName={urllib.parse.quote_plus(cluster_name)}&"
++            f"reportName={urllib.parse.quote_plus(report_name)}"
++        )
++    bearer_token = f'Bearer {token.get_token()}'
++
++    async def _download_report() -> None:
++        timeout = aiohttp.ClientTimeout(total=300)
++        async with aiohttp.ClientSession(timeout=timeout) as session:
++            async with session.get(
++                request_url,
+                 headers={
+-                    "Authorization": f'Bearer {token.get_token()}'
+-                },
+-                timeout=300,
+-                stream=True
+-        ) as request_stream:
+-            request_stream.raise_for_status()
+-            with open(
+-                    location_act,
+-                    'wb'
+-            ) as write_stream:
+-                for chunk in request_stream.iter_content(chunk_size=8192):
+-                    write_stream.write(chunk)
+-    else:
+-        with requests.get(
+-                (
+-                    f"{coguard_api_url}/coguard-cli/report-audit-zip?userName={username}&"
+-                    f"clusterName={urllib.parse.quote_plus(cluster_name)}&"
+-                    f"reportName={urllib.parse.quote_plus(report_name)}"
+-                ),
+-                headers={
+-                    "Authorization": f'Bearer {token.get_token()}'
+-                },
+-                timeout=300,
+-                stream=True
+-        ) as request_stream:
+-            request_stream.raise_for_status()
+-            with open(
+-                    location_act,
+-                    'wb'
+-            ) as write_stream:
+-                for chunk in request_stream.iter_content(chunk_size=8192):
+-                    write_stream.write(chunk)
++                    "Authorization": bearer_token
++                }
++            ) as request_stream:
++                request_stream.raise_for_status()
++                with open(
++                        location_act,
++                        'wb'
++                ) as write_stream:
++                    write_stream.write(await request_stream.read())
++
++    asyncio.run(_download_report())
++
+ 
+ def log(message: str, coguard_api_url: str):
+     """
+     The call to the endpoint to determine a list of fixable rule identifiers.
+     """
+-    resp = requests.post(
+-        f"{coguard_api_url}/logging/log-message",
+-        headers={"content-type": "application/json"},
+-        json={"message": message},
+-        timeout=300
+-    )
+-    if resp.status_code != 204:
+-        logging.debug("Passing minimal debug logging failed.")
++    async def _log() -> None:
++        timeout = aiohttp.ClientTimeout(total=300)
++        async with aiohttp.ClientSession(timeout=timeout) as session:
++            async with session.post(
++                _normalize_url(f"{coguard_api_url}/logging/log-message"),
++                headers={"content-type": "application/json"},
++                json={"message": message}
++            ) as resp:
++                if resp.status != 204:
++                    logging.debug("Passing minimal debug logging failed.")
++
++    asyncio.run(_log())

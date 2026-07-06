@@ -1,0 +1,204 @@
+--- a/pdpyras.py
++++ b/pdpyras.py
+@@ -3,22 +3,55 @@
+ # See LICENSE for details.
+ 
+ # Standard libraries
++import asyncio
+ import logging
++import json
+ import sys
+ import time
+ from copy import deepcopy
+-from datetime import datetime
++from dataclasses import dataclass
++from datetime import datetime, timedelta
+ from random import random
+ from typing import Iterator, Union
+ from warnings import warn
+ 
+-# Upstream components on which this client is based:
+-from requests import Response, Session
+-from requests import __version__ as REQUESTS_VERSION
+-
+-# HTTP client exceptions:
+-from urllib3.exceptions import HTTPError, PoolError
+-from requests.exceptions import RequestException
++# HTTP client:
++import aiohttp
++
++from aiohttp import __version__ as AIOHTTP_VERSION
++
++
++@dataclass
++class RequestInfo:
++    method: str
++    url: str
++
++
++class Response:
++    def __init__(self, method, url, status_code, headers, content, text,
++            elapsed, encoding):
++        self.request = RequestInfo(method=method, url=url)
++        self.url = url
++        self.status_code = status_code
++        self.headers = headers
++        self.content = content
++        self._text = text
++        self.elapsed = elapsed
++        self.encoding = encoding
++
++    @property
++    def ok(self):
++        return bool(self.status_code) and self.status_code < 400
++
++    def __bool__(self):
++        return self.ok
++
++    @property
++    def text(self):
++        return self._text
++
++    def json(self, **kwargs):
++        return json.loads(self._text, **kwargs)
+ 
+ __version__ = '5.4.0'
+ 
+@@ -862,11 +895,11 @@
+ ### CLASSES ###
+ ###############
+ 
+-class PDSession(Session):
++class PDSession:
+     """
+     Base class for making HTTP requests to PagerDuty APIs
+ 
+-    This is an opinionated wrapper of `requests.Session`_, with a few additional
++    This is an opinionated wrapper of `aiohttp`-backed HTTP requests, with a few additional
+     features:
+ 
+     - The client will reattempt the request with auto-increasing cooldown/retry
+@@ -910,9 +943,6 @@
+     will be raised if this happens.
+     """
+ 
+-    parent = None
+-    """The ``super`` object (`requests.Session`_)"""
+-
+     permitted_methods = ()
+     """
+     A tuple of the methods permitted by the API which the client implements.
+@@ -966,8 +996,7 @@
+     url = ""
+ 
+     def __init__(self, api_key: str, debug=False):
+-        self.parent = super(PDSession, self)
+-        self.parent.__init__()
++        self.headers = {}
+         self.api_key = api_key
+         self.log = logging.getLogger(__name__)
+         self.print_debug = debug
+@@ -1100,7 +1129,7 @@
+             The path/URL to request. If it does not start with the base URL, the
+             base URL will be prepended.
+         :param **kwargs:
+-            Custom keyword arguments to pass to ``requests.Session.request``.
++            Custom keyword arguments to pass to the underlying HTTP request.
+         :type method: str
+         :type url: str
+         :returns:
+@@ -1122,9 +1151,9 @@
+         headers = kwargs.get('headers', {})
+         req_kw.update({
+             'headers': self.prepare_headers(method, user_headers=headers),
+-            'stream': False,
+             'timeout': self.timeout
+         })
++        req_kw.pop('stream', None)
+ 
+         # Special changes to user-supplied parameters, for convenience
+         if 'params' in kwargs and kwargs['params']:
+@@ -1133,9 +1162,9 @@
+         # Make the request (and repeat w/cooldown if the rate limit is reached):
+         while True:
+             try:
+-                response = self.parent.request(method, full_url, **req_kw)
++                response = self._run(self._request(method, full_url, **req_kw))
+                 self.postprocess(response)
+-            except (HTTPError, PoolError, RequestException) as e:
++            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+                 network_attempts += 1
+                 if network_attempts > self.max_network_attempts:
+                     error_msg = f"{endpoint}: Non-transient network " \
+@@ -1189,6 +1218,59 @@
+                 # All went according to plan.
+                 return response
+ 
++    def get(self, url, **kwargs) -> Response:
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, **kwargs) -> Response:
++        return self.request('POST', url, **kwargs)
++
++    def put(self, url, **kwargs) -> Response:
++        return self.request('PUT', url, **kwargs)
++
++    def delete(self, url, **kwargs) -> Response:
++        return self.request('DELETE', url, **kwargs)
++
++    async def _request(self, method, url, **kwargs) -> Response:
++        timeout = kwargs.pop('timeout', None)
++        if timeout is not None:
++            kwargs['timeout'] = aiohttp.ClientTimeout(total=timeout)
++        started = time.perf_counter()
++        async with aiohttp.ClientSession() as session:
++            async with session.request(method, url, **kwargs) as response:
++                body = await response.read()
++                elapsed = timedelta(seconds=time.perf_counter() - started)
++                encoding = response.charset or 'utf-8'
++                text = body.decode(encoding, errors='replace')
++                return Response(
++                    method=method,
++                    url=str(response.url),
++                    status_code=response.status,
++                    headers=response.headers,
++                    content=body,
++                    text=text,
++                    elapsed=elapsed,
++                    encoding=encoding,
++                )
++
++    def _run(self, coro):
++        loop = asyncio.new_event_loop()
++        try:
++            asyncio.set_event_loop(loop)
++            return loop.run_until_complete(coro)
++        finally:
++            asyncio.set_event_loop(None)
++            loop.close()
++
++    def close(self):
++        pass
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc, tb):
++        self.close()
++        return False
++
+     @property
+     def stagger_cooldown(self) -> float:
+         """
+@@ -1237,9 +1319,9 @@
+ 
+     @property
+     def user_agent(self) -> str:
+-        return 'pdpyras/%s python-requests/%s Python/%d.%d'%(
++        return 'pdpyras/%s python-aiohttp/%s Python/%d.%d'%(
+             __version__,
+-            REQUESTS_VERSION,
++            AIOHTTP_VERSION,
+             sys.version_info.major,
+             sys.version_info.minor
+         )

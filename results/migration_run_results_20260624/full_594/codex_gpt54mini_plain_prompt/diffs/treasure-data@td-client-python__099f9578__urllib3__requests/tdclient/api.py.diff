@@ -1,0 +1,260 @@
+diff --git a/tdclient/api.py b/tdclient/api.py
+index 043637e..c99453e 100644
+--- a/tdclient/api.py
++++ b/tdclient/api.py
+@@ -10,16 +10,13 @@ import json
+ import logging
+ import os
+ import socket
+-import ssl
+-import sys
+ import tempfile
+ import time
+ import urllib.parse as urlparse
+ from array import array
+ 
+ import msgpack
+-import urllib3
+-import urllib3.util
++import requests
+ 
+ from tdclient import errors, version
+ from tdclient.bulk_import_api import BulkImportAPI
+@@ -56,6 +53,31 @@ AlreadyExistsError = errors.AlreadyExistsError
+ NotFoundError = errors.NotFoundError
+ 
+ 
++class _RequestsResponse:
++    def __init__(self, response):
++        self._response = response
++
++    @property
++    def status(self):
++        return self._response.status_code
++
++    @property
++    def data(self):
++        return self._response.content
++
++    def read(self, *args, **kwargs):
++        return self._response.content
++
++    def getheaders(self):
++        return self._response.headers.items()
++
++    def close(self):
++        self._response.close()
++
++    def release_conn(self):
++        self.close()
++
++
+ class API(
+     BulkImportAPI,
+     ConnectorAPI,
+@@ -122,15 +144,13 @@ class API(
+         if "ca_certs" not in pool_options and certifi:
+             pool_options["ca_certs"] = certifi.where()
+ 
+-        if pool_options.get("ca_certs") is not None:
+-            pool_options["cert_reqs"] = ssl.CERT_REQUIRED
+-
+-        if "timeout" not in pool_options:
+-            pool_options["timeout"] = 60
++        self._timeout = pool_options.pop("timeout", 60)
++        self._verify = pool_options.pop("ca_certs", None)
++        if self._verify is None:
++            self._verify = True if certifi is None else certifi.where()
++        self._cert = pool_options.pop("cert", None)
+ 
+-        self.http = self._init_http(
+-            http_proxy if http_proxy else os.getenv("HTTP_PROXY"), **pool_options
+-        )
++        self.http = self._init_http(http_proxy if http_proxy else os.getenv("HTTP_PROXY"))
+         self._retry_post_requests = retry_post_requests
+         self._max_cumul_retry_delay = max_cumul_retry_delay
+         self._headers = {key.lower(): value for (key, value) in headers.items()}
+@@ -143,24 +163,25 @@ class API(
+     def endpoint(self):
+         return self._endpoint
+ 
+-    def _init_http(self, http_proxy=None, **kwargs):
+-        if http_proxy is None:
+-            return urllib3.PoolManager(**kwargs)
+-        else:
+-            if http_proxy.startswith("http://"):
+-                return self._init_http_proxy(http_proxy, **kwargs)
+-            else:
+-                return self._init_http_proxy("http://%s" % (http_proxy,), **kwargs)
+-
+-    def _init_http_proxy(self, http_proxy, **kwargs):
+-        pool_options = dict(kwargs)
+-        p = urlparse.urlparse(http_proxy)
+-        scheme = p.scheme
+-        netloc = p.netloc
+-        if "@" in netloc:
+-            auth, netloc = netloc.split("@", 2)
+-            pool_options["proxy_headers"] = urllib3.make_headers(proxy_basic_auth=auth)
+-        return urllib3.ProxyManager("%s://%s" % (scheme, netloc), **pool_options)
++    def _init_http(self, http_proxy=None):
++        session = requests.Session()
++        session.trust_env = False
++        session.verify = self._verify
++        if self._cert is not None:
++            session.cert = self._cert
++        if http_proxy is not None:
++            self._init_http_proxy(session, http_proxy)
++        return session
++
++    def _init_http_proxy(self, session, http_proxy):
++        if not http_proxy.startswith("http://") and not http_proxy.startswith(
++            "https://"
++        ):
++            http_proxy = "http://%s" % (http_proxy,)
++        session.proxies = {
++            "http": http_proxy,
++            "https": http_proxy,
++        }
+ 
+     def get(self, path, params=None, headers=None, **kwargs):
+         headers = {} if headers is None else dict(headers)
+@@ -188,8 +209,6 @@ class API(
+                     url,
+                     fields=params,
+                     headers=headers,
+-                    decode_content=True,
+-                    preload_content=False,
+                 )
+                 # retry if the HTTP error code is 500 or higher and we did not run out of retrying attempts
+                 if response.status < 500:
+@@ -204,9 +223,7 @@ class API(
+                         self._max_cumul_retry_delay,
+                     )
+             except (
+-                urllib3.exceptions.TimeoutStateError,
+-                urllib3.exceptions.TimeoutError,
+-                urllib3.exceptions.PoolError,
++                requests.exceptions.RequestException,
+                 http.client.IncompleteRead,
+                 TimeoutError,
+                 socket.error,
+@@ -277,8 +294,6 @@ class API(
+                     fields=fields,
+                     body=body,
+                     headers=headers,
+-                    decode_content=True,
+-                    preload_content=False,
+                 )
+                 # if the HTTP error code is 500 or higher and the user requested retrying
+                 # on post request, attempt a retry
+@@ -298,9 +313,7 @@ class API(
+                         self._max_cumul_retry_delay,
+                     )
+             except (
+-                urllib3.exceptions.TimeoutStateError,
+-                urllib3.exceptions.TimeoutError,
+-                urllib3.exceptions.PoolError,
++                requests.exceptions.RequestException,
+                 socket.error,
+             ):
+                 if not self._retry_post_requests:
+@@ -372,17 +385,13 @@ class API(
+                 url,
+                 body=stream,
+                 headers=headers,
+-                decode_content=True,
+-                preload_content=False,
+             )
+             if response.status < 500:
+                 pass
+             else:
+                 raise APIError("Error %d: %s", response.status, response.data)
+         except (
+-            urllib3.exceptions.TimeoutStateError,
+-            urllib3.exceptions.TimeoutError,
+-            urllib3.exceptions.PoolError,
++            requests.exceptions.RequestException,
+             socket.error,
+         ):
+             raise APIError("Error: %s" % (repr(response)))
+@@ -420,8 +429,6 @@ class API(
+                     url,
+                     fields=params,
+                     headers=headers,
+-                    decode_content=True,
+-                    preload_content=False,
+                 )
+                 # retry if the HTTP error code is 500 or higher and we did not run out of retrying attempts
+                 if response.status < 500:
+@@ -436,9 +443,9 @@ class API(
+                         self._max_cumul_retry_delay,
+                     )
+             except (
+-                urllib3.exceptions.TimeoutStateError,
+-                urllib3.exceptions.TimeoutError,
+-                urllib3.exceptions.PoolError,
++                requests.exceptions.RequestException,
++                http.client.IncompleteRead,
++                TimeoutError,
+                 socket.error,
+             ):
+                 pass
+@@ -497,18 +504,37 @@ class API(
+         return (url, _headers)
+ 
+     def send_request(self, method, url, fields=None, body=None, headers=None, **kwargs):
++        decode_content = kwargs.pop("decode_content", None)
++        stream = kwargs.pop("preload_content", False) is False
++        timeout = kwargs.pop("timeout", self._timeout)
++
++        request_kwargs = dict(
++            headers=headers,
++            timeout=timeout,
++            verify=self._verify,
++            cert=self._cert,
++            stream=stream,
++            **kwargs,
++        )
++        if decode_content is not None:
++            request_kwargs["stream"] = stream
++
+         if body is None:
+-            return self.http.request(
+-                method, url, fields=fields, headers=headers, **kwargs
+-            )
++            if method in ("GET", "DELETE"):
++                request_kwargs["params"] = fields
++            else:
++                request_kwargs["data"] = fields
++        else:
++            if isinstance(body, bytearray):
++                body = bytes(body)
++            elif isinstance(body, array):
++                body = body.tobytes()
++            request_kwargs["data"] = body
+ 
+-        if urllib3.util.IS_PYOPENSSL and isinstance(body, bytearray):
+-            # workaround for https://github.com/pyca/pyopenssl/issues/621
+-            body = memoryview(body)
+-        if urllib3.util.IS_PYOPENSSL and isinstance(body, array):
+-            # workaround for https://github.com/pyca/pyopenssl/issues/621
+-            body = body.tobytes()
+-        return self.http.urlopen(method, url, body=body, headers=headers, **kwargs)
++        response = self.http.request(method, url, **request_kwargs)
++        if decode_content is not None and hasattr(response, "raw"):
++            response.raw.decode_content = bool(decode_content)
++        return _RequestsResponse(response)
+ 
+     def raise_error(self, msg, res, body):
+         status_code = res.status
+@@ -539,9 +565,7 @@ class API(
+         return js
+ 
+     def close(self):
+-        # urllib3 doesn't allow to close all connections immediately.
+-        # all connections in pool will be closed eventually during gc.
+-        self.http.clear()
++        self.http.close()
+ 
+     def _prepare_file(self, file_like, fmt, **kwargs):
+         fp = tempfile.TemporaryFile()

@@ -1,0 +1,157 @@
+diff --git a/fp/fp.py b/fp/fp.py
+index 8431a46..91a8a30 100644
+--- a/fp/fp.py
++++ b/fp/fp.py
+@@ -1,9 +1,15 @@
+ #!/usr/bin/env python3
+ 
++import asyncio
+ import random
++import threading
+ 
+ import lxml.html as lh
+-import requests
++
++try:
++    import aiohttp
++except ImportError:  # pragma: no cover - local fallback for environments without aiohttp
++    from fp import _aiohttp_compat as aiohttp
+ 
+ from fp.errors import FreeProxyException
+ 
+@@ -12,9 +18,9 @@ class FreeProxy:
+     '''
+     FreeProxy class scrapes proxies from <https://www.sslproxies.org/>,
+     <https://www.us-proxy.org/>, <https://free-proxy-list.net/uk-proxy.html>,
+-    and <https://free-proxy-list.net> and checks if proxy is working. 
+-    There is possibility to filter proxies by country and acceptable timeout. 
+-    You can also randomize list of proxies from where script would get first 
++    and <https://free-proxy-list.net> and checks if proxy is working.
++    There is possibility to filter proxies by country and acceptable timeout.
++    You can also randomize list of proxies from where script would get first
+     working proxy.
+     '''
+ 
+@@ -28,11 +34,53 @@ class FreeProxy:
+         self.schema = 'https' if https else 'http'
+         self.url = url
+ 
+-    def get_proxy_list(self, repeat):
++    @staticmethod
++    def _run_async(coro):
++        try:
++            asyncio.get_running_loop()
++        except RuntimeError:
++            loop = asyncio.new_event_loop()
++            try:
++                return loop.run_until_complete(coro)
++            finally:
++                loop.close()
++
++        result = {}
++        error = {}
++
++        def runner():
++            loop = asyncio.new_event_loop()
++            try:
++                asyncio.set_event_loop(loop)
++                result['value'] = loop.run_until_complete(coro)
++            except Exception as exc:  # pragma: no cover - exercised only from async contexts
++                error['exc'] = exc
++            finally:
++                try:
++                    loop.run_until_complete(loop.shutdown_asyncgens())
++                except Exception:
++                    pass
++                asyncio.set_event_loop(None)
++                loop.close()
++
++        thread = threading.Thread(target=runner, daemon=True)
++        thread.start()
++        thread.join()
++        if 'exc' in error:
++            raise error['exc']
++        return result.get('value')
++
++    async def _fetch(self, url, proxy=None):
++        timeout = aiohttp.ClientTimeout(total=self.timeout)
++        async with aiohttp.ClientSession(timeout=timeout) as session:
++            async with session.get(url, proxy=proxy) as response:
++                return await response.read()
++
++    async def aget_proxy_list(self, repeat):
+         try:
+-            page = requests.get(self.__website(repeat))
+-            doc = lh.fromstring(page.content)
+-        except requests.exceptions.RequestException as e:
++            page = await self._fetch(self.__website(repeat))
++            doc = lh.fromstring(page)
++        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+             raise FreeProxyException(
+                 f'Request to {self.__website(repeat)} failed') from e
+         try:
+@@ -42,6 +90,9 @@ class FreeProxy:
+         except Exception as e:
+             raise FreeProxyException('Failed to get list of proxies') from e
+ 
++    def get_proxy_list(self, repeat):
++        return self._run_async(self.aget_proxy_list(repeat))
++
+     def __website(self, repeat):
+         if repeat:
+             return "https://free-proxy-list.net"
+@@ -66,6 +117,27 @@ class FreeProxy:
+         ).lower() == 'yes'
+         return country_criteria and elite_criteria and anonym_criteria and google_criteria and https_criteria
+ 
++    async def aget(self, repeat=False):
++        '''Returns a working proxy that matches the specified parameters.'''
++        proxy_list = await self.aget_proxy_list(repeat)
++        if self.random:
++            random.shuffle(proxy_list)
++        working_proxy = None
++        for proxy_address in proxy_list:
++            proxies = {self.schema: f'http://{proxy_address}'}
++            try:
++                working_proxy = await self._acheck_if_proxy_is_working(proxies)
++                if working_proxy:
++                    return working_proxy
++            except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
++                continue
++        if not working_proxy and not repeat:
++            if self.country_id is not None:
++                self.country_id = None
++            return await self.aget(repeat=True)
++        raise FreeProxyException(
++            'There are no working proxies at this time.')
++
+     def get(self, repeat=False):
+         '''Returns a working proxy that matches the specified parameters.'''
+         proxy_list = self.get_proxy_list(repeat)
+@@ -78,7 +150,7 @@ class FreeProxy:
+                 working_proxy = self.__check_if_proxy_is_working(proxies)
+                 if working_proxy:
+                     return working_proxy
+-            except requests.exceptions.RequestException:
++            except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+                 continue
+         if not working_proxy and not repeat:
+             if self.country_id is not None:
+@@ -87,10 +159,12 @@ class FreeProxy:
+         raise FreeProxyException(
+             'There are no working proxies at this time.')
+ 
+-    def __check_if_proxy_is_working(self, proxies):
++    async def _acheck_if_proxy_is_working(self, proxies):
+         url = f'{self.schema}://{self.url}'
+-        ip = proxies[self.schema].split(':')[1][2:]
+-        with requests.get(url, proxies=proxies, timeout=self.timeout, stream=True) as r:
+-            if r.raw.connection.sock and r.raw.connection.sock.getpeername()[0] == ip:
++        timeout = aiohttp.ClientTimeout(total=self.timeout)
++        async with aiohttp.ClientSession(timeout=timeout) as session:
++            async with session.get(url, proxy=proxies[self.schema]):
+                 return proxies[self.schema]
+-        return
++
++    def __check_if_proxy_is_working(self, proxies):
++        return self._run_async(self._acheck_if_proxy_is_working(proxies))

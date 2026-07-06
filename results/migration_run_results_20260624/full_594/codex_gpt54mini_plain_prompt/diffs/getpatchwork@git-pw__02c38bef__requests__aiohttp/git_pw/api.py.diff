@@ -1,0 +1,421 @@
+diff --git a/git_pw/api.py b/git_pw/api.py
+index fac6854..7e6b145 100644
+--- a/git_pw/api.py
++++ b/git_pw/api.py
+@@ -2,6 +2,8 @@
+ Simple wrappers around request methods.
+ """
+ 
++import asyncio
++import json
+ from functools import update_wrapper
+ import logging
+ import os.path
+@@ -10,8 +12,8 @@ import sys
+ import tempfile
+ import typing as ty
+ 
++import aiohttp
+ import click
+-import requests
+ 
+ import git_pw
+ from git_pw import config
+@@ -22,30 +24,11 @@ LOG = logging.getLogger(__name__)
+ Filters = ty.List[ty.Tuple[str, str]]
+ 
+ 
+-class HTTPTokenAuth(requests.auth.AuthBase):
+-    """Attaches HTTP Token Authentication to the given Request object."""
+-
+-    def __init__(self, token: str):
+-        self.token = token
+-
+-    def __call__(
+-        self,
+-        r: requests.PreparedRequest,
+-    ) -> requests.PreparedRequest:
+-        r.headers['Authorization'] = self._token_auth_str(self.token)
+-        return r
+-
+-    @staticmethod
+-    def _token_auth_str(token: str) -> str:
+-        """Return a Token auth string."""
+-        return 'Token {}'.format(token.strip())
+-
+-
+-def _get_auth(optional: bool = False) -> ty.Optional[requests.auth.AuthBase]:
++def _get_auth(optional: bool = False) -> ty.Optional[aiohttp.BasicAuth]:
+     if CONF.token:
+-        return HTTPTokenAuth(CONF.token)
++        return None
+     elif CONF.username and CONF.password:
+-        return requests.auth.HTTPBasicAuth(CONF.username, CONF.password)
++        return aiohttp.BasicAuth(CONF.username, CONF.password)
+     elif not optional:
+         LOG.error('Authentication information missing')
+         LOG.error(
+@@ -57,9 +40,20 @@ def _get_auth(optional: bool = False) -> ty.Optional[requests.auth.AuthBase]:
+ 
+ 
+ def _get_headers() -> ty.Dict[str, str]:
+-    return {
++    headers = {
+         'User-Agent': 'git-pw ({})'.format(git_pw.__version__),
+     }
++    if CONF.token:
++        headers['Authorization'] = 'Token {}'.format(CONF.token.strip())
++    return headers
++
++
++def _get_request_kwargs(optional: bool = False) -> ty.Dict[str, ty.Any]:
++    kwargs: ty.Dict[str, ty.Any] = {'headers': _get_headers()}
++    auth = _get_auth(optional=optional)
++    if auth is not None:
++        kwargs['auth'] = auth
++    return kwargs
+ 
+ 
+ def _get_server() -> str:
+@@ -105,24 +99,50 @@ def _get_project() -> str:
+         sys.exit(1)
+ 
+ 
+-def _handle_error(
++def _raise_client_error(
++    operation: str,
++    exc: aiohttp.ClientError,
++) -> ty.NoReturn:
++    LOG.error(
++        'Failed to %s resource. Is your configuration correct?', operation
++    )
++    LOG.error("Use the '--debug' flag for more information")
++
++    if CONF.debug:
++        raise exc
++
++    sys.exit(1)
++
++
++async def _raise_response_error(
+     operation: str,
+-    exc: requests.exceptions.RequestException,
+-) -> None:
+-    if exc.response is not None and exc.response.content:
++    rsp: aiohttp.ClientResponse,
++) -> ty.NoReturn:
++    body = await rsp.read()
++
++    if body:
+         # server errors should always be reported
+-        if exc.response.status_code in range(500, 512):  # 5xx Server Error
++        if 500 <= rsp.status < 512:
+             LOG.error(
+                 'Server error. Please report this issue to '
+                 'https://github.com/getpatchwork/patchwork'
+             )
+-            raise
++            raise aiohttp.ClientResponseError(
++                rsp.request_info,
++                rsp.history,
++                status=rsp.status,
++                message=rsp.reason or '',
++                headers=rsp.headers,
++            )
+ 
+         # we make the assumption that all responses will be JSON encoded
+-        if exc.response.status_code == 404:
++        if rsp.status == 404:
+             LOG.error('Resource not found')
+         else:
+-            LOG.error(exc.response.json())
++            try:
++                LOG.error(json.loads(body.decode('utf-8')))
++            except (UnicodeDecodeError, json.JSONDecodeError):
++                LOG.error(body.decode('utf-8', 'replace'))
+     else:
+         LOG.error(
+             'Failed to %s resource. Is your configuration '
+@@ -131,95 +151,109 @@ def _handle_error(
+         LOG.error("Use the '--debug' flag for more information")
+ 
+     if CONF.debug:
+-        raise
+-    else:
+-        sys.exit(1)
+-
+-
+-def _get(
+-    url: str,
+-    params: ty.Optional[Filters] = None,
+-    stream: bool = False,
+-) -> requests.Response:
+-    """Make GET request and handle errors."""
+-    LOG.debug('GET %s', url)
+-
+-    try:
+-        # TODO(stephenfin): We only use a subset of the types possible for
+-        # 'params' (namely a list of tuples) but it doesn't seem possible to
+-        # indicate this
+-        rsp = requests.get(
+-            url,
+-            auth=_get_auth(optional=True),
+-            headers=_get_headers(),
+-            stream=stream,
+-            params=params,
+-        )  # type: ignore
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
+-        _handle_error('fetch', exc)
+-
+-    LOG.debug('Got response')
++        raise aiohttp.ClientResponseError(
++            rsp.request_info,
++            rsp.history,
++            status=rsp.status,
++            message=rsp.reason or '',
++            headers=rsp.headers,
++        )
+ 
+-    return rsp
++    sys.exit(1)
+ 
+ 
+-def _post(
++async def _request_json(
++    method: str,
+     url: str,
+-    data: ty.List[ty.Tuple[str, ty.Any]],
+-) -> requests.Response:
+-    """Make POST request and handle errors."""
+-    LOG.debug('POST %s, data=%r', url, data)
+-
+-    try:
+-        rsp = requests.post(
+-            url, auth=_get_auth(), headers=_get_headers(), data=data
+-        )
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
+-        _handle_error('create', exc)
++    operation: str,
++    params: ty.Optional[Filters] = None,
++    data: ty.Optional[ty.List[ty.Tuple[str, ty.Any]]] = None,
++    optional_auth: bool = False,
++) -> ty.Dict:
++    LOG.debug('%s %s%s', method, url, ', data=%r' % (data,) if data else '')
+ 
+-    LOG.debug('Got response')
++    async with aiohttp.ClientSession(
++        **_get_request_kwargs(optional_auth)
++    ) as session:
++        try:
++            async with session.request(
++                method, url, params=params, data=data
++            ) as rsp:
++                if rsp.status >= 400:
++                    await _raise_response_error(operation, rsp)
+ 
+-    return rsp
++                LOG.debug('Got response')
++                return await rsp.json()
++        except aiohttp.ClientError as exc:
++            _raise_client_error(operation, exc)
+ 
+ 
+-def _patch(
++async def _download_async(
+     url: str,
+-    data: ty.List[ty.Tuple[str, ty.Any]],
+-) -> requests.Response:
+-    """Make PATCH request and handle errors."""
+-    LOG.debug('PATCH %s, data=%r', url, data)
+-
+-    try:
+-        rsp = requests.patch(
+-            url,
+-            auth=_get_auth(),
+-            headers=_get_headers(),
+-            data=data,
+-        )
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
+-        _handle_error('update', exc)
+-
+-    LOG.debug('Got response')
+-
+-    return rsp
+-
++    params: ty.Optional[Filters] = None,
++    output: ty.Optional[str] = None,
++) -> ty.Optional[str]:
++    LOG.debug('GET %s', url)
+ 
+-def _delete(url: str) -> requests.Response:
+-    """Make DELETE request and handle errors."""
++    async with aiohttp.ClientSession(
++        **_get_request_kwargs(optional=True)
++    ) as session:
++        try:
++            async with session.get(url, params=params) as rsp:
++                if rsp.status >= 400:
++                    await _raise_response_error('fetch', rsp)
++
++                # we don't catch anything here because we should break if
++                # these are missing
++                header = re.search(
++                    'filename=(.+)',
++                    rsp.headers.get('content-disposition') or '',
++                )
++                if not header:
++                    LOG.error(
++                        'Filename was expected but was not provided in response'
++                    )
++                    sys.exit(1)
++
++                if output == '-':
++                    output_path = output
++                    output_file = sys.stdout.buffer
++                else:
++                    if output:
++                        output_path = output
++                        if os.path.isdir(output):
++                            output_path = os.path.join(output, header.group(1))
++                    else:
++                        output_path = os.path.join(
++                            tempfile.mkdtemp(prefix='git-pw'),
++                            header.group(1),
++                        )
++                    LOG.debug('Saving to %s', output_path)
++                    output_file = open(output_path, 'wb')
++
++                try:
++                    async for block in rsp.content.iter_chunked(1024):
++                        output_file.write(block)
++                finally:
++                    output_file.close()
++
++                return output_path
++        except aiohttp.ClientError as exc:
++            _raise_client_error('fetch', exc)
++
++
++async def _delete_async(url: str) -> None:
+     LOG.debug('DELETE %s', url)
+ 
+-    try:
+-        rsp = requests.delete(url, auth=_get_auth(), headers=_get_headers())
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
+-        _handle_error('delete', exc)
+-
+-    LOG.debug('Got response')
++    async with aiohttp.ClientSession(**_get_request_kwargs()) as session:
++        try:
++            async with session.delete(url) as rsp:
++                if rsp.status >= 400:
++                    await _raise_response_error('delete', rsp)
+ 
+-    return rsp
++                LOG.debug('Got response')
++        except aiohttp.ClientError as exc:
++            _raise_client_error('delete', exc)
+ 
+ 
+ def version() -> ty.Tuple[int, int]:
+@@ -237,7 +271,7 @@ def version() -> ty.Tuple[int, int]:
+ def download(
+     url: str,
+     params: ty.Optional[Filters] = None,
+-    output: ty.Optional[ty.Optional[str]] = None,
++    output: ty.Optional[str] = None,
+ ) -> ty.Optional[str]:
+     """Retrieve a specific API resource and save it to a file/stdout.
+ 
+@@ -256,41 +290,7 @@ def download(
+         A path to an output file containing the content, else None if stdout
+         used.
+     """
+-    rsp = _get(url, params, stream=True)
+-
+-    # we don't catch anything here because we should break if these are missing
+-    header = re.search(
+-        'filename=(.+)',
+-        rsp.headers.get('content-disposition') or '',
+-    )
+-    if not header:
+-        LOG.error('Filename was expected but was not provided in response')
+-        sys.exit(1)
+-
+-    if output == '-':
+-        output_path = output
+-        output_file = sys.stdout.buffer
+-    else:
+-        if output:
+-            output_path = output
+-            if os.path.isdir(output):
+-                output_path = os.path.join(output, header.group(1))
+-        else:
+-            output_path = os.path.join(
+-                tempfile.mkdtemp(prefix='git-pw'),
+-                header.group(1),
+-            )
+-        LOG.debug('Saving to %s', output_path)
+-        output_file = open(output_path, 'wb')
+-
+-    try:
+-        # we use iter_content because patches can be binary
+-        for block in rsp.iter_content(1024):
+-            output_file.write(block)
+-    finally:
+-        output_file.close()
+-
+-    return output_path
++    return asyncio.run(_download_async(url, params, output))
+ 
+ 
+ def index(resource_type: str, params: ty.Optional[Filters] = None) -> dict:
+@@ -316,7 +316,7 @@ def index(resource_type: str, params: ty.Optional[Filters] = None) -> dict:
+     params = params or []
+     params.append(('project', _get_project()))
+ 
+-    return _get(url, params).json()
++    return asyncio.run(_request_json('GET', url, 'fetch', params=params, optional_auth=True))
+ 
+ 
+ def detail(
+@@ -339,7 +339,7 @@ def detail(
+     # NOTE(stephenfin): All resources must have a trailing '/'
+     url = '/'.join([_get_server(), resource_type, str(resource_id), ''])
+ 
+-    return _get(url, params, stream=False).json()
++    return asyncio.run(_request_json('GET', url, 'fetch', params=params, optional_auth=True))
+ 
+ 
+ def create(
+@@ -360,7 +360,7 @@ def create(
+     # NOTE(stephenfin): All resources must have a trailing '/'
+     url = '/'.join([_get_server(), resource_type, ''])
+ 
+-    return _post(url, data).json()
++    return asyncio.run(_request_json('POST', url, 'create', data=data))
+ 
+ 
+ def delete(resource_type: str, resource_id: ty.Union[str, int]) -> None:
+@@ -378,7 +378,7 @@ def delete(resource_type: str, resource_id: ty.Union[str, int]) -> None:
+     # NOTE(stephenfin): All resources must have a trailing '/'
+     url = '/'.join([_get_server(), resource_type, str(resource_id), ''])
+ 
+-    _delete(url)
++    asyncio.run(_delete_async(url))
+ 
+ 
+ def update(
+@@ -401,7 +401,7 @@ def update(
+     # NOTE(stephenfin): All resources must have a trailing '/'
+     url = '/'.join([_get_server(), resource_type, str(resource_id), ''])
+ 
+-    return _patch(url, data).json()
++    return asyncio.run(_request_json('PATCH', url, 'update', data=data))
+ 
+ 
+ def validate_minimum_version(

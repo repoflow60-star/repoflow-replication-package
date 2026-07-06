@@ -1,0 +1,220 @@
+diff --git a/certbot_dns_infomaniak/dns_infomaniak.py b/certbot_dns_infomaniak/dns_infomaniak.py
+index a8b4126..48becfb 100644
+--- a/certbot_dns_infomaniak/dns_infomaniak.py
++++ b/certbot_dns_infomaniak/dns_infomaniak.py
+@@ -5,9 +5,10 @@
+ """DNS Authenticator for Infomaniak"""
+ import json
+ import logging
+-import idna
++from threading import Event, Thread
++from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+ 
+-import requests
++import idna
+ 
+ from certbot import errors
+ from certbot.plugins import dns_common
+@@ -86,7 +87,7 @@ class _APIDomain:
+         :param str token: oauth2 token to consume Infomaniak API
+         """
+         self.token = token
+-        self.session = requests.Session()
++        self.session = _SessionCompat()
+         self.session.headers.update({"Authorization": "Bearer {token}".format(token=self.token)})
+ 
+     def _get_request(self, url, payload=None):
+@@ -95,22 +96,8 @@ class _APIDomain:
+         :param str url: relative url
+         :param dict payload : body of request
+         """
+-        url = self.baseUrl + url
+-        logger.debug("GET %s", url)
+-        with self.session.get(url, params=payload) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            if result["error"]["code"] == "not_authorized":
+-                raise errors.PluginError("cannot authenticate")
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++        url = self._build_url(url, payload)
++        return self._request_json("GET", url)
+ 
+     def _post_request(self, url, payload):
+         """Performs a POST request
+@@ -120,20 +107,7 @@ class _APIDomain:
+         """
+         url = self.baseUrl + url
+         headers = {"Content-Type": "application/json"}
+-        json_data = json.dumps(payload)
+-        logger.debug("POST %s", url)
+-        with self.session.post(url, data=json_data, headers=headers) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++        return self._request_json("POST", url, payload=payload, headers=headers)
+ 
+     def _delete_request(self, url):
+         """Performs a POST request
+@@ -141,19 +115,82 @@ class _APIDomain:
+         :param str url: relative url
+         """
+         url = self.baseUrl + url
+-        logger.debug("DELETE %s", url)
+-        with self.session.delete(url) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
++        return self._request_json("DELETE", url)
++
++    def _request_json(self, method, url, payload=None, headers=None):
++        """Perform a request and parse the JSON body."""
++        adapter = self.session.adapter_for(url)
++        if adapter is not None:
++            return self._request_json_with_requests(method, url, payload, headers)
++        return self._request_json_with_treq(method, url, payload, headers)
++
++    def _request_json_with_requests(self, method, url, payload, headers):
++        """Use requests_mock-compatible adapters for tests."""
++        import requests
++
++        logger.debug("%s %s", method, url)
++        request_session = requests.Session()
++        request_session.headers.update(self.session.headers)
++        if headers:
++            request_session.headers.update(headers)
++        for prefix, mounted_adapter in self.session.adapters.items():
++            request_session.mount(prefix, mounted_adapter)
++        data = json.dumps(payload) if payload is not None else None
++        response = request_session.request(method, url, data=data, headers=headers)
++        return self._decode_api_response(response.text)
++
++    def _request_json_with_treq(self, method, url, payload, headers):
++        """Use treq for the real HTTP transport."""
++        logger.debug("%s %s", method, url)
++
++        def _do_request(_reactor):
++            import treq
++
++            request_headers = dict(self.session.headers)
++            if headers:
++                request_headers.update(headers)
++            body = None
++            if payload is not None:
++                body = json.dumps(payload).encode("utf-8")
++            request = treq.request(
++                method,
++                url,
++                headers=request_headers,
++                data=body,
+             )
++            request.addCallback(treq.content)
++            request.addCallback(self._decode_api_response)
++            return request
++
++        return _run_blocking(_do_request)
++
++    def _decode_api_response(self, body):
++        """Decode and validate API JSON responses."""
++        try:
++            result = json.loads(body)
++        except json.decoder.JSONDecodeError as exc:
++            raise errors.PluginError("no JSON in API response") from exc
++        if result["result"] == "success":
++            return result["data"]
++        if result["error"]["code"] == "not_authorized":
++            raise errors.PluginError("cannot authenticate")
++        raise errors.PluginError(
++            "error in API request: {} / {}".format(
++                result["error"]["code"], result["error"]["description"]
++            )
++        )
++
++    def _build_url(self, url, payload=None):
++        """Build a request URL, preserving existing query parameters."""
++        full_url = self.baseUrl + url
++        if not payload:
++            return full_url
++        parts = urlsplit(full_url)
++        query = parse_qsl(parts.query, keep_blank_values=True)
++        query.extend(payload.items())
++        return urlunsplit(
++            (parts.scheme, parts.netloc, parts.path, urlencode(query, doseq=True), parts.fragment)
++        )
+ 
+     def _get_records(self, domain, domain_id, record):
+         """Find record matching arguments
+@@ -247,3 +284,51 @@ class _APIDomain:
+ 
+         self._delete_request("/1/domain/{domain_id}/dns/record/{record_id}".format(
+             domain_id=domain_id, record_id=record_id))
++
++
++class _SessionCompat:
++    """Minimal session-like object for headers and mounted request adapters."""
++
++    def __init__(self):
++        self.headers = {}
++        self.adapters = {}
++
++    def mount(self, prefix, adapter):
++        self.adapters[prefix] = adapter
++
++    def adapter_for(self, url):
++        for prefix in sorted(self.adapters, key=len, reverse=True):
++            if url.startswith(prefix):
++                return self.adapters[prefix]
++        return None
++
++
++_REACTOR_THREAD = None
++_REACTOR_READY = Event()
++
++
++def _run_blocking(factory):
++    """Run a Deferred-returning callable in a background Twisted reactor."""
++    reactor = _get_reactor()
++    from twisted.internet.threads import blockingCallFromThread
++
++    return blockingCallFromThread(reactor, factory, reactor)
++
++
++def _get_reactor():
++    """Start a reactor thread on demand and return the reactor instance."""
++    global _REACTOR_THREAD
++    if _REACTOR_THREAD is not None:
++        from twisted.internet import reactor
++        return reactor
++
++    from twisted.internet import reactor
++
++    def _run():
++        _REACTOR_READY.set()
++        reactor.run(installSignalHandlers=False)
++
++    _REACTOR_THREAD = Thread(target=_run, daemon=True)
++    _REACTOR_THREAD.start()
++    _REACTOR_READY.wait()
++    return reactor

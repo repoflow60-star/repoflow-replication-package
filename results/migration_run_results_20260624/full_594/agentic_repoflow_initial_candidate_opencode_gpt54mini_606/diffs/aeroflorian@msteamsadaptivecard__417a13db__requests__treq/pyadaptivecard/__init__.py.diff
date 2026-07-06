@@ -1,0 +1,126 @@
+--- a/pyadaptivecard/__init__.py
++++ b/pyadaptivecard/__init__.py
+@@ -1,4 +1,99 @@
+-import requests
++import json
++import threading
++
++import treq
++from twisted.internet import reactor
++from twisted.web.client import ProxyAgent
++
++
++_reactor_lock = threading.Lock()
++_reactor_thread = None
++
++
++def _ensure_reactor_running():
++    global _reactor_thread
++
++    if reactor.running:
++        return
++
++    with _reactor_lock:
++        if reactor.running:
++            return
++        if _reactor_thread is None or not _reactor_thread.is_alive():
++            _reactor_thread = threading.Thread(
++                target=reactor.run,
++                kwargs={"installSignalHandlers": False},
++                daemon=True,
++            )
++            _reactor_thread.start()
++
++    while not reactor.running:
++        if _reactor_thread is not None and not _reactor_thread.is_alive():
++            raise RuntimeError("Unable to start Twisted reactor")
++        threading.Event().wait(0.01)
++
++
++def _perform_request(url, payload, headers, proxy):
++    _ensure_reactor_running()
++
++    done = threading.Event()
++    state = {}
++
++    def _dispatch():
++        request_kwargs = {"data": payload, "headers": headers}
++        if proxy is not None:
++            request_kwargs["agent"] = ProxyAgent(reactor, proxy.encode("utf-8"))
++
++        try:
++            deferred = treq.request("POST", url, **request_kwargs)
++        except Exception as exc:
++            state["error"] = exc
++            done.set()
++            return
++
++        def _handle_response(response):
++            try:
++                content_deferred = treq.content(response)
++            except Exception as exc:
++                state["error"] = exc
++                done.set()
++                return response
++
++            def _handle_content(content):
++                state["status_code"] = response.code
++                state["text"] = content.decode("utf-8", errors="replace")
++                done.set()
++                return content
++
++            def _handle_content_error(failure):
++                state["error"] = failure
++                done.set()
++                return failure
++
++            try:
++                content_deferred.addCallbacks(_handle_content, _handle_content_error)
++            except Exception as exc:
++                state["error"] = exc
++                done.set()
++            return response
++
++        def _handle_error(failure):
++            state["error"] = failure
++            done.set()
++            return failure
++
++        deferred.addCallbacks(_handle_response, _handle_error)
++
++    reactor.callFromThread(_dispatch)
++    done.wait()
++
++    if "error" in state:
++        error = state["error"]
++        if hasattr(error, "raiseException"):
++            error.raiseException()
++        raise error
++
++    return state["status_code"], state["text"]
+ 
+ 
+ class ActivitySection:
+@@ -283,13 +378,15 @@
+                 }
+             ]
+         }
+-        if self._proxy is not None:
+-            response = requests.post(self.url, json=message_body, headers=header, proxies={"https": self._proxy})
+-        else:
+-            response = requests.post(self.url, json=message_body, headers=header)
+-        if 200 <= response.status_code <= 202:
++        response_status_code, response_text = _perform_request(
++            self.url,
++            json.dumps(message_body).encode("utf-8"),
++            header,
++            self._proxy,
++        )
++        if 200 <= response_status_code <= 202:
+             print("Adaptive Card sent!")
+         else:
+             print("Error while sending adaptive card")
+-            print(f"Response status code: {response.status_code}")
+-            print(f"Response text: {response.text}")
++            print(f"Response status code: {response_status_code}")
++            print(f"Response text: {response_text}")

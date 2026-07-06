@@ -1,0 +1,103 @@
+--- a/pastepwn/util/request.py
++++ b/pastepwn/util/request.py
+@@ -1,14 +1,18 @@
+ import logging
+-from threading import Lock
++from threading import Event, Lock, Thread
++from urllib.parse import urlencode
+ 
+-from requests import Session, utils
+-from requests.exceptions import Timeout
++from treq import content as treq_content
++from treq import request as treq_request
++from twisted.internet import defer, reactor, threads
+ 
+ 
+ class Request:
+     _instance = None
+     _initialized = False
+     _lock = Lock()
++    _reactor_started = False
++    _reactor_ready = Event()
+ 
+     def __new__(cls, *args, **kwargs):
+         # override method to implement singleton
+@@ -22,13 +26,53 @@
+     def __init__(self, proxies=None, headers=None):
+         if not self._initialized:
+             self.logger = logging.getLogger(__name__)
+-            self.session = Session()
+             self.proxies = proxies
+             self.headers = headers
+             self.logger.info("Using the following custom proxies: %s", proxies)
+-            system_proxies = utils.get_environ_proxies("https://example.com")
+-            self.logger.info("Using the following system proxies: %s", system_proxies)
++            self._ensure_reactor()
+             Request._initialized = True
++
++    @classmethod
++    def _ensure_reactor(cls):
++        if reactor.running or cls._reactor_started:
++            return
++
++        with cls._lock:
++            if reactor.running or cls._reactor_started:
++                return
++
++            thread = Thread(target=cls._run_reactor, name="treq-reactor", daemon=True)
++            thread.start()
++            cls._reactor_started = True
++
++        cls._reactor_ready.wait()
++
++    @staticmethod
++    def _run_reactor():
++        reactor.callWhenRunning(Request._reactor_ready.set)
++        reactor.run(installSignalHandlers=False)
++
++    @staticmethod
++    def _encode_data(data):
++        if isinstance(data, dict):
++            return urlencode(data, doseq=True).encode("utf-8")
++
++        return data
++
++    def _request_async(self, method, url, headers, data, timeout, **kwargs):
++        request_kwargs = dict(kwargs)
++        request_kwargs["headers"] = headers
++
++        if data is not None:
++            request_kwargs["data"] = self._encode_data(data)
++
++        deferred = treq_request(method, url, **request_kwargs)
++        if timeout is not None:
++            deferred = deferred.addTimeout(timeout, reactor)
++
++        deferred.addCallback(treq_content)
++        deferred.addCallback(lambda body: body.decode("utf-8"))
++        return deferred
+ 
+     def _request_wrapper(self, data, timeout, *args, **kwargs):
+         headers = {"User-Agent": "pastepwn (https://github.com/d-Rickyy-b/pastepwn)"}
+@@ -36,14 +80,17 @@
+         if self.headers is not None:
+             headers.update(self.headers)
+ 
++        method = kwargs.pop("method")
++        url = kwargs.pop("url")
++
+         try:
+-            response = self.session.request(*args, headers=headers, proxies=self.proxies, data=data, timeout=timeout, **kwargs)
+-        except Timeout:
+-            url = kwargs.get("url")
++            self._ensure_reactor()
++            response = threads.blockingCallFromThread(reactor, self._request_async, method, url, headers, data, timeout, **kwargs)
++        except defer.TimeoutError:
+             self.logger.warning("Timeout while requesting %s!", url)
+             return ""
+ 
+-        return response.content.decode("utf-8")
++        return response
+ 
+     def get(self, url, data=None, timeout=5):
+         return self._request_wrapper(method="GET", url=url, data=data, timeout=timeout)

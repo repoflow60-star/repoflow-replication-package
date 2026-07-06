@@ -1,0 +1,687 @@
+--- a/tdclient/api.py
++++ b/tdclient/api.py
+@@ -17,9 +17,8 @@
+ import urllib.parse as urlparse
+
+ from array import array
+
+ 
+
++import aiohttp
+
+ import msgpack
+
+-import urllib3
+
+-import urllib3.util
+
+ 
+
+ from tdclient import errors, version
+
+ from tdclient.bulk_import_api import BulkImportAPI
+
+@@ -144,23 +143,30 @@
+         return self._endpoint
+
+ 
+
+     def _init_http(self, http_proxy=None, **kwargs):
+
++        timeout = kwargs.get("timeout", 60)
+
++        if isinstance(timeout, (int, float)):
+
++            timeout = aiohttp.ClientTimeout(total=timeout)
+
++
+
++        connector_kwargs = {}
+
++        if "ca_certs" in kwargs and kwargs["ca_certs"] is not None:
+
++            connector_kwargs["ssl"] = ssl.create_default_context(cafile=kwargs["ca_certs"])
+
++        elif kwargs.get("cert_reqs") == ssl.CERT_REQUIRED:
+
++            connector_kwargs["ssl"] = ssl.create_default_context()
+
++
+
+         if http_proxy is None:
+
+-            return urllib3.PoolManager(**kwargs)
+
++            connector = aiohttp.TCPConnector(**connector_kwargs)
+
++            return aiohttp.ClientSession(timeout=timeout, connector=connector)
+
+         else:
+
+             if http_proxy.startswith("http://"):
+
+-                return self._init_http_proxy(http_proxy, **kwargs)
+
+-            else:
+
+-                return self._init_http_proxy("http://%s" % (http_proxy,), **kwargs)
+
++                return self._init_http_proxy(http_proxy, timeout=timeout, **connector_kwargs)
+
++            else:
+
++                return self._init_http_proxy("http://%s" % (http_proxy,), timeout=timeout, **connector_kwargs)
+
+ 
+
+     def _init_http_proxy(self, http_proxy, **kwargs):
+
+-        pool_options = dict(kwargs)
+
+-        p = urlparse.urlparse(http_proxy)
+
+-        scheme = p.scheme
+
+-        netloc = p.netloc
+
+-        if "@" in netloc:
+
+-            auth, netloc = netloc.split("@", 2)
+
+-            pool_options["proxy_headers"] = urllib3.make_headers(proxy_basic_auth=auth)
+
+-        return urllib3.ProxyManager("%s://%s" % (scheme, netloc), **pool_options)
+
++        timeout = kwargs.pop("timeout", aiohttp.ClientTimeout(total=60))
+
++        if isinstance(timeout, (int, float)):
+
++            timeout = aiohttp.ClientTimeout(total=timeout)
+
++        return aiohttp.ClientSession(timeout=timeout, trust_env=False)
+
+ 
+
+     def get(self, path, params=None, headers=None, **kwargs):
+
+         headers = {} if headers is None else dict(headers)
+
+@@ -174,40 +180,33 @@
+             repr(params),
+
+         )
+
+ 
+
+-        # up to 7 retries with exponential (base 2) back-off starting at 'retry_delay'
+
+         retry_delay = 5
+
+         cumul_retry_delay = 0
+
+ 
+
+-        # for both exceptions and 500+ errors retrying is enabled by default.
+
+-        # The total number of retries cumulatively should not exceed 10 minutes / 600 seconds
+
+         response = None
+
+         while True:
+
+             try:
+
+                 response = self.send_request(
+
+                     "GET",
+
+                     url,
+
+-                    fields=params,
+
++                    params=params,
+
+                     headers=headers,
+
+-                    decode_content=True,
+
+-                    preload_content=False,
+
+-                )
+
+-                # retry if the HTTP error code is 500 or higher and we did not run out of retrying attempts
+
++                )
+
+                 if response.status < 500:
+
+                     break
+
+                 else:
+
+                     log.warning(
+
+                         "Error %d: %s. Retrying after %d seconds... (cumulative: %d/%d)",
+
+                         response.status,
+
+-                        response.data,
+
++                        response._body,
+
+                         retry_delay,
+
+                         cumul_retry_delay,
+
+                         self._max_cumul_retry_delay,
+
+                     )
+
+             except (
+
+-                urllib3.exceptions.TimeoutStateError,
+
+-                urllib3.exceptions.TimeoutError,
+
+-                urllib3.exceptions.PoolError,
+
+-                http.client.IncompleteRead,
+
++                aiohttp.ClientConnectionError,
+
++                aiohttp.ClientPayloadError,
+
++                asyncio.TimeoutError,
+
+                 TimeoutError,
+
+                 socket.error,
+
+             ):
+
+@@ -235,7 +234,7 @@
+ 
+
+         log.debug(
+
+             "REST GET response:\n  headers: %s\n  status: %d\n  body: <omitted>",
+
+-            repr(dict(response.getheaders())),
+
++            repr(dict(response.headers)),
+
+             response.status,
+
+         )
+
+ 
+
+@@ -252,16 +251,9 @@
+             repr(params),
+
+         )
+
+ 
+
+-        # up to 7 retries with exponential (base 2) back-off starting at 'retry_delay'
+
+         retry_delay = 5
+
+         cumul_retry_delay = 0
+
+ 
+
+-        # for both exceptions and 500+ errors retrying can be enabled by initialization
+
+-        # parameter 'retry_post_requests'. The total number of retries cumulatively
+
+-        # should not exceed 10 minutes / 600 seconds
+
+-
+
+-        # use `params` as request parameter if it is a `dict`.
+
+-        # otherwise, use it as byte string of request body.
+
+         body = fields = None
+
+         if isinstance(params, dict):
+
+             fields = params
+
+@@ -274,14 +266,10 @@
+                 response = self.send_request(
+
+                     "POST",
+
+                     url,
+
+-                    fields=fields,
+
+-                    body=body,
+
++                    params=fields,
+
++                    data=body,
+
+                     headers=headers,
+
+-                    decode_content=True,
+
+-                    preload_content=False,
+
+-                )
+
+-                # if the HTTP error code is 500 or higher and the user requested retrying
+
+-                # on post request, attempt a retry
+
++                )
+
+                 if response.status < 500:
+
+                     break
+
+                 else:
+
+@@ -292,15 +280,15 @@
+                     log.warning(
+
+                         "Error %d: %s. Retrying after %d seconds... (cumulative: %d/%d)",
+
+                         response.status,
+
+-                        response.data,
+
++                        response._body,
+
+                         retry_delay,
+
+                         cumul_retry_delay,
+
+                         self._max_cumul_retry_delay,
+
+                     )
+
+             except (
+
+-                urllib3.exceptions.TimeoutStateError,
+
+-                urllib3.exceptions.TimeoutError,
+
+-                urllib3.exceptions.PoolError,
+
++                aiohttp.ClientConnectionError,
+
++                aiohttp.ClientPayloadError,
+
++                asyncio.TimeoutError,
+
+                 socket.error,
+
+             ):
+
+                 if not self._retry_post_requests:
+
+@@ -328,7 +316,7 @@
+ 
+
+         log.debug(
+
+             "REST POST response:\n  headers: %s\n  status: %d\n  body: <omitted>",
+
+-            repr(dict(response.getheaders())),
+
++            repr(dict(response.headers)),
+
+             response.status,
+
+         )
+
+ 
+
+@@ -348,13 +336,11 @@
+         )
+
+ 
+
+         if hasattr(bytes_or_stream, "read"):
+
+-            # file-like must support `read` and `fileno` to work with `httplib`
+
+             fileno_supported = hasattr(bytes_or_stream, "fileno")
+
+             if fileno_supported:
+
+                 try:
+
+                     bytes_or_stream.fileno()
+
+                 except io.UnsupportedOperation:
+
+-                    # `io.BytesIO` doesn't support `fileno`
+
+                     fileno_supported = False
+
+             if fileno_supported:
+
+                 stream = bytes_or_stream
+
+@@ -362,7 +348,6 @@
+                 stream = array("b", bytes_or_stream.read())
+
+ 
+
+         else:
+
+-            # send request body as an `array.array` since `httplib` requires the request body to be a unicode string
+
+             stream = array("b", bytes_or_stream)
+
+ 
+
+         response = None
+
+@@ -370,26 +355,24 @@
+             response = self.send_request(
+
+                 "PUT",
+
+                 url,
+
+-                body=stream,
+
++                data=stream,
+
+                 headers=headers,
+
+-                decode_content=True,
+
+-                preload_content=False,
+
+             )
+
+             if response.status < 500:
+
+                 pass
+
+             else:
+
+-                raise APIError("Error %d: %s", response.status, response.data)
+
++                raise APIError("Error %d: %s", response.status, response._body)
+
+         except (
+
+-            urllib3.exceptions.TimeoutStateError,
+
+-            urllib3.exceptions.TimeoutError,
+
+-            urllib3.exceptions.PoolError,
+
++            aiohttp.ClientConnectionError,
+
++            aiohttp.ClientPayloadError,
+
++            asyncio.TimeoutError,
+
+             socket.error,
+
+         ):
+
+             raise APIError("Error: %s" % (repr(response)))
+
+ 
+
+         log.debug(
+
+             "REST PUT response:\n  headers: %s\n  status: %d\n  body: <omitted>",
+
+-            repr(dict(response.getheaders())),
+
++            repr(dict(response.headers)),
+
+             response.status,
+
+         )
+
+ 
+
+@@ -406,39 +389,33 @@
+             repr(params),
+
+         )
+
+ 
+
+-        # up to 7 retries with exponential (base 2) back-off starting at 'retry_delay'
+
+         retry_delay = 5
+
+         cumul_retry_delay = 0
+
+ 
+
+-        # for both exceptions and 500+ errors retrying is enabled by default.
+
+-        # The total number of retries cumulatively should not exceed 10 minutes / 600 seconds
+
+         response = None
+
+         while True:
+
+             try:
+
+                 response = self.send_request(
+
+                     "DELETE",
+
+                     url,
+
+-                    fields=params,
+
++                    params=params,
+
+                     headers=headers,
+
+-                    decode_content=True,
+
+-                    preload_content=False,
+
+-                )
+
+-                # retry if the HTTP error code is 500 or higher and we did not run out of retrying attempts
+
++                )
+
+                 if response.status < 500:
+
+                     break
+
+                 else:
+
+                     log.warning(
+
+                         "Error %d: %s. Retrying after %d seconds... (cumulative: %d/%d)",
+
+                         response.status,
+
+-                        response.data,
+
++                        response._body,
+
+                         retry_delay,
+
+                         cumul_retry_delay,
+
+                         self._max_cumul_retry_delay,
+
+                     )
+
+             except (
+
+-                urllib3.exceptions.TimeoutStateError,
+
+-                urllib3.exceptions.TimeoutError,
+
+-                urllib3.exceptions.PoolError,
+
++                aiohttp.ClientConnectionError,
+
++                aiohttp.ClientPayloadError,
+
++                asyncio.TimeoutError,
+
+                 socket.error,
+
+             ):
+
+                 pass
+
+@@ -465,7 +442,7 @@
+ 
+
+         log.debug(
+
+             "REST DELETE response:\n  headers: %s\n  status: %d\n  body: <omitted>",
+
+-            repr(dict(response.getheaders())),
+
++            repr(dict(response.headers)),
+
+             response.status,
+
+         )
+
+ 
+
+@@ -479,36 +456,30 @@
+             url = endpoint
+
+         else:
+
+             p = urlparse.urlparse(endpoint)
+
+-            # should not use `os.path.join` since it returns path string like "/foo\\bar"
+
+             request_path = path if p.path == "/" else "/".join([p.path, path])
+
+             url = urlparse.urlunparse(
+
+                 urlparse.ParseResult(
+
+                     p.scheme, p.netloc, request_path, p.params, p.query, p.fragment
+
+                 )
+
+             )
+
+-        # use default headers first
+
+         _headers = dict(self._headers)
+
+-        # add default headers
+
+         _headers["authorization"] = "TD1 %s" % (self._apikey,)
+
+         _headers["date"] = email.utils.formatdate(time.time())
+
+         _headers["user-agent"] = self._user_agent
+
+-        # override given headers
+
+         _headers.update({key.lower(): value for (key, value) in headers.items()})
+
+         return (url, _headers)
+
+ 
+
+     def send_request(self, method, url, fields=None, body=None, headers=None, **kwargs):
+
+         if body is None:
+
+             return self.http.request(
+
+-                method, url, fields=fields, headers=headers, **kwargs
+
++                method, url, params=fields, headers=headers, **kwargs
+
+             )
+
+ 
+
+-        if urllib3.util.IS_PYOPENSSL and isinstance(body, bytearray):
+
+-            # workaround for https://github.com/pyca/pyopenssl/issues/621
+
++        if isinstance(body, bytearray):
+
+             body = memoryview(body)
+
+-        if urllib3.util.IS_PYOPENSSL and isinstance(body, array):
+
+-            # workaround for https://github.com/pyca/pyopenssl/issues/621
+
++        if isinstance(body, array):
+
+             body = body.tobytes()
+
+-        return self.http.urlopen(method, url, body=body, headers=headers, **kwargs)
+
++        return self.http.request(method, url, data=body, headers=headers, **kwargs)
+
+ 
+
+     def raise_error(self, msg, res, body):
+
+         status_code = res.status
+
+@@ -539,9 +510,7 @@
+         return js
+
+ 
+
+     def close(self):
+
+-        # urllib3 doesn't allow to close all connections immediately.
+
+-        # all connections in pool will be closed eventually during gc.
+
+-        self.http.clear()
+
++        self.http.close()
+
+ 
+
+     def _prepare_file(self, file_like, fmt, **kwargs):
+
+         fp = tempfile.TemporaryFile()
+
+@@ -579,14 +548,12 @@
+             return reader(file_like, **kwargs)
+
+ 
+
+     def _read_msgpack_file(self, file_like, **kwargs):
+
+-        # current impl doesn't tolerate any unpack error
+
+         unpacker = msgpack.Unpacker(file_like, raw=False)
+
+         for record in unpacker:
+
+             validate_record(record)
+
+             yield record
+
+ 
+
+     def _read_json_file(self, file_like, **kwargs):
+
+-        # current impl doesn't tolerate any JSON parse error
+
+         for s in file_like:
+
+             record = json.loads(s.decode("utf-8"))
+
+             validate_record(record)

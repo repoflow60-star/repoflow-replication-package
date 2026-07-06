@@ -1,0 +1,142 @@
+diff --git a/iconsdk/providers/http_provider.py b/iconsdk/providers/http_provider.py
+index 472d63d..b684cff 100644
+--- a/iconsdk/providers/http_provider.py
++++ b/iconsdk/providers/http_provider.py
+@@ -14,12 +14,20 @@
+ 
+ import json
+ import re
++import ssl
++import asyncio
+ from json.decoder import JSONDecodeError
++from dataclasses import dataclass
+ from time import time, monotonic
+ from typing import Union, Optional
+ from urllib.parse import urlparse, urlunparse
++from urllib.request import Request, urlopen
++from urllib.error import HTTPError
+ 
+-import requests
++try:
++    import aiohttp
++except ImportError:  # pragma: no cover - exercised when aiohttp is unavailable in the environment
++    aiohttp = None
+ from multimethod import multimethod
+ from websocket import WebSocket, WebSocketTimeoutException
+ 
+@@ -119,11 +127,8 @@ class HTTPProvider(Provider):
+             yield key, value
+ 
+     @staticmethod
+-    def _make_post_request(request_url: str, data: dict, **kwargs) -> requests.Response:
+-        kwargs.setdefault('timeout', 10)
+-        with requests.Session() as session:
+-            response = session.post(url=request_url, data=json.dumps(data), **kwargs)
+-        return response
++    def _make_post_request(request_url: str, data: dict, **kwargs):
++        return _post_request(request_url, data, **kwargs)
+ 
+     def _make_id(self) -> int:
+         return int(time())
+@@ -147,7 +152,7 @@ class HTTPProvider(Provider):
+             raise JSONRPCException(f'Unknown response: {raw_response}')
+ 
+     @staticmethod
+-    def _return_custom_response(response: requests.Response, full_response: bool = False) -> Union[str, list, dict]:
++    def _return_custom_response(response, full_response: bool = False) -> Union[str, list, dict]:
+         content = json.loads(response.content)
+         if full_response:
+             return content
+@@ -203,3 +208,92 @@ class WebSocketMonitor(Monitor):
+ 
+     def read(self, timeout: Optional[float] = None) -> any:
+         return self.__read_json(timeout=timeout)
++
++
++@dataclass
++class _HTTPResponse:
++    status_code: int
++    content: bytes
++
++    @property
++    def ok(self) -> bool:
++        return 200 <= self.status_code < 400
++
++    @property
++    def status(self) -> int:
++        return self.status_code
++
++
++def _run_coroutine(coro):
++    try:
++        asyncio.get_running_loop()
++    except RuntimeError:
++        return asyncio.run(coro)
++
++    from threading import Thread
++
++    result = {}
++    error = {}
++
++    def _runner():
++        try:
++            result['value'] = asyncio.run(coro)
++        except BaseException as exc:  # pragma: no cover - defensive threading bridge
++            error['exc'] = exc
++
++    thread = Thread(target=_runner)
++    thread.start()
++    thread.join()
++    if error:
++        raise error['exc']
++    return result['value']
++
++
++async def _aiohttp_post_request(request_url: str, data: dict, **kwargs) -> _HTTPResponse:
++    timeout = kwargs.pop('timeout', 10)
++    headers = kwargs.pop('headers', None)
++    allow_redirects = kwargs.pop('allow_redirects', True)
++    verify = kwargs.pop('verify', True)
++
++    session_kwargs = {}
++    if timeout is not None:
++        session_kwargs['timeout'] = aiohttp.ClientTimeout(total=timeout)
++    if headers is not None:
++        session_kwargs['headers'] = headers
++
++    request_kwargs = dict(kwargs)
++    request_kwargs['allow_redirects'] = allow_redirects
++    if verify is False:
++        request_kwargs['ssl'] = False
++    elif verify is not True:
++        request_kwargs['ssl'] = verify
++
++    async with aiohttp.ClientSession(**session_kwargs) as session:
++        async with session.post(request_url, data=json.dumps(data), **request_kwargs) as response:
++            content = await response.read()
++            return _HTTPResponse(status_code=response.status, content=content)
++
++
++def _urllib_post_request(request_url: str, data: dict, **kwargs) -> _HTTPResponse:
++    timeout = kwargs.pop('timeout', 10)
++    headers = dict(kwargs.pop('headers', {}) or {})
++    kwargs.pop('allow_redirects', None)
++    verify = kwargs.pop('verify', True)
++    headers.setdefault('Content-Type', 'application/json')
++
++    request = Request(request_url, data=json.dumps(data).encode('utf-8'), headers=headers, method='POST')
++    context = None
++    if verify is False and request_url.startswith('https://'):
++        context = ssl._create_unverified_context()
++
++    try:
++        with urlopen(request, timeout=timeout, context=context) as response:
++            return _HTTPResponse(status_code=response.getcode(), content=response.read())
++    except HTTPError as exc:
++        return _HTTPResponse(status_code=exc.code, content=exc.read())
++
++
++def _post_request(request_url: str, data: dict, **kwargs) -> _HTTPResponse:
++    if aiohttp is not None:
++        return _run_coroutine(_aiohttp_post_request(request_url, data, **kwargs))
++    return _urllib_post_request(request_url, data, **kwargs)

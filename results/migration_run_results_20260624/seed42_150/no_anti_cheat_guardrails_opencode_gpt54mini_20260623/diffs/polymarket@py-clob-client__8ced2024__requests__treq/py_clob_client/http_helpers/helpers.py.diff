@@ -1,0 +1,116 @@
+--- a/py_clob_client/http_helpers/helpers.py
++++ b/py_clob_client/http_helpers/helpers.py
+@@ -1,4 +1,8 @@
+-import requests
++import json
++import threading
++
++import treq
++from twisted.internet import reactor, threads
+ 
+ from py_clob_client.clob_types import (
+     DropNotificationParams,
+@@ -17,6 +21,70 @@
+ PUT = "PUT"
+ 
+ 
++_reactor_thread = None
++_reactor_started = threading.Event()
++_reactor_lock = threading.Lock()
++
++
++class _ResponseAdapter:
++    def __init__(self, status_code, body):
++        self.status_code = status_code
++        self.body = body
++
++    @property
++    def text(self):
++        if isinstance(self.body, bytes):
++            return self.body.decode("utf-8", errors="replace")
++        return self.body
++
++    def json(self):
++        text = self.text
++        return json.loads(text) if text is not None else None
++
++
++def _ensure_reactor_running():
++    global _reactor_thread
++    if reactor.running:
++        return
++
++    with _reactor_lock:
++        if reactor.running:
++            return
++
++        if _reactor_thread is None or not _reactor_thread.is_alive():
++            _reactor_started.clear()
++
++            def _run_reactor():
++                _reactor_started.set()
++                reactor.run(installSignalHandlers=False)
++
++            _reactor_thread = threading.Thread(target=_run_reactor, daemon=True)
++            _reactor_thread.start()
++
++    _reactor_started.wait()
++
++
++def _decode_response(resp):
++    status_code = getattr(resp, "code", getattr(resp, "status_code", None))
++
++    def _handle_body(body):
++        if status_code != 200:
++            raise PolyApiException(resp=_ResponseAdapter(status_code, body))
++
++        if not body:
++            return ""
++
++        if isinstance(body, bytes):
++            body = body.decode("utf-8", errors="replace")
++
++        try:
++            return json.loads(body)
++        except Exception:
++            return body
++
++    return treq.content(resp).addCallback(_handle_body)
++
++
+ def overloadHeaders(method: str, headers: dict) -> dict:
+     if headers is None:
+         headers = dict()
+@@ -35,18 +103,20 @@
+ def request(endpoint: str, method: str, headers=None, data=None):
+     try:
+         headers = overloadHeaders(method, headers)
+-        resp = requests.request(
+-            method=method, url=endpoint, headers=headers, json=data if data else None
+-        )
+-        if resp.status_code != 200:
+-            raise PolyApiException(resp)
+-
+-        try:
+-            return resp.json()
+-        except requests.JSONDecodeError:
+-            return resp.text
+-
+-    except requests.RequestException:
++        _ensure_reactor_running()
++
++        payload = json.dumps(data).encode("utf-8") if data else None
++
++        def _do_request():
++            return treq.request(method, endpoint, headers=headers, data=payload).addCallback(
++                _decode_response
++            )
++
++        return threads.blockingCallFromThread(reactor, _do_request)
++
++    except PolyApiException:
++        raise
++    except Exception:
+         raise PolyApiException(error_msg="Request exception!")
+ 
+ 

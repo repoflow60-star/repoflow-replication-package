@@ -1,0 +1,296 @@
+diff --git a/tdclient/api.py b/tdclient/api.py
+index 043637e..20a8c76 100644
+--- a/tdclient/api.py
++++ b/tdclient/api.py
+@@ -4,22 +4,19 @@ import contextlib
+ import csv
+ import email.utils
+ import gzip
+-import http
++import asyncio
+ import io
+ import json
+ import logging
+ import os
+-import socket
+ import ssl
+-import sys
+ import tempfile
+ import time
+ import urllib.parse as urlparse
+ from array import array
+ 
+ import msgpack
+-import urllib3
+-import urllib3.util
++import aiohttp
+ 
+ from tdclient import errors, version
+ from tdclient.bulk_import_api import BulkImportAPI
+@@ -56,6 +53,113 @@ AlreadyExistsError = errors.AlreadyExistsError
+ NotFoundError = errors.NotFoundError
+ 
+ 
++class _Proxy:
++    def __init__(self, url):
++        self.url = url
++
++
++class _Response:
++    def __init__(self, status, headers, body):
++        self.status = status
++        self.data = body
++        self._headers = dict(headers)
++        self._offset = 0
++        self._closed = False
++
++    def read(self, size=None):
++        if size is None or size < 0:
++            size = len(self.data) - self._offset
++        start = self._offset
++        end = min(len(self.data), start + size)
++        self._offset = end
++        return self.data[start:end]
++
++    def stream(self, size=None):
++        size = 1024 if size is None else size
++        while True:
++            chunk = self.read(size)
++            if not chunk:
++                break
++            yield chunk
++
++    def getheaders(self):
++        return list(self._headers.items())
++
++    def close(self):
++        self._closed = True
++
++
++class _AiohttpTransport:
++    def __init__(
++        self,
++        timeout=60,
++        ca_certs=None,
++        proxy=None,
++        proxy_auth=None,
++        **kwargs,
++    ):
++        self._timeout = timeout
++        self._ca_certs = ca_certs
++        self.proxy = _Proxy(proxy) if proxy is not None else None
++        self.proxy_headers = {}
++        if proxy_auth is not None:
++            self.proxy_headers["proxy-authorization"] = proxy_auth.encode()
++        self._proxy = proxy
++        self._proxy_auth = proxy_auth
++
++    def clear(self):
++        return None
++
++    def close(self):
++        return None
++
++    def request(self, method, url, fields=None, body=None, headers=None, **kwargs):
++        return asyncio.run(
++            self._request(method, url, fields=fields, body=body, headers=headers, **kwargs)
++        )
++
++    def urlopen(self, method, url, body=None, headers=None, **kwargs):
++        return self.request(method, url, body=body, headers=headers, **kwargs)
++
++    async def _request(self, method, url, fields=None, body=None, headers=None, **kwargs):
++        request_kwargs = {}
++        if headers is not None:
++            request_kwargs["headers"] = headers
++        if self._proxy is not None:
++            request_kwargs["proxy"] = self._proxy
++        if self._proxy_auth is not None:
++            request_kwargs["proxy_auth"] = self._proxy_auth
++
++        if fields is not None:
++            if method.upper() in {"GET", "DELETE"}:
++                request_kwargs["params"] = fields
++            else:
++                request_kwargs["data"] = fields
++
++        if body is not None:
++            if hasattr(body, "read"):
++                body = body.read()
++            elif isinstance(body, array):
++                body = body.tobytes()
++            elif isinstance(body, bytearray):
++                body = bytes(body)
++            elif isinstance(body, memoryview):
++                body = body.tobytes()
++            request_kwargs["data"] = body
++
++        if self._ca_certs is not None:
++            ssl_context = ssl.create_default_context(cafile=self._ca_certs)
++        else:
++            ssl_context = None
++
++        timeout = aiohttp.ClientTimeout(total=self._timeout)
++        connector = aiohttp.TCPConnector(ssl=ssl_context)
++        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
++            async with session.request(method, url, **request_kwargs) as response:
++                body = await response.read()
++                return _Response(response.status, response.headers, body)
++
++
+ class API(
+     BulkImportAPI,
+     ConnectorAPI,
+@@ -145,22 +249,27 @@ class API(
+ 
+     def _init_http(self, http_proxy=None, **kwargs):
+         if http_proxy is None:
+-            return urllib3.PoolManager(**kwargs)
+-        else:
+-            if http_proxy.startswith("http://"):
+-                return self._init_http_proxy(http_proxy, **kwargs)
+-            else:
+-                return self._init_http_proxy("http://%s" % (http_proxy,), **kwargs)
++            return _AiohttpTransport(**kwargs)
++        if http_proxy.startswith("http://") or http_proxy.startswith("https://"):
++            return self._init_http_proxy(http_proxy, **kwargs)
++        return self._init_http_proxy("http://%s" % (http_proxy,), **kwargs)
+ 
+     def _init_http_proxy(self, http_proxy, **kwargs):
+-        pool_options = dict(kwargs)
+         p = urlparse.urlparse(http_proxy)
+         scheme = p.scheme
+         netloc = p.netloc
+         if "@" in netloc:
+-            auth, netloc = netloc.split("@", 2)
+-            pool_options["proxy_headers"] = urllib3.make_headers(proxy_basic_auth=auth)
+-        return urllib3.ProxyManager("%s://%s" % (scheme, netloc), **pool_options)
++            auth, netloc = netloc.rsplit("@", 1)
++            username, password = auth.split(":", 1) if ":" in auth else (auth, "")
++            proxy_auth = aiohttp.BasicAuth(username, password)
++        else:
++            proxy_auth = None
++        return _AiohttpTransport(
++            timeout=kwargs.get("timeout", 60),
++            ca_certs=kwargs.get("ca_certs"),
++            proxy="%s://%s" % (scheme, netloc),
++            proxy_auth=proxy_auth,
++        )
+ 
+     def get(self, path, params=None, headers=None, **kwargs):
+         headers = {} if headers is None else dict(headers)
+@@ -188,8 +297,6 @@ class API(
+                     url,
+                     fields=params,
+                     headers=headers,
+-                    decode_content=True,
+-                    preload_content=False,
+                 )
+                 # retry if the HTTP error code is 500 or higher and we did not run out of retrying attempts
+                 if response.status < 500:
+@@ -203,14 +310,7 @@ class API(
+                         cumul_retry_delay,
+                         self._max_cumul_retry_delay,
+                     )
+-            except (
+-                urllib3.exceptions.TimeoutStateError,
+-                urllib3.exceptions.TimeoutError,
+-                urllib3.exceptions.PoolError,
+-                http.client.IncompleteRead,
+-                TimeoutError,
+-                socket.error,
+-            ):
++            except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError, OSError):
+                 pass
+ 
+             if cumul_retry_delay <= self._max_cumul_retry_delay:
+@@ -277,8 +377,6 @@ class API(
+                     fields=fields,
+                     body=body,
+                     headers=headers,
+-                    decode_content=True,
+-                    preload_content=False,
+                 )
+                 # if the HTTP error code is 500 or higher and the user requested retrying
+                 # on post request, attempt a retry
+@@ -297,12 +395,7 @@ class API(
+                         cumul_retry_delay,
+                         self._max_cumul_retry_delay,
+                     )
+-            except (
+-                urllib3.exceptions.TimeoutStateError,
+-                urllib3.exceptions.TimeoutError,
+-                urllib3.exceptions.PoolError,
+-                socket.error,
+-            ):
++            except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError, OSError):
+                 if not self._retry_post_requests:
+                     raise APIError("Retrying stopped by retry_post_requests == False")
+ 
+@@ -372,19 +465,12 @@ class API(
+                 url,
+                 body=stream,
+                 headers=headers,
+-                decode_content=True,
+-                preload_content=False,
+             )
+             if response.status < 500:
+                 pass
+             else:
+                 raise APIError("Error %d: %s", response.status, response.data)
+-        except (
+-            urllib3.exceptions.TimeoutStateError,
+-            urllib3.exceptions.TimeoutError,
+-            urllib3.exceptions.PoolError,
+-            socket.error,
+-        ):
++        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError, OSError):
+             raise APIError("Error: %s" % (repr(response)))
+ 
+         log.debug(
+@@ -420,8 +506,6 @@ class API(
+                     url,
+                     fields=params,
+                     headers=headers,
+-                    decode_content=True,
+-                    preload_content=False,
+                 )
+                 # retry if the HTTP error code is 500 or higher and we did not run out of retrying attempts
+                 if response.status < 500:
+@@ -435,12 +519,7 @@ class API(
+                         cumul_retry_delay,
+                         self._max_cumul_retry_delay,
+                     )
+-            except (
+-                urllib3.exceptions.TimeoutStateError,
+-                urllib3.exceptions.TimeoutError,
+-                urllib3.exceptions.PoolError,
+-                socket.error,
+-            ):
++            except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError, OSError):
+                 pass
+ 
+             if cumul_retry_delay <= self._max_cumul_retry_delay:
+@@ -501,13 +580,6 @@ class API(
+             return self.http.request(
+                 method, url, fields=fields, headers=headers, **kwargs
+             )
+-
+-        if urllib3.util.IS_PYOPENSSL and isinstance(body, bytearray):
+-            # workaround for https://github.com/pyca/pyopenssl/issues/621
+-            body = memoryview(body)
+-        if urllib3.util.IS_PYOPENSSL and isinstance(body, array):
+-            # workaround for https://github.com/pyca/pyopenssl/issues/621
+-            body = body.tobytes()
+         return self.http.urlopen(method, url, body=body, headers=headers, **kwargs)
+ 
+     def raise_error(self, msg, res, body):
+@@ -539,8 +611,6 @@ class API(
+         return js
+ 
+     def close(self):
+-        # urllib3 doesn't allow to close all connections immediately.
+-        # all connections in pool will be closed eventually during gc.
+         self.http.clear()
+ 
+     def _prepare_file(self, file_like, fmt, **kwargs):

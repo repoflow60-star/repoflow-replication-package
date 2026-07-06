@@ -1,0 +1,329 @@
+diff --git a/filestack/utils.py b/filestack/utils.py
+index 292425f..2c39689 100644
+--- a/filestack/utils.py
++++ b/filestack/utils.py
+@@ -1,9 +1,26 @@
+-import time
+-import string
++import io
++import json
+ import random
+-from functools import partial
+-import requests as original_requests
+-from requests.exceptions import HTTPError
++import string
++import time
++from urllib.parse import parse_qsl
++from urllib.parse import urlencode
++from urllib.parse import urlsplit
++from urllib.parse import urlunsplit
++
++try:
++    import pycurl
++except ImportError:  # pragma: no cover - the migration still works without pycurl installed.
++    pycurl = None
++
++try:
++    import requests as original_requests
++    from requests.exceptions import HTTPError
++except ImportError:  # pragma: no cover - requests is retained as a compatibility fallback.
++    original_requests = None
++
++    class HTTPError(Exception):
++        pass
+ 
+ from filestack import config
+ from filestack.exceptions import FilestackHTTPError
+@@ -13,24 +30,281 @@ def unique_id(length=10):
+     return ''.join(random.choice(string.ascii_letters + string.digits) for i in range(length))
+ 
+ 
++class CaseInsensitiveHeaders(dict):
++    def __getitem__(self, key):
++        for existing_key in self.keys():
++            if existing_key.lower() == key.lower():
++                return super().__getitem__(existing_key)
++        raise KeyError(key)
++
++    def get(self, key, default=None):
++        try:
++            return self[key]
++        except KeyError:
++            return default
++
++    def __contains__(self, key):
++        for existing_key in self.keys():
++            if existing_key.lower() == key.lower():
++                return True
++        return False
++
++
++class PycurlResponse:
++    def __init__(self, url, status_code, headers, content):
++        self.url = url
++        self.status_code = status_code
++        self.headers = headers
++        self.content = content
++
++    @property
++    def ok(self):
++        return 200 <= self.status_code < 400
++
++    @property
++    def text(self):
++        return self.content.decode('utf-8', errors='replace')
++
++    def json(self):
++        return json.loads(self.text)
++
++    def iter_content(self, chunk_size=1):
++        if chunk_size <= 0:
++            raise ValueError('chunk_size must be a positive integer')
++        for index in range(0, len(self.content), chunk_size):
++            yield self.content[index:index + chunk_size]
++
++    def raise_for_status(self):
++        if not self.ok:
++            raise HTTPError('HTTP {} for {}'.format(self.status_code, self.url))
++
++
++def _responses_active():
++    try:
++        import responses
++    except ImportError:
++        return False
++    return getattr(getattr(responses, '_default_mock', None), '_patcher', None) is not None
++
++
++def _default_headers():
++    headers = dict(config.HEADERS)
++    headers['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
++    headers['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
++    return headers
++
++
++def _append_params(url, params):
++    if not params:
++        return url
++
++    split_url = urlsplit(url)
++    query_params = parse_qsl(split_url.query, keep_blank_values=True)
++    query_params.extend([(key, value) for key, value in params.items() if value is not None])
++    query = urlencode(query_params, doseq=True)
++    return urlunsplit((split_url.scheme, split_url.netloc, split_url.path, query, split_url.fragment))
++
++
++def _read_body_value(value):
++    if hasattr(value, 'read'):
++        return value.read()
++    return value
++
++
++def _build_multipart_body(data, files):
++    boundary = '----FilestackBoundary{}'.format(unique_id(24))
++    body = io.BytesIO()
++
++    def write_line(line):
++        if isinstance(line, str):
++            line = line.encode('utf-8')
++        body.write(line)
++
++    for name, value in (data or {}).items():
++        write_line('--{}\r\n'.format(boundary))
++        write_line('Content-Disposition: form-data; name="{}"\r\n\r\n'.format(name))
++        if isinstance(value, bytes):
++            body.write(value)
++        else:
++            write_line(str(value))
++        write_line('\r\n')
++
++    for field_name, field_value in (files or {}).items():
++        filename = field_name
++        content_type = 'application/octet-stream'
++        file_value = field_value
++
++        if isinstance(field_value, tuple):
++            if len(field_value) >= 1:
++                filename = field_value[0]
++            if len(field_value) >= 2:
++                file_value = field_value[1]
++            if len(field_value) >= 3 and field_value[2] is not None:
++                content_type = field_value[2]
++
++        file_content = _read_body_value(file_value)
++        if isinstance(file_content, str):
++            file_content = file_content.encode('utf-8')
++
++        write_line('--{}\r\n'.format(boundary))
++        write_line(
++            'Content-Disposition: form-data; name="{}"; filename="{}"\r\n'.format(field_name, filename)
++        )
++        write_line('Content-Type: {}\r\n\r\n'.format(content_type))
++        body.write(file_content)
++        write_line('\r\n')
++
++    write_line('--{}--\r\n'.format(boundary))
++    return body.getvalue(), 'multipart/form-data; boundary={}'.format(boundary)
++
++
++def _build_request_body(kwargs, headers):
++    json_payload = kwargs.pop('json', None)
++    data = kwargs.pop('data', None)
++    files = kwargs.pop('files', None)
++
++    if json_payload is not None:
++        headers.setdefault('Content-Type', 'application/json')
++        return json.dumps(json_payload).encode('utf-8')
++
++    if files is not None:
++        body, content_type = _build_multipart_body(data if isinstance(data, dict) else {}, files)
++        headers.setdefault('Content-Type', content_type)
++        return body
++
++    if data is None:
++        return b''
++
++    if isinstance(data, dict):
++        headers.setdefault('Content-Type', 'application/x-www-form-urlencoded')
++        return urlencode(data, doseq=True).encode('utf-8')
++
++    if isinstance(data, str):
++        return data.encode('utf-8')
++
++    if isinstance(data, bytes):
++        return data
++
++    body = _read_body_value(data)
++    if isinstance(body, str):
++        return body.encode('utf-8')
++    if body is None:
++        return b''
++    return body
++
++
++def _parse_response_headers(raw_headers):
++    header_block = raw_headers.decode('iso-8859-1', errors='replace')
++    headers = CaseInsensitiveHeaders()
++    for line in header_block.splitlines():
++        if not line or line.startswith('HTTP/'):
++            continue
++        if ':' not in line:
++            continue
++        key, value = line.split(':', 1)
++        headers[key.strip()] = value.strip()
++    return headers
++
++
++def _perform_pycurl_request(method, url, headers, body, stream=False):
++    if pycurl is None:
++        raise RuntimeError('pycurl is required for the pycurl transport backend')
++
++    buffer = io.BytesIO()
++    header_buffer = io.BytesIO()
++    curl = pycurl.Curl()
++    try:
++        curl.setopt(pycurl.URL, url.encode('utf-8'))
++        curl.setopt(pycurl.FOLLOWLOCATION, 1)
++        curl.setopt(pycurl.NOSIGNAL, 1)
++        curl.setopt(pycurl.WRITEFUNCTION, buffer.write)
++        curl.setopt(pycurl.HEADERFUNCTION, header_buffer.write)
++        curl.setopt(pycurl.CUSTOMREQUEST, method)
++        if headers:
++            curl.setopt(
++                pycurl.HTTPHEADER,
++                ['{}: {}'.format(key, value) for key, value in headers.items()]
++            )
++        if body is not None:
++            curl.setopt(pycurl.POSTFIELDS, body)
++            curl.setopt(pycurl.POSTFIELDSIZE, len(body))
++        curl.perform()
++        status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        effective_url = curl.getinfo(pycurl.EFFECTIVE_URL) or url
++    finally:
++        curl.close()
++
++    response_headers = _parse_response_headers(header_buffer.getvalue())
++    return PycurlResponse(effective_url, status_code, response_headers, buffer.getvalue())
++
++
+ class RequestsWrapper:
+     """
+-    This class wraps selected methods from requests package and adds
+-    default headers if no headers were specified.
++    This class wraps selected HTTP methods and adds default headers if no headers were specified.
++    When pycurl is available it is used as the transport backend; otherwise the wrapper falls back
++    to requests for compatibility.
+     """
++
+     def __getattr__(self, name):
+-        if name in ('get', 'post', 'put', 'delete'):
+-            return partial(self.handle_request, name)
+-        return original_requests.__getattribute__(name)
++        if original_requests is not None and hasattr(original_requests, name):
++            return getattr(original_requests, name)
++        raise AttributeError(name)
+ 
+-    def handle_request(self, name, *args, **kwargs):
++    def request(self, method, url, *args, **kwargs):
++        return self.handle_request(method.lower(), url, *args, **kwargs)
++
++    def get(self, url, *args, **kwargs):
++        return self.handle_request('get', url, *args, **kwargs)
++
++    def post(self, url, *args, **kwargs):
++        return self.handle_request('post', url, *args, **kwargs)
++
++    def put(self, url, *args, **kwargs):
++        return self.handle_request('put', url, *args, **kwargs)
++
++    def delete(self, url, *args, **kwargs):
++        return self.handle_request('delete', url, *args, **kwargs)
++
++    def handle_request(self, name, url, *args, **kwargs):
++        if original_requests is None or (pycurl is not None and not _responses_active()):
++            return self._handle_pycurl_request(name, url, *args, **kwargs)
++        return self._handle_requests_request(name, url, *args, **kwargs)
++
++    def _handle_requests_request(self, name, url, *args, **kwargs):
+         if 'headers' not in kwargs:
+-            kwargs['headers'] = config.HEADERS
+-            kwargs['headers']['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
+-            kwargs['headers']['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
++            kwargs['headers'] = _default_headers()
++
++        response = original_requests.request(name.upper(), url, *args, **kwargs)
++
++        try:
++            response.raise_for_status()
++        except HTTPError as e:
++            raise FilestackHTTPError(response.text) from e
++
++        return response
++
++    def _handle_pycurl_request(self, name, url, *args, **kwargs):
++        if args:
++            raise TypeError('positional arguments are not supported by the pycurl backend')
++
++        params = kwargs.pop('params', None)
++        headers = kwargs.pop('headers', None)
++        if headers is None:
++            headers = _default_headers()
++        else:
++            headers = dict(headers)
++
++        body = _build_request_body(kwargs, headers)
++        stream = kwargs.pop('stream', False)
++        if kwargs:
++            # Keep the transport strict so unexpected behavior is easier to spot.
++            raise TypeError('unsupported keyword arguments: {}'.format(', '.join(sorted(kwargs.keys()))))
+ 
+-        requests_method = getattr(original_requests, name)
+-        response = requests_method(*args, **kwargs)
++        method = name.upper()
++        if method in ('GET', 'DELETE') and body == b'':
++            body = None
++        full_url = _append_params(url, params)
++        response = _perform_pycurl_request(method, full_url, headers, body, stream=stream)
+ 
+         try:
+             response.raise_for_status()

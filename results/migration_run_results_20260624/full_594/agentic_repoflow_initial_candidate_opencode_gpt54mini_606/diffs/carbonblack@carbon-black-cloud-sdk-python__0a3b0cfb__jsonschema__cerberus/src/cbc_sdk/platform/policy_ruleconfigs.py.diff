@@ -1,0 +1,154 @@
+--- a/src/cbc_sdk/platform/policy_ruleconfigs.py
++++ b/src/cbc_sdk/platform/policy_ruleconfigs.py
+@@ -14,9 +14,132 @@
+ """Policy rule configuration implementation as part of Platform API"""
+ 
+ import copy
+-import jsonschema
++from cerberus import SchemaError, Validator
+ from cbc_sdk.base import MutableBaseModel
+ from cbc_sdk.errors import ApiError, InvalidObjectError
++
++
++_SCHEMA_TYPE_TO_CERBERUS = {
++    'array': 'list',
++    'boolean': 'boolean',
++    'integer': 'integer',
++    'number': 'number',
++    'object': 'dict',
++    'string': 'string',
++}
++
++
++def _schema_type_to_cerberus(json_type):
++    """Translate a JSON schema type into a Cerberus type."""
++    cerberus_type = _SCHEMA_TYPE_TO_CERBERUS.get(json_type)
++    if cerberus_type is None:
++        raise ApiError(f"internal error: '{json_type}' is not valid under any of the given schemas")
++    return cerberus_type
++
++
++def _field_to_cerberus(field_schema):
++    """Translate a JSON schema property definition into a Cerberus rule."""
++    field_schema = dict(field_schema)
++    json_type = field_schema.pop('type', 'string')
++
++    if isinstance(json_type, list):
++        cerberus_rules = [_field_to_cerberus(dict(field_schema, type=field_type))
++                          for field_type in json_type if field_type != 'null']
++        if not cerberus_rules:
++            raise ApiError("internal error: 'null' is not valid under any of the given schemas")
++        if len(cerberus_rules) == 1:
++            cerberus_rule = cerberus_rules[0]
++        else:
++            cerberus_rule = {'anyof': cerberus_rules}
++        if 'null' in json_type:
++            cerberus_rule['nullable'] = True
++        return cerberus_rule
++
++    if json_type == 'object':
++        cerberus_rule = {'type': 'dict', 'allow_unknown': True}
++        properties = field_schema.get('properties', {})
++        if properties:
++            cerberus_rule['schema'] = {name: _field_to_cerberus(value)
++                                       for name, value in properties.items()}
++        return cerberus_rule
++
++    if json_type == 'array':
++        cerberus_rule = {'type': 'list'}
++        items = field_schema.get('items')
++        if items is not None:
++            cerberus_rule['schema'] = _field_to_cerberus(items)
++        return cerberus_rule
++
++    cerberus_rule = {'type': _schema_type_to_cerberus(json_type)}
++    if 'enum' in field_schema:
++        cerberus_rule['allowed'] = field_schema['enum']
++    return cerberus_rule
++
++
++def _value_matches_type(value, json_type):
++    """Return True when *value* satisfies the JSON schema type name."""
++    if json_type == 'array':
++        return isinstance(value, list)
++    if json_type == 'boolean':
++        return isinstance(value, bool)
++    if json_type == 'integer':
++        return isinstance(value, int) and not isinstance(value, bool)
++    if json_type == 'null':
++        return value is None
++    if json_type == 'number':
++        return isinstance(value, (int, float)) and not isinstance(value, bool)
++    if json_type == 'object':
++        return isinstance(value, dict)
++    if json_type == 'string':
++        return isinstance(value, str)
++    return False
++
++
++def _validation_error(schema, value):
++    """Mirror the JSON schema error text used by the legacy validator."""
++    json_type = schema.get('type', 'string')
++
++    if isinstance(json_type, list):
++        if not any(_value_matches_type(value, field_type) for field_type in json_type):
++            expected_type = next((field_type for field_type in json_type if field_type != 'null'), json_type[0])
++            return f"{value!r} is not of type '{expected_type}'"
++        if value is None:
++            return None
++    elif not _value_matches_type(value, json_type):
++        return f"{value!r} is not of type '{json_type}'"
++
++    if json_type == 'object':
++        for name, subschema in schema.get('properties', {}).items():
++            if name in value:
++                error = _validation_error(subschema, value[name])
++                if error is not None:
++                    return error
++        return None
++
++    if json_type == 'array':
++        items = schema.get('items')
++        if items is not None:
++            for item in value:
++                error = _validation_error(items, item)
++                if error is not None:
++                    return error
++        return None
++
++    enum_values = schema.get('enum')
++    if enum_values is not None and value not in enum_values:
++        return f"{value!r} is not one of {enum_values!r}"
++
++    return None
++
++
++def _parameter_schema_to_cerberus(parameter_schema):
++    """Convert the API's JSON schema shape into a Cerberus schema."""
++    if not isinstance(parameter_schema, dict):
++        raise ApiError('internal error: invalid parameter schema')
++    if parameter_schema.get('type', 'object') != 'object':
++        raise ApiError(f"internal error: '{parameter_schema.get('type')}' is not valid under any of the given schemas")
++    return {name: _field_to_cerberus(value)
++            for name, value in parameter_schema.get('properties', {}).items()}
+ 
+ 
+ class PolicyRuleConfig(MutableBaseModel):
+@@ -198,11 +321,12 @@
+             parameter_validations = self._parent.get_ruleconfig_parameter_schema(self._model_unique_id)
+         my_parameters = self._info.get('parameters', {})
+         try:
+-            jsonschema.validate(instance=my_parameters, schema=parameter_validations)
+-        except jsonschema.ValidationError as e:
+-            raise InvalidObjectError(f"parameter error: {e.message}", e)
+-        except jsonschema.exceptions.SchemaError as e:
+-            raise ApiError(f"internal error: {e.message}", e)
++            validator = Validator(_parameter_schema_to_cerberus(parameter_validations), allow_unknown=True)
++            if not validator.validate(my_parameters):
++                error_message = _validation_error(parameter_validations, my_parameters)
++                raise InvalidObjectError(f"parameter error: {error_message or validator.errors}")
++        except SchemaError as e:
++            raise ApiError(f"internal error: {e}", e)
+         self._info['parameters'] = my_parameters
+ 
+ 

@@ -1,0 +1,229 @@
+--- a/pdpyras.py
++++ b/pdpyras.py
+@@ -3,22 +3,161 @@
+ # See LICENSE for details.
+ 
+ # Standard libraries
++import json
+ import logging
+ import sys
+ import time
+ from copy import deepcopy
+-from datetime import datetime
++from datetime import datetime, timedelta
+ from random import random
++from types import SimpleNamespace
+ from typing import Iterator, Union
+ from warnings import warn
++from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+ 
+ # Upstream components on which this client is based:
+-from requests import Response, Session
+-from requests import __version__ as REQUESTS_VERSION
++from pkg_resources import get_distribution
++from urllib3 import PoolManager
+ 
+ # HTTP client exceptions:
+ from urllib3.exceptions import HTTPError, PoolError
+-from requests.exceptions import RequestException
++
++try:
++    REQUESTS_VERSION = get_distribution('requests').version
++except Exception:
++    REQUESTS_VERSION = 'unknown'
++
++
++class RequestException(Exception):
++    pass
++
++
++class Response:
++    """Compatibility wrapper around urllib3 responses."""
++
++    def __init__(self, raw, method: str = 'GET', url: str = None,
++            elapsed_seconds: float = None):
++        if hasattr(raw, 'status') or hasattr(raw, 'status_code') or \
++                hasattr(raw, 'data') or hasattr(raw, 'content'):
++            self.raw = raw
++            self.request = SimpleNamespace(method=method, url=url)
++            self.elapsed = timedelta(seconds=elapsed_seconds or 0)
++            self.headers = getattr(raw, 'headers', {})
++            status = getattr(raw, 'status', None)
++            if status is None:
++                status = getattr(raw, 'status_code', 0)
++            self.status_code = status
++            self.url = url
++            self.status = self.status_code
++            body = getattr(raw, 'data', None)
++            if body is None:
++                body = getattr(raw, 'content', None)
++            if body is None:
++                body = getattr(raw, 'text', b'')
++            self._body = body
++        else:
++            self.raw = None
++            self.request = SimpleNamespace(method='GET', url=url or '')
++            self.elapsed = timedelta(seconds=0)
++            self.headers = {}
++            self.status_code = int(raw)
++            self.url = url or ''
++            self.status = self.status_code
++            self._body = method
++
++    @property
++    def ok(self):
++        return 200 <= int(self.status_code) < 400
++
++    @property
++    def content(self):
++        return self._body
++
++    @property
++    def text(self):
++        if isinstance(self._body, str):
++            return self._body
++        content_type = self.headers.get('content-type', '')
++        if not content_type:
++            content_type = self.headers.get('Content-Type', '')
++        charset = None
++        for part in content_type.split(';')[1:]:
++            if 'charset=' in part.lower():
++                charset = part.split('=', 1)[1].strip()
++                break
++        return (self._body or b'').decode(charset or 'utf-8', errors='replace')
++
++    def json(self):
++        return json.loads(self.text)
++
++    def __bool__(self):
++        return self.ok
++
++    def __getattr__(self, name):
++        return getattr(self.raw, name)
++
++
++def _append_query_params(url: str, params) -> str:
++    scheme, netloc, path, query, fragment = urlsplit(url)
++    query_items = parse_qsl(query, keep_blank_values=True)
++    if hasattr(params, 'items'):
++        query_items.extend(list(params.items()))
++    else:
++        query_items.extend(list(params))
++    return urlunsplit((scheme, netloc, path, urlencode(query_items, doseq=True), fragment))
++
++
++class _Urllib3SessionAdapter:
++    def __init__(self):
++        self._manager = PoolManager()
++
++    def request(self, method, url, **kwargs):
++        headers = kwargs.pop('headers', None)
++        params = kwargs.pop('params', None)
++        json_body = kwargs.pop('json', None)
++        data = kwargs.pop('data', None)
++        stream = kwargs.pop('stream', False)
++        timeout = kwargs.pop('timeout', None)
++        allow_redirects = kwargs.pop('allow_redirects', None)
++        if params:
++            url = _append_query_params(url, params)
++
++        if json_body is not None:
++            body = json.dumps(json_body).encode('utf-8')
++        elif data is not None:
++            if isinstance(data, str):
++                body = data.encode('utf-8')
++            elif isinstance(data, (bytes, bytearray)):
++                body = data
++            elif hasattr(data, 'items'):
++                body = urlencode(list(data.items()), doseq=True).encode('utf-8')
++            else:
++                body = data
++        else:
++            body = kwargs.pop('body', None)
++
++        req_kw = dict(kwargs)
++        if headers is not None:
++            req_kw['headers'] = headers
++        if timeout is not None:
++            req_kw['timeout'] = timeout
++        if allow_redirects is not None:
++            req_kw['redirect'] = allow_redirects
++        req_kw['preload_content'] = not stream
++        req_kw['retries'] = req_kw.get('retries', False)
++        if body is not None:
++            req_kw['body'] = body
++
++        start = time.perf_counter()
++        raw_response = self._manager.request(method, url, **req_kw)
++        response_url = getattr(raw_response, 'geturl', lambda: url)()
++        return Response(raw_response, method, response_url,
++            time.perf_counter() - start)
++
++    def close(self):
++        close = getattr(self._manager, 'clear', None)
++        if callable(close):
++            close()
+ 
+ __version__ = '5.4.0'
+ 
+@@ -862,7 +1001,7 @@
+ ### CLASSES ###
+ ###############
+ 
+-class PDSession(Session):
++class PDSession:
+     """
+     Base class for making HTTP requests to PagerDuty APIs
+ 
+@@ -911,7 +1050,7 @@
+     """
+ 
+     parent = None
+-    """The ``super`` object (`requests.Session`_)"""
++    """The underlying HTTP transport adapter."""
+ 
+     permitted_methods = ()
+     """
+@@ -966,8 +1105,8 @@
+     url = ""
+ 
+     def __init__(self, api_key: str, debug=False):
+-        self.parent = super(PDSession, self)
+-        self.parent.__init__()
++        self.parent = _Urllib3SessionAdapter()
++        self.headers = {}
+         self.api_key = api_key
+         self.log = logging.getLogger(__name__)
+         self.print_debug = debug
+@@ -1189,6 +1328,31 @@
+                 # All went according to plan.
+                 return response
+ 
++    def delete(self, url, **kw) -> Response:
++        kw.setdefault('allow_redirects', True)
++        return self.request('DELETE', url, **kw)
++
++    def get(self, url, **kw) -> Response:
++        kw.setdefault('allow_redirects', True)
++        return self.request('GET', url, **kw)
++
++    def post(self, url, data=None, json=None, **kw) -> Response:
++        return self.request('POST', url, data=data, json=json, **kw)
++
++    def put(self, url, data=None, json=None, **kw) -> Response:
++        return self.request('PUT', url, data=data, json=json, **kw)
++
++    def close(self):
++        close = getattr(self.parent, 'close', None)
++        if callable(close):
++            close()
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc_val, exc_tb):
++        self.close()
++
+     @property
+     def stagger_cooldown(self) -> float:
+         """

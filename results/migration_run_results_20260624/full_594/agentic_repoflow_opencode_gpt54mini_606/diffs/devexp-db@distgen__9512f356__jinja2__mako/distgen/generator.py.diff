@@ -1,0 +1,250 @@
+--- a/distgen/generator.py
++++ b/distgen/generator.py
+@@ -1,7 +1,11 @@
+ import os
+ import sys
+-import jinja2
+ import functools
++from collections.abc import Mapping, Sequence
++
++from mako import exceptions as mako_exceptions
++from mako.lookup import TemplateLookup
++from mako.template import Template
+ 
+ from distgen.err import fatal
+ from distgen.pathmanager import PathManager
+@@ -19,6 +23,107 @@
+     USE_IMP = True
+ 
+ 
++class _UndefinedTemplateValue(object):
++    def __bool__(self):
++        return False
++
++    __nonzero__ = __bool__
++
++    def __iter__(self):
++        return iter(())
++
++    def __len__(self):
++        return 0
++
++    def __getattr__(self, name):
++        return self
++
++    def __getitem__(self, key):
++        return self
++
++    def __repr__(self):
++        return "UNDEFINED"
++
++    def __str__(self):
++        return ""
++
++
++_UNDEFINED = _UndefinedTemplateValue()
++
++
++class _TemplateMapping(object):
++    def __init__(self, value):
++        self._value = value
++
++    def __getattr__(self, name):
++        if isinstance(self._value, Mapping) and name in self._value:
++            return _template_wrap(self._value[name])
++        return _UNDEFINED
++
++    def __getitem__(self, key):
++        if isinstance(self._value, Mapping):
++            return _template_wrap(self._value.get(key, _UNDEFINED))
++        return _UNDEFINED
++
++    def __iter__(self):
++        if isinstance(self._value, Mapping):
++            return iter(self._value)
++        return iter(())
++
++    def __len__(self):
++        if isinstance(self._value, Mapping):
++            return len(self._value)
++        return 0
++
++    def __bool__(self):
++        return bool(self._value)
++
++    __nonzero__ = __bool__
++
++
++class _TemplateSequence(object):
++    def __init__(self, value):
++        self._value = value
++
++    def __iter__(self):
++        if isinstance(self._value, Sequence):
++            for item in self._value:
++                yield _template_wrap(item)
++        return
++
++    def __getitem__(self, key):
++        if isinstance(self._value, Sequence):
++            try:
++                return _template_wrap(self._value[key])
++            except (IndexError, TypeError):
++                return _UNDEFINED
++        return _UNDEFINED
++
++    def __len__(self):
++        if isinstance(self._value, Sequence):
++            return len(self._value)
++        return 0
++
++    def __bool__(self):
++        return bool(self._value)
++
++    __nonzero__ = __bool__
++
++
++def _template_wrap(value):
++    if value is _UNDEFINED:
++        return value
++    if isinstance(value, Mapping):
++        return _TemplateMapping(value)
++    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
++        return _TemplateSequence(value)
++    return value
++
++
++def _template_defined(value):
++    return value is not _UNDEFINED
++
++
+ class Generator(object):
+     project = None
+ 
+@@ -26,7 +131,7 @@
+     pm_tpl = None
+     pm_spc = None
+ 
+-    def __init__(self, global_jinja_args=None):
++    def __init__(self, global_template_args=None, **_kwargs):
+         here = os.path.dirname(os.path.abspath(__file__))
+         self.pm_cfg = PathManager(
+             [os.path.join(here, "distconf"),
+@@ -41,10 +146,10 @@
+         )
+ 
+         self.pm_spc = PathManager([])
+-        self.jinjaenv_args = {'keep_trailing_newline': True}
+-
+-        if global_jinja_args:
+-            self.jinjaenv_args.update(global_jinja_args)
++        self.template_lookup_args = {}
++
++        if global_template_args:
++            self.template_lookup_args.update(global_template_args)
+ 
+     def load_project(self, project):
+         self.project = self._load_project_from_dir(project)
+@@ -52,37 +157,9 @@
+             self.project = AbstractProject()
+         self.project.directory = project
+ 
+-        def file_load(name):
+-            """
+-            The default FileSystemLoader doesn't load files specified
+-            by absolute paths or paths that include '..' - therefore
+-            we provide a custom fallback function that handles this.
+-            """
+-            name = os.path.abspath(name)
+-            try:
+-                with open(name, 'rb') as f:
+-                    return f.read().decode('utf-8')
+-            except Exception:
+-                raise jinja2.TemplateNotFound(name)
+-
+-        def string_load(name):
+-            """
+-            Allow specifying a string instead of template to be able
+-            to return expanded config/specs/...
+-            """
+-            if name.startswith(('{{', '{%')):
+-                return name
+-            raise jinja2.TemplateNotFound(name)
+-
+-        loader = jinja2.ChoiceLoader([
+-            jinja2.FileSystemLoader(self.pm_tpl.get_path()),
+-            jinja2.FunctionLoader(string_load),
+-            jinja2.FunctionLoader(file_load),
+-        ])
+-
+-        self.project.tplgen = jinja2.Environment(
+-            loader=loader,
+-            **self.jinjaenv_args
++        self.project.tplgen = TemplateLookup(
++            directories=self.pm_tpl.get_path(),
++            **self.template_lookup_args
+         )
+ 
+         self.project.abstract_initialize()
+@@ -203,7 +280,9 @@
+                 _changed, s[i] = self._rerender_spec(s[i], **kwargs)
+                 changed |= _changed
+         elif isinstance(s, str):
+-            new_spec = jinja2.Template(s).render(**kwargs)
++            if ('${' not in s and '<%' not in s and not s.lstrip().startswith('%')):
++                return changed, s
++            new_spec = Template(text=s, lookup=self.project.tplgen).render(**kwargs)
+             changed = s != new_spec
+             s = new_spec
+         else:
+@@ -250,6 +329,15 @@
+             yaml.dg_load = yaml.load
+ 
+         return yaml
++
++    def _load_template(self, template):
++        if os.path.isfile(template):
++            return Template(filename=template, lookup=self.project.tplgen)
++
++        if template.startswith(('${', '<%', '%')):
++            return Template(text=template, lookup=self.project.tplgen)
++
++        return self.project.tplgen.get_template(template)
+ 
+     def render(self, specfiles, multispec, multispec_selectors, template,
+                config, cmd_cfg, output, confdirs=None,
+@@ -311,21 +399,26 @@
+                 fatal(str(exc), exc.exit_code)
+ 
+         try:
+-            tpl = self.project.tplgen.get_template(template)
+-        except jinja2.exceptions.TemplateNotFound as err:
++            tpl = self._load_template(template)
++        except (
++            mako_exceptions.TemplateLookupException,
++            mako_exceptions.TopLevelLookupException,
++            FileNotFoundError,
++        ) as err:
+             fatal("Can not find template {0}".format(err))
+ 
+         self.project.inst_finish(specfiles, template, sysconfig, spec)
+ 
+         rendering_kwargs = {
+-            'config': sysconfig,
+-            'macros': sysconfig['macros'],
+-            'm': sysconfig['macros'],
+-            'container': {'name': 'docker'},
+-            'spec': spec,
++            'config': _template_wrap(sysconfig),
++            'macros': _template_wrap(sysconfig['macros']),
++            'm': _template_wrap(sysconfig['macros']),
++            'container': _template_wrap({'name': 'docker'}),
++            'spec': _template_wrap(spec),
+             'project': self.project,
+             'commands': Commands(cmd_cfg, sysconfig),
+-            'env': os.environ,
++            'env': _template_wrap(os.environ),
++            'defined': _template_defined,
+         }
+ 
+         self._recursive_render_spec(

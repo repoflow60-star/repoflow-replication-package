@@ -1,0 +1,121 @@
+--- a/wikipediaapi/__init__.py
++++ b/wikipediaapi/__init__.py
+@@ -10,12 +10,15 @@
+ 
+ from collections import defaultdict
+ from enum import IntEnum
++import json
+ import logging
+ import re
++import threading
+ from typing import Any, Optional, Union
+ from urllib import parse
+ 
+-import requests
++import treq
++from twisted.internet import reactor, threads
+ 
+ USER_AGENT = (
+     "Wikipedia-API/"
+@@ -24,6 +27,38 @@
+ )
+ 
+ log = logging.getLogger(__name__)
++
++
++class _SessionState:
++    def __init__(self, headers: dict[str, Any]) -> None:
++        self.headers = headers
++
++    def close(self) -> None:
++        pass
++
++
++_REACTOR_READY = threading.Event()
++_REACTOR_LOCK = threading.Lock()
++_REACTOR_THREAD_STARTED = False
++
++
++def _run_reactor() -> None:
++    reactor.callWhenRunning(_REACTOR_READY.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor_running() -> None:
++    global _REACTOR_THREAD_STARTED
++
++    if reactor.running or _REACTOR_READY.is_set():
++        return
++
++    with _REACTOR_LOCK:
++        if not _REACTOR_THREAD_STARTED and not reactor.running:
++            _REACTOR_THREAD_STARTED = True
++            threading.Thread(target=_run_reactor, daemon=True).start()
++
++    _REACTOR_READY.wait()
+ 
+ 
+ # https://www.mediawiki.org/wiki/API:Main_page
+@@ -140,15 +175,14 @@
+         """
+         Constructs Wikipedia object for extracting information Wikipedia.
+ 
+-        :param user_agent: HTTP User-Agent used in requests
++        :param user_agent: HTTP User-Agent used for Wikipedia API calls
+                 https://meta.wikimedia.org/wiki/User-Agent_policy
+         :param language: Language mutation of Wikipedia -
+                 http://meta.wikimedia.org/wiki/List_of_Wikipedias
+         :param extract_format: Format used for extractions
+                 :class:`ExtractFormat` object.
+         :param headers:  Headers sent as part of HTTP request
+-        :param kwargs: Optional parameters used in -
+-                http://docs.python-requests.org/en/master/api/#requests.request
++        :param kwargs: Optional parameters forwarded to treq.get
+ 
+         Examples:
+ 
+@@ -188,12 +222,12 @@
+             self.extract_format,
+         )
+ 
+-        self._session = requests.Session()
+-        self._session.headers.update(default_headers)
++        self._session = _SessionState(default_headers)
+         self._request_kwargs = kwargs
++        self._request_timeout = self._request_kwargs.pop("timeout")
+ 
+     def __del__(self) -> None:
+-        """Closes session."""
++        """Releases the session state."""
+         if hasattr(self, "_session") and self._session:
+             self._session.close()
+ 
+@@ -526,8 +560,26 @@
+         )
+         params["format"] = "json"
+         params["redirects"] = 1
+-        r = self._session.get(base_url, params=params, **self._request_kwargs)
+-        return r.json()
++        _ensure_reactor_running()
++        return threads.blockingCallFromThread(
++            reactor,
++            self._query_json,
++            base_url,
++            params,
++        )
++
++    def _query_json(self, base_url: str, params: dict[str, Any]):
++        deferred = treq.get(
++            base_url,
++            params=params,
++            headers=self._session.headers,
++            **self._request_kwargs,
++        )
++        if self._request_timeout is not None:
++            deferred.addTimeout(self._request_timeout, reactor)
++        deferred.addCallback(treq.content)
++        deferred.addCallback(json.loads)
++        return deferred
+ 
+     def _build_extracts(self, extract, page: "WikipediaPage") -> str:
+         """Constructs summary of given page."""

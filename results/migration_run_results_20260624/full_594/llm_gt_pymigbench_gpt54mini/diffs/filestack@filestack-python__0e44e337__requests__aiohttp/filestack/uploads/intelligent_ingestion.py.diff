@@ -1,0 +1,120 @@
+--- a/filestack/uploads/intelligent_ingestion.py
++++ b/filestack/uploads/intelligent_ingestion.py
+@@ -12,7 +12,7 @@
+ 
+ from base64 import b64encode
+ 
+-from filestack.utils import requests
++import aiohttp
+ 
+ from filestack import config
+ 
+@@ -40,7 +40,7 @@
+         raise Exception('Minimal chunk size failed')
+ 
+ 
+-def upload_part(apikey, filename, filepath, filesize, storage, start_response, part):
++async def upload_part(apikey, filename, filepath, filesize, storage, start_response, part):
+     with open(filepath, 'rb') as f:
+         f.seek(part['seek_point'])
+         part_bytes = io.BytesIO(f.read(DEFAULT_PART_SIZE))
+@@ -58,40 +58,43 @@
+     chunk_data = part_bytes.read(CHUNK_SIZE)
+     offset = 0
+ 
+-    while chunk_data:
+-        payload = payload_base.copy()
+-        payload.update({
+-            'size': len(chunk_data),
+-            'md5': b64encode(hashlib.md5(chunk_data).digest()).strip().decode('utf-8'),
+-            'offset': offset,
+-            'fii': True
+-        })
++    async with aiohttp.ClientSession() as session:
++        while chunk_data:
++            payload = payload_base.copy()
++            payload.update({
++                'size': len(chunk_data),
++                'md5': b64encode(hashlib.md5(chunk_data).digest()).strip().decode('utf-8'),
++                'offset': offset,
++                'fii': True
++            })
+ 
+-        try:
+-            url = 'https://{}/multipart/upload'.format(start_response['location_url'])
+-            api_resp = requests.post(url, json=payload).json()
+-            s3_resp = requests.put(api_resp['url'], headers=api_resp['headers'], data=chunk_data)
+-            if not s3_resp.ok:
+-                raise Exception('Incorrect S3 response')
+-            offset += len(chunk_data)
+-            chunk_data = part_bytes.read(CHUNK_SIZE)
+-        except Exception as e:
+-            log.error('Upload failed: %s', str(e))
+-            with lock:
+-                if CHUNK_SIZE >= len(chunk_data):
+-                    decrease_chunk_size()
++            try:
++                url = 'https://{}/multipart/upload'.format(start_response['location_url'])
++                async with session.post(url, json=payload) as api_resp:
++                    api_resp = await api_resp.json()
++                async with session.put(api_resp['url'], headers=api_resp['headers'], data=chunk_data) as s3_resp:
++                    if not s3_resp.ok:
++                        raise Exception('Incorrect S3 response')
++                offset += len(chunk_data)
++                chunk_data = part_bytes.read(CHUNK_SIZE)
++            except Exception as e:
++                log.error('Upload failed: %s', str(e))
++                with lock:
++                    if CHUNK_SIZE >= len(chunk_data):
++                        decrease_chunk_size()
+ 
+-            part_bytes.seek(offset)
+-            chunk_data = part_bytes.read(CHUNK_SIZE)
++                part_bytes.seek(offset)
++                chunk_data = part_bytes.read(CHUNK_SIZE)
+ 
+     payload = payload_base.copy()
+     payload.update({'size': filesize})
+ 
+     url = 'https://{}/multipart/commit'.format(start_response['location_url'])
+-    requests.post(url, json=payload)
++    async with session.post(url, json=payload) as resp:
++        await resp.text()
+ 
+ 
+-def upload(apikey, filepath, file_obj, storage, params=None, security=None):
++async def upload(apikey, filepath, file_obj, storage, params=None, security=None):
+     params = params or {}
+ 
+     filename = params.get('filename') or os.path.split(filepath)[1]
+@@ -119,7 +122,9 @@
+             'signature': security.signature
+         })
+ 
+-    start_response = requests.post(config.MULTIPART_START_URL, json=payload).json()
++    async with aiohttp.ClientSession() as session:
++        async with session.post(config.MULTIPART_START_URL, json=payload) as start_resp:
++            start_response = await start_resp.json()
+     parts = [
+         {
+             'seek_point': seek_point,
+@@ -147,12 +152,12 @@
+         payload['upload_tags'] = params.pop('upload_tags')
+ 
+     complete_url = 'https://{}/multipart/complete'.format(start_response['location_url'])
+-    session = requests.Session()
+     retries = Retry(total=7, backoff_factor=0.2, status_forcelist=[202], allowed_methods=frozenset(['POST']))
+-    session.mount('http://', requests.adapters.HTTPAdapter(max_retries=retries))
+-    response = session.post(complete_url, json=payload, headers=config.HEADERS)
+-    if response.status_code != 200:
+-        log.error('Did not receive a correct complete response: %s. Content %s', response, response.content)
+-        raise Exception('Invalid complete response: {}'.format(response.content))
++    async with aiohttp.ClientSession() as session:
++        async with session.post(complete_url, json=payload, headers=config.HEADERS) as response:
++            if response.status != 200:
++                content = await response.read()
++                log.error('Did not receive a correct complete response: %s. Content %s', response, content)
++                raise Exception('Invalid complete response: {}'.format(content))
+ 
+-    return response.json()
++            return await response.json()

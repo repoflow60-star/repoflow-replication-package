@@ -1,0 +1,121 @@
+--- a/pyschlage/auth.py
++++ b/pyschlage/auth.py
+@@ -4,11 +4,13 @@
+ 
+ from functools import wraps
+ from typing import Callable
++import io
++import json
+ 
+ from botocore.exceptions import ClientError
+ import pycognito
+ from pycognito import utils
+-import requests
++import pycurl
+ 
+ from .exceptions import NotAuthorizedError, UnknownError
+ 
+@@ -28,13 +30,27 @@
+ USER_POOL_ID = USER_POOL_REGION + "_2zhrVs9d4"
+ 
+ 
++class _Response:
++    def __init__(self, body: bytes, status_code: int, reason: str) -> None:
++        self._body = body
++        self.status_code = status_code
++        self.reason = reason
++
++    def json(self):
++        return json.loads(self._body.decode("utf-8"))
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise pycurl.error(self.status_code, self.reason)
++
++
+ def _translate_auth_errors(
+     # pylint: disable=invalid-name
+-    fn: Callable[..., requests.Response],
++    fn: Callable[..., pycurl.Curl],
+     # pylint: enable=invalid-name
+-) -> Callable[..., requests.Response]:
++) -> Callable[..., pycurl.Curl]:
+     @wraps(fn)
+-    def wrapper(*args, **kwargs) -> requests.Response:
++    def wrapper(*args, **kwargs) -> pycurl.Curl:
+         try:
+             return fn(*args, **kwargs)
+         except ClientError as ex:
+@@ -50,19 +66,19 @@
+ 
+ def _translate_http_errors(
+     # pylint: disable=invalid-name
+-    fn: Callable[..., requests.Response],
++    fn: Callable[..., _Response],
+     # pylint: enable=invalid-name
+-) -> Callable[..., requests.Response]:
++) -> Callable[..., _Response]:
+     @wraps(fn)
+-    def wrapper(*args, **kwargs) -> requests.Response:
++    def wrapper(*args, **kwargs) -> _Response:
+         resp = fn(*args, **kwargs)
+         try:
+             resp.raise_for_status()
+             return resp
+-        except requests.HTTPError as ex:
++        except pycurl.error as ex:
+             try:
+                 message = resp.json().get("message", resp.reason)
+-            except requests.JSONDecodeError:
++            except json.JSONDecodeError:
+                 message = resp.reason
+             raise UnknownError(message) from ex
+ 
+@@ -100,7 +116,7 @@
+         :raise pyschlage.exceptions.NotAuthorizedError: When authentication fails.
+         :raise pyschlage.exceptions.UnknownError: On other errors.
+         """
+-        self.auth(requests.Request())
++        self.auth(None)
+ 
+     @property
+     def user_id(self) -> str:
+@@ -117,7 +133,7 @@
+     @_translate_auth_errors
+     def request(
+         self, method: str, path: str, base_url: str = BASE_URL, **kwargs
+-    ) -> requests.Response:
++    ) -> _Response:
+         """Performs a request against the Schlage WiFi cloud service.
+ 
+         :meta private:
+@@ -128,4 +144,28 @@
+         kwargs["headers"]["X-Api-Key"] = API_KEY
+         kwargs.setdefault("timeout", _DEFAULT_TIMEOUT)
+         # pylint: disable=missing-timeout
+-        return requests.request(method, f"{base_url}/{path.lstrip('/')}", **kwargs)
++        buffer = io.BytesIO()
++        header_buffer = io.BytesIO()
++        curl = pycurl.Curl()
++        curl.setopt(pycurl.URL, f"{base_url}/{path.lstrip('/')}")
++        curl.setopt(pycurl.CUSTOMREQUEST, method.upper())
++        curl.setopt(pycurl.WRITEDATA, buffer)
++        curl.setopt(pycurl.HEADERFUNCTION, header_buffer.write)
++        curl.setopt(pycurl.TIMEOUT, kwargs["timeout"])
++        headers = [f"{key}: {value}" for key, value in kwargs["headers"].items()]
++        curl.setopt(pycurl.HTTPHEADER, headers)
++        if "data" in kwargs:
++            curl.setopt(pycurl.POSTFIELDS, kwargs["data"])
++        if "json" in kwargs:
++            curl.setopt(pycurl.POSTFIELDS, json.dumps(kwargs["json"]))
++            headers.append("Content-Type: application/json")
++            curl.setopt(pycurl.HTTPHEADER, headers)
++        curl.perform()
++        status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        reason = ""
++        header_text = header_buffer.getvalue().decode("iso-8859-1")
++        for line in header_text.splitlines():
++            if line.lower().startswith("status:"):
++                reason = line.split(":", 1)[1].strip()
++        curl.close()
++        return _Response(buffer.getvalue(), status_code, reason)

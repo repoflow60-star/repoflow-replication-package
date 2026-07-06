@@ -1,0 +1,173 @@
+--- a/cas.py
++++ b/cas.py
+@@ -1,8 +1,9 @@
+ import datetime
+ import logging
+ from uuid import uuid4
+-
+-import requests
++from io import BytesIO
++
++import pycurl
+ from lxml import etree
+ from six.moves.urllib import parse as urllib_parse
+ 
+@@ -79,7 +80,35 @@
+         self.renew = renew
+         self.username_attribute = username_attribute
+         self.verify_ssl_certificate = verify_ssl_certificate
+-        self.session = session or requests.sessions.Session()
++        self.session = session or pycurl.Curl()
++
++    def _perform_request(self, url, method='GET', params=None, data=None, headers=None, stream=False):
++        buffer = BytesIO()
++        curl = self.session
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.WRITEDATA, buffer)
++        curl.setopt(pycurl.FOLLOWLOCATION, 1)
++        curl.setopt(pycurl.SSL_VERIFYPEER, 1 if self.verify_ssl_certificate else 0)
++        curl.setopt(pycurl.SSL_VERIFYHOST, 2 if self.verify_ssl_certificate else 0)
++        if headers:
++            curl.setopt(pycurl.HTTPHEADER, headers)
++        else:
++            curl.setopt(pycurl.HTTPHEADER, [])
++        if method == 'POST':
++            curl.setopt(pycurl.POST, 1)
++            curl.setopt(pycurl.POSTFIELDS, data)
++        else:
++            curl.setopt(pycurl.HTTPGET, 1)
++        if params:
++            query = urllib_parse.urlencode(params)
++            if '?' in url:
++                curl.setopt(pycurl.URL, ''.join([url, '&', query]))
++            else:
++                curl.setopt(pycurl.URL, ''.join([url, '?', query]))
++        curl.perform()
++        status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        content = buffer.getvalue()
++        return status_code, content
+ 
+     def verify_ticket(self, ticket):
+         """Verify ticket.
+@@ -140,10 +169,10 @@
+         Raises:
+             CASError: Non 200 http code or bad XML body.
+         """
+-        response = self.session.get(self.get_proxy_url(pgt), verify=self.verify_ssl_certificate)
+-        if response.status_code == 200:
++        status_code, content = self._perform_request(self.get_proxy_url(pgt))
++        if status_code == 200:
+             from lxml import etree
+-            root = etree.fromstring(response.content)
++            root = etree.fromstring(content)
+             tickets = root.xpath(
+                 "//cas:proxyTicket",
+                 namespaces={"cas": "http://www.yale.edu/tp/cas"}
+@@ -156,7 +185,7 @@
+             )
+             if len(errors) == 1:
+                 raise CASError(errors[0].attrib['code'], errors[0].text)
+-        raise CASError("Bad http code %s" % response.status_code)
++        raise CASError("Bad http code %s" % status_code)
+ 
+ 
+ class CASClientV1(CASClientBase):
+@@ -172,20 +201,19 @@
+         params = [('ticket', ticket), ('service', self.service_url)]
+         url = (urllib_parse.urljoin(self.server_url, 'validate') + '?' +
+                urllib_parse.urlencode(params))
+-        page = self.session.get(
++        status_code, content = self._perform_request(
+             url,
+-            stream=True,
+-            verify=self.verify_ssl_certificate
++            stream=True
+         )
+         try:
+-            page_iterator = page.iter_lines(chunk_size=8192)
+-            verified = next(page_iterator).strip()
++            page_iterator = content.splitlines()
++            verified = page_iterator[0].strip().decode('utf8')
+             if verified == 'yes':
+-                return next(page_iterator).strip(), None, None
++                return page_iterator[1].strip().decode('utf8'), None, None
+             else:
+                 return None, None, None
+         finally:
+-            page.close()
++            pass
+ 
+ 
+ class CASClientV2(CASClientBase):
+@@ -212,15 +240,11 @@
+         if self.proxy_callback:
+             params.update({'pgtUrl': self.proxy_callback})
+         base_url = urllib_parse.urljoin(self.server_url, self.url_suffix)
+-        page = self.session.get(
++        status_code, content = self._perform_request(
+             base_url,
+-            params=params,
+-            verify=self.verify_ssl_certificate
++            params=params
+         )
+-        try:
+-            return page.content
+-        finally:
+-            page.close()
++        return content
+ 
+     @classmethod
+     def parse_attributes_xml_element(cls, element):
+@@ -338,7 +362,7 @@
+         try:
+             user = None
+             attributes = {}
+-            response = page.content
++            response = page
+             tree = ElementTree.fromstring(response)
+             # Find the authentication status
+             success = tree.find('.//' + SAML_1_0_PROTOCOL_NS + 'StatusCode')
+@@ -363,28 +387,31 @@
+                         attributes[at.attrib['AttributeName']] = values[0].text
+             return user, attributes, None
+         finally:
+-            page.close()
++            pass
+ 
+     def fetch_saml_validation(self, ticket):
+         """We do the SAML validation"""
+ 
+-        headers = {
+-            'soapaction': 'http://www.oasis-open.org/committees/security',
+-            'cache-control': 'no-cache',
+-            'pragma': 'no-cache',
+-            'accept': 'text/xml',
+-            'connection': 'keep-alive',
+-            'content-type': 'text/xml; charset=utf-8',
+-        }
++        headers = [
++            'soapaction: http://www.oasis-open.org/committees/security',
++            'cache-control: no-cache',
++            'pragma: no-cache',
++            'accept: text/xml',
++            'connection: keep-alive',
++            'content-type: text/xml; charset=utf-8',
++        ]
+         params = {'TARGET': self.service_url}
+         saml_validate_url = urllib_parse.urljoin(
+             self.server_url, 'samlValidate',
+         )
+-        return self.session.post(
++        status_code, content = self._perform_request(
+             saml_validate_url,
+-            self.get_saml_assertion(ticket),
++            method='POST',
+             params=params,
+-            headers=headers)
++            data=self.get_saml_assertion(ticket),
++            headers=headers
++        )
++        return content
+ 
+     @classmethod
+     def get_saml_assertion(cls, ticket):

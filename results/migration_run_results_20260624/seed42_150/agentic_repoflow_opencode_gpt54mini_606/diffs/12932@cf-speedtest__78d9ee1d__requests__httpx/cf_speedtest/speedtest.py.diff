@@ -1,0 +1,292 @@
+--- a/cf_speedtest/speedtest.py
++++ b/cf_speedtest/speedtest.py
+@@ -3,17 +3,20 @@
+ 
+ import argparse
+ import math
++import socket
+ import statistics
++import ssl
+ import time
+ from timeit import default_timer as timer
+ 
+-import requests
+-import urllib3
++import httpx
+ 
+ import cf_speedtest.locations as locations
+ import cf_speedtest.options as options
+ 
+-REQ_SESSION = requests.Session()
++REQ_SESSION = httpx.Client(timeout=None, follow_redirects=True)
++REQ_SESSION_VERIFY_SSL = True
++REQ_SESSION_PROXY_DICT = None
+ 
+ CGI_ENDPOINT = 'https://speed.cloudflare.com/cdn-cgi/trace'
+ DOWNLOAD_ENDPOINT = 'https://speed.cloudflare.com/__down?measId=0&bytes={}'
+@@ -55,17 +58,188 @@
+                     pass
+     return 0.0
+ 
++
++def _ensure_req_session() -> None:
++    global REQ_SESSION, REQ_SESSION_VERIFY_SSL, REQ_SESSION_PROXY_DICT
++
++    if REQ_SESSION_VERIFY_SSL == VERIFY_SSL and REQ_SESSION_PROXY_DICT == PROXY_DICT:
++        return
++
++    REQ_SESSION.close()
++    session_kwargs = {
++        'verify': VERIFY_SSL,
++        'timeout': None,
++        'follow_redirects': True,
++    }
++    if PROXY_DICT:
++        proxy_url = PROXY_DICT['https']
++        if proxy_url.startswith('socks'):
++            session_kwargs['transport'] = _SocksProxyTransport(proxy_url, VERIFY_SSL)
++        else:
++            session_kwargs['mounts'] = {
++                'http://': httpx.HTTPTransport(proxy=proxy_url, verify=VERIFY_SSL),
++                'https://': httpx.HTTPTransport(proxy=proxy_url, verify=VERIFY_SSL),
++            }
++    REQ_SESSION = httpx.Client(**session_kwargs)
++    REQ_SESSION_VERIFY_SSL = VERIFY_SSL
++    REQ_SESSION_PROXY_DICT = PROXY_DICT
++
++
++class _SocksProxyTransport(httpx.BaseTransport):
++    def __init__(self, proxy_url: str, verify_ssl: bool) -> None:
++        proxy = httpx.URL(proxy_url)
++        if proxy.host is None:
++            raise ValueError('Invalid SOCKS proxy URL')
++
++        self._proxy_host = proxy.host
++        self._proxy_port = proxy.port or 1080
++        self._verify_ssl = verify_ssl
++        self._username = proxy.username
++        self._password = proxy.password
++
++    def handle_request(self, request: httpx.Request) -> httpx.Response:
++        sock = socket.create_connection((self._proxy_host, self._proxy_port))
++        try:
++            self._negotiate_socks5(sock, request.url.host or '', request.url.port or 443)
++            stream = sock
++            if request.url.scheme == 'https':
++                context = ssl.create_default_context()
++                if not self._verify_ssl:
++                    context = ssl._create_unverified_context()
++                stream = context.wrap_socket(sock, server_hostname=request.url.host)
++
++            body = request.read()
++            self._send_http_request(stream, request, body)
++            status_code, headers, response_body = self._read_http_response(stream)
++            return httpx.Response(status_code, headers=headers, content=response_body, request=request)
++        finally:
++            sock.close()
++
++    def _negotiate_socks5(self, sock: socket.socket, host: str, port: int) -> None:
++        methods = [0x00]
++        if self._username is not None or self._password is not None:
++            methods = [0x00, 0x02]
++        sock.sendall(bytes([0x05, len(methods), *methods]))
++        version, method = self._read_exact(sock, 2)
++        if version != 0x05:
++            raise OSError('Invalid SOCKS5 proxy response')
++        if method == 0x02:
++            username = (self._username or '').encode('utf-8')
++            password = (self._password or '').encode('utf-8')
++            if len(username) > 255 or len(password) > 255:
++                raise OSError('SOCKS5 credentials are too long')
++            sock.sendall(bytes([0x01, len(username)]) + username + bytes([len(password)]) + password)
++            version, status = self._read_exact(sock, 2)
++            if version != 0x01 or status != 0x00:
++                raise OSError('SOCKS5 authentication failed')
++        elif method != 0x00:
++            raise OSError('SOCKS5 proxy does not accept supported auth methods')
++
++        host_bytes = host.encode('idna')
++        if len(host_bytes) > 255:
++            raise OSError('Destination host name is too long')
++        request = bytearray([0x05, 0x01, 0x00, 0x03, len(host_bytes)])
++        request.extend(host_bytes)
++        request.extend(port.to_bytes(2, 'big'))
++        sock.sendall(request)
++
++        version, status, _, atyp = self._read_exact(sock, 4)
++        if version != 0x05 or status != 0x00:
++            raise OSError('SOCKS5 connect failed')
++
++        if atyp == 0x01:
++            self._read_exact(sock, 4)
++        elif atyp == 0x03:
++            addr_len = self._read_exact(sock, 1)[0]
++            self._read_exact(sock, addr_len)
++        elif atyp == 0x04:
++            self._read_exact(sock, 16)
++        self._read_exact(sock, 2)
++
++    def _send_http_request(self, stream, request: httpx.Request, body: bytes) -> None:
++        path = request.url.path or '/'
++        if request.url.query:
++            path = f'{path}?{request.url.query.decode("ascii")}'
++
++        headers = {k.lower(): v for k, v in request.headers.items()}
++        headers['host'] = request.url.host or ''
++        if request.url.port and request.url.port not in (80, 443):
++            headers['host'] = f'{headers["host"]}:{request.url.port}'
++        headers['connection'] = 'close'
++        headers['accept-encoding'] = 'identity'
++        headers['content-length'] = str(len(body))
++
++        request_line = f'{request.method} {path} HTTP/1.1\r\n'
++        header_lines = ''.join(f'{name}: {value}\r\n' for name, value in headers.items())
++        stream.sendall(request_line.encode('ascii') + header_lines.encode('latin-1') + b'\r\n' + body)
++
++    def _read_http_response(self, stream) -> tuple[int, dict[str, str], bytes]:
++        status_line = self._readline(stream).decode('latin-1').rstrip('\r\n')
++        _, status_code, _ = status_line.split(' ', 2)
++        headers = {}
++        while True:
++            line = self._readline(stream)
++            if line in (b'\r\n', b'\n', b''):
++                break
++            name, value = line.decode('latin-1').split(':', 1)
++            headers[name.strip()] = value.strip()
++
++        body = b''
++        transfer_encoding = headers.get('Transfer-Encoding', '').lower()
++        if 'chunked' in transfer_encoding:
++            chunks = []
++            while True:
++                chunk_size = int(self._readline(stream).split(b';', 1)[0].strip(), 16)
++                if chunk_size == 0:
++                    while True:
++                        trailer = self._readline(stream)
++                        if trailer in (b'\r\n', b'\n', b''):
++                            break
++                    break
++                chunks.append(self._read_exact(stream, chunk_size))
++                self._read_exact(stream, 2)
++            body = b''.join(chunks)
++        elif 'Content-Length' in headers:
++            body = self._read_exact(stream, int(headers['Content-Length']))
++        else:
++            chunks = []
++            while True:
++                data = stream.recv(65536)
++                if not data:
++                    break
++                chunks.append(data)
++            body = b''.join(chunks)
++
++        return int(status_code), headers, body
++
++    def _read_exact(self, stream, count: int) -> bytes:
++        data = bytearray()
++        while len(data) < count:
++            chunk = stream.recv(count - len(data))
++            if not chunk:
++                raise OSError('Unexpected end of stream')
++            data.extend(chunk)
++        return bytes(data)
++
++    def _readline(self, stream) -> bytes:
++        data = bytearray()
++        while True:
++            char = stream.recv(1)
++            if not char:
++                break
++            data.extend(char)
++            if data.endswith(b'\n'):
++                break
++        return bytes(data)
++
+ # given an amount of bytes, upload it and return the elapsed seconds taken
+ 
+ 
+ def upload_test(total_bytes: int) -> int | float:
++    _ensure_req_session()
+     start = timer()
+ 
+-    r = REQ_SESSION.post(
+-        UPLOAD_ENDPOINT, data=bytearray(
+-            total_bytes,
+-        ), headers=UPLOAD_HEADERS, verify=VERIFY_SSL, proxies=PROXY_DICT,
+-    )
++    r = REQ_SESSION.post(UPLOAD_ENDPOINT, data=bytearray(total_bytes), headers=UPLOAD_HEADERS)
+     r.raise_for_status()
+     total_time_taken = timer() - start
+ 
+@@ -84,10 +258,11 @@
+ 
+ 
+ def download_test(total_bytes: int) -> int | float:
++    _ensure_req_session()
+     endpoint = DOWNLOAD_ENDPOINT.format(total_bytes)
+     start = timer()
+ 
+-    r = REQ_SESSION.get(endpoint, verify=VERIFY_SSL, proxies=PROXY_DICT)
++    r = REQ_SESSION.get(endpoint)
+     r.raise_for_status()
+ 
+     total_time_taken = timer() - start
+@@ -107,10 +282,11 @@
+ 
+ 
+ def latency_test() -> float:
++    _ensure_req_session()
+     endpoint = DOWNLOAD_ENDPOINT.format(0)
+ 
+     start = timer()
+-    r = REQ_SESSION.get(endpoint, verify=VERIFY_SSL,  proxies=PROXY_DICT)
++    r = REQ_SESSION.get(endpoint)
+     r.raise_for_status()
+ 
+     total_time_taken = timer() - start
+@@ -128,7 +304,8 @@
+ 
+ 
+ def get_our_country() -> str:
+-    r = REQ_SESSION.get(CGI_ENDPOINT, verify=VERIFY_SSL,  proxies=PROXY_DICT)
++    _ensure_req_session()
++    r = REQ_SESSION.get(CGI_ENDPOINT)
+     r.raise_for_status()
+ 
+     cgi_data = r.text
+@@ -144,11 +321,8 @@
+ 
+ 
+ def preamble() -> str:
+-    r = REQ_SESSION.get(
+-        DOWNLOAD_ENDPOINT.format(
+-            0,
+-        ), verify=VERIFY_SSL,  proxies=PROXY_DICT,
+-    )
++    _ensure_req_session()
++    r = REQ_SESSION.get(DOWNLOAD_ENDPOINT.format(0))
+     r.raise_for_status()
+ 
+     our_ip = r.headers.get('cf-meta-ip')
+@@ -290,8 +464,6 @@
+ 
+ def main(argv=None) -> int:
+     global PROXY_DICT, VERIFY_SSL, OUTPUT_FILE
+-    # disable annoying warning when using verify=False in requests.get("x", verify=False)
+-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+ 
+     parser = argparse.ArgumentParser()
+     parser_with_args = options.add_run_options(parser)
+@@ -309,10 +481,8 @@
+ 
+     # set up proxy dictionary
+     if proxy:
+-        if proxy.startswith('socks'):
+-            PROXY_DICT = {'http': f'{proxy}', 'https': f'{proxy}'}
+-        elif proxy.startswith('http'):
+-            PROXY_DICT = {'http': f'{proxy}', 'https': f'{proxy}'}
++        if proxy.startswith(('socks', 'http://', 'https://')):
++            PROXY_DICT = {'http': proxy, 'https': proxy}
+         else:
+             PROXY_DICT = {
+                 'http': f'http://{proxy}',

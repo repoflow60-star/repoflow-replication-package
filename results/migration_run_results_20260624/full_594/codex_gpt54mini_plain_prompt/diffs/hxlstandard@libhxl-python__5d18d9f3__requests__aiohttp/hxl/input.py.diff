@@ -1,0 +1,372 @@
+diff --git a/hxl/input.py b/hxl/input.py
+index 19af971..16eafae 100644
+--- a/hxl/input.py
++++ b/hxl/input.py
+@@ -31,13 +31,103 @@ import hxl, hxl.filters
+ 
+ from hxl.util import logup
+ 
+-import abc, collections, csv, datetime, dateutil.parser, hashlib, \
++import abc, asyncio, collections, csv, datetime, dateutil.parser, hashlib, \
+     io, io_wrapper, json, jsonpath_ng.ext, logging, \
+-    os.path, re, requests, shutil, six, sys, \
++    os.path, re, shutil, six, sys, threading, \
+     tempfile, time, urllib.parse, xlrd3 as xlrd, zipfile
+ 
++import aiohttp
++
+ logger = logging.getLogger(__name__)
+ 
++
++def _run_async(coro):
++    """Run a coroutine from synchronous code.
++
++    If there is already an event loop running in this thread, run the
++    coroutine in a helper thread so we do not nest event loops.
++    """
++    try:
++        asyncio.get_running_loop()
++    except RuntimeError:
++        return asyncio.run(coro)
++
++    result = {}
++    error = {}
++
++    def runner():
++        try:
++            result["value"] = asyncio.run(coro)
++        except Exception as exc:  # pragma: no cover - propagated below
++            error["value"] = exc
++
++    thread = threading.Thread(target=runner, daemon=True)
++    thread.start()
++    thread.join()
++    if error:
++        raise error["value"]
++    return result["value"]
++
++
++def _aiohttp_session_kwargs(input_options, headers=None):
++    """Build keyword arguments for an aiohttp ClientSession."""
++    session_kwargs = {}
++    if input_options and input_options.timeout is not None:
++        session_kwargs["timeout"] = aiohttp.ClientTimeout(total=input_options.timeout)
++    if headers is None and input_options is not None:
++        headers = input_options.http_headers
++    if headers is not None:
++        session_kwargs["headers"] = headers
++    if input_options and not input_options.verify_ssl:
++        session_kwargs["connector"] = aiohttp.TCPConnector(ssl=False)
++    return session_kwargs
++
++
++async def _aiohttp_fetch_bytes(url, input_options, method="GET", headers=None, params=None, data=None, allow_redirects=True):
++    """Fetch a URL and return status, headers, and the raw body."""
++    session_kwargs = _aiohttp_session_kwargs(input_options, headers=headers)
++    request_kwargs = {"allow_redirects": allow_redirects}
++    if params is not None:
++        request_kwargs["params"] = params
++    if data is not None:
++        request_kwargs["data"] = data
++
++    async with aiohttp.ClientSession(**session_kwargs) as session:
++        async with session.request(method, url, **request_kwargs) as response:
++            status = response.status
++            response_headers = response.headers
++            if status == 403:
++                return status, response_headers, None
++            response.raise_for_status()
++            return status, response_headers, await response.read()
++
++
++async def _aiohttp_fetch_json(url, input_options, method="GET", headers=None, params=None, data=None, allow_redirects=True):
++    """Fetch a URL and return status, headers, and parsed JSON."""
++    session_kwargs = _aiohttp_session_kwargs(input_options, headers=headers)
++    request_kwargs = {"allow_redirects": allow_redirects}
++    if params is not None:
++        request_kwargs["params"] = params
++    if data is not None:
++        request_kwargs["data"] = data
++
++    async with aiohttp.ClientSession(**session_kwargs) as session:
++        async with session.request(method, url, **request_kwargs) as response:
++            status = response.status
++            response_headers = response.headers
++            if status == 403:
++                return status, response_headers, None
++            response.raise_for_status()
++            return status, response_headers, await response.json(content_type=None)
++
++
++async def _aiohttp_head(url, input_options, headers=None):
++    """Fetch headers for a URL without following redirects."""
++    session_kwargs = _aiohttp_session_kwargs(input_options, headers=headers)
++    async with aiohttp.ClientSession(**session_kwargs) as session:
++        async with session.head(url, allow_redirects=False) as response:
++            return response.status, response.headers
++
+ __all__ = (
+     "data",
+     "tagger",
+@@ -621,23 +711,15 @@ def open_url_or_file(url_or_filename, input_options):
+         try:
+             url = munge_url(url_or_filename, input_options)
+             logup("Trying to open remote resource", {"url": url_or_filename})
+-            response = requests.get(
+-                url,
+-                stream=True,
+-                verify=input_options.verify_ssl,
+-                timeout=input_options.timeout,
+-                headers=input_options.http_headers
+-            )
+-            logup("Response status", {"url": url_or_filename, "status": response.status_code})
+-            if (response.status_code == 403): # CKAN sends "403 Forbidden" for a private file
++            status, response_headers, content = _run_async(_aiohttp_fetch_bytes(url, input_options))
++            logup("Response status", {"url": url_or_filename, "status": status})
++            if (status == 403): # CKAN sends "403 Forbidden" for a private file
+                 raise HXLAuthorizationException("Access not authorized", url=url)
+-            else:
+-                response.raise_for_status()
+         except Exception as e:
+             logger.error("Cannot open URL %s (%s)", url_or_filename, str(e))
+             raise e
+ 
+-        content_type = response.headers.get('content-type')
++        content_type = response_headers.get('content-type')
+         if content_type:
+             result = re.match(r'^(\S+)\s*;\s*charset=(\S+)$', content_type)
+             if result:
+@@ -646,15 +728,14 @@ def open_url_or_file(url_or_filename, input_options):
+             else:
+                 mime_type = content_type.lower()
+ 
+-        content_length = response.headers.get('content-length')
++        content_length = response_headers.get('content-length')
+         if content_length is not None:
+             try:
+                 content_length = int(content_length)
+             except:
+                 content_length = None
+ 
+-        # return (RequestResponseIOWrapper(response), mime_type, file_ext, encoding, content_length, fileno,)
+-        return (io.BytesIO(response.content), mime_type, file_ext, encoding, content_length, fileno,)
++        return (io.BytesIO(content), mime_type, file_ext, encoding, content_length, fileno,)
+ 
+     elif input_options.allow_local:
+         # Default to a local file, if allowed
+@@ -819,53 +900,38 @@ class InputOptions:
+ 
+ # Deprecated - will remove in future release
+ class RequestResponseIOWrapper(io.RawIOBase):
+-    """Wrapper for a Response object from the requests library.  Streaming
+-    in requests is a bit broken: for example, if you're streaming, the
+-    stream from the raw property doesn't unzip the payload.
++    """Deprecated response wrapper for streamed HTTP content.
++
++    This class is retained for compatibility, but the main code path now
++    reads response bodies eagerly with aiohttp instead.
+     """
+ 
+     BUFFER_SIZE = 0x1000
+-    """Size of input chunk buffer from requests.raw.iter_content"""
++    """Size of input chunk buffer."""
+ 
+     def __init__(self, response):
+-        """Construct a wrapper around a requests response object
+-        @param response: the HTTP response from the requests library
++        """Construct a wrapper around a response object.
++        @param response: the HTTP response object.
+         """
+         self.response = response
+-        self.buffer = None
+-        self.buffer_pos = -1
+-        self.iter = response.iter_content(self.BUFFER_SIZE) # iterator through the input
++        if hasattr(response, "read") and asyncio.iscoroutinefunction(response.read):
++            self.buffer = io.BytesIO(_run_async(response.read()))
++        elif hasattr(response, "content") and hasattr(response.content, "read") and asyncio.iscoroutinefunction(response.content.read):
++            self.buffer = io.BytesIO(_run_async(response.content.read()))
++        elif hasattr(response, "content") and isinstance(response.content, (bytes, bytearray)):
++            self.buffer = io.BytesIO(bytes(response.content))
++        else:
++            content = getattr(response, "content", b"")
++            if isinstance(content, (bytes, bytearray)):
++                self.buffer = io.BytesIO(bytes(content))
++            else:
++                self.buffer = io.BytesIO(b"")
+ 
+     def read(self, size=-1):
+-        """Read raw byte input from the requests raw.iter_content iterator
+-        The function will unzip zipped content.
++        """Read raw byte input from the response iterator.
+         @param size: the maximum number of bytes to read, or -1 for all available.
+         """
+-        result = bytearray()
+-
+-        if size == -1:
+-            # Read all of the content at once
+-            for chunk in self.iter:
+-                result += chunk
+-            self.buffer = None
+-        else:
+-            # Read from chunks until we have enough content
+-            while size > 0:
+-                if not self.buffer:
+-                    try:
+-                        self.buffer = next(self.iter)
+-                    except StopIteration:
+-                         # stop if we've run out of input
+-                        break
+-                    self.buffer_pos = 0
+-                avail = min(len(self.buffer)-self.buffer_pos, size) #actually read
+-                result += self.buffer[self.buffer_pos:self.buffer_pos+avail]
+-                size -= avail
+-                self.buffer_pos += avail
+-                if self.buffer_pos >= len(self.buffer):
+-                    self.buffer = None
+-
+-        return bytes(result) # FIXME - how can we avoid a copy?
++        return self.buffer.read(size)
+ 
+     def readinto(self, b):
+         """Read content into a buffer of some kind.
+@@ -879,18 +945,18 @@ class RequestResponseIOWrapper(io.RawIOBase):
+ 
+     def readable(self):
+         """Flag whether the content is readable."""
+-        try:
+-            return self.response.raw.readable()
+-        except:
+-            return True
++        return True
+ 
+     @property
+     def content_type(self):
+-        return self.response.headers.get('Content-type')
++        if hasattr(self.response, "headers"):
++            return self.response.headers.get('Content-type')
++        return None
+ 
+     def close(self):
+         """Close the streaming response."""
+-        return self.response.close()
++        if hasattr(self.response, "close"):
++            return self.response.close()
+ 
+ 
+ class AbstractInput(object):
+@@ -1654,9 +1720,9 @@ def munge_url(url, input_options):
+     result = re.match(GOOGLE_DRIVE_URL, url)
+     if result:
+         logup("HEAD request for Google Drive URL", {"url": url})
+-        response = requests.head(url)
+-        if response.is_redirect:
+-            new_url = response.headers['Location']
++        status, response_headers = _run_async(_aiohttp_head(url, input_options))
++        if status in (301, 302, 303, 307, 308):
++            new_url = response_headers['Location']
+             logup("Google Drive redirect", {"url": url, "redirect": new_url})
+             logger.info("Following Google Drive redirect to %s", new_url)
+             url = new_url
+@@ -1749,7 +1815,7 @@ def _get_ckan_urls(site_url, dataset_id, resource_id, input_options):
+         # CKAN resource URL
+         ckan_api_query = '{}/api/3/action/resource_show?id={}'.format(site_url, resource_id)
+         logup("Trying CKAN API call", {"url": ckan_api_query})
+-        ckan_api_result = requests.get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
++        _, _, ckan_api_result = _run_async(_aiohttp_fetch_json(ckan_api_query, input_options))
+         if ckan_api_result['success']:
+             url = ckan_api_result['result']['url']
+             logup("Found candidate URL for CKAN dataset", {"url": url})
+@@ -1772,7 +1838,7 @@ def _get_ckan_urls(site_url, dataset_id, resource_id, input_options):
+     else:
+         # CKAN dataset (package) URL
+         ckan_api_query = '{}/api/3/action/package_show?id={}'.format(site_url, dataset_id)
+-        ckan_api_result = requests.get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
++        _, _, ckan_api_result = _run_async(_aiohttp_fetch_json(ckan_api_query, input_options))
+         if ckan_api_result['success']:
+             for resource in ckan_api_result['result']['resources']:
+                 url = resource['url']
+@@ -1822,20 +1888,19 @@ def _get_kobo_url(asset_id, url, input_options, max_export_age_seconds=14400):
+         "q": "source:{}".format(asset_id)
+     }
+     logup("Trying Kobo dataset", {"url": asset_id})
+-    response = requests.get(
+-        "https://kobo.humanitarianresponse.info/exports/",
+-        verify=input_options.verify_ssl,
+-        headers=input_options.http_headers,
+-        params=params
++    status, _, response_json = _run_async(
++        _aiohttp_fetch_json(
++            "https://kobo.humanitarianresponse.info/exports/",
++            input_options,
++            params=params
++        )
+     )
+-    logup("Result for Kobo dataset", {"asset_id": asset_id, "status": response.status_code})
++    logup("Result for Kobo dataset", {"asset_id": asset_id, "status": status})
+     # check for errors
+-    if (response.status_code == 403): # CKAN sends "403 Forbidden" for a private file
++    if (status == 403): # CKAN sends "403 Forbidden" for a private file
+         raise HXLAuthorizationException("Access not authorized", url=url)
+-    else:
+-        response.raise_for_status()
+ 
+-    exports = response.json()['results']
++    exports = response_json['results']
+     if len(exports) > 0:
+         export = exports[-1]
+         created = dateutil.parser.isoparse(export['date_created'])
+@@ -1858,40 +1923,34 @@ def _get_kobo_url(asset_id, url, input_options, max_export_age_seconds=14400):
+         "hierarchy_in_labels": False,
+         "group_sep": ",",
+     }
+-    response = requests.post(
+-        "https://kobo.humanitarianresponse.info/exports/",
+-        verify=input_options.verify_ssl,
+-        headers=http_headers,
+-        data=params
++    status, _, response_json = _run_async(
++        _aiohttp_fetch_json(
++            "https://kobo.humanitarianresponse.info/exports/",
++            input_options,
++            method="POST",
++            data=params
++        )
+     )
+-    logup("Generated Kobo export", {"asset_id": asset_id, "status": response.status_code})
++    logup("Generated Kobo export", {"asset_id": asset_id, "status": status})
+     # check for errors
+-    if (response.status_code == 403): # CKAN sends "403 Forbidden" for a private file
++    if (status == 403): # CKAN sends "403 Forbidden" for a private file
+         raise HXLAuthorizationException("Access not authorized", url=url)
+-    else:
+-        response.raise_for_status()
+ 
+-    info_url = response.json().get("url")
++    info_url = response_json.get("url")
+ 
+     # 3. Look up the data record for the export to get the download URL
+ 
+     fail_counter = 0
+     while True:
+         logup("Getting info for Kobo export", {"url": info_url})
+-        response = requests.get(
+-            info_url,
+-            verify=input_options.verify_ssl,
+-            headers=http_headers
+-        )
+-        logup("Response for Kobo info", {"url": info_url, "status": response.status_code})
++        status, _, response_json = _run_async(_aiohttp_fetch_json(info_url, input_options))
++        logup("Response for Kobo info", {"url": info_url, "status": status})
+ 
+         # check for errors
+-        if (response.status_code == 403): # CKAN sends "403 Forbidden" for a private file
++        if (status == 403): # CKAN sends "403 Forbidden" for a private file
+             raise HXLAuthorizationException("Access not authorized", url=info_url)
+-        else:
+-            response.raise_for_status()
+ 
+-        url = response.json().get("result")
++        url = response_json.get("result")
+ 
+         if url:
+             logger.info("Kobo export URL: %s", url)

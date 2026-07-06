@@ -1,0 +1,175 @@
+--- a/hxl/input.py
++++ b/hxl/input.py
+@@ -33,10 +33,18 @@
+ 
+ import abc, collections, csv, datetime, dateutil.parser, hashlib, \
+     io, io_wrapper, json, jsonpath_ng.ext, logging, \
+-    os.path, re, requests, shutil, six, sys, \
++    os.path, re, shutil, six, sys, \
+     tempfile, time, urllib.parse, xlrd3 as xlrd, zipfile
+ 
++import httpx
++
+ logger = logging.getLogger(__name__)
++
++
++def _default_http_headers(headers):
++    result = dict(headers or {})
++    result.setdefault('User-Agent', 'python-requests/2.31.0')
++    return result
+ 
+ __all__ = (
+     "data",
+@@ -621,18 +629,21 @@
+         try:
+             url = munge_url(url_or_filename, input_options)
+             logup("Trying to open remote resource", {"url": url_or_filename})
+-            response = requests.get(
++            response = httpx.get(
+                 url,
+-                stream=True,
+                 verify=input_options.verify_ssl,
+                 timeout=input_options.timeout,
+-                headers=input_options.http_headers
++                headers=_default_http_headers(input_options.http_headers),
++                follow_redirects=True,
+             )
+             logup("Response status", {"url": url_or_filename, "status": response.status_code})
+             if (response.status_code == 403): # CKAN sends "403 Forbidden" for a private file
+                 raise HXLAuthorizationException("Access not authorized", url=url)
+             else:
+                 response.raise_for_status()
++        except httpx.RequestError as e:
++            logger.error("Cannot open URL %s (%s)", url_or_filename, str(e))
++            raise HXLIOException(str(e), url=url_or_filename) from e
+         except Exception as e:
+             logger.error("Cannot open URL %s (%s)", url_or_filename, str(e))
+             raise e
+@@ -820,25 +831,23 @@
+ 
+ # Deprecated - will remove in future release
+ class RequestResponseIOWrapper(io.RawIOBase):
+-    """Wrapper for a Response object from the requests library.  Streaming
+-    in requests is a bit broken: for example, if you're streaming, the
+-    stream from the raw property doesn't unzip the payload.
+-    """
++    """Wrapper for a streamed HTTP response object."""
+ 
+     BUFFER_SIZE = 0x1000
+-    """Size of input chunk buffer from requests.raw.iter_content"""
++    """Size of input chunk buffer."""
+ 
+     def __init__(self, response):
+-        """Construct a wrapper around a requests response object
+-        @param response: the HTTP response from the requests library
+-        """
++        """Construct a wrapper around a streamed HTTP response."""
+         self.response = response
+         self.buffer = None
+         self.buffer_pos = -1
+-        self.iter = response.iter_content(self.BUFFER_SIZE) # iterator through the input
++        iterator = getattr(response, 'iter_bytes', None)
++        if iterator is None:
++            iterator = response.iter_content
++        self.iter = iterator(self.BUFFER_SIZE) # iterator through the input
+ 
+     def read(self, size=-1):
+-        """Read raw byte input from the requests raw.iter_content iterator
++        """Read raw byte input from the response iterator.
+         The function will unzip zipped content.
+         @param size: the maximum number of bytes to read, or -1 for all available.
+         """
+@@ -1657,7 +1666,13 @@
+     result = re.match(GOOGLE_DRIVE_URL, url)
+     if result:
+         logup("HEAD request for Google Drive URL", {"url": url})
+-        response = requests.head(url)
++        response = httpx.head(
++            url,
++            verify=input_options.verify_ssl,
++            timeout=input_options.timeout,
++            headers=_default_http_headers(input_options.http_headers),
++            follow_redirects=False,
++        )
+         if response.is_redirect:
+             new_url = response.headers['Location']
+             logup("Google Drive redirect", {"url": url, "redirect": new_url})
+@@ -1752,7 +1767,13 @@
+         # CKAN resource URL
+         ckan_api_query = '{}/api/3/action/resource_show?id={}'.format(site_url, resource_id)
+         logup("Trying CKAN API call", {"url": ckan_api_query})
+-        ckan_api_result = requests.get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
++        ckan_api_result = httpx.get(
++            ckan_api_query,
++            verify=input_options.verify_ssl,
++            headers=_default_http_headers(input_options.http_headers),
++            timeout=input_options.timeout,
++            follow_redirects=True,
++        ).json()
+         if ckan_api_result['success']:
+             url = ckan_api_result['result']['url']
+             logup("Found candidate URL for CKAN dataset", {"url": url})
+@@ -1775,7 +1796,13 @@
+     else:
+         # CKAN dataset (package) URL
+         ckan_api_query = '{}/api/3/action/package_show?id={}'.format(site_url, dataset_id)
+-        ckan_api_result = requests.get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
++        ckan_api_result = httpx.get(
++            ckan_api_query,
++            verify=input_options.verify_ssl,
++            headers=_default_http_headers(input_options.http_headers),
++            timeout=input_options.timeout,
++            follow_redirects=True,
++        ).json()
+         if ckan_api_result['success']:
+             for resource in ckan_api_result['result']['resources']:
+                 url = resource['url']
+@@ -1825,11 +1852,13 @@
+         "q": "source:{}".format(asset_id)
+     }
+     logup("Trying Kobo dataset", {"url": asset_id})
+-    response = requests.get(
++    response = httpx.get(
+         "https://kobo.humanitarianresponse.info/exports/",
+         verify=input_options.verify_ssl,
+-        headers=input_options.http_headers,
+-        params=params
++        headers=_default_http_headers(input_options.http_headers),
++        params=params,
++        timeout=input_options.timeout,
++        follow_redirects=True,
+     )
+     logup("Result for Kobo dataset", {"asset_id": asset_id, "status": response.status_code})
+     # check for errors
+@@ -1861,11 +1890,13 @@
+         "hierarchy_in_labels": False,
+         "group_sep": ",",
+     }
+-    response = requests.post(
++    response = httpx.post(
+         "https://kobo.humanitarianresponse.info/exports/",
+         verify=input_options.verify_ssl,
+-        headers=http_headers,
+-        data=params
++        headers=_default_http_headers(input_options.http_headers),
++        data=params,
++        timeout=input_options.timeout,
++        follow_redirects=False,
+     )
+     logup("Generated Kobo export", {"asset_id": asset_id, "status": response.status_code})
+     # check for errors
+@@ -1881,10 +1912,12 @@
+     fail_counter = 0
+     while True:
+         logup("Getting info for Kobo export", {"url": info_url})
+-        response = requests.get(
++        response = httpx.get(
+             info_url,
+             verify=input_options.verify_ssl,
+-            headers=http_headers
++            headers=_default_http_headers(input_options.http_headers),
++            timeout=input_options.timeout,
++            follow_redirects=True,
+         )
+         logup("Response for Kobo info", {"url": info_url, "status": response.status_code})
+ 

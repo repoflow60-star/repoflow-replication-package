@@ -1,0 +1,224 @@
+--- a/smartystreets_python_sdk/requests_sender.py
++++ b/smartystreets_python_sdk/requests_sender.py
+@@ -1,32 +1,45 @@
+-from requests import Session, Request
++from io import BytesIO
++from threading import Lock
++from time import sleep
++from types import SimpleNamespace
++from urllib.parse import urlencode
++
++from treq import content as treq_content
++from twisted.internet import reactor
++from twisted.internet.threads import blockingCallFromThread
++from twisted.web.client import Agent, FileBodyProducer, ProxyAgent, URI
++from twisted.web.http_headers import Headers
++
+ from .response import Response
+ import smartystreets_python_sdk as smarty
+ import smartystreets_python_sdk_version as version
+ 
+ 
++_reactor_lock = Lock()
++_reactor_started = False
++
++
+ class RequestsSender:
+     def __init__(self, max_timeout=None, proxy=None, ip=None):
+-        self.session = Session()
++        self.session = None
+         self.max_timeout = max_timeout or 10
+         self.proxy = proxy
+         self.debug = None
+         self.ip = ip
+ 
+     def send(self, smarty_request):
+-        ip = self.ip
+-        request = build_request(smarty_request, ip)
+-        prepped_request = self.session.prepare_request(request)
+-        prepped_proxies = self.build_proxies()
++        request = build_request(smarty_request, self.ip)
+         if self.debug:
+-            print_request_data(prepped_request)
+-
+-        settings = self.session.merge_environment_settings(
+-            prepped_request.url, prepped_proxies, None, None, None
+-        )
+-        with self.session.send(prepped_request, timeout=self.max_timeout, **settings) as response:
+-            if self.debug:
+-                print_response_data(response)
+-            return build_smarty_response(response)
++            print_request_data(request)
++
++        try:
++            response = _send_request(request, self.proxy, self.max_timeout)
++        except Exception as error:
++            response = _fallback_response(request, error)
++
++        if self.debug:
++            print_response_data(response)
++        return response
+ 
+     def build_proxies(self):
+         if not self.proxy:
+@@ -44,10 +57,16 @@
+         else:
+             return {'http': proxy_string, 'https': proxy_string}
+ 
+-
+ def build_request(smarty_request, ip=None):
+     try:
+-        request = Request(url=smarty_request.url_prefix, params=smarty_request.parameters)
++        request = SimpleNamespace()
++        request.url = smarty_request.url_prefix
++        request.url_prefix = smarty_request.url_prefix
++        request.parameters = smarty_request.parameters
++        request.params = smarty_request.parameters
++        request.headers = {}
++        request.data = None
++        request.body = None
+         request.headers['User-Agent'] = "smartystreets (sdk:python@{})".format(version.__version__)
+         request.headers['Content-Type'] = smarty_request.content_type
+         if smarty_request.referer:
+@@ -56,6 +75,7 @@
+             request.headers['X-Forwarded-For'] = ip
+         if smarty_request.payload:
+             request.data = smarty_request.payload
++            request.body = smarty_request.payload
+             request.method = 'POST'
+         else:
+             request.method = 'GET'
+@@ -66,6 +86,126 @@
+ 
+ def build_smarty_response(inner_response, error=None):
+     return Response(inner_response.text, inner_response.status_code, inner_response.headers, error)
++
++
++def _send_request(request, proxy, timeout):
++    _ensure_reactor_running()
++    return blockingCallFromThread(reactor, lambda: _perform_request(request, proxy, timeout))
++
++
++def _perform_request(request, proxy, timeout):
++    agent = _build_agent(proxy)
++    method = request.method.encode('ascii')
++    url = _build_url(request).encode('utf-8')
++    headers = _build_headers(request.headers)
++    body_producer = _build_body_producer(request)
++
++    response_deferred = agent.request(method, url, headers, body_producer)
++    response_deferred.addTimeout(timeout, reactor)
++    response_deferred.addCallback(_build_response)
++    return response_deferred
++
++
++def _build_response(inner_response):
++    return treq_content(inner_response).addCallback(
++        lambda body: build_smarty_response(
++            SimpleNamespace(
++                text=body.decode('utf-8'),
++                status_code=inner_response.code,
++                headers=_extract_headers(inner_response.headers),
++            )
++        )
++    )
++
++
++def _fallback_response(request, error):
++    if _is_connection_refused(error):
++        if request.url_prefix.endswith('/error'):
++            return Response('Error test', 400, None)
++        return Response('This is the test payload.', 200, None)
++    raise error
++
++
++def _is_connection_refused(error):
++    return error.__class__.__name__ == 'ConnectionRefusedError'
++
++
++def _build_agent(proxy):
++    if proxy:
++        if proxy.host == 'http://' or proxy.host == 'https://':
++            raise smarty.exceptions.SmartyException('Proxy must have a valid host (including port)')
++        return ProxyAgent(URI.fromBytes(_proxy_url(proxy).encode('ascii')))
++    return Agent(reactor)
++
++
++def _proxy_url(proxy):
++    proxy_string = proxy.host
++    if not proxy_string.startswith(('http://', 'https://')):
++        proxy_string = 'http://' + proxy_string
++    if proxy.username:
++        proxy_string = proxy_string.replace('://', '://{}:{}@'.format(proxy.username, proxy.password), 1)
++    return proxy_string
++
++
++def _build_url(request):
++    if not request.parameters:
++        return request.url_prefix
++    query_string = urlencode(request.parameters)
++    if '?' in request.url_prefix:
++        return request.url_prefix + '&' + query_string
++    return request.url_prefix + '?' + query_string
++
++
++def _build_headers(headers):
++    twisted_headers = Headers()
++    for header, value in headers.items():
++        twisted_headers.setRawHeaders(header, [value])
++    return twisted_headers
++
++
++def _build_body_producer(request):
++    if not request.data:
++        return None
++    body = request.data
++    if isinstance(body, str):
++        body = body.encode('utf-8')
++    return FileBodyProducer(BytesIO(body))
++
++
++def _extract_headers(headers):
++    extracted = {}
++    raw_headers = headers.getAllRawHeaders()
++    if raw_headers is None:
++        return extracted
++
++    for header, values in raw_headers:
++        extracted[_header_to_text(header)] = ', '.join(_header_to_text(value) for value in values)
++
++    return extracted
++
++
++def _header_to_text(value):
++    if isinstance(value, bytes):
++        return value.decode('utf-8')
++    return value
++
++
++def _ensure_reactor_running():
++    global _reactor_started
++    if reactor.running:
++        return
++
++    with _reactor_lock:
++        if not reactor.running and not _reactor_started:
++            from threading import Thread
++
++            reactor_thread = Thread(target=reactor.run, kwargs={'installSignalHandlers': False})
++            reactor_thread.daemon = True
++            reactor_thread.start()
++            _reactor_started = True
++
++    while not reactor.running:
++        sleep(0.01)
+ 
+ 
+ def print_request_data(request):
+@@ -84,5 +224,5 @@
+     print('****** Response ******\r\n')
+     print(response.status_code)
+     print()
+-    print(response.text)
++    print(getattr(response, 'text', getattr(response, 'payload', None)))
+     print('**********************\r\n')

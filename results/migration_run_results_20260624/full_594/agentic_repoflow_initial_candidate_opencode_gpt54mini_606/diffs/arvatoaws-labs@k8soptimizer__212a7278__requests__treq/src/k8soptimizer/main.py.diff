@@ -1,0 +1,92 @@
+--- a/src/k8soptimizer/main.py
++++ b/src/k8soptimizer/main.py
+@@ -27,8 +27,9 @@
+ import re
+ import sys
+ import time
+-
+-import requests
++import threading
++
++import treq
+ from beartype import beartype
+ from beartype.typing import Optional, Tuple
+ from kubernetes import client, config
+@@ -40,6 +41,8 @@
+     V2HorizontalPodAutoscaler,
+ )
+ from pythonjsonlogger import jsonlogger
++from twisted.internet import reactor
++from twisted.internet.threads import blockingCallFromThread
+ 
+ from . import __version__, helpers
+ 
+@@ -50,6 +53,9 @@
+ __domain__ = "arvato-aws.io"
+ 
+ _logger = logging.getLogger(__name__)
++
++_reactor_thread = None
++_reactor_thread_lock = threading.Lock()
+ 
+ 
+ PROMETHEUS_URL = os.getenv("PROMETHEUS_URL", "http://localhost:9090")
+@@ -178,6 +184,34 @@
+         return True
+ 
+ 
++def _ensure_reactor_running() -> None:
++    # treq needs a running Twisted reactor; keep one alive in a daemon thread.
++    global _reactor_thread
++    if reactor.running:
++        return
++    with _reactor_thread_lock:
++        if reactor.running:
++            return
++        if _reactor_thread is None or not _reactor_thread.is_alive():
++            _reactor_thread = threading.Thread(
++                target=lambda: reactor.run(installSignalHandlers=False),
++                name="twisted-reactor",
++                daemon=True,
++            )
++            _reactor_thread.start()
++    while not reactor.running:
++        time.sleep(0.01)
++
++
++def _treq_get_json(url: str, **kwargs) -> dict:
++    _ensure_reactor_running()
++
++    def _request():
++        return treq.get(url, **kwargs).addCallback(treq.json_content)
++
++    return blockingCallFromThread(reactor, _request)
++
++
+ @beartype
+ def query_prometheus(query: str) -> dict:
+     """
+@@ -196,8 +230,7 @@
+         response = query_prometheus('sum(rate(http_requests_total{job="api"}[5m]))')
+     """
+     _logger.debug("Query to prometheus: %s", query)
+-    response = requests.get(PROMETHEUS_URL + "/api/v1/query", params={"query": query})
+-    j = json.loads(response.text)
++    j = _treq_get_json(PROMETHEUS_URL + "/api/v1/query", params={"query": query})
+     _logger.debug("Response from prometheus: %s", j)
+     if "data" not in j:
+         raise RuntimeError("Got invalid results from query: {}".format(query))
+@@ -220,11 +253,10 @@
+     Example:
+         connection_successful = verify_prometheus_connection()
+     """
+-    response = requests.get(PROMETHEUS_URL + "/api/v1/status/buildinfo")
+-    j = json.loads(response.text)
++    j = _treq_get_json(PROMETHEUS_URL + "/api/v1/status/buildinfo")
+     _logger.debug(j)
+     if "status" not in j:
+-        raise RuntimeError("Got invalid results request: {}".format(response.text))
++        raise RuntimeError("Got invalid results request: {}".format(j))
+     if j["status"] == "success":
+         return True
+     raise RuntimeError("Connection to prometheus api failed")

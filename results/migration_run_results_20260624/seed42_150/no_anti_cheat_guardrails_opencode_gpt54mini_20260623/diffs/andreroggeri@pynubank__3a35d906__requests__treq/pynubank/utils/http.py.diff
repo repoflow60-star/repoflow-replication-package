@@ -1,0 +1,236 @@
+--- a/pynubank/utils/http.py
++++ b/pynubank/utils/http.py
+@@ -1,13 +1,154 @@
+-from requests import Response
+-from requests_pkcs12 import get, post
+-
+-from pynubank import NuRequestException
++import json
++import threading
++from dataclasses import dataclass
++from io import BytesIO
++
++import treq
++from OpenSSL import crypto
++from cryptography.hazmat.primitives import serialization
++from cryptography.hazmat.primitives.serialization import pkcs12
++from twisted.internet import defer, reactor
++from twisted.internet.ssl import CertificateOptions
++from twisted.web.client import Agent, FileBodyProducer
++from twisted.web.http_headers import Headers
++
++from pynubank.exception import NuException, NuRequestException
++
++
++@dataclass
++class HttpResponse:
++    status_code: int
++    url: str
++    headers: dict
++    body: bytes
++
++    def json(self) -> dict:
++        return json.loads(self.body.decode())
++
++
++_REACTOR_THREAD = None
++_REACTOR_READY = threading.Event()
++_REACTOR_LOCK = threading.Lock()
++
++
++def _run_reactor():
++    reactor.callWhenRunning(_REACTOR_READY.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor_running():
++    global _REACTOR_THREAD
++
++    with _REACTOR_LOCK:
++        if reactor.running:
++            _REACTOR_READY.set()
++            return
++
++        if _REACTOR_THREAD is None or not _REACTOR_THREAD.is_alive():
++            _REACTOR_READY.clear()
++            _REACTOR_THREAD = threading.Thread(target=_run_reactor, daemon=True)
++            _REACTOR_THREAD.start()
++
++    _REACTOR_READY.wait()
++
++
++def _headers_to_dict(headers) -> dict:
++    parsed = {}
++    if headers is None:
++        return parsed
++
++    get_all = getattr(headers, 'getAllRawHeaders', None)
++    if get_all is None:
++        return dict(headers)
++
++    for name, values in get_all():
++        if not values:
++            continue
++
++        key = name.decode() if isinstance(name, bytes) else name
++        value = values[0]
++        parsed_value = value.decode() if isinstance(value, bytes) else value
++        parsed[key] = parsed_value
++        parsed[key.lower()] = parsed_value
++
++    return parsed
++
++
++def _twisted_headers(headers: dict) -> Headers:
++    if not headers:
++        return Headers({})
++
++    return Headers({name.encode(): [value.encode()] for name, value in headers.items()})
++
++
++async def _request(method: str, url: str, headers: dict, agent=None, payload: dict = None) -> HttpResponse:
++    request_headers = _twisted_headers(headers or {})
++
++    if agent is None:
++        agent = Agent(reactor)
++
++    if method == 'get':
++        response = await agent.request(b'GET', url.encode(), request_headers)
++    else:
++        body = json.dumps(payload).encode()
++        producer = FileBodyProducer(BytesIO(body))
++        response = await agent.request(b'POST', url.encode(), request_headers, producer)
++
++    body = await treq.content(response)
++    response_url = url
++    request = getattr(response, 'request', None)
++    absolute_uri = getattr(request, 'absoluteURI', None)
++    if absolute_uri:
++        response_url = absolute_uri.decode() if isinstance(absolute_uri, bytes) else absolute_uri
++
++    return HttpResponse(
++        status_code=response.code,
++        url=response_url,
++        headers=_headers_to_dict(response.headers),
++        body=body,
++    )
++
++
++def _run_sync(factory):
++    _ensure_reactor_running()
++    outcome = {}
++    finished = threading.Event()
++
++    def _success(value):
++        outcome['value'] = value
++        finished.set()
++        return value
++
++    def _failure(failure):
++        outcome['failure'] = failure
++        finished.set()
++
++    def _invoke():
++        d = defer.ensureDeferred(factory())
++        d.addCallbacks(_success, _failure)
++
++    reactor.callFromThread(_invoke)
++    finished.wait()
++
++    if 'failure' in outcome:
++        outcome['failure'].raiseException()
++
++    return outcome['value']
++
++
++def get(url: str, headers: dict = None, agent=None) -> HttpResponse:
++    return _run_sync(lambda: _request('get', url, headers, agent))
++
++
++def post(url: str, json: dict, headers: dict = None, agent=None) -> HttpResponse:
++    return _run_sync(lambda: _request('post', url, headers, agent, json))
+ 
+ 
+ class HttpClient:
+ 
+     def __init__(self):
+         self._cert = None
++        self._agent = None
+         self._headers = {
+             'Content-Type': 'application/json',
+             'X-Correlation-Id': 'and-7-86-2-1000005524.9twu3pgr',
+@@ -16,6 +157,7 @@
+ 
+     def set_cert_data(self, cert_data: bytes):
+         self._cert = cert_data
++        self._agent = None
+ 
+     def set_header(self, name: str, value: str):
+         self._headers[name] = value
+@@ -28,22 +170,57 @@
+ 
+     @property
+     def _cert_args(self):
+-        return {'pkcs12_data': self._cert, 'pkcs12_password': ''} if self._cert else {}
+-
+-    def _handle_response(self, response: Response) -> dict:
++        return {'agent': self._agent} if self._agent else {}
++
++    def _build_agent(self):
++        if not self._cert:
++            return None
++
++        private_key, certificate, _ = pkcs12.load_key_and_certificates(self._cert, None)
++        if private_key is None or certificate is None:
++            raise NuException('Invalid certificate data.')
++
++        private_key_data = private_key.private_bytes(
++            encoding=serialization.Encoding.PEM,
++            format=serialization.PrivateFormat.PKCS8,
++            encryption_algorithm=serialization.NoEncryption(),
++        )
++        certificate_data = certificate.public_bytes(serialization.Encoding.PEM)
++
++        context = CertificateOptions(
++            privateKey=crypto.load_privatekey(crypto.FILETYPE_PEM, private_key_data),
++            certificate=crypto.load_certificate(crypto.FILETYPE_PEM, certificate_data),
++        )
++        return Agent(reactor, contextFactory=context)
++
++    def _ensure_agent(self):
++        if self._cert and self._agent is None:
++            self._agent = self._build_agent()
++
++    def _handle_response(self, response: HttpResponse) -> dict:
+         if response.status_code != 200:
+             raise NuRequestException(response)
+ 
+         return response.json()
+ 
+-    def raw_get(self, url: str) -> Response:
+-        return get(url, headers=self._headers, **self._cert_args)
+-
+-    def raw_post(self, url: str, json: dict) -> Response:
+-        return post(url, json=json, headers=self._headers, **self._cert_args)
++    def raw_get(self, url: str) -> HttpResponse:
++        self._ensure_agent()
++        response = get(url, headers=self._headers, **self._cert_args)
++        if not getattr(response, 'url', None):
++            response.url = url
++
++        return response
++
++    def raw_post(self, url: str, json: dict) -> HttpResponse:
++        self._ensure_agent()
++        response = post(url, json=json, headers=self._headers, **self._cert_args)
++        if not getattr(response, 'url', None):
++            response.url = url
++
++        return response
+ 
+     def get(self, url: str) -> dict:
+         return self._handle_response(self.raw_get(url))
+ 
+     def post(self, url: str, json: dict) -> dict:
+-        return self._handle_response(post(url, json=json, headers=self._headers, **self._cert_args))
++        return self._handle_response(self.raw_post(url, json))

@@ -1,0 +1,239 @@
+diff --git a/whatsapp_api_client_python/API.py b/whatsapp_api_client_python/API.py
+index 4449db9..144c6b5 100644
+--- a/whatsapp_api_client_python/API.py
++++ b/whatsapp_api_client_python/API.py
+@@ -1,9 +1,15 @@
+-import json
++import json as json_module
+ import logging
+-from typing import Any, NoReturn, Optional
++import math
++import time
++from dataclasses import dataclass
++from io import BytesIO
++from typing import Any, Optional
+ 
+-from requests import Response, Session
+-from requests.adapters import HTTPAdapter, Retry
++try:
++    import pycurl
++except ImportError:  # pragma: no cover - exercised only when dependency is absent
++    pycurl = None
+ 
+ from .response import Response as GreenAPIResponse
+ from .tools import (
+@@ -20,6 +26,178 @@ from .tools import (
+ )
+ 
+ 
++@dataclass
++class _TransportResponse:
++    status_code: int
++    text: str
++
++
++class Session:
++    def __init__(self) -> None:
++        self.headers: dict[str, str] = {}
++
++    def request(
++            self,
++            method: str,
++            url: str,
++            json: Optional[dict] = None,
++            data: Optional[Any] = None,
++            files: Optional[dict] = None,
++            timeout: Optional[float] = None,
++            headers: Optional[dict] = None,
++            **_: Any
++    ) -> _TransportResponse:
++        if pycurl is None:
++            raise RuntimeError(
++                "pycurl is required to perform HTTP requests."
++            )
++
++        method = method.upper()
++        request_headers = dict(self.headers)
++        if headers:
++            request_headers.update(headers)
++
++        body: Optional[bytes] = None
++
++        if files:
++            post_fields = []
++            for key, value in (json or data or {}).items():
++                post_fields.append((key, str(value)))
++
++            for key, value in files.items():
++                if not isinstance(value, tuple) or len(value) < 2:
++                    raise ValueError(
++                        "Files must be provided as (filename, fileobj, "
++                        "content_type) tuples."
++                    )
++
++                file_name = value[0]
++                file_object = value[1]
++                content_type = value[2] if len(value) > 2 and value[2] else None
++                file_path = getattr(file_object, "name", file_object)
++                if not content_type:
++                    content_type = "application/octet-stream"
++
++                post_fields.append(
++                    (
++                        key,
++                        (
++                            pycurl.FORM_FILE,
++                            file_path,
++                            pycurl.FORM_FILENAME,
++                            file_name,
++                            pycurl.FORM_CONTENTTYPE,
++                            content_type,
++                        ),
++                    )
++                )
++
++            return self._perform_request(
++                method=method,
++                url=url,
++                request_headers=request_headers,
++                timeout=timeout,
++                post_fields=post_fields,
++            )
++
++        if json is not None:
++            body = json_module.dumps(json, ensure_ascii=False).encode("utf-8")
++            request_headers.setdefault("Content-Type", "application/json")
++        elif data is not None:
++            if isinstance(data, bytes):
++                body = data
++            elif isinstance(data, bytearray):
++                body = bytes(data)
++            elif isinstance(data, str):
++                body = data.encode("utf-8")
++            else:
++                body = str(data).encode("utf-8")
++
++        return self._perform_request(
++            method=method,
++            url=url,
++            request_headers=request_headers,
++            timeout=timeout,
++            body=body,
++        )
++
++    def _perform_request(
++            self,
++            method: str,
++            url: str,
++            request_headers: dict[str, str],
++            timeout: Optional[float],
++            body: Optional[bytes] = None,
++            post_fields: Optional[list] = None
++    ) -> _TransportResponse:
++        attempts = 3
++        backoff_factor = 1.0
++        last_error: Optional[Exception] = None
++
++        for attempt in range(attempts):
++            buffer = BytesIO()
++
++            try:
++                with pycurl.Curl() as curl:
++                    curl.setopt(pycurl.URL, url.encode("utf-8"))
++                    curl.setopt(pycurl.WRITEDATA, buffer)
++                    curl.setopt(pycurl.NOSIGNAL, 1)
++                    curl.setopt(pycurl.FOLLOWLOCATION, 1)
++
++                    if timeout is not None:
++                        curl_timeout = max(1, int(math.ceil(timeout)))
++                        curl.setopt(pycurl.TIMEOUT, curl_timeout)
++                        curl.setopt(pycurl.CONNECTTIMEOUT, curl_timeout)
++
++                    if request_headers:
++                        curl.setopt(
++                            pycurl.HTTPHEADER,
++                            [f"{key}: {value}" for key, value in request_headers.items()]
++                        )
++
++                    if post_fields is not None:
++                        curl.setopt(pycurl.HTTPPOST, post_fields)
++                        if method != "POST":
++                            curl.setopt(pycurl.CUSTOMREQUEST, method)
++                    elif body is not None:
++                        if method == "GET":
++                            curl.setopt(pycurl.HTTPGET, 1)
++                        else:
++                            curl.setopt(pycurl.CUSTOMREQUEST, method)
++                            curl.setopt(pycurl.POSTFIELDS, body)
++                            curl.setopt(pycurl.POSTFIELDSIZE, len(body))
++                    else:
++                        if method == "GET":
++                            curl.setopt(pycurl.HTTPGET, 1)
++                        elif method == "POST":
++                            curl.setopt(pycurl.POST, 1)
++                        else:
++                            curl.setopt(pycurl.CUSTOMREQUEST, method)
++
++                    curl.perform()
++                    status_code = int(curl.getinfo(pycurl.RESPONSE_CODE))
++                    response_text = buffer.getvalue().decode(
++                        "utf-8", errors="replace"
++                    )
++            except Exception as error:
++                last_error = error
++                if attempt < attempts - 1:
++                    time.sleep(backoff_factor * (2 ** attempt))
++                    continue
++                raise error
++
++            if status_code == 429 and attempt < attempts - 1:
++                time.sleep(backoff_factor * (2 ** attempt))
++                continue
++
++            return _TransportResponse(status_code, response_text)
++
++        if last_error is not None:
++            raise last_error
++
++        return _TransportResponse(500, "")
++
++
+ class GreenApi:
+     host: str
+     media: str
+@@ -116,14 +294,14 @@ class GreenApi:
+ 
+         return GreenAPIResponse(response.status_code, response.text)
+ 
+-    def __handle_response(self, response: Response) -> Optional[NoReturn]:
++    def __handle_response(self, response: Any) -> None:
+         status_code = response.status_code
+         if status_code != 200 or self.debug_mode:
+             try:
+-                data = json.dumps(
+-                    json.loads(response.text), ensure_ascii=False, indent=4
++                data = json_module.dumps(
++                    json_module.loads(response.text), ensure_ascii=False, indent=4
+                 )
+-            except json.JSONDecodeError:
++            except json_module.JSONDecodeError:
+                 data = response.text
+ 
+             if status_code != 200:
+@@ -161,16 +339,6 @@ class GreenApi:
+     def __prepare_session(self) -> None:
+         self.session.headers["Connection"] = "close"
+ 
+-        retry = Retry(
+-            total=3,
+-            backoff_factor=1.0,
+-            allowed_methods=None,
+-            status_forcelist=[429]
+-        )
+-
+-        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+-
+ 
+ class GreenAPI(GreenApi):
+     pass

@@ -1,0 +1,209 @@
+--- a/sectxt/__init__.py
++++ b/sectxt/__init__.py
+@@ -2,6 +2,7 @@
+ # SPDX-License-Identifier: EUPL-1.2
+ #
+ import codecs
++import ssl
+ 
+ import langcodes
+ import re
+@@ -10,6 +11,7 @@
+ import validators
+ from collections import defaultdict
+ from datetime import datetime, timezone
++from threading import Event, Lock, Thread
+ from typing import Optional, Union, List, DefaultDict
+ from urllib.parse import urlsplit, urlunsplit
+ from pgpy_dtc import PGPMessage
+@@ -22,11 +24,149 @@
+     from typing import TypedDict
+ 
+ import dateutil.parser
+-import requests
++import treq
++from twisted.internet import reactor, ssl as twisted_ssl, threads
++from twisted.internet.defer import inlineCallbacks
++from twisted.web.client import Agent
++from twisted.web.iweb import IPolicyForHTTPS
++from zope.interface import implementer
+ 
+ __version__ = "0.9.6"
+ 
+-s = requests.Session()
++USER_AGENT = (
++    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) "
++    "Gecko/20100101 Firefox/12.0"
++)
++REQUEST_TIMEOUT_SECONDS = 5
++_reactor_started = Event()
++_reactor_lock = Lock()
++_reactor_thread: Optional[Thread] = None
++
++
++@implementer(IPolicyForHTTPS)
++class _NoVerifyTLSContextFactory:
++    def creatorForNetloc(self, hostname, port):
++        return twisted_ssl.CertificateOptions()
++
++
++class _ResponseHistory:
++    def __init__(self, url: str):
++        self.url = url
++
++
++class _Response:
++    def __init__(self, status_code: int, headers: dict, content: bytes, url: str, history: List[_ResponseHistory]):
++        self.status_code = status_code
++        self.headers = headers
++        self.content = content
++        self.url = url
++        self.history = history
++
++
++def _start_reactor() -> None:
++    reactor.callWhenRunning(_reactor_started.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor() -> None:
++    global _reactor_thread
++    if reactor.running:
++        _reactor_started.set()
++        return
++    with _reactor_lock:
++        if _reactor_thread is None:
++            _reactor_thread = Thread(
++                target=_start_reactor,
++                name="sectxt-treq-reactor",
++                daemon=True,
++            )
++            _reactor_thread.start()
++    _reactor_started.wait()
++
++
++def _decode_header(value) -> str:
++    if isinstance(value, bytes):
++        return value.decode("latin-1")
++    return value
++
++
++def _response_url(response, fallback: str) -> str:
++    request = getattr(response, "request", None)
++    absolute_uri = getattr(request, "absoluteURI", None)
++    if isinstance(absolute_uri, bytes):
++        return absolute_uri.decode("utf-8")
++    if absolute_uri:
++        return absolute_uri
++    return fallback
++
++
++def _response_history(response, fallback: str) -> List[_ResponseHistory]:
++    history = []
++    previous_response = getattr(response, "previousResponse", None)
++    while previous_response is not None:
++        history.append(_ResponseHistory(_response_url(previous_response, fallback)))
++        previous_response = getattr(previous_response, "previousResponse", None)
++    history.reverse()
++    return history
++
++
++def _http_client(verify: bool = True):
++    if verify:
++        return Agent(reactor)
++    return Agent(
++        reactor,
++        contextFactory=_NoVerifyTLSContextFactory(),
++    )
++
++
++@inlineCallbacks
++def _treq_get(url: str, verify: bool = True):
++    response = yield treq.get(
++        url,
++        headers={"User-Agent": USER_AGENT},
++        timeout=REQUEST_TIMEOUT_SECONDS,
++        agent=_http_client(verify),
++    )
++    content = yield treq.content(response)
++    headers = {}
++    for key, values in response.headers.getAllRawHeaders():
++        headers[_decode_header(key).lower()] = ", ".join(
++            _decode_header(value) for value in values
++        )
++
++    return _Response(
++        status_code=response.code,
++        headers=headers,
++        content=content,
++        url=_response_url(response, url),
++        history=_response_history(response, url),
++    )
++
++
++def _http_get(url: str, verify: bool = True):
++    _ensure_reactor()
++    return threads.blockingCallFromThread(reactor, _treq_get, url, verify)
++
++
++def _is_tls_error(exc: Exception) -> bool:
++    if isinstance(exc, ssl.SSLError):
++        return True
++
++    reasons = getattr(exc, "reasons", ())
++    for reason in reasons:
++        nested = getattr(reason, "value", reason)
++        if isinstance(nested, Exception) and _is_tls_error(nested):
++            return True
++
++    exc_type = type(exc)
++    exc_name = exc_type.__name__.lower()
++    exc_module = exc_type.__module__.lower()
++    return (
++        "ssl" in exc_name
++        or "ssl" in exc_module
++        or "certificate" in exc_name
++        or "verification" in exc_name
++    )
+ 
+ 
+ class ErrorDict(TypedDict):
+@@ -557,32 +697,19 @@
+                 for path in [".well-known/security.txt", "security.txt"]:
+                     url = urlunsplit((scheme, self._loc, path, None, None))
+                     try:
+-                        resp = requests.get(
+-                            url,
+-                            headers={
+-                                'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                              'Gecko/20100101 Firefox/12.0'},
+-                            timeout=5
+-                        )
+-                    except requests.exceptions.SSLError:
++                        resp = _http_get(url)
++                    except Exception as exc:
++                        if not _is_tls_error(exc):
++                            continue
+                         if not any(d["code"] == "invalid_cert" for d in self._errors):
+                             self._add_error(
+                                 "invalid_cert",
+                                 "security.txt must be served with a valid TLS certificate.",
+                             )
+                         try:
+-                            resp = requests.get(
+-                                url,
+-                                headers={
+-                                    'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                                  'Gecko/20100101 Firefox/12.0'},
+-                                timeout=5,
+-                                verify=False
+-                            )
+-                        except:
++                            resp = _http_get(url, verify=False)
++                        except Exception:
+                             continue
+-                    except:
+-                        continue
+                     if resp.status_code == 200:
+                         if resp.history:
+                             if not resp.url.endswith(path):

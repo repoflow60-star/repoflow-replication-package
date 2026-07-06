@@ -1,0 +1,244 @@
+--- a/srpenergy/client.py
++++ b/srpenergy/client.py
+@@ -4,14 +4,18 @@
+ 
+ """
+ 
++import asyncio
++import inspect
+ from datetime import datetime, timedelta
+ import re
++from types import SimpleNamespace
+ from urllib.parse import unquote
+ 
++import aiohttp
+ from dateutil.parser import parse
+-import requests
+ 
+ BASE_USAGE_URL = "https://myaccount.srpnet.com/myaccountapi/api/"
++requests = SimpleNamespace(Session=aiohttp.ClientSession)
+ 
+ 
+ def get_pretty_date(date_part):
+@@ -112,6 +116,33 @@
+     return rate, is_peak
+ 
+ 
++async def _await_if_needed(value):
++    if inspect.isawaitable(value):
++        return await value
++
++    return value
++
++
++async def _response_json(response):
++    try:
++        payload = response.json(content_type=None)
++    except TypeError:
++        payload = response.json()
++
++    return await _await_if_needed(payload)
++
++
++async def _close_response(response):
++    close = getattr(response, "release", None)
++    if callable(close):
++        await _await_if_needed(close())
++
++
++def _xsrf_token_from_cookie(cookie):
++    value = cookie.value if hasattr(cookie, "value") else cookie
++    return unquote(value)
++
++
+ class SrpEnergyClient:
+     """SrpEnergyClient(accountid, username, password).
+ 
+@@ -187,21 +218,23 @@
+ 
+         """
+         try:
+-
+-            with requests.Session() as session:
+-
+-                response = session.post(
++            return asyncio.run(self._validate_async())
++        except Exception:  # pylint: disable=W0703
++            return False
++
++    async def _validate_async(self):
++        session_cls = getattr(requests, "Session")
++
++        async with session_cls() as session:
++            response = await _await_if_needed(
++                session.post(
+                     BASE_USAGE_URL + "/login/authorize",
+                     data={"username": self.username, "password": self.password},
+                 )
+-                data = response.json()
+-
+-                valid = data["message"] == "Log in successful."
+-
+-                return valid
+-
+-        except Exception:  # pylint: disable=W0703
+-            return False
++            )
++            data = await _response_json(response)
++
++        return data["message"] == "Log in successful."
+ 
+     def usage(self, startdate, enddate, is_tou=False):  # pylint: disable=R0914
+         """Get the energy usage for a given date range.
+@@ -267,22 +300,32 @@
+             raise ValueError("Parameter startdate can not be greater than now.")
+ 
+         try:
+-
+-            # Convert datetime to strings
+-            str_startdate = startdate.strftime("%m-%d-%Y")
+-            str_enddate = enddate.strftime("%m-%d-%Y")
+-
+-            with requests.Session() as session:
+-
+-                response = session.post(
++            return asyncio.run(self._usage_async(startdate, enddate, is_tou))
++        except Exception as ex:
++            raise ex
++
++    async def _usage_async(self, startdate, enddate, is_tou=False):
++        # Convert datetime to strings
++        str_startdate = startdate.strftime("%m-%d-%Y")
++        str_enddate = enddate.strftime("%m-%d-%Y")
++
++        session_cls = getattr(requests, "Session")
++
++        async with session_cls() as session:
++            response = await _await_if_needed(
++                session.post(
+                     BASE_USAGE_URL + "login/authorize",
+                     data={"username": self.username, "password": self.password},
+                 )
+-
+-                response = session.get(BASE_USAGE_URL + "login/antiforgerytoken")
+-                xsrf_token = unquote(response.cookies["xsrf-token"])
+-
+-                response = session.get(
++            )
++            await _close_response(response)
++
++            response = await _await_if_needed(session.get(BASE_USAGE_URL + "login/antiforgerytoken"))
++            xsrf_token = _xsrf_token_from_cookie(response.cookies["xsrf-token"])
++            await _close_response(response)
++
++            response = await _await_if_needed(
++                session.get(
+                     BASE_USAGE_URL
+                     + "usage/hourlydetail?billaccount="
+                     + self.accountid
+@@ -292,55 +335,53 @@
+                     + str_enddate,
+                     headers={"x-xsrf-token": xsrf_token},
+                 )
+-
+-                data = response.json()
+-                hourly_usage_list = data["hourlyUsageList"]
+-
+-                usage = []
+-                for row in hourly_usage_list:
+-
+-                    total_kwh = row["totalKwh"]
+-                    if total_kwh == 0:
+-                        # Build the total_kwh from separate fields for EZ-3.
+-                        total_kwh = (
+-                            row["onPeakKwh"]
+-                            + row["offPeakKwh"]
+-                            + row["shoulderKwh"]
+-                            + row["superOffPeakKwh"]
+-                        )
+-
+-                    total_cost = row["totalCost"]
+-                    if total_cost == 0:
+-                        # Build the total_cost from separate fields for EZ-3.
+-                        total_cost = (
+-                            row["onPeakCost"]
+-                            + row["offPeakCost"]
+-                            + row["shoulderCost"]
+-                            + row["superOffPeakCost"]
+-                        )
+-
+-                    # Check if on Time of Use Plan
+-                    if is_tou:
+-
+-                        rate, is_peak = get_rate(row["date"])
+-
+-                        if is_peak:
+-                            total_kwh = row["onPeakKwh"]
+-                        else:
+-                            total_kwh = row["offPeakKwh"]
+-
+-                        total_cost = total_kwh * rate
+-
+-                    values = (
+-                        get_pretty_date(row["date"]),
+-                        get_pretty_time(row["date"]),
+-                        row["date"],
+-                        total_kwh,
+-                        round(total_cost, 2),
+-                    )
+-                    usage.append(values)
+-
+-                return usage
+-
+-        except Exception as ex:
+-            raise ex
++            )
++            data = await _response_json(response)
++
++        hourly_usage_list = data["hourlyUsageList"]
++
++        usage = []
++        for row in hourly_usage_list:
++
++            total_kwh = row["totalKwh"]
++            if total_kwh == 0:
++                # Build the total_kwh from separate fields for EZ-3.
++                total_kwh = (
++                    row["onPeakKwh"]
++                    + row["offPeakKwh"]
++                    + row["shoulderKwh"]
++                    + row["superOffPeakKwh"]
++                )
++
++            total_cost = row["totalCost"]
++            if total_cost == 0:
++                # Build the total_cost from separate fields for EZ-3.
++                total_cost = (
++                    row["onPeakCost"]
++                    + row["offPeakCost"]
++                    + row["shoulderCost"]
++                    + row["superOffPeakCost"]
++                )
++
++            # Check if on Time of Use Plan
++            if is_tou:
++
++                rate, is_peak = get_rate(row["date"])
++
++                if is_peak:
++                    total_kwh = row["onPeakKwh"]
++                else:
++                    total_kwh = row["offPeakKwh"]
++
++                total_cost = total_kwh * rate
++
++            values = (
++                get_pretty_date(row["date"]),
++                get_pretty_time(row["date"]),
++                row["date"],
++                total_kwh,
++                round(total_cost, 2),
++            )
++            usage.append(values)
++
++        return usage

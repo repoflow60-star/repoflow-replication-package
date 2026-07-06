@@ -1,0 +1,166 @@
+diff --git a/wikipediaapi/__init__.py b/wikipediaapi/__init__.py
+index 5522182..225615f 100644
+--- a/wikipediaapi/__init__.py
++++ b/wikipediaapi/__init__.py
+@@ -12,10 +12,18 @@ from collections import defaultdict
+ from enum import IntEnum
+ import logging
+ import re
++import threading
+ from typing import Any, Optional, Union
+ from urllib import parse
+ 
+-import requests
++try:
++    import treq
++    from twisted.internet import reactor
++    from twisted.internet.threads import blockingCallFromThread
++except ImportError:
++    treq = None
++    reactor = None
++    blockingCallFromThread = None
+ 
+ USER_AGENT = (
+     "Wikipedia-API/"
+@@ -30,6 +38,111 @@ log = logging.getLogger(__name__)
+ PagesDict = dict[str, "WikipediaPage"]
+ 
+ 
++class _RequestsResponseAdapter:
++    """Small response wrapper exposing the subset we use."""
++
++    def __init__(self, response):
++        self._response = response
++
++    def json(self):
++        return self._response.json()
++
++
++class _RequestsSessionAdapter:
++    """Synchronous HTTP client backed by requests."""
++
++    def __init__(self, headers: dict[str, Any], request_kwargs: dict[str, Any]):
++        import requests
++
++        self.headers = headers
++        self._session = requests.Session()
++        self._session.headers.update(headers)
++        self._request_kwargs = request_kwargs
++
++    def get(self, url: str, params=None, **kwargs):
++        request_kwargs = dict(self._request_kwargs)
++        request_kwargs.update(kwargs)
++        return _RequestsResponseAdapter(
++            self._session.get(url, params=params, **request_kwargs)
++        )
++
++    def close(self):
++        self._session.close()
++
++
++class _TreqResponseAdapter:
++    """Small response wrapper exposing the subset we use."""
++
++    def __init__(self, response):
++        self._response = response
++
++    def json(self):
++        return blockingCallFromThread(reactor, treq.json_content, self._response)
++
++
++class _TreqSessionAdapter:
++    """Synchronous HTTP client backed by treq and a background reactor."""
++
++    _reactor_thread_started = False
++    _reactor_thread_lock = threading.Lock()
++    _reactor_thread = None
++
++    def __init__(self, headers: dict[str, Any], request_kwargs: dict[str, Any]):
++        self.headers = headers
++        self._request_kwargs = request_kwargs
++        self._ensure_reactor()
++
++    @classmethod
++    def _ensure_reactor(cls):
++        if cls._reactor_thread_started:
++            return
++
++        with cls._reactor_thread_lock:
++            if cls._reactor_thread_started:
++                return
++
++            def _run_reactor():
++                reactor.run(installSignalHandlers=False)
++
++            cls._reactor_thread = threading.Thread(
++                target=_run_reactor,
++                name="wikipediaapi-treq-reactor",
++                daemon=True,
++            )
++            cls._reactor_thread.start()
++            cls._reactor_thread_started = True
++
++    def get(self, url: str, params=None, **kwargs):
++        request_kwargs = dict(self._request_kwargs)
++        request_kwargs.update(kwargs)
++        request_kwargs["headers"] = self.headers
++        if params is not None:
++            request_kwargs["params"] = params
++
++        response = blockingCallFromThread(
++            reactor,
++            treq.get,
++            url,
++            **request_kwargs,
++        )
++        return _TreqResponseAdapter(response)
++
++    def close(self):
++        return None
++
++
++def _create_http_session(
++    headers: dict[str, Any], request_kwargs: dict[str, Any]
++) -> object:
++    if treq is not None and reactor is not None and blockingCallFromThread is not None:
++        # treq does not cover every requests keyword argument, so keep the
++        # requests-backed path for explicit proxy-style usage.
++        if "proxies" not in request_kwargs:
++            return _TreqSessionAdapter(headers, request_kwargs)
++
++    return _RequestsSessionAdapter(headers, request_kwargs)
++
++
+ class ExtractFormat(IntEnum):
+     """Represents extraction format."""
+ 
+@@ -147,8 +260,7 @@ class Wikipedia:
+         :param extract_format: Format used for extractions
+                 :class:`ExtractFormat` object.
+         :param headers:  Headers sent as part of HTTP request
+-        :param kwargs: Optional parameters used in -
+-                http://docs.python-requests.org/en/master/api/#requests.request
++        :param kwargs: Optional parameters passed to the underlying HTTP client.
+ 
+         Examples:
+ 
+@@ -188,9 +300,7 @@ class Wikipedia:
+             self.extract_format,
+         )
+ 
+-        self._session = requests.Session()
+-        self._session.headers.update(default_headers)
+-        self._request_kwargs = kwargs
++        self._session = _create_http_session(default_headers, kwargs)
+ 
+     def __del__(self) -> None:
+         """Closes session."""
+@@ -526,7 +636,7 @@ class Wikipedia:
+         )
+         params["format"] = "json"
+         params["redirects"] = 1
+-        r = self._session.get(base_url, params=params, **self._request_kwargs)
++        r = self._session.get(base_url, params=params)
+         return r.json()
+ 
+     def _build_extracts(self, extract, page: "WikipediaPage") -> str:

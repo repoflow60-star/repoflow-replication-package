@@ -1,0 +1,231 @@
+diff --git a/whatsapp_api_client_python/API.py b/whatsapp_api_client_python/API.py
+index 4449db9..699be5f 100644
+--- a/whatsapp_api_client_python/API.py
++++ b/whatsapp_api_client_python/API.py
+@@ -1,9 +1,28 @@
++import asyncio
+ import json
+ import logging
+-from typing import Any, NoReturn, Optional
++import sys
++from concurrent.futures import ThreadPoolExecutor
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, Dict, Optional
++
++_LOCAL_SITE_PACKAGES = (
++    Path(__file__).resolve().parents[3]
++    / "venv_overlay"
++    / "merged"
++    / "lib"
++    / f"python{sys.version_info.major}.{sys.version_info.minor}"
++    / "site-packages"
++)
++
++if _LOCAL_SITE_PACKAGES.exists():
++    local_site_packages = str(_LOCAL_SITE_PACKAGES)
++    if local_site_packages not in sys.path:
++        sys.path.insert(0, local_site_packages)
+ 
+-from requests import Response, Session
+-from requests.adapters import HTTPAdapter, Retry
++import aiohttp
++from aiohttp import ClientTimeout, FormData
+ 
+ from .response import Response as GreenAPIResponse
+ from .tools import (
+@@ -20,6 +39,168 @@ from .tools import (
+ )
+ 
+ 
++@dataclass
++class _SessionResponse:
++    status_code: int
++    text: str
++
++
++class Session:
++    def __init__(self) -> None:
++        self.headers: Dict[str, str] = {}
++
++    def mount(self, *_args: Any, **_kwargs: Any) -> None:
++        return None
++
++    def request(
++            self,
++            method: str,
++            url: str,
++            json: Optional[dict] = None,
++            data: Any = None,
++            files: Optional[dict] = None,
++            timeout: Optional[float] = None,
++            headers: Optional[dict] = None,
++            **kwargs: Any
++    ) -> _SessionResponse:
++        return self.__run(self.__request(
++            method=method,
++            url=url,
++            json=json,
++            data=data,
++            files=files,
++            timeout=timeout,
++            headers=headers,
++            **kwargs
++        ))
++
++    @staticmethod
++    def __run(coro: Any) -> Any:
++        try:
++            asyncio.get_running_loop()
++        except RuntimeError:
++            return asyncio.run(coro)
++
++        with ThreadPoolExecutor(max_workers=1) as executor:
++            future = executor.submit(asyncio.run, coro)
++            return future.result()
++
++    async def __request(
++            self,
++            method: str,
++            url: str,
++            json: Optional[dict] = None,
++            data: Any = None,
++            files: Optional[dict] = None,
++            timeout: Optional[float] = None,
++            headers: Optional[dict] = None,
++            **kwargs: Any
++    ) -> _SessionResponse:
++        request_headers = dict(self.headers)
++
++        if headers:
++            request_headers.update(headers)
++
++        timeout_object = (
++            ClientTimeout(total=timeout) if timeout is not None else None
++        )
++
++        last_error: Optional[Exception] = None
++
++        for attempt in range(4):
++            try:
++                request_kwargs = dict(kwargs)
++
++                if json is not None:
++                    request_kwargs["json"] = json
++                elif files:
++                    request_kwargs["data"] = self.__build_form_data(
++                        data, files
++                    )
++                elif data is not None:
++                    request_kwargs["data"] = data
++
++                if timeout_object is not None:
++                    request_kwargs["timeout"] = timeout_object
++
++                async with aiohttp.ClientSession(
++                        headers=request_headers
++                ) as session:
++                    async with session.request(
++                            method=method,
++                            url=url,
++                            **request_kwargs
++                    ) as response:
++                        response_text = await response.text()
++
++                        if response.status == 429 and attempt < 3:
++                            await asyncio.sleep(2 ** attempt)
++                            continue
++
++                        return _SessionResponse(
++                            status_code=response.status,
++                            text=response_text
++                        )
++            except (aiohttp.ClientError, asyncio.TimeoutError) as error:
++                last_error = error
++
++                if attempt < 3:
++                    await asyncio.sleep(2 ** attempt)
++                    continue
++
++                raise
++
++        if last_error is not None:
++            raise last_error
++
++        raise RuntimeError("Request failed without a captured response.")
++
++    @staticmethod
++    def __build_form_data(data: Any, files: dict) -> FormData:
++        form = FormData()
++
++        if isinstance(data, dict):
++            for key, value in data.items():
++                form.add_field(key, Session.__normalize_field_value(value))
++        elif data is not None:
++            form.add_field("data", Session.__normalize_field_value(data))
++
++        for key, file_value in files.items():
++            file_name = None
++            file_obj = file_value
++            content_type = None
++
++            if isinstance(file_value, tuple):
++                if len(file_value) == 3:
++                    file_name, file_obj, content_type = file_value
++                elif len(file_value) == 2:
++                    file_name, file_obj = file_value
++                else:
++                    file_obj = file_value[-1]
++
++            if content_type:
++                form.add_field(
++                    key,
++                    file_obj,
++                    filename=file_name,
++                    content_type=content_type
++                )
++            elif file_name is not None:
++                form.add_field(key, file_obj, filename=file_name)
++            else:
++                form.add_field(key, file_obj)
++
++        return form
++
++    @staticmethod
++    def __normalize_field_value(value: Any) -> Any:
++        if value is None:
++            return ""
++        if isinstance(value, bool):
++            return "true" if value else "false"
++        return value
++
++
+ class GreenApi:
+     host: str
+     media: str
+@@ -116,7 +297,7 @@ class GreenApi:
+ 
+         return GreenAPIResponse(response.status_code, response.text)
+ 
+-    def __handle_response(self, response: Response) -> Optional[NoReturn]:
++    def __handle_response(self, response: Any) -> None:
+         status_code = response.status_code
+         if status_code != 200 or self.debug_mode:
+             try:
+@@ -161,16 +342,6 @@ class GreenApi:
+     def __prepare_session(self) -> None:
+         self.session.headers["Connection"] = "close"
+ 
+-        retry = Retry(
+-            total=3,
+-            backoff_factor=1.0,
+-            allowed_methods=None,
+-            status_forcelist=[429]
+-        )
+-
+-        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+-
+ 
+ class GreenAPI(GreenApi):
+     pass

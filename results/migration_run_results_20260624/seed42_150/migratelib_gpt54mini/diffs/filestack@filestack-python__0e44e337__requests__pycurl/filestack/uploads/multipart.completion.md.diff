@@ -1,0 +1,410 @@
+--- /dev/null
++++ b/filestack/uploads/multipart.completion.md
+@@ -0,0 +1,204 @@
++I replaced the `requests`-based HTTP calls with `pycurl` equivalents, keeping the same function names, variables, and overall flow. The JSON POST requests now use a `pycurl.Curl` handle with request body and response capture, and the PUT upload now sends the chunk bytes with headers set from the multipart response while reading the returned `ETag` from the response headers.
+
++
+
++```python
+
++import os
+
++import hashlib
+
++import mimetypes
+
++import multiprocessing
+
++from base64 import b64encode
+
++from functools import partial
+
++from concurrent.futures import ThreadPoolExecutor
+
++from io import BytesIO
+
++from urllib.parse import urlencode
+
++
+
++import pycurl
+
++
+
++from filestack import config
+
++
+
++
+
++class Chunk:
+
++    def __init__(self, num, seek_point, data=None, filepath=None):
+
++        self.num = num
+
++        self.seek_point = seek_point
+
++        self.data = data
+
++        self.filepath = filepath
+
++
+
++    def __repr__(self):
+
++        return '<Chunk part: {}, seek: {}>'.format(self.num, self.seek_point)
+
++
+
++    @property
+
++    def bytes(self):
+
++        if self.data:
+
++            return self.data
+
++
+
++        with open(self.filepath, 'rb') as f:
+
++            f.seek(self.seek_point)
+
++            data = f.read(config.DEFAULT_CHUNK_SIZE)
+
++
+
++        return data
+
++
+
++
+
++def _pycurl_request(url, method='GET', json_data=None, headers=None, data=None):
+
++    response_body = BytesIO()
+
++    response_headers = BytesIO()
+
++
+
++    curl = pycurl.Curl()
+
++    curl.setopt(pycurl.URL, url)
+
++    curl.setopt(pycurl.FOLLOWLOCATION, 1)
+
++    curl.setopt(pycurl.WRITEFUNCTION, response_body.write)
+
++    curl.setopt(pycurl.HEADERFUNCTION, response_headers.write)
+
++
+
++    request_headers = []
+
++    if headers:
+
++        for key, value in headers.items():
+
++            request_headers.append('{}: {}'.format(key, value))
+
++
+
++    if json_data is not None:
+
++        body = bytes(str(json_data).replace("'", '"'), 'utf-8')
+
++        curl.setopt(pycurl.POSTFIELDS, body)
+
++        request_headers.append('Content-Type: application/json')
+
++        if method == 'POST':
+
++            curl.setopt(pycurl.POST, 1)
+
++        elif method == 'PUT':
+
++            curl.setopt(pycurl.CUSTOMREQUEST, 'PUT')
+
++    elif data is not None:
+
++        curl.setopt(pycurl.POSTFIELDS, data)
+
++        if method == 'PUT':
+
++            curl.setopt(pycurl.CUSTOMREQUEST, 'PUT')
+
++        elif method == 'POST':
+
++            curl.setopt(pycurl.POST, 1)
+
++    else:
+
++        if method == 'POST':
+
++            curl.setopt(pycurl.POST, 1)
+
++        elif method == 'PUT':
+
++            curl.setopt(pycurl.CUSTOMREQUEST, 'PUT')
+
++
+
++    if request_headers:
+
++        curl.setopt(pycurl.HTTPHEADER, request_headers)
+
++
+
++    curl.perform()
+
++    status_code = curl.getinfo(pycurl.RESPONSE_CODE)
+
++    curl.close()
+
++
+
++    response_body.seek(0)
+
++    response_headers.seek(0)
+
++
+
++    class Response:
+
++        def __init__(self, body, headers, status_code):
+
++            self._body = body
+
++            self.headers = headers
+
++            self.status_code = status_code
+
++
+
++        def json(self):
+
++            import json
+
++            return json.loads(self._body.read().decode('utf-8'))
+
++
+
++    parsed_headers = {}
+
++    for line in response_headers.read().decode('utf-8').splitlines():
+
++        if ':' in line:
+
++            key, value = line.split(':', 1)
+
++            parsed_headers[key.strip()] = value.strip()
+
++
+
++    return Response(response_body, parsed_headers, status_code)
+
++
+
++
+
++def multipart_request(url, payload, params=None, security=None):
+
++    for key in ('path', 'location', 'region', 'container', 'access'):
+
++        if key in params:
+
++            payload['store'][key] = params[key]
+
++
+
++    if security:
+
++        payload.update({
+
++            'policy': security.policy_b64,
+
++            'signature': security.signature
+
++        })
+
++
+
++    return _pycurl_request(url, method='POST', json_data=payload).json()
+
++
+
++
+
++def make_chunks(filepath=None, file_obj=None, filesize=None):
+
++    chunks = []
+
++    for num, seek_point in enumerate(range(0, filesize, config.DEFAULT_CHUNK_SIZE)):
+
++        if filepath:
+
++            chunks.append(Chunk(num + 1, seek_point, filepath=filepath))
+
++        else:  # file_obj
+
++            file_obj.seek(seek_point)
+
++            chunks.append(Chunk(num + 1, seek_point, data=file_obj.read(config.DEFAULT_CHUNK_SIZE)))
+
++
+
++    if file_obj:
+
++        del file_obj
+
++
+
++    return chunks
+
++
+
++
+
++def upload_chunk(apikey, filename, storage, start_response, chunk):
+
++    payload = {
+
++        'apikey': apikey,
+
++        'part': chunk.num,
+
++        'size': len(chunk.bytes),
+
++        'md5': b64encode(hashlib.md5(chunk.bytes).digest()).strip().decode('utf-8'),
+
++        'uri': start_response['uri'],
+
++        'region': start_response['region'],
+
++        'upload_id': start_response['upload_id'],
+
++        'store': {
+
++            'location': storage,
+
++        }
+
++    }
+
++
+
++    fs_resp = _pycurl_request(
+
++        'https://{}/multipart/upload'.format(start_response['location_url']),
+
++        method='POST',
+
++        json_data=payload
+
++    ).json()
+
++
+
++    resp = _pycurl_request(fs_resp['url'], method='PUT', headers=fs_resp['headers'], data=chunk.bytes)
+
++
+
++    return {'part_number': chunk.num, 'etag': resp.headers['ETag']}
+
++
+
++
+
++def multipart_upload(apikey, filepath, file_obj, storage, params=None, security=None):
+
++    params = params or {}
+
++
+
++    upload_processes = multiprocessing.cpu_count()
+
++
+
++    if filepath:
+
++        filename = params.get('filename') or os.path.split(filepath)[1]
+
++        mimetype = params.get('mimetype') or mimetypes.guess_type(filepath)[0] or config.DEFAULT_UPLOAD_MIMETYPE
+
++        filesize = os.path.getsize(filepath)
+
++    else:
+
++        filename = params.get('filename', 'unnamed_file')
+
++        mimetype = params.get('mimetype') or config.DEFAULT_UPLOAD_MIMETYPE
+
++        file_obj.seek(0, os.SEEK_END)
+
++        filesize = file_obj.tell()
+
++
+
++    payload = {
+
++        'apikey': apikey,
+
++        'filename': filename,
+
++        'mimetype': mimetype,
+
++        'size': filesize,
+
++        'store': {
+
++            'location': storage
+
++        }
+
++    }
+
++
+
++    chunks = make_chunks(filepath, file_obj, filesize)
+
++    start_response = multipart_request(config.MULTIPART_START_URL, payload, params, security)
+
++    upload_func = partial(upload_chunk, apikey, filename, storage, start_response)
+
++
+
++    with ThreadPoolExecutor(max_workers=upload_processes) as executor:
+
++        uploaded_parts = list(executor.map(upload_func, chunks))
+
++
+
++    location_url = start_response.pop('location_url')
+
++    payload.update(start_response)
+
++    payload['parts'] = uploaded_parts
+
++
+
++    if 'workflows' in params:
+
++        payload['store']['workflows'] = params.pop('workflows')
+
++
+
++    if 'upload_tags' in params:
+
++        payload['upload_tags'] = params.pop('upload_tags')
+
++
+
++    complete_url = 'https://{}/multipart/complete'.format(location_url)
+
++    complete_response = multipart_request(complete_url, payload, params, security)
+
++    return complete_response
+
++```

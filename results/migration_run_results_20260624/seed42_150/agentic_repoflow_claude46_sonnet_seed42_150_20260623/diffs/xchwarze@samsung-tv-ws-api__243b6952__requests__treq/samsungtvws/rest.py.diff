@@ -1,0 +1,97 @@
+--- a/samsungtvws/rest.py
++++ b/samsungtvws/rest.py
+@@ -7,13 +7,37 @@
+ """
+ 
+ import logging
++import ssl
++import threading
++import time
+ from typing import Any, Dict, Optional
+ 
+-import requests
++import treq
++from twisted.internet import defer, reactor, threads
++from twisted.internet.error import ConnectionRefusedError as TwistedConnectionRefusedError
++from twisted.web._newclient import ResponseNeverReceived
+ 
+ from . import connection, exceptions, helper
+ 
+ _LOGGING = logging.getLogger(__name__)
++
++_reactor_started = False
++_reactor_lock = threading.Lock()
++
++
++def _ensure_reactor_running() -> None:
++    """Start the Twisted reactor in a background daemon thread if not already running."""
++    global _reactor_started
++    with _reactor_lock:
++        if not _reactor_started:
++            _reactor_started = True
++            t = threading.Thread(
++                target=lambda: reactor.run(installSignalHandlers=False),  # type: ignore[attr-defined]
++                daemon=True,
++            )
++            t.start()
++            # Give the reactor thread a moment to start before first use
++            time.sleep(0.05)
+ 
+ 
+ class SamsungTVRest(connection.SamsungTVWSBaseConnection):
+@@ -32,17 +56,45 @@
+ 
+     def _rest_request(self, target: str, method: str = "GET") -> Dict[str, Any]:
+         url = self._format_rest_url(target)
++        timeout = self.timeout if self.timeout is not None else 0
++
++        kwargs: Dict[str, Any] = {"timeout": timeout}
++        # Disable SSL certificate verification for self-signed TV certificates
++        if url.startswith("https"):
++            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
++            ssl_context.check_hostname = False
++            ssl_context.verify_mode = ssl.CERT_NONE
++            kwargs["contextFactory"] = ssl_context
++
++        _ensure_reactor_running()
++
++        @defer.inlineCallbacks  # type: ignore[misc]
++        def _do_request() -> "defer.Generator[Any, Any, Dict[str, Any]]":
++            try:
++                if method == "POST":
++                    response = yield treq.post(url, **kwargs)
++                elif method == "PUT":
++                    response = yield treq.put(url, **kwargs)
++                elif method == "DELETE":
++                    response = yield treq.delete(url, **kwargs)
++                else:
++                    response = yield treq.get(url, **kwargs)
++                text = yield treq.text_content(response)
++                defer.returnValue(helper.process_api_response(text))
++            except (
++                TwistedConnectionRefusedError,
++                ResponseNeverReceived,
++                ConnectionError,
++            ) as err:
++                raise exceptions.HttpApiError(
++                    "TV unreachable or feature not supported on this model."
++                ) from err
++
+         try:
+-            if method == "POST":
+-                response = requests.post(url, timeout=self.timeout, verify=False)
+-            elif method == "PUT":
+-                response = requests.put(url, timeout=self.timeout, verify=False)
+-            elif method == "DELETE":
+-                response = requests.delete(url, timeout=self.timeout, verify=False)
+-            else:
+-                response = requests.get(url, timeout=self.timeout, verify=False)
+-            return helper.process_api_response(response.text)
+-        except requests.ConnectionError as err:
++            return threads.blockingCallFromThread(reactor, _do_request)  # type: ignore[attr-defined,return-value]
++        except exceptions.HttpApiError:
++            raise
++        except Exception as err:
+             raise exceptions.HttpApiError(
+                 "TV unreachable or feature not supported on this model."
+             ) from err
