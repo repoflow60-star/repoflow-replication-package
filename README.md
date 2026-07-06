@@ -1,8 +1,10 @@
-# RepoFlow Sanitized Open-Source Data Package
+# RepoFlow Open-Source Replication Package
 
-This directory is a sanitized open-source-only subset of the RepoFlow paper data package. It keeps the artifacts needed to inspect the open-source benchmark results, dataset analytics, motivating example, and human-audit support package while excluding private/proprietary data and local machine metadata.
+This repository is the sanitized open-source replication package for the RepoFlow paper. It contains the artifacts needed to inspect the open-source benchmark results, dataset analytics, motivating example, and human-audit support package.
 
-## Included
+The package is intended for public release. It excludes private/proprietary benchmark data, raw execution workspaces, virtual environments, overlay filesystems, local machine paths, Git history from the source artifact tree, credentials, and processing/rebuild code except for the small local human-audit viewer.
+
+## Repository Layout
 
 - `motivating_examples/`
   Compact motivating example evidence and static viewer payload.
@@ -19,9 +21,11 @@ This directory is a sanitized open-source-only subset of the RepoFlow paper data
 - `analysis/figures/outputs/`
   Generated figure data and rendered SVG/PNG figures for the open-source comparisons.
 
-## Excluded
+## Data Scope
 
-This copy intentionally excludes proprietary/private data, Git metadata, processing/rebuild code except the human-audit viewer server, raw local run roots, overlays, venvs, caches, and local machine paths.
+Included benchmark artifacts are limited to open-source repository cases. The package intentionally excludes proprietary/private data, local raw-run roots, overlays, venvs, caches, and local machine metadata.
+
+Repository-relative diffs may contain variable names, comments, or paths that originally appeared in public open-source repositories. These are retained as benchmark evidence. Local execution paths and credential provenance strings from our environment are not retained.
 
 ## Human Audit Viewer
 
@@ -36,3 +40,9 @@ Then open `http://<machine-address>:8765/index.html`.
 
 - `MANIFEST.json` records package scope, exclusions, and run-level counts.
 - `SHA256SUMS.txt` records checksums for files in this sanitized copy.
+
+To verify checksums:
+
+```bash
+sha256sum -c SHA256SUMS.txt
+```
