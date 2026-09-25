@@ -21,6 +21,10 @@ The package is intended for public release. It excludes private/proprietary benc
 - `analysis/figures/outputs/`
   Generated figure data and rendered SVG/PNG figures for the open-source comparisons.
 
+## Benchmark Curation
+
+The [curation report](analysis/dataset_curation/README.md) provides the complete case inventory, exclusion reasons, and corrected count reconciliation. It explains the difference between the upstream paper's reported starting count and the available artifact, while confirming that the published 594-case evaluation set is unchanged.
+
 ## Data Scope
 
 Included benchmark artifacts are limited to open-source repository cases. The package intentionally excludes proprietary/private data, local raw-run roots, overlays, venvs, caches, and local machine metadata.
