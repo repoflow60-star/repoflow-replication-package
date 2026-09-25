@@ -50,3 +50,7 @@ To verify checksums:
 ```bash
 sha256sum -c SHA256SUMS.txt
 ```
+
+## Results by library pair
+
+The [library-pair breakdown](analysis/library_pair_results/README.md) reports instance counts and success rates for all 48 directed pairs in the full 594-case open-source benchmark, for RepoFlow and all three baselines. CSV data and source-hash verification are included.
