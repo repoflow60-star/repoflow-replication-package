@@ -54,3 +54,7 @@ sha256sum -c SHA256SUMS.txt
 ## Results by library pair
 
 The [library-pair breakdown](analysis/library_pair_results/README.md) reports instance counts and success rates for all 48 directed pairs in the full 594-case open-source benchmark, for RepoFlow and all three baselines. CSV data and source-hash verification are included.
+
+## Preliminary documentation experiment
+
+The [historical API-reference comparison](analysis/preliminary_api_documentation/README.md) provides the settings, per-case outcomes, and verification for documentation enabled versus disabled on 134 cases in an earlier prototype. Its historical success metric is distinct from the final paper’s integrity-validated results.
