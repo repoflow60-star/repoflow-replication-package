@@ -1,0 +1,145 @@
+--- a/authomize/rest_api_client/client/base_client.py
++++ b/authomize/rest_api_client/client/base_client.py
+@@ -1,13 +1,15 @@
+ from typing import Optional
+ 
+-import requests
+-from requests import Response
++import aiohttp
+ 
+ AUTHOMIZE_API_URL = 'https://api.authomize.com'
+ 
+ 
+ class ClientError(Exception):
++    """Raised when the API returns an error or an unexpected response."""
++
+     def __init__(self, message):
++        super().__init__(message)
+         self.message = message
+ 
+ 
+@@ -15,22 +17,32 @@
+     def __init__(self, auth_token: str, base_url: str = AUTHOMIZE_API_URL):
+         self.auth_token = auth_token
+         self.base_url = base_url
+-        self.session = requests.Session()
+-        self.session.headers.update({'Authorization': self.authorization_header})
++        # ClientSession must be created while an event loop is running.  The
++        # public client is intentionally cheap to construct, so create it on
++        # the first request instead of in __init__.
++        self.session: Optional[aiohttp.ClientSession] = None
+ 
+     @property
+     def authorization_header(self) -> str:
+         raise NotImplementedError()
+ 
++    async def _get_session(self) -> aiohttp.ClientSession:
++        if self.session is None or self.session.closed:
++            self.session = aiohttp.ClientSession(
++                headers={'Authorization': self.authorization_header},
++            )
++        return self.session
++
+     @staticmethod
+-    def _handle_response(response: Response):
+-        if response.ok:
+-            return BaseClient._handle_ok_response(response)
++    async def _handle_response(response: aiohttp.ClientResponse):
++        if 200 <= response.status < 300:
++            return await BaseClient._handle_ok_response(response)
++
+         try:
+-            response_json = response.json()
++            # API errors are JSON, but accepting a missing/incorrect content
++            # type keeps error handling useful for proxies and gateways too.
++            response_json = await response.json(content_type=None)
+             detail = response_json.get('detail')
+-            if 400 <= response.status_code < 500:
+-                response.reason = response.text
+         except Exception:
+             detail = None
+         if detail:
+@@ -38,44 +50,56 @@
+         response.raise_for_status()
+ 
+     @staticmethod
+-    def _handle_ok_response(response: Response) -> dict:
+-        if content_type := response.headers.get('content-type'):
+-            if content_type.startswith('application/json'):
+-                return response.json()
++    async def _handle_ok_response(response: aiohttp.ClientResponse) -> dict:
++        content_type = response.headers.get('content-type')
++        if content_type and content_type.startswith('application/json'):
++            return await response.json(content_type=None)
+ 
+         raise ClientError(
+             message={
+-                'status_code': response.status_code,
+-                'url': response.url,
++                'status_code': response.status,
++                'url': str(response.url),
+                 'message': 'Unexpected response from API',
+-                'raw': response.content,
++                'raw': await response.read(),
+             },
+         )
+ 
+-    def http_get(self, url, params=None):
+-        url = self.base_url + url
+-        response = self.session.get(url, params=params)
+-        return self._handle_response(response)
++    async def http_get(self, url, params=None):
++        session = await self._get_session()
++        async with session.get(self.base_url + url, params=params) as response:
++            return await self._handle_response(response)
+ 
+-    def http_post(self, url: str, body: Optional[str] = None):
+-        url = self.base_url + url
+-        response = self.session.post(
+-            url,
++    async def http_post(self, url: str, body: Optional[str] = None):
++        session = await self._get_session()
++        async with session.post(
++            self.base_url + url,
+             headers={'Content-Type': 'application/json'},
+             data=body,
+-        )
+-        return self._handle_response(response)
++        ) as response:
++            return await self._handle_response(response)
+ 
+-    def http_patch(self, url: str, body: Optional[str] = None):
+-        url = self.base_url + url
+-        response = self.session.patch(
+-            url,
++    async def http_patch(self, url: str, body: Optional[str] = None):
++        session = await self._get_session()
++        async with session.patch(
++            self.base_url + url,
+             headers={'Content-Type': 'application/json'},
+             data=body,
+-        )
+-        return self._handle_response(response)
++        ) as response:
++            return await self._handle_response(response)
+ 
+-    def http_delete(self, url: str, params=None):
+-        url = self.base_url + url
+-        response = self.session.delete(url, params=params)
+-        return self._handle_response(response)
++    async def http_delete(self, url: str, params=None):
++        session = await self._get_session()
++        async with session.delete(self.base_url + url, params=params) as response:
++            return await self._handle_response(response)
++
++    async def close(self):
++        if self.session is not None and not self.session.closed:
++            await self.session.close()
++
++    async def __aenter__(self):
++        return self
++
++    async def __aexit__(self, exc_type, exc_value, traceback):
++        await self.close()
++
++__all__ = ['AUTHOMIZE_API_URL', 'BaseClient', 'ClientError']

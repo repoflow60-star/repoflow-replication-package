@@ -1,0 +1,154 @@
+--- a/appstoreserverlibrary/api_client.py
++++ b/appstoreserverlibrary/api_client.py
+@@ -1,11 +1,15 @@
+ # Copyright (c) 2023 Apple Inc. Licensed under MIT License.
+ 
++import asyncio
+ import calendar
+ import datetime
++import io
++import json as json_module
+ from enum import IntEnum, Enum
+ from typing import Any, Dict, List, MutableMapping, Optional, Type, TypeVar, Union
++from urllib.parse import urlencode
+ from attr import define
+-import requests
++import pycurl
+ 
+ import jwt
+ from cryptography.hazmat.backends import default_backend
+@@ -34,6 +38,65 @@
+ 
+ T = TypeVar('T')
+ 
++
++class _PycurlResponse:
++    def __init__(self, status_code: int, headers: MutableMapping[str, str], content: bytes):
++        self.status_code = status_code
++        self.headers = headers
++        self.content = content
++
++    def json(self):
++        return json_module.loads(self.content.decode("utf-8"))
++
++
++def _execute_pycurl_request(method: str, url: str, params: Dict[str, Union[str, List[str]]], headers: Dict[str, str], json: Dict[str, Any]) -> _PycurlResponse:
++    if params:
++        query_string = urlencode(params, doseq=True)
++        url += ("&" if "?" in url else "?") + query_string
++
++    response_body = io.BytesIO()
++    response_headers = []
++
++    def header_function(header):
++        response_headers.append(header)
++        return len(header)
++
++    curl = pycurl.Curl()
++    try:
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.CUSTOMREQUEST, method)
++        curl.setopt(pycurl.WRITEFUNCTION, response_body.write)
++        curl.setopt(pycurl.HEADERFUNCTION, header_function)
++
++        if method == "GET":
++            curl.setopt(pycurl.HTTPGET, 1)
++        elif method == "POST":
++            curl.setopt(pycurl.POST, 1)
++
++        request_headers = [key + ": " + value for key, value in headers.items()]
++
++        if json is not None:
++            request_body = json_module.dumps(json).encode("utf-8")
++            request_headers.append("Content-Type: application/json")
++            curl.setopt(pycurl.POSTFIELDS, request_body)
++
++        curl.setopt(pycurl.HTTPHEADER, request_headers)
++        curl.perform()
++
++        status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++    finally:
++        curl.close()
++
++    parsed_headers = {}
++    for header in response_headers:
++        header = header.decode("iso-8859-1").strip()
++        if ":" in header:
++            key, value = header.split(":", 1)
++            parsed_headers[key.strip().lower()] = value.strip()
++
++    return _PycurlResponse(status_code, parsed_headers, response_body.getvalue())
++
++
+ class APIError(IntEnum):
+     GENERAL_BAD_REQUEST = 4000000
+     """
+@@ -450,6 +513,7 @@
+         except ValueError:
+             pass
+ 
++
+ class GetTransactionHistoryVersion(str, Enum):
+     V1 = "v1"
+     """
+@@ -457,6 +521,7 @@
+     """
+ 
+     V2 = "v2"
++
+ 
+ class BaseAppStoreServerAPIClient:
+     def __init__(self, signing_key: bytes, key_id: str, issuer_id: str, bundle_id: str, environment: Environment):
+@@ -533,8 +598,8 @@
+         response = self._execute_request(method, url, queryParameters, headers, json)
+         return self._parse_response(response.status_code, response.headers, lambda: response.json(), destination_class)
+ 
+-    def _execute_request(self, method: str, url: str, params: Dict[str, Union[str, List[str]]], headers: Dict[str, str], json: Dict[str, Any]) -> requests.Response:
+-        return requests.request(method, url, params=params, headers=headers, json=json)
++    def _execute_request(self, method: str, url: str, params: Dict[str, Union[str, List[str]]], headers: Dict[str, str], json: Dict[str, Any]) -> _PycurlResponse:
++        return _execute_pycurl_request(method, url, params, headers, json)
+ 
+     def extend_renewal_date_for_all_active_subscribers(self, mass_extend_renewal_date_request: MassExtendRenewalDateRequest) -> MassExtendRenewalDateResponse: 
+         """
+@@ -694,6 +759,7 @@
+         :throws APIException: If a response was returned indicating the request could not be processed
+         """
+         return self._make_request("/inApps/v1/lookup/" + order_id, "GET", {}, None, OrderLookupResponse)
++
+     def request_test_notification(self) -> SendTestNotificationResponse:
+         """
+         Ask App Store Server Notifications to send a test notification to your server.
+@@ -719,14 +785,9 @@
+ class AsyncAppStoreServerAPIClient(BaseAppStoreServerAPIClient):
+     def __init__(self, signing_key: bytes, key_id: str, issuer_id: str, bundle_id: str, environment: Environment):
+         super().__init__(signing_key=signing_key, key_id=key_id, issuer_id=issuer_id, bundle_id=bundle_id, environment=environment)
+-        try:
+-            import httpx
+-            self.http_client = httpx.AsyncClient()
+-        except:
+-            raise ModuleNotFoundError("httpx not found but attempting to instantiate an async client")
+ 
+     async def async_close(self):
+-        await self.http_client.aclose()
++        return
+     
+     async def _make_request(self, path: str, method: str, queryParameters: Dict[str, Union[str, List[str]]], body, destination_class: Type[T]) -> T:
+         url = self._get_full_url(path)
+@@ -737,7 +798,8 @@
+         return self._parse_response(response.status_code, response.headers, lambda: response.json(), destination_class)
+ 
+     async def _execute_request(self, method: str, url: str, params: Dict[str, Union[str, List[str]]], headers: Dict[str, str], json: Dict[str, Any]):
+-        return await self.http_client.request(method, url, params=params, headers=headers, json=json)
++        loop = asyncio.get_running_loop()
++        return await loop.run_in_executor(None, _execute_pycurl_request, method, url, params, headers, json)
+ 
+     async def extend_renewal_date_for_all_active_subscribers(self, mass_extend_renewal_date_request: MassExtendRenewalDateRequest) -> MassExtendRenewalDateResponse: 
+         """
+@@ -897,6 +959,7 @@
+         :throws APIException: If a response was returned indicating the request could not be processed
+         """
+         return await self._make_request("/inApps/v1/lookup/" + order_id, "GET", {}, None, OrderLookupResponse)
++
+     async def request_test_notification(self) -> SendTestNotificationResponse:
+         """
+         Ask App Store Server Notifications to send a test notification to your server.

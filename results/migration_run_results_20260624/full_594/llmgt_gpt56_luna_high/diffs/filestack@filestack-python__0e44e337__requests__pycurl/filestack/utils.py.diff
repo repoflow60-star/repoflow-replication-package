@@ -1,0 +1,127 @@
+--- a/filestack/utils.py
++++ b/filestack/utils.py
+@@ -1,27 +1,53 @@
++import json
+ import time
+ import string
+ import random
+ from functools import partial
+-import requests as original_requests
+-from requests.exceptions import HTTPError
++from io import BytesIO
++from urllib.parse import urlencode
++import pycurl
+ 
+ from filestack import config
+ from filestack.exceptions import FilestackHTTPError
+ 
+ 
+ def unique_id(length=10):
+-    return ''.join(random.choice(string.ascii_letters + string.digits) for i in range(length))
++    return ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(length))
++
++
++class PycurlHTTPError(Exception):
++    pass
++
++
++class PycurlResponse:
++    def __init__(self, status_code, content, headers):
++        self.status_code = status_code
++        self.content = content
++        self.headers = {}
++
++        for line in headers.decode('iso-8859-1').splitlines():
++            if ':' in line:
++                key, value = line.split(':', 1)
++                self.headers[key.strip()] = value.strip()
++
++    @property
++    def text(self):
++        return self.content.decode('utf-8', errors='replace')
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise PycurlHTTPError(self.text)
+ 
+ 
+ class RequestsWrapper:
+     """
+-    This class wraps selected methods from requests package and adds
++    This class wraps selected HTTP methods using pycurl and adds
+     default headers if no headers were specified.
+     """
+     def __getattr__(self, name):
+         if name in ('get', 'post', 'put', 'delete'):
+             return partial(self.handle_request, name)
+-        return original_requests.__getattribute__(name)
++        return pycurl.__getattribute__(name)
+ 
+     def handle_request(self, name, *args, **kwargs):
+         if 'headers' not in kwargs:
+@@ -29,12 +55,56 @@
+             kwargs['headers']['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
+             kwargs['headers']['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
+ 
+-        requests_method = getattr(original_requests, name)
+-        response = requests_method(*args, **kwargs)
++        url = args[0] if len(args) > 0 else kwargs.pop('url')
++
++        params = kwargs.pop('params', None)
++        if params:
++            url = '{}{}{}'.format(url, '&' if '?' in url else '?', urlencode(params, doseq=True))
++
++        request_headers = ['{}: {}'.format(key, value) for key, value in (kwargs['headers'] or {}).items()]
++
++        if 'json' in kwargs:
++            request_data = json.dumps(kwargs['json']).encode()
++        else:
++            request_data = kwargs.get('data')
++            if isinstance(request_data, (dict, list, tuple)):
++                request_data = urlencode(request_data, doseq=True).encode()
++            if isinstance(request_data, str):
++                request_data = request_data.encode()
++
++        response_body = BytesIO()
++        response_headers = BytesIO()
++
++        curl = pycurl.Curl()
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.CUSTOMREQUEST, name.upper())
++        curl.setopt(pycurl.HTTPHEADER, request_headers)
++        curl.setopt(pycurl.WRITEDATA, response_body)
++        curl.setopt(pycurl.HEADERFUNCTION, response_headers.write)
++        curl.setopt(pycurl.FOLLOWLOCATION, kwargs.get('allow_redirects', True))
++
++        if 'timeout' in kwargs:
++            curl.setopt(pycurl.TIMEOUT, kwargs['timeout'])
++
++        if name == 'post':
++            curl.setopt(pycurl.POST, 1)
++
++        if request_data is not None:
++            curl.setopt(pycurl.POSTFIELDS, request_data)
++
++        curl.perform()
++
++        response = PycurlResponse(
++            curl.getinfo(pycurl.RESPONSE_CODE),
++            response_body.getvalue(),
++            response_headers.getvalue()
++        )
++
++        curl.close()
+ 
+         try:
+             response.raise_for_status()
+-        except HTTPError as e:
++        except PycurlHTTPError as e:
+             raise FilestackHTTPError(response.text) from e
+ 
+         return response
+@@ -61,4 +131,4 @@
+     else:
+         transformation_url = transformation
+ 
+-    return transformation_url
++    return transformation_url

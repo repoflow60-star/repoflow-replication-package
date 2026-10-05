@@ -1,0 +1,440 @@
+--- a/pdpyras.py
++++ b/pdpyras.py
+@@ -3,24 +3,200 @@
+ # See LICENSE for details.
+ 
+ # Standard libraries
++import json
+ import logging
+ import sys
++import threading
+ import time
+ from copy import deepcopy
+-from datetime import datetime
++from datetime import datetime, timedelta
+ from random import random
+ from typing import Iterator, Union
+ from warnings import warn
+ 
+ # Upstream components on which this client is based:
+-from requests import Response, Session
+-from requests import __version__ as REQUESTS_VERSION
++import treq
++from twisted.internet import reactor
++from twisted.internet.threads import blockingCallFromThread
+ 
+ # HTTP client exceptions:
+-from urllib3.exceptions import HTTPError, PoolError
+-from requests.exceptions import RequestException
++class _TreqNetworkError(Exception):
++    """An error raised while making a request through treq."""
++
++
++# These names were historically exposed by this module. Keep them available for
++# callers while using one transport-specific exception internally.
++HTTPError = _TreqNetworkError
++PoolError = _TreqNetworkError
++RequestException = _TreqNetworkError
++
++
++class _Headers(dict):
++    """A case-insensitive mapping for request and response headers."""
++
++    @staticmethod
++    def _key(key):
++        return key.lower() if isinstance(key, str) else key
++
++    def __contains__(self, key):
++        normalized = self._key(key)
++        return any(self._key(existing) == normalized for existing in self)
++
++    def __getitem__(self, key):
++        normalized = self._key(key)
++        for existing, value in self.items():
++            if self._key(existing) == normalized:
++                return value
++        raise KeyError(key)
++
++    def __setitem__(self, key, value):
++        normalized = self._key(key)
++        for existing in list(self):
++            if self._key(existing) == normalized:
++                dict.__delitem__(self, existing)
++        dict.__setitem__(self, key, value)
++
++    def get(self, key, default=None):
++        try:
++            return self[key]
++        except KeyError:
++            return default
++
++    def update(self, other=(), **kwargs):
++        if hasattr(other, 'keys'):
++            for key in other.keys():
++                self[key] = other[key]
++        else:
++            for key, value in other:
++                self[key] = value
++        for key, value in kwargs.items():
++            self[key] = value
++
++
++class _RequestMetadata:
++    def __init__(self, method, url):
++        self.method = method
++        self.url = url
++
++
++class _ResponseAdapter:
++    """Synchronous response value built from a real treq response."""
++
++    def __init__(self, response, body, method, url, started):
++        self.status_code = response.code
++        self.ok = response.code < 400
++        self.url = url
++        self.content = body
++        self.text = body.decode('utf-8', errors='replace')
++        self.headers = _Headers()
++        for name, values in response.headers.getAllRawHeaders():
++            if isinstance(name, bytes):
++                name = name.decode('latin1')
++            decoded = [
++                value.decode('latin1') if isinstance(value, bytes) else str(value)
++                for value in values
++            ]
++            self.headers[name] = ', '.join(decoded)
++        self.request = _RequestMetadata(method, url)
++        self.elapsed = timedelta(seconds=time.monotonic() - started)
++
++    def json(self):
++        return json.loads(self.text)
++
++
++_reactor_lock = threading.Lock()
++_reactor_ready = None
++_reactor_thread = None
++
++
++def _ensure_reactor():
++    global _reactor_ready, _reactor_thread
++    if reactor.running:
++        return
++    with _reactor_lock:
++        if reactor.running:
++            return
++        if _reactor_thread is None:
++            _reactor_ready = threading.Event()
++
++            def run_reactor():
++                reactor.callWhenRunning(_reactor_ready.set)
++                reactor.run(installSignalHandlers=False)
++
++            _reactor_thread = threading.Thread(
++                target=run_reactor,
++                name='pdpyras-treq-reactor',
++                daemon=True,
++            )
++            _reactor_thread.start()
++    _reactor_ready.wait()
++
++
++class _TreqSession:
++    """Synchronous session facade that performs requests with treq."""
++
++    def __init__(self):
++        self.headers = _Headers()
++
++    def request(self, method, url, **kwargs):
++        started = time.monotonic()
++        request_kwargs = {
++            key: kwargs[key]
++            for key in ('headers', 'params', 'data', 'json', 'timeout')
++            if key in kwargs
++        }
++        if 'headers' in request_kwargs:
++            request_kwargs['headers'] = {
++                name.encode('latin1') if isinstance(name, str) else name:
++                [
++                    item.encode('latin1') if isinstance(item, str) else item
++                    for item in (value if isinstance(value, (list, tuple)) else [value])
++                ]
++                for name, value in request_kwargs['headers'].items()
++            }
++        if 'allow_redirects' in kwargs:
++            request_kwargs['browser_like_redirects'] = kwargs['allow_redirects']
++
++        try:
++            _ensure_reactor()
++            response = blockingCallFromThread(
++                reactor,
++                treq.request,
++                method,
++                url,
++                **request_kwargs
++            )
++            body = blockingCallFromThread(reactor, treq.content, response)
++        except Exception as error:
++            raise _TreqNetworkError(str(error)) from error
++        return _ResponseAdapter(response, body, method, url, started)
++
++    def get(self, url, **kwargs):
++        kwargs.setdefault('allow_redirects', True)
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, data=None, json=None, **kwargs):
++        return self.request('POST', url, data=data, json=json, **kwargs)
++
++    def put(self, url, data=None, json=None, **kwargs):
++        return self.request('PUT', url, data=data, json=json, **kwargs)
++
++    def delete(self, url, **kwargs):
++        return self.request('DELETE', url, **kwargs)
++
++    def close(self):
++        pass
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc_value, traceback):
++        self.close()
+ 
+ __version__ = '5.4.0'
++
++# Keep the established user-agent format while the transport changes.
++HTTP_CLIENT_VERSION = '2.34.2'
+ 
+ #######################
+ ### CLIENT DEFAULTS ###
+@@ -579,7 +755,7 @@
+         # Plural if listing via GET to the index endpoint, or doing a multi-put:
+         return path_nodes[-1]
+ 
+-def unwrap(response: Response, wrapper) -> Union[dict, list]:
++def unwrap(response: _ResponseAdapter, wrapper) -> Union[dict, list]:
+     """
+     Unwraps a wrapped entity.
+ 
+@@ -624,7 +800,7 @@
+     Makes methods return the full response body object after decoding from JSON.
+ 
+     Intended for use on functions that take a URL positional argument followed
+-    by keyword arguments and return a `requests.Response`_ object.
++    by keyword arguments and return a response object.
+     """
+     doc = method.__doc__
+     def call(self, url, **kw):
+@@ -680,7 +856,7 @@
+     the ``json`` keyword argument will be normalized to include the wrapper.
+ 
+     Methods using this decorator will raise a :class:`PDHTTPError` with its
+-    ``response`` property being being the `requests.Response`_ object in the
++    ``response`` property being being the response object in the
+     case of any error (as of version 4.2 this is subclassed as
+     :class:`PDHTTPError`), so that the implementer can access it by catching the
+     exception, and thus design their own custom logic around different types of
+@@ -689,7 +865,7 @@
+     :param method: Method being decorated. Must take one positional argument
+         after ``self`` that is the URL/path to the resource, followed by keyword
+         any number of keyword arguments, and must return an object of class
+-        `requests.Response`_, and be named after the HTTP method but with "r"
++        a response object, and be named after the HTTP method but with "r"
+         prepended.
+     :returns: A callable object; the reformed method
+     """
+@@ -731,7 +907,7 @@
+         details_msg = f" {details}"
+     warn(f"Keyword argument \"{deprecated_name}\" is deprecated.{details_msg}")
+ 
+-def http_error_message(r: Response, context=None) -> str:
++def http_error_message(r: _ResponseAdapter, context=None) -> str:
+     """
+     Formats a message describing a HTTP error.
+ 
+@@ -809,7 +985,7 @@
+     else:
+         return r_name.rstrip('s')
+ 
+-def successful_response(r: Response, context=None) -> Response:
++def successful_response(r: _ResponseAdapter, context=None) -> _ResponseAdapter:
+     """Validates the response as successful.
+ 
+     Returns the response if it was successful; otherwise, raises an exception.
+@@ -840,7 +1016,7 @@
+     else:
+         return text
+ 
+-def try_decoding(r: Response) -> Union[dict, list, str]:
++def try_decoding(r: _ResponseAdapter) -> Union[dict, list, str]:
+     """
+     JSON-decode a response body
+ 
+@@ -862,11 +1038,11 @@
+ ### CLASSES ###
+ ###############
+ 
+-class PDSession(Session):
++class PDSession(_TreqSession):
+     """
+     Base class for making HTTP requests to PagerDuty APIs
+ 
+-    This is an opinionated wrapper of `requests.Session`_, with a few additional
++    This is an opinionated wrapper of a treq-backed session, with a few additional
+     features:
+ 
+     - The client will reattempt the request with auto-increasing cooldown/retry
+@@ -911,7 +1087,7 @@
+     """
+ 
+     parent = None
+-    """The ``super`` object (`requests.Session`_)"""
++    """The ``super`` object for the treq-backed session."""
+ 
+     permitted_methods = ()
+     """
+@@ -937,7 +1113,7 @@
+       encountered first), and then return the final response.
+ 
+     The default behavior is to retry without limit on status 429, raise an
+-    exception on a 401, and return the `requests.Response`_ object in any other case
++    exception on a 401, and return the response object in any other case
+     (assuming a HTTP response was received from the server).
+     """
+ 
+@@ -1089,7 +1265,7 @@
+             delattr(self, '_debugHandler')
+         # else: no-op; only happens if debug is set to the same value twice
+ 
+-    def request(self, method, url, **kwargs) -> Response:
++    def request(self, method, url, **kwargs) -> _ResponseAdapter:
+         """
+         Make a generic PagerDuty API request.
+ 
+@@ -1100,11 +1276,11 @@
+             The path/URL to request. If it does not start with the base URL, the
+             base URL will be prepended.
+         :param **kwargs:
+-            Custom keyword arguments to pass to ``requests.Session.request``.
++            Custom keyword arguments to pass to the underlying HTTP request.
+         :type method: str
+         :type url: str
+         :returns:
+-            The `requests.Response`_ object corresponding to the HTTP response
++            The response object corresponding to the HTTP response
+         """
+         sleep_timer = self.sleep_timer
+         network_attempts = 0
+@@ -1239,7 +1415,7 @@
+     def user_agent(self) -> str:
+         return 'pdpyras/%s python-requests/%s Python/%d.%d'%(
+             __version__,
+-            REQUESTS_VERSION,
++            HTTP_CLIENT_VERSION,
+             sys.version_info.major,
+             sys.version_info.minor
+         )
+@@ -1355,9 +1531,9 @@
+             raise PDServerError(err_msg, response)
+         return response_body['dedup_key']
+ 
+-    def post(self, *args, **kw) -> Response:
+-        """
+-        Override of ``requests.Session.post``
++    def post(self, *args, **kw) -> _ResponseAdapter:
++        """
++        Override of the session's ``post`` method
+ 
+         Adds the ``routing_key`` parameter to the body before sending.
+         """
+@@ -1540,7 +1716,7 @@
+     PagerDuty REST API v2 session object class.
+ 
+     Implements the most generic and oft-implemented aspects of PagerDuty's REST
+-    API v2 as an opinionated wrapper of `requests.Session`_.
++    API v2 as an opinionated wrapper of a treq-backed session.
+ 
+     Inherits from :class:`PDSession`.
+ 
+@@ -1995,16 +2171,16 @@
+         else:
+             return self.rpost(resource, json=values)
+ 
+-    def postprocess(self, response: Response, suffix=None):
++    def postprocess(self, response: _ResponseAdapter, suffix=None):
+         """
+         Records performance information / request metadata about the API call.
+ 
+         :param response:
+-            The `requests.Response`_ object returned by the request method
++            The response object returned by the request method
+         :param suffix:
+             Optional suffix to append to the key
+         :type method: str
+-        :type response: `requests.Response`_
++        :type response: response object
+         :type suffix: str or None
+         """
+         method = response.request.method.upper()
+@@ -2049,7 +2225,7 @@
+ 
+     @resource_url
+     @requires_success
+-    def rdelete(self, resource, **kw) -> Response:
++    def rdelete(self, resource, **kw) -> _ResponseAdapter:
+         """
+         Delete a resource.
+ 
+@@ -2058,7 +2234,7 @@
+             representing an API resource that contains an item with key ``self``
+             whose value is the URL of the resource.
+         :param **kw:
+-            Custom keyword arguments to pass to ``requests.Session.delete``
++            Custom keyword arguments to pass to the underlying HTTP request
+         :type resource: str or dict
+         """
+         return self.delete(resource, **kw)
+@@ -2077,7 +2253,7 @@
+             representing an API resource that contains an item with key ``self``
+             whose value is the URL of the resource.
+         :param **kw:
+-            Custom keyword arguments to pass to ``requests.Session.get``
++            Custom keyword arguments to pass to the underlying HTTP request
+         :returns:
+             Dictionary representation of the requested object
+         :type resource: str or dict
+@@ -2095,7 +2271,7 @@
+             The path/URL to which to send the POST request, which should be an
+             index endpoint.
+         :param **kw:
+-            Custom keyword arguments to pass to ``requests.Session.post``
++            Custom keyword arguments to pass to the underlying HTTP request
+         :returns:
+             Dictionary representation of the created object
+         :type path: str
+@@ -2115,7 +2291,7 @@
+             representing an API resource that contains an item with key ``self``
+             whose value is the URL of the resource.
+         :param **kw:
+-            Custom keyword arguments to pass to ``requests.Session.put``
++            Custom keyword arguments to pass to the underlying HTTP request
+         :returns:
+             Dictionary representation of the updated object
+         """
+@@ -2186,7 +2362,7 @@
+ 
+     This class was created to make it easier to more cleanly handle errors by
+     way of a class that is guaranteed to have its ``response`` be a valid
+-    `requests.Response`_ object.
++    response object.
+ 
+     Whereas, the more generic :class:`PDClientError` could also be used
+     to denote such things as non-transient network errors wherein no response
+@@ -2214,7 +2390,7 @@
+             print("HTTP error: "+str(e.response.status_code))
+     """
+ 
+-    def __init__(self, message, response: Response):
++    def __init__(self, message, response: _ResponseAdapter):
+         super(PDHTTPError, self).__init__(message, response=response)
+ 
+ class PDServerError(PDHTTPError):

@@ -1,0 +1,291 @@
+--- a/sectxt/__init__.py
++++ b/sectxt/__init__.py
+@@ -2,6 +2,7 @@
+ # SPDX-License-Identifier: EUPL-1.2
+ #
+ import codecs
++import ssl
+ 
+ import langcodes
+ import re
+@@ -22,11 +23,15 @@
+     from typing import TypedDict
+ 
+ import dateutil.parser
+-import requests
++import treq
++from twisted.internet.defer import ensureDeferred
++from twisted.internet.error import SSLError
++from twisted.internet.selectreactor import SelectReactor
++from twisted.internet.ssl import ClientContextFactory
++from twisted.web.client import Agent, BrowserLikeRedirectAgent
++from twisted.web.http_headers import Headers
+ 
+ __version__ = "0.9.6"
+-
+-s = requests.Session()
+ 
+ 
+ class ErrorDict(TypedDict):
+@@ -552,88 +557,179 @@
+             security_txt_file.close()
+             super()._process()
+         else:
+-            security_txt_found = False
+-            for scheme in ["https", "http"]:
+-                for path in [".well-known/security.txt", "security.txt"]:
+-                    url = urlunsplit((scheme, self._loc, path, None, None))
+-                    try:
+-                        resp = requests.get(
+-                            url,
+-                            headers={
+-                                'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                              'Gecko/20100101 Firefox/12.0'},
+-                            timeout=5
+-                        )
+-                    except requests.exceptions.SSLError:
+-                        if not any(d["code"] == "invalid_cert" for d in self._errors):
+-                            self._add_error(
+-                                "invalid_cert",
+-                                "security.txt must be served with a valid TLS certificate.",
+-                            )
++            user_agent = (
++                "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) "
++                "Gecko/20100101 Firefox/12.0"
++            )
++
++            def response_url(response, default):
++                value = getattr(response, "url", None)
++                if value is None:
++                    request = getattr(response, "request", None)
++                    value = getattr(request, "absoluteURI", default)
++                if isinstance(value, bytes):
++                    value = value.decode("ascii")
++                return value or default
++
++            def response_history(response):
++                history = getattr(response, "history", None)
++                if history is not None:
++                    return history
++                history = []
++                previous = getattr(response, "previousResponse", None)
++                while previous is not None:
++                    history.insert(0, previous)
++                    previous = getattr(previous, "previousResponse", None)
++                return history
++
++            def is_certificate_error(error):
++                pending = [error]
++                seen = set()
++                while pending:
++                    current = pending.pop()
++                    if id(current) in seen:
++                        continue
++                    seen.add(id(current))
++                    if isinstance(current, (SSLError, ssl.SSLError)):
++                        return True
++                    error_name = type(current).__name__.lower()
++                    error_module = type(current).__module__.lower()
++                    if "certificate" in error_name or "ssl" in error_module:
++                        return True
++                    pending.extend(getattr(current, "reasons", ()) or ())
++                    value = getattr(current, "value", None)
++                    if value is not None and value is not current:
++                        pending.append(value)
++                    cause = getattr(current, "__cause__", None)
++                    if cause is not None:
++                        pending.append(cause)
++                return False
++
++            async def request(url, reactor, verify_certificate=True):
++                headers = {b"User-Agent": [user_agent.encode("ascii")]}
++                if verify_certificate:
++                    return await treq.get(
++                        url,
++                        headers=headers,
++                        timeout=5,
++                        reactor=reactor,
++                        browser_like_redirects=True,
++                    )
++
++                agent = BrowserLikeRedirectAgent(
++                    Agent(reactor, contextFactory=ClientContextFactory())
++                )
++                deferred = agent.request(
++                    b"GET", url.encode("ascii"), Headers(headers)
++                )
++                return await deferred.addTimeout(5, reactor)
++
++            async def fetch_security_txt(reactor):
++                for scheme in ["https", "http"]:
++                    for path in [".well-known/security.txt", "security.txt"]:
++                        url = urlunsplit((scheme, self._loc, path, None, None))
+                         try:
+-                            resp = requests.get(
+-                                url,
+-                                headers={
+-                                    'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                                  'Gecko/20100101 Firefox/12.0'},
+-                                timeout=5,
+-                                verify=False
+-                            )
+-                        except:
++                            resp = await request(url, reactor)
++                        except Exception as error:
++                            if not is_certificate_error(error):
++                                continue
++                            if not any(d["code"] == "invalid_cert" for d in self._errors):
++                                self._add_error(
++                                    "invalid_cert",
++                                    "security.txt must be served with a valid TLS certificate.",
++                                )
++                            try:
++                                resp = await request(url, reactor, verify_certificate=False)
++                            except Exception:
++                                continue
++
++                        if resp.code != 200:
+                             continue
+-                    except:
+-                        continue
+-                    if resp.status_code == 200:
+-                        if resp.history:
+-                            if not resp.url.endswith(path):
+-                                continue
+-                        self._path = path
+-                        self._url = url
+-                        if scheme != "https":
+-                            self._add_error(
+-                                "invalid_uri_scheme",
+-                                "Insecure URI scheme HTTP is not allowed. "
+-                                "The security.txt file access MUST use "
+-                                'the "https" scheme',
+-                            )
+-                        if path != CORRECT_PATH:
+-                            self._add_error(
+-                                "location",
+-                                "security.txt was located on the top-level path "
+-                                "(legacy place), but must be placed under "
+-                                "the '/.well-known/' path.",
+-                            )
+-                        if "content-type" not in resp.headers:
+-                            self._add_error(
+-                                "no_content_type", "HTTP Content-Type header must be sent."
+-                            )
+-                        else:
+-                            m = Message()
+-                            m['content-type'] = resp.headers["content-type"]
+-                            params = dict(m.get_params())
+-                            if "text/plain" not in params:
+-                                self._add_error(
+-                                    "invalid_media",
+-                                    "Media type in Content-Type header must be "
+-                                    "'text/plain'.",
+-                                )
+-                            charset = params.get("charset", "utf-8").lower()
+-                            if charset != "utf-8" and charset != "csutf8":
+-                                # According to RFC9116, charset default is utf-8
+-                                self._add_error(
+-                                    "invalid_charset",
+-                                    "Charset parameter in Content-Type header must be "
+-                                    "'utf-8' if present.",
+-                                )
+-                        self._content = resp.content
+-                        if resp.history:
+-                            self._urls = [resp.history[0].url, resp.url]
+-                        else:
+-                            self._urls = [url]
+-                        super()._process()
+-                        security_txt_found = True
+-                        break
+-                if security_txt_found:
+-                    break
+-            if not security_txt_found:
++
++                        history = response_history(resp)
++                        final_url = response_url(resp, url)
++                        if history and not final_url.endswith(path):
++                            continue
++
++                        content_type = None
++                        for header_name, values in resp.headers.getAllRawHeaders():
++                            if header_name.lower() == b"content-type" or header_name.lower() == "content-type":
++                                content_type = values[0]
++                                if isinstance(content_type, bytes):
++                                    content_type = content_type.decode("latin-1")
++                                break
++
++                        try:
++                            content = await treq.content(resp)
++                        except Exception:
++                            continue
++                        return scheme, path, url, final_url, history, content_type, content
++                return None
++
++            result = []
++            reactor = SelectReactor()
++
++            def start_fetch():
++                deferred = ensureDeferred(fetch_security_txt(reactor))
++
++                def fetched(value):
++                    result.append(value)
++                    reactor.stop()
++
++                def failed(failure):
++                    reactor.stop()
++
++                deferred.addCallbacks(fetched, failed)
++
++            reactor.callWhenRunning(start_fetch)
++            reactor.run()
++            fetch_result = result[0] if result else None
++            if fetch_result is None:
+                 self._add_error("no_security_txt", "security.txt could not be located.")
++                return
++
++            scheme, path, url, final_url, history, content_type, content = fetch_result
++            self._path = path
++            self._url = url
++            if scheme != "https":
++                self._add_error(
++                    "invalid_uri_scheme",
++                    "Insecure URI scheme HTTP is not allowed. "
++                    "The security.txt file access MUST use "
++                    'the "https" scheme',
++                )
++            if path != CORRECT_PATH:
++                self._add_error(
++                    "location",
++                    "security.txt was located on the top-level path "
++                    "(legacy place), but must be placed under "
++                    "the '/.well-known/' path.",
++                )
++            if content_type is None:
++                self._add_error(
++                    "no_content_type", "HTTP Content-Type header must be sent."
++                )
++            else:
++                m = Message()
++                m["content-type"] = content_type
++                params = dict(m.get_params())
++                if "text/plain" not in params:
++                    self._add_error(
++                        "invalid_media",
++                        "Media type in Content-Type header must be "
++                        "'text/plain'.",
++                    )
++                charset = params.get("charset", "utf-8").lower()
++                if charset != "utf-8" and charset != "csutf8":
++                    # According to RFC9116, charset default is utf-8
++                    self._add_error(
++                        "invalid_charset",
++                        "Charset parameter in Content-Type header must be "
++                        "'utf-8' if present.",
++                    )
++            self._content = content
++            if history:
++                self._urls = [response_url(history[0], url), final_url]
++            else:
++                self._urls = [url]
++            super()._process()

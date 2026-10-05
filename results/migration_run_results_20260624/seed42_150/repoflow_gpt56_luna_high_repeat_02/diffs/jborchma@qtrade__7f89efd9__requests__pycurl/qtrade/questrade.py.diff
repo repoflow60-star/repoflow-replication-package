@@ -1,0 +1,173 @@
+--- a/qtrade/questrade.py
++++ b/qtrade/questrade.py
+@@ -1,9 +1,12 @@
+ """Core module for Questrade API wrapper."""
+ 
++import io
++import json as jsonlib
+ import logging
+-from typing import Any, Dict, List, Optional, Union
+-
+-import requests
++from typing import Any, Dict, List, Optional, Tuple, Union
++from urllib.parse import urlencode
++
++import pycurl
+ import yaml
+ 
+ from .utility import TokenDict, get_access_token_yaml, validate_access_token
+@@ -37,8 +40,8 @@
+         save_yaml: bool = True,
+     ):
+         self.access_token: TokenDict
+-        self.headers = None
+-        self.session = requests.Session()
++        self.headers = {}
++        self.session = pycurl.Curl()
+ 
+         self.access_code = access_code
+         self.token_yaml = token_yaml
+@@ -50,13 +53,66 @@
+                 + " "
+                 + self.access_token["access_token"]
+             }
+-            # add headers to session
+-            self.session.headers.update(self.headers)
+         else:
+             self._get_access_token(save_yaml=save_yaml)
+ 
+         self.account_id = None
+         self.positions = None
++
++    def _request(
++        self,
++        method: str,
++        url: str,
++        params: Optional[Dict] = None,
++        data: Any = None,
++        json: Any = None,
++        timeout: Optional[int] = None,
++        use_session_headers: bool = True,
++    ) -> Tuple[bytes, int]:
++        """Perform an HTTP request using the shared pycurl handle."""
++        if params:
++            query = urlencode(params, doseq=True)
++            url += ("&" if "?" in url else "?") + query
++
++        request_headers = []
++        if use_session_headers:
++            request_headers = [
++                "{}: {}".format(key, value) for key, value in self.headers.items()
++            ]
++
++        body = None
++        if data is not None:
++            if isinstance(data, dict):
++                body = urlencode(data, doseq=True).encode("utf-8")
++                request_headers.append("Content-Type: application/x-www-form-urlencoded")
++            elif isinstance(data, bytes):
++                body = data
++            else:
++                body = str(data).encode("utf-8")
++        elif json is not None:
++            body = jsonlib.dumps(json).encode("utf-8")
++            request_headers.append("Content-Type: application/json")
++
++        response_buffer = io.BytesIO()
++        self.session.reset()
++        self.session.setopt(pycurl.URL, url)
++        self.session.setopt(pycurl.CUSTOMREQUEST, method.upper())
++        self.session.setopt(pycurl.HTTPHEADER, request_headers)
++        self.session.setopt(pycurl.FOLLOWLOCATION, True)
++        if timeout is not None:
++            self.session.setopt(pycurl.TIMEOUT, timeout)
++        self.session.setopt(pycurl.WRITEFUNCTION, response_buffer.write)
++        if body is not None:
++            self.session.setopt(pycurl.POSTFIELDS, body)
++        self.session.perform()
++
++        return response_buffer.getvalue(), int(self.session.getinfo(pycurl.RESPONSE_CODE))
++
++    @staticmethod
++    def _raise_for_status(status_code: int):
++        """Raise an exception for an unsuccessful HTTP response."""
++        if status_code >= 400:
++            raise RuntimeError("HTTP error {}".format(status_code))
+ 
+     def _send_message(
+         self,
+@@ -91,9 +147,11 @@
+         else:
+             log.error("Access token not set...")
+             raise Exception("Access token not set...")
+-        resp = self.session.request(method, url, params=params, data=data, json=json, timeout=30)
+-        resp.raise_for_status()
+-        return resp.json()
++        response_body, status_code = self._request(
++            method, url, params=params, data=data, json=json, timeout=30
++        )
++        self._raise_for_status(status_code)
++        return jsonlib.loads(response_body.decode("utf-8"))
+ 
+     def save_token_to_yaml(self, yaml_path: str = "access_token.yml"):
+         """Save the token payload as a yaml-file.
+@@ -131,9 +189,11 @@
+         """
+         url = TOKEN_URL + str(self.access_code)
+         log.info("Getting access token...")
+-        data = requests.get(url)
+-        data.raise_for_status()
+-        response = data.json()
++        response_body, status_code = self._request(
++            url=url, method="get", use_session_headers=False
++        )
++        self._raise_for_status(status_code)
++        response = jsonlib.loads(response_body.decode("utf-8"))
+ 
+         # validate response
+         validate_access_token(**response)
+@@ -152,8 +212,6 @@
+             + self.access_token["access_token"]
+         }
+ 
+-        self.session.headers.update(self.headers)
+-
+         # save access token
+         if save_yaml:
+             log.info("Saving yaml file to {}...".format(yaml_path))  # pylint: disable=W1202
+@@ -191,9 +249,11 @@
+ 
+         url = TOKEN_URL + str(old_access_token["refresh_token"])
+         log.info("Refreshing access token...")
+-        data = requests.get(url)
+-        data.raise_for_status()
+-        response = data.json()
++        response_body, status_code = self._request(
++            url=url, method="get", use_session_headers=False
++        )
++        self._raise_for_status(status_code)
++        response = jsonlib.loads(response_body.decode("utf-8"))
+ 
+         # validate response
+         validate_access_token(**response)
+@@ -211,9 +271,6 @@
+             + " "
+             + self.access_token["access_token"]
+         }
+-
+-        # update headers
+-        self.session.headers.update(self.headers)
+ 
+         # save access token
+         if from_yaml:
+@@ -606,8 +663,8 @@
+         """
+         uri = self.access_token["api_server"] + "/v1/accounts/" + str(acct_id) + "/orders"
+         log.info("Posting order...")
+-        data = self.session.post(uri, json=order_dict)
+-        data.raise_for_status()
++        _, status_code = self._request("post", uri, json=order_dict)
++        self._raise_for_status(status_code)
+         response = self._send_message(
+             "post", "accounts/" + str(acct_id) + "/orders", json=order_dict
+         )

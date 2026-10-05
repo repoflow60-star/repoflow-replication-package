@@ -1,0 +1,106 @@
+--- a/pynubank/utils/http.py
++++ b/pynubank/utils/http.py
+@@ -1,7 +1,75 @@
+-from requests import Response
+-from requests_pkcs12 import get, post
++import os
++import ssl
++import tempfile
++from typing import Optional
++
++from OpenSSL import crypto
++from urllib3 import PoolManager, request
++from urllib3.response import BaseHTTPResponse
+ 
+ from pynubank import NuRequestException
++
++
++def get(url: str, headers: Optional[dict] = None, **kwargs) -> BaseHTTPResponse:
++    """Perform a GET request using urllib3."""
++    return _request('GET', url, headers=headers, **kwargs)
++
++
++def post(url: str, json: dict, headers: Optional[dict] = None, **kwargs) -> BaseHTTPResponse:
++    """Perform a JSON POST request using urllib3."""
++    return _request('POST', url, headers=headers, json=json, **kwargs)
++
++
++def _request(method: str, url: str, headers: Optional[dict] = None,
++             pkcs12_data: Optional[bytes] = None,
++             pkcs12_password: str = '', json: Optional[dict] = None) -> BaseHTTPResponse:
++    # urllib3 does not accept PKCS#12 data directly. Build an
++    # SSL context from the bundle instead and give it to a pool manager.
++    if pkcs12_data:
++        pool = PoolManager(ssl_context=_pkcs12_ssl_context(pkcs12_data, pkcs12_password))
++        response = pool.request(method, url, headers=headers, json=json)
++    else:
++        response = request(method, url, headers=headers, json=json)
++
++    # urllib3 stores the path in ``url`` for responses from a pool. Keep the
++    # complete URL available to callers.
++    response.url = url
++    return response
++
++
++def _pkcs12_ssl_context(pkcs12_data: bytes, password: str) -> ssl.SSLContext:
++    """Create an SSL context containing the client certificate in a PKCS#12."""
++    password_bytes = password if isinstance(password, bytes) else password.encode('utf-8')
++    bundle = crypto.load_pkcs12(pkcs12_data, password_bytes)
++
++    cert = bundle.get_certificate()
++    key = bundle.get_privatekey()
++    if cert is None or key is None:
++        raise ValueError('The PKCS#12 data does not contain a client certificate and private key')
++
++    pem = crypto.dump_certificate(crypto.FILETYPE_PEM, cert)
++    pem += crypto.dump_privatekey(crypto.FILETYPE_PEM, key)
++    for ca_cert in bundle.get_ca_certificates() or ():
++        pem += crypto.dump_certificate(crypto.FILETYPE_PEM, ca_cert)
++
++    ssl_context = ssl.create_default_context()
++    path = None
++    try:
++        with tempfile.NamedTemporaryFile(mode='wb', delete=False) as certificate_file:
++            certificate_file.write(pem)
++            path = certificate_file.name
++        ssl_context.load_cert_chain(path)
++    finally:
++        if path is not None:
++            os.unlink(path)
++
++    return ssl_context
++
++
++def response_status_code(response: BaseHTTPResponse) -> int:
++    """Return an HTTP status from urllib3 or a legacy response-like object."""
++    status = getattr(response, 'status', None)
++    return status if status is not None else response.status_code
+ 
+ 
+ class HttpClient:
+@@ -30,20 +98,20 @@
+     def _cert_args(self):
+         return {'pkcs12_data': self._cert, 'pkcs12_password': ''} if self._cert else {}
+ 
+-    def _handle_response(self, response: Response) -> dict:
+-        if response.status_code != 200:
++    def _handle_response(self, response: BaseHTTPResponse) -> dict:
++        if response_status_code(response) != 200:
+             raise NuRequestException(response)
+ 
+         return response.json()
+ 
+-    def raw_get(self, url: str) -> Response:
++    def raw_get(self, url: str) -> BaseHTTPResponse:
+         return get(url, headers=self._headers, **self._cert_args)
+ 
+-    def raw_post(self, url: str, json: dict) -> Response:
++    def raw_post(self, url: str, json: dict) -> BaseHTTPResponse:
+         return post(url, json=json, headers=self._headers, **self._cert_args)
+ 
+     def get(self, url: str) -> dict:
+         return self._handle_response(self.raw_get(url))
+ 
+     def post(self, url: str, json: dict) -> dict:
+-        return self._handle_response(post(url, json=json, headers=self._headers, **self._cert_args))
++        return self._handle_response(self.raw_post(url, json=json))

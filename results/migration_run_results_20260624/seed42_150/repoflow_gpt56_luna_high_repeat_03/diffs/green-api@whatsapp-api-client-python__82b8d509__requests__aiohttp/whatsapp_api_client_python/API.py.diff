@@ -1,0 +1,143 @@
+--- a/whatsapp_api_client_python/API.py
++++ b/whatsapp_api_client_python/API.py
+@@ -1,9 +1,9 @@
++import asyncio
+ import json
+ import logging
+ from typing import Any, NoReturn, Optional
+ 
+-from requests import Response, Session
+-from requests.adapters import HTTPAdapter, Retry
++import aiohttp
+ 
+ from .response import Response as GreenAPIResponse
+ from .tools import (
+@@ -18,6 +18,102 @@
+     serviceMethods,
+     webhooks
+ )
++
++
++class _HttpResult:
++    def __init__(self, status_code: int, text: str):
++        self.status_code = status_code
++        self.text = text
++
++
++class _AioHttpSession:
++    def __init__(self):
++        self.headers = {}
++
++    def request(self, method: str, url: str, **arguments: Any) -> _HttpResult:
++        return asyncio.run(self.__request(method, url, arguments))
++
++    async def __request(
++            self, method: str, url: str, arguments: dict
++    ) -> _HttpResult:
++        files = arguments.pop("files", None)
++        payload = arguments.pop("data", None)
++        timeout = arguments.pop("timeout", None)
++
++        headers = dict(self.headers)
++        headers.update(arguments.pop("headers", None) or {})
++        arguments["headers"] = headers
++
++        if timeout is not None and not isinstance(timeout, aiohttp.ClientTimeout):
++            arguments["timeout"] = aiohttp.ClientTimeout(total=timeout)
++        elif timeout is not None:
++            arguments["timeout"] = timeout
++
++        for attempt in range(4):
++            attempt_arguments = dict(arguments)
++            if files:
++                if attempt:
++                    self.__rewind_files(files)
++                attempt_arguments["data"] = self.__form_data(payload, files)
++            elif payload is not None:
++                attempt_arguments["data"] = payload
++
++            try:
++                async with aiohttp.ClientSession() as session:
++                    async with session.request(
++                            method, url, **attempt_arguments
++                    ) as response:
++                        text = await response.text()
++                        status_code = response.status
++            except (aiohttp.ClientError, asyncio.TimeoutError):
++                if attempt == 3:
++                    raise
++                await asyncio.sleep(1.0 * (2 ** attempt))
++                continue
++
++            if status_code == 429 and attempt < 3:
++                await asyncio.sleep(1.0 * (2 ** attempt))
++                continue
++
++            return _HttpResult(status_code, text)
++
++        raise RuntimeError("Request retry loop exited unexpectedly")
++
++    @staticmethod
++    def __form_data(payload: Any, files: dict) -> aiohttp.FormData:
++        form = aiohttp.FormData()
++
++        if payload:
++            for name, value in payload.items():
++                form.add_field(name, value)
++
++        for name, value in files.items():
++            if isinstance(value, tuple):
++                filename = value[0] if len(value) > 0 else None
++                file_value = value[1] if len(value) > 1 else None
++                content_type = value[2] if len(value) > 2 else None
++                form.add_field(
++                    name,
++                    file_value,
++                    filename=filename,
++                    content_type=content_type,
++                )
++            else:
++                form.add_field(name, value)
++
++        return form
++
++    @staticmethod
++    def __rewind_files(files: dict) -> None:
++        for value in files.values():
++            file_value = value[1] if isinstance(value, tuple) else value
++            if hasattr(file_value, "seek"):
++                file_value.seek(0)
++
++
++# Keep the session construction seam used by existing callers while routing
++# all actual I/O through aiohttp.
++Session = _AioHttpSession
+ 
+ 
+ class GreenApi:
+@@ -116,7 +212,7 @@
+ 
+         return GreenAPIResponse(response.status_code, response.text)
+ 
+-    def __handle_response(self, response: Response) -> Optional[NoReturn]:
++    def __handle_response(self, response: Any) -> Optional[NoReturn]:
+         status_code = response.status_code
+         if status_code != 200 or self.debug_mode:
+             try:
+@@ -161,16 +257,6 @@
+     def __prepare_session(self) -> None:
+         self.session.headers["Connection"] = "close"
+ 
+-        retry = Retry(
+-            total=3,
+-            backoff_factor=1.0,
+-            allowed_methods=None,
+-            status_forcelist=[429]
+-        )
+-
+-        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+-
+ 
+ class GreenAPI(GreenApi):
+     pass

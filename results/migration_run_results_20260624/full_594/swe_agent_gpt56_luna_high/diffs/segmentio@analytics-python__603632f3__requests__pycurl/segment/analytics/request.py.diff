@@ -1,0 +1,203 @@
+--- a/segment/analytics/request.py
++++ b/segment/analytics/request.py
+@@ -1,34 +1,156 @@
+ from datetime import date, datetime
+ from io import BytesIO
+ from gzip import GzipFile
++import json
+ import logging
+-import json
++from urllib.parse import urlsplit
++
++import pycurl
+ from dateutil.tz import tzutc
+-from requests.auth import HTTPBasicAuth
+-from requests import sessions
+ 
+ from segment.analytics.version import VERSION
+ from segment.analytics.utils import remove_trailing_slash
+ 
+-_session = sessions.Session()
++
++class _CaseInsensitiveHeaders(dict):
++    """A small case-insensitive mapping for headers returned by libcurl."""
++
++    def get(self, key, default=None):
++        key = key.lower()
++        for name, value in self.items():
++            if name.lower() == key:
++                return value
++        return default
++
++    def __getitem__(self, key):
++        value = self.get(key)
++        if value is None and not any(name.lower() == key.lower()
++                                     for name in self):
++            raise KeyError(key)
++        return value
++
++    def __contains__(self, key):
++        return any(name.lower() == key.lower() for name in self)
++
++
++class Response:
++    """The portion of an HTTP response used by the analytics client.
++
++    PycURL writes the response body to a file-like object and exposes the
++    status code through ``getinfo``.  Keeping this tiny response object means
++    the rest of the client does not need to know about the transport details.
++    """
++
++    def __init__(self, body, status_code, headers, reason=''):
++        self.content = body
++        self.status_code = status_code
++        self.headers = headers
++        self.reason = reason
++
++    @property
++    def text(self):
++        return self.content.decode('utf-8', errors='replace')
++
++    def json(self):
++        return json.loads(self.text)
++
++
++def _parse_headers(raw_headers):
++    """Parse libcurl's header callback output into headers and reason."""
++    headers = _CaseInsensitiveHeaders()
++    reason = ''
++    # A response can contain informational responses and (when a proxy is
++    # used) a CONNECT response.  The last status line is the response whose
++    # body libcurl returns, so discard headers from earlier status blocks.
++    current = None
++    current_reason = ''
++    for raw_line in raw_headers.splitlines():
++        line = raw_line.decode('iso-8859-1', errors='replace').strip('\r')
++        if line.startswith('HTTP/'):
++            current = {}
++            parts = line.split(' ', 2)
++            current_reason = parts[2] if len(parts) > 2 else ''
++            continue
++        if not line:
++            if current is not None:
++                headers = _CaseInsensitiveHeaders(current)
++                reason = current_reason
++                current = None
++            continue
++        if ':' in line and current is not None:
++            name, value = line.split(':', 1)
++            current[name.strip()] = value.strip()
++    if current is not None:
++        headers = _CaseInsensitiveHeaders(current)
++        reason = current_reason
++    return headers, reason
++
++
++def _proxy_for(url, proxies):
++    """Return the proxy applicable to *url* from a mapping or URL."""
++    if not proxies:
++        return None
++    if isinstance(proxies, str):
++        return proxies
++    if not isinstance(proxies, dict):
++        return None
++    scheme = urlsplit(url).scheme
++    return (proxies.get(scheme) or proxies.get('%s://' % scheme) or
++            proxies.get('all') or proxies.get('all://'))
++
++
++def _request(url, data, headers=None, timeout=15, proxies=None):
++    """Perform one HTTP request with pycurl and return a response object."""
++    body = BytesIO()
++    raw_headers = BytesIO()
++    curl = pycurl.Curl()
++    try:
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.POST, 1)
++        curl.setopt(pycurl.POSTFIELDS, data if isinstance(data, bytes)
++                    else data.encode('utf-8'))
++        curl.setopt(pycurl.WRITEDATA, body)
++        curl.setopt(pycurl.HEADERFUNCTION, raw_headers.write)
++        # TIMEOUT only accepts integral seconds in pycurl 7.46.0.  The
++        # millisecond option preserves support for sub-second timeout values
++        # (and avoids truncating a small positive timeout to zero).
++        if timeout is not None:
++            timeout_ms = int(float(timeout) * 1000)
++            if timeout_ms == 0 and float(timeout) > 0:
++                timeout_ms = 1
++            curl.setopt(pycurl.TIMEOUT_MS, timeout_ms)
++        curl.setopt(pycurl.FOLLOWLOCATION, 1)
++
++        if headers:
++            curl.setopt(pycurl.HTTPHEADER,
++                        ['%s: %s' % (name, value)
++                         for name, value in headers.items()])
++        proxy = _proxy_for(url, proxies)
++        if proxy:
++            curl.setopt(pycurl.PROXY, proxy)
++
++        curl.perform()
++        status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        response_headers, reason = _parse_headers(raw_headers.getvalue())
++        return Response(body.getvalue(), status_code, response_headers, reason)
++    finally:
++        curl.close()
+ 
+ 
+ def post(write_key, host=None, gzip=False, timeout=15, proxies=None, oauth_manager=None, **kwargs):
+-    """Post the `kwargs` to the API"""
++    """Post the ``kwargs`` to the API using pycurl."""
+     log = logging.getLogger('segment')
+     body = kwargs
+-    if not "sentAt" in body.keys():
+-        body["sentAt"] = datetime.now(tz=tzutc()).isoformat()
+-    body["writeKey"] = write_key
++    if 'sentAt' not in body:
++        body['sentAt'] = datetime.now(tz=tzutc()).isoformat()
++    body['writeKey'] = write_key
+     url = remove_trailing_slash(host or 'https://api.segment.io') + '/v1/batch'
+-    auth = None
+-    if oauth_manager:
+-        auth = oauth_manager.get_token()
++    auth = oauth_manager.get_token() if oauth_manager else None
+     data = json.dumps(body, cls=DatetimeSerializer)
+     log.debug('making request: %s', data)
+     headers = {
+         'Content-Type': 'application/json',
+-        'User-Agent': 'analytics-python/' + VERSION
++        'User-Agent': 'analytics-python/' + VERSION,
+     }
+     if auth:
+         headers['Authorization'] = 'Bearer {}'.format(auth)
+@@ -37,26 +159,15 @@
+         headers['Content-Encoding'] = 'gzip'
+         buf = BytesIO()
+         with GzipFile(fileobj=buf, mode='w') as gz:
+-            # 'data' was produced by json.dumps(),
+-            # whose default encoding is utf-8.
+             gz.write(data.encode('utf-8'))
+         data = buf.getvalue()
+ 
+-    kwargs = {
+-        "data": data,
+-        "headers": headers,
+-        "timeout": 15,
+-    }
+-
+-    if proxies:
+-        kwargs['proxies'] = proxies
+-    res = None
+     try:
+-        res = _session.post(url, data=data, headers=headers, timeout=timeout)
+-    except Exception as e:
+-        log.error(e)
+-        raise e
+-        
++        res = _request(url, data, headers, timeout, proxies)
++    except Exception as error:
++        log.error(error)
++        raise
++
+     if res.status_code == 200:
+         log.debug('data uploaded successfully')
+         return res

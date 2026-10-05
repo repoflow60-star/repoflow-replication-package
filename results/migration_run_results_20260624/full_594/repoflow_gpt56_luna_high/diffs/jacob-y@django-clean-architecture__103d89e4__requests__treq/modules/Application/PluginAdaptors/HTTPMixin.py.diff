@@ -1,0 +1,114 @@
+--- a/modules/Application/PluginAdaptors/HTTPMixin.py
++++ b/modules/Application/PluginAdaptors/HTTPMixin.py
+@@ -1,6 +1,32 @@
+-import requests
+-from requests.exceptions import RequestException
++import json
++import threading
+ from abc import ABC, abstractmethod
++from urllib.parse import urlencode
++
++import treq
++from twisted.internet import reactor
++from twisted.python.failure import Failure
++
++
++_reactor_ready = threading.Event()
++_reactor_start_lock = threading.Lock()
++_reactor_started = False
++
++
++def _run_reactor() -> None:
++    reactor.callWhenRunning(_reactor_ready.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor() -> None:
++    global _reactor_started
++    if reactor.running:
++        return
++    with _reactor_start_lock:
++        if not reactor.running and not _reactor_started:
++            _reactor_started = True
++            threading.Thread(target=_run_reactor, daemon=True).start()
++    _reactor_ready.wait()
+ 
+ 
+ class HTTPMixin(ABC):
+@@ -18,26 +44,63 @@
+                 raise Exception(f'Unsupported HTTP method {self._method()}')
+ 
+     def _get(self) -> dict:
+-        return self._process_response(requests.get(self._endpoint(), headers=self._headers(), auth=self._auth()))
++        endpoint = self._endpoint()
++        try:
++            response = self._wait_for(
++                treq.get(endpoint, headers=self._headers(), auth=self._auth())
++            )
++        except Exception as error:
++            raise Exception(f'Connection failed while calling {endpoint}') from error
++        return self._process_response(response, endpoint)
+ 
+     def _post(self) -> dict:
++        endpoint = self._endpoint()
++        headers = dict(self._headers())
++        auth = self._auth()
+         if self._is_form_encoded():
+-            headers = self._headers()
+             headers['Content-Type'] = 'application/x-www-form-urlencoded'
+-            return self._process_response(
+-                requests.post(self._endpoint(), data=self._data(), headers=self._headers(), auth=self._auth()))
+-        return self._process_response(
+-            requests.post(self._endpoint(), json=self._data(), headers=self._headers(), auth=self._auth()))
++            data = self._form_data()
++        else:
++            headers.setdefault('Content-Type', 'application/json')
++            data = json.dumps(self._data()).encode('utf-8')
++        try:
++            response = self._wait_for(
++                treq.post(endpoint, data=data, headers=headers, auth=auth)
++            )
++        except Exception as error:
++            raise Exception(f'Connection failed while calling {endpoint}') from error
++        return self._process_response(response, endpoint)
++
++    def _form_data(self) -> bytes:
++        return urlencode(self._data(), doseq=True).encode('utf-8')
+ 
+     @staticmethod
+-    def _process_response(response: requests.Response) -> dict:
++    def _wait_for(deferred):
++        _ensure_reactor()
++        completed = threading.Event()
++        result = []
++
++        def complete(value):
++            result.append(value)
++            completed.set()
++            return value
++
++        deferred.addBoth(complete)
++        completed.wait()
++        value = result[0]
++        if isinstance(value, Failure):
++            value.raiseException()
++        return value
++
++    @staticmethod
++    def _process_response(response, endpoint: str) -> dict:
++        status_code = response.code
+         try:
+-            if 200 <= response.status_code < 500:
+-                return response.json()
+-            else:
+-                raise Exception(f"HTTP {response.status_code} error while calling {response.url}")
+-        except RequestException:
+-            raise Exception(f"Connection failed while calling {response.url}")
++            if 200 <= status_code < 500:
++                return HTTPMixin._wait_for(treq.json_content(response))
++        except Exception as error:
++            raise Exception(f'Connection failed while calling {endpoint}') from error
++        raise Exception(f'HTTP {status_code} error while calling {endpoint}')
+ 
+     @abstractmethod
+     def _method(self) -> str:

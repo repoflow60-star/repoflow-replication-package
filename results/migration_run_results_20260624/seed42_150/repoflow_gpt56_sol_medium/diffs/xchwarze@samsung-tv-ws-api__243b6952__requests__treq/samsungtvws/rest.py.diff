@@ -1,0 +1,75 @@
+--- a/samsungtvws/rest.py
++++ b/samsungtvws/rest.py
+@@ -7,13 +7,36 @@
+ """
+ 
+ import logging
++import threading
+ from typing import Any, Dict, Optional
+ 
+-import requests
++import treq
++from twisted.internet import defer, error, threads
++from twisted.internet.selectreactor import SelectReactor
++from twisted.web.client import Agent, ResponseFailed, WebClientContextFactory
+ 
+ from . import connection, exceptions, helper
+ 
+ _LOGGING = logging.getLogger(__name__)
++
++_REACTOR = SelectReactor()
++_REACTOR_READY = threading.Event()
++_REACTOR_LOCK = threading.Lock()
++
++
++def _run_reactor() -> None:
++    _REACTOR.callWhenRunning(_REACTOR_READY.set)
++    _REACTOR.run(installSignalHandlers=False)
++
++
++def _ensure_reactor_running() -> None:
++    if _REACTOR_READY.is_set():
++        return
++
++    with _REACTOR_LOCK:
++        if not _REACTOR_READY.is_set():
++            threading.Thread(target=_run_reactor, daemon=True).start()
++    _REACTOR_READY.wait()
+ 
+ 
+ class SamsungTVRest(connection.SamsungTVWSBaseConnection):
+@@ -32,17 +55,24 @@
+ 
+     def _rest_request(self, target: str, method: str = "GET") -> Dict[str, Any]:
+         url = self._format_rest_url(target)
++
++        def request() -> "defer.Deferred[str]":
++            # Samsung TVs commonly use self-signed certificates on port 8002.
++            agent = Agent(_REACTOR, contextFactory=WebClientContextFactory())
++            response = treq.request(
++                method,
++                url,
++                agent=agent,
++                timeout=self.timeout,
++            )
++            response.addCallback(treq.text)
++            return response
++
+         try:
+-            if method == "POST":
+-                response = requests.post(url, timeout=self.timeout, verify=False)
+-            elif method == "PUT":
+-                response = requests.put(url, timeout=self.timeout, verify=False)
+-            elif method == "DELETE":
+-                response = requests.delete(url, timeout=self.timeout, verify=False)
+-            else:
+-                response = requests.get(url, timeout=self.timeout, verify=False)
+-            return helper.process_api_response(response.text)
+-        except requests.ConnectionError as err:
++            _ensure_reactor_running()
++            body = threads.blockingCallFromThread(_REACTOR, request)
++            return helper.process_api_response(body)
++        except (defer.CancelledError, error.ConnectError, ResponseFailed) as err:
+             raise exceptions.HttpApiError(
+                 "TV unreachable or feature not supported on this model."
+             ) from err

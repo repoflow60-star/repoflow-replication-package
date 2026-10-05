@@ -1,0 +1,596 @@
+--- a/src/cl_sii/rut/crypto_utils.py
++++ b/src/cl_sii/rut/crypto_utils.py
+@@ -1,12 +1,559 @@
+ import re
+ from typing import Optional
+ 
+-import cryptography
+-import cryptography.hazmat.backends.openssl.backend as crypto_x509_backend
+-import cryptography.hazmat.primitives.serialization.pkcs12
+-import cryptography.x509
++from Crypto.Cipher import AES, ARC2, ARC4, DES3
++from Crypto.Hash import HMAC, MD5, SHA1, SHA224, SHA256, SHA384, SHA512
++from Crypto.Protocol.KDF import PBKDF2
++from Crypto.Util.Padding import unpad
+ 
+ from . import Rut, constants
++
++
++class _OtherName:
++    def __init__(self, type_id, value):
++        self.type_id = type_id
++        self.value = value
++
++
++class _SubjectAlternativeName:
++    def __init__(self, oid, value):
++        self.oid = oid
++        self.value = value
++
++
++def _der_read(data: bytes, offset: int = 0):
++    if offset >= len(data):
++        raise ValueError('Malformed DER data')
++
++    tag = data[offset]
++    offset += 1
++
++    if offset >= len(data):
++        raise ValueError('Malformed DER length')
++
++    length = data[offset]
++    offset += 1
++
++    if length & 0x80:
++        length_bytes = length & 0x7F
++        if length_bytes == 0 or offset + length_bytes > len(data):
++            raise ValueError('Malformed DER length')
++
++        length = int.from_bytes(data[offset:offset + length_bytes], 'big')
++        offset += length_bytes
++
++    end = offset + length
++    if end > len(data):
++        raise ValueError('Malformed DER value')
++
++    return tag, data[offset:end], end
++
++
++def _der_children(data: bytes):
++    children = []
++    offset = 0
++
++    while offset < len(data):
++        tag, value, end = _der_read(data, offset)
++        children.append((tag, value, end))
++        offset = end
++
++    return children
++
++
++def _der_integer(value: bytes) -> int:
++    return int.from_bytes(value, 'big', signed=False)
++
++
++def _der_oid(value: bytes) -> str:
++    if not value:
++        raise ValueError('Malformed DER OID')
++
++    first = value[0]
++    if first < 40:
++        first_arc = 0
++        second_arc = first
++    elif first < 80:
++        first_arc = 1
++        second_arc = first - 40
++    else:
++        first_arc = 2
++        second_arc = first - 80
++
++    arcs = [first_arc, second_arc]
++    current = 0
++
++    for byte in value[1:]:
++        current = (current << 7) | (byte & 0x7F)
++        if not byte & 0x80:
++            arcs.append(current)
++            current = 0
++
++    if current:
++        raise ValueError('Malformed DER OID')
++
++    return '.'.join(str(arc) for arc in arcs)
++
++
++def _algorithm_identifier(data: bytes):
++    children = _der_children(data)
++    if not children:
++        raise ValueError('Malformed algorithm identifier')
++
++    oid = _der_oid(children[0][1])
++    parameters = children[1] if len(children) > 1 else None
++
++    return oid, parameters
++
++
++def _hash_module_from_oid(oid: str):
++    return {
++        '1.2.840.113549.2.5': MD5,
++        '1.3.14.3.2.26': SHA1,
++        '2.16.840.1.101.3.4.2.4': SHA224,
++        '2.16.840.1.101.3.4.2.1': SHA256,
++        '2.16.840.1.101.3.4.2.2': SHA384,
++        '2.16.840.1.101.3.4.2.3': SHA512,
++    }.get(oid)
++
++
++def _pkcs12_password(password: bytes) -> bytes:
++    return password.decode('utf-8').encode('utf-16-be') + b'\x00\x00'
++
++
++def _pkcs12_kdf(
++    password: bytes,
++    salt: bytes,
++    id_byte: int,
++    length: int,
++    iterations: int,
++    hash_module,
++) -> bytes:
++    password = _pkcs12_password(password)
++
++    digest_size = hash_module.digest_size
++    block_size = hash_module.block_size
++
++    diversifier = bytes([id_byte]) * block_size
++    salt_value = salt * ((block_size + len(salt) - 1) // len(salt)) if salt else b''
++    password_value = (
++        password * ((block_size + len(password) - 1) // len(password))
++        if password
++        else b''
++    )
++
++    internal_state = bytearray(salt_value + password_value)
++    result = bytearray()
++
++    for offset in range(0, length, digest_size):
++        value = hash_module.new(diversifier + bytes(internal_state)).digest()
++
++        for _ in range(1, iterations):
++            value = hash_module.new(value).digest()
++
++        result.extend(value)
++
++        if internal_state:
++            adjustment = int.from_bytes(
++                (value * ((block_size + len(value) - 1) // len(value)))[:block_size],
++                'big',
++            ) + 1
++
++            for block_offset in range(0, len(internal_state), block_size):
++                block = int.from_bytes(
++                    internal_state[block_offset:block_offset + block_size],
++                    'big',
++                )
++                block = (
++                    block
++                    + adjustment
++                ) % (1 << (8 * block_size))
++                internal_state[block_offset:block_offset + block_size] = block.to_bytes(
++                    block_size,
++                    'big',
++                )
++
++    return bytes(result[:length])
++
++
++def _decrypt_pkcs12_pbe(
++    algorithm_oid: str,
++    parameters,
++    password: bytes,
++    encrypted_data: bytes,
++) -> bytes:
++    if parameters is None or parameters[0] != 0x30:
++        raise ValueError('Malformed PKCS12 PBE parameters')
++
++    pbe_parameters = _der_children(parameters[1])
++    salt = pbe_parameters[0][1]
++    iterations = _der_integer(pbe_parameters[1][1])
++
++    pbe_algorithms = {
++        '1.2.840.113549.1.12.1.1': (ARC4, 16, None, None),
++        '1.2.840.113549.1.12.1.2': (ARC4, 5, None, None),
++        '1.2.840.113549.1.12.1.3': (DES3, 24, 8, None),
++        '1.2.840.113549.1.12.1.4': (DES3, 16, 8, None),
++        '1.2.840.113549.1.12.1.5': (ARC2, 16, 8, 128),
++        '1.2.840.113549.1.12.1.6': (ARC2, 5, 8, 40),
++    }
++
++    cipher_class, key_length, iv_length, effective_key_length = pbe_algorithms.get(
++        algorithm_oid,
++        (None, None, None, None),
++    )
++
++    if cipher_class is None:
++        raise ValueError(f'Unsupported PKCS12 PBE algorithm: {algorithm_oid}')
++
++    key = _pkcs12_kdf(
++        password=password,
++        salt=salt,
++        id_byte=1,
++        length=key_length,
++        iterations=iterations,
++        hash_module=SHA1,
++    )
++
++    if iv_length is None:
++        cipher = cipher_class.new(key)
++        return cipher.decrypt(encrypted_data)
++
++    iv = _pkcs12_kdf(
++        password=password,
++        salt=salt,
++        id_byte=2,
++        length=iv_length,
++        iterations=iterations,
++        hash_module=SHA1,
++    )
++
++    if cipher_class is ARC2:
++        cipher = cipher_class.new(
++            key,
++            cipher_class.MODE_CBC,
++            iv,
++            effective_keylen=effective_key_length,
++        )
++    else:
++        cipher = cipher_class.new(key, cipher_class.MODE_CBC, iv)
++
++    return unpad(cipher.decrypt(encrypted_data), cipher.block_size)
++
++
++def _decrypt_pbes2(
++    parameters,
++    password: bytes,
++    encrypted_data: bytes,
++) -> bytes:
++    if parameters is None or parameters[0] != 0x30:
++        raise ValueError('Malformed PBES2 parameters')
++
++    pbes2_parameters = _der_children(parameters[1])
++    kdf_oid, kdf_parameters = _algorithm_identifier(pbes2_parameters[0][1])
++    encryption_oid, encryption_parameters = _algorithm_identifier(
++        pbes2_parameters[1][1],
++    )
++
++    if kdf_oid != '1.2.840.113549.1.5.12':
++        raise ValueError(f'Unsupported PBES2 key derivation function: {kdf_oid}')
++
++    if kdf_parameters is None or kdf_parameters[0] != 0x30:
++        raise ValueError('Malformed PBKDF2 parameters')
++
++    pbkdf2_parameters = _der_children(kdf_parameters[1])
++    salt = pbkdf2_parameters[0][1]
++    iterations = _der_integer(pbkdf2_parameters[1][1])
++
++    key_length = None
++    prf_hash_module = SHA1
++
++    for parameter in pbkdf2_parameters[2:]:
++        if parameter[0] == 0x02:
++            key_length = _der_integer(parameter[1])
++        elif parameter[0] == 0x30:
++            prf_oid, _ = _algorithm_identifier(parameter[1])
++            prf_hash_module = {
++                '1.2.840.113549.2.7': SHA1,
++                '1.2.840.113549.2.9': SHA224,
++                '1.2.840.113549.2.9': SHA256,
++                '1.2.840.113549.2.10': SHA384,
++                '1.2.840.113549.2.11': SHA512,
++            }.get(prf_oid)
++
++            if prf_hash_module is None:
++                raise ValueError(f'Unsupported PBKDF2 PRF: {prf_oid}')
++
++    encryption_parameters_value = (
++        encryption_parameters[1]
++        if encryption_parameters is not None
++        else None
++    )
++    if encryption_parameters_value is None:
++        raise ValueError('Missing PBES2 encryption parameters')
++
++    encryption_iv = encryption_parameters_value
++
++    cipher_information = {
++        '2.16.840.1.101.3.4.1.2': (AES, 16),
++        '2.16.840.1.101.3.4.1.22': (AES, 24),
++        '2.16.840.1.101.3.4.1.42': (AES, 32),
++        '1.2.840.113549.3.7': (DES3, 24),
++    }
++
++    cipher_class, default_key_length = cipher_information.get(
++        encryption_oid,
++        (None, None),
++    )
++
++    if cipher_class is None:
++        raise ValueError(f'Unsupported PBES2 encryption algorithm: {encryption_oid}')
++
++    if key_length is None:
++        key_length = default_key_length
++
++    key = PBKDF2(
++        password,
++        salt,
++        dkLen=key_length,
++        count=iterations,
++        hmac_hash_module=prf_hash_module,
++    )
++
++    cipher = cipher_class.new(
++        key,
++        cipher_class.MODE_CBC,
++        encryption_iv,
++    )
++
++    return unpad(cipher.decrypt(encrypted_data), cipher.block_size)
++
++
++def _decrypt_encrypted_data(
++    encrypted_data: bytes,
++    password: bytes,
++) -> bytes:
++    encrypted_data_children = _der_children(encrypted_data)
++    encrypted_content_info = encrypted_data_children[1][1]
++    encrypted_content_info_children = _der_children(encrypted_content_info)
++
++    algorithm_oid, algorithm_parameters = _algorithm_identifier(
++        encrypted_content_info_children[1][1],
++    )
++
++    encrypted_content = encrypted_content_info_children[2]
++    if encrypted_content[0] == 0x80:
++        encrypted_value = encrypted_content[1]
++    elif encrypted_content[0] == 0xA0:
++        encrypted_value = _der_read(encrypted_content[1])[1]
++    else:
++        raise ValueError('Malformed encrypted content')
++
++    if algorithm_oid == '1.2.840.113549.1.5.13':
++        return _decrypt_pbes2(
++            parameters=algorithm_parameters,
++            password=password,
++            encrypted_data=encrypted_value,
++        )
++
++    return _decrypt_pkcs12_pbe(
++        algorithm_oid=algorithm_oid,
++        parameters=algorithm_parameters,
++        password=password,
++        encrypted_data=encrypted_value,
++    )
++
++
++def _extract_certificates_from_safe_contents(
++    safe_contents: bytes,
++) -> list[bytes]:
++    safe_contents_children = _der_children(_der_read(safe_contents)[1])
++    certificates = []
++
++    for safe_bag in safe_contents_children:
++        safe_bag_children = _der_children(safe_bag[1])
++        bag_id = _der_oid(safe_bag_children[0][1])
++        bag_value = safe_bag_children[1]
++
++        if bag_value[0] != 0xA0:
++            continue
++
++        bag_value_der = _der_read(bag_value[1])
++        bag_value_children = _der_children(bag_value_der[1])
++
++        if bag_id == '1.2.840.113549.1.12.10.1.3':
++            cert_id = _der_oid(bag_value_children[0][1])
++            if cert_id != '1.2.840.113549.1.9.22.1':
++                continue
++
++            cert_value = bag_value_children[1]
++            cert_value_der = _der_read(cert_value[1])
++            certificates.append(cert_value_der[1])
++        elif bag_id == '1.2.840.113549.1.12.10.1.6':
++            certificates.extend(
++                _extract_certificates_from_safe_contents(bag_value_der[1]),
++            )
++
++    return certificates
++
++
++def _verify_pkcs12_mac(
++    mac_data: bytes,
++    authenticated_safe: bytes,
++    password: bytes,
++) -> None:
++    mac_data_children = _der_children(mac_data)
++    digest_info = _der_children(mac_data_children[0][1])
++    digest_oid, _ = _algorithm_identifier(digest_info[0][1])
++    digest = digest_info[1][1]
++    salt = mac_data_children[1][1]
++    iterations = (
++        _der_integer(mac_data_children[2][1])
++        if len(mac_data_children) > 2
++        else 1
++    )
++
++    hash_module = _hash_module_from_oid(digest_oid)
++    if hash_module is None:
++        raise ValueError(f'Unsupported PKCS12 MAC algorithm: {digest_oid}')
++
++    mac_key = _pkcs12_kdf(
++        password=password,
++        salt=salt,
++        id_byte=3,
++        length=hash_module.digest_size,
++        iterations=iterations,
++        hash_module=hash_module,
++    )
++
++    calculated_digest = HMAC.new(
++        mac_key,
++        authenticated_safe,
++        digestmod=hash_module,
++    ).digest()
++
++    if calculated_digest != digest:
++        raise ValueError('Invalid PKCS12 password or MAC')
++
++
++def _load_key_and_certificates(
++    data: bytes,
++    password: bytes,
++):
++    pfx_children = _der_children(_der_read(data)[1])
++    auth_safe_content_info = _der_children(pfx_children[1][1])
++    auth_safe_content = _der_read(auth_safe_content_info[1][1])
++    authenticated_safe = auth_safe_content[1]
++
++    if len(pfx_children) > 2:
++        _verify_pkcs12_mac(
++            mac_data=pfx_children[2][1],
++            authenticated_safe=authenticated_safe,
++            password=password,
++        )
++
++    certificates = []
++
++    for content_info in _der_children(_der_read(authenticated_safe)[1]):
++        content_info_children = _der_children(content_info[1])
++        content_type = _der_oid(content_info_children[0][1])
++        content = _der_read(content_info_children[1][1])
++
++        if content_type == '1.2.840.113549.1.7.1':
++            certificates.extend(
++                _extract_certificates_from_safe_contents(content[1]),
++            )
++        elif content_type == '1.2.840.113549.1.7.6':
++            decrypted_content = _decrypt_encrypted_data(
++                encrypted_data=content[1],
++                password=password,
++            )
++            certificates.extend(
++                _extract_certificates_from_safe_contents(decrypted_content),
++            )
++
++    x509_cert = certificates[0] if certificates else None
++    additional_certs = certificates[1:]
++
++    return None, x509_cert, additional_certs
++
++
++def _get_other_name_value(value: bytes) -> bytes:
++    current_value = value
++
++    for _ in range(2):
++        try:
++            tag, nested_value, end = _der_read(current_value)
++        except ValueError:
++            break
++
++        if end != len(current_value):
++            break
++
++        if tag in (0x04, 0x0C, 0x13, 0x16, 0x1A, 0x1E):
++            current_value = nested_value
++        else:
++            break
++
++    return current_value
++
++
++def _get_subject_alt_name(x509_cert: bytes) -> _SubjectAlternativeName:
++    certificate_children = _der_children(_der_read(x509_cert)[1])
++    tbs_certificate_children = _der_children(certificate_children[0][1])
++
++    for extension_field in tbs_certificate_children:
++        if extension_field[0] != 0xA3:
++            continue
++
++        extensions = _der_read(extension_field[1])
++        for extension in _der_children(extensions[1]):
++            extension_children = _der_children(extension[1])
++            extension_oid = _der_oid(extension_children[0][1])
++
++            if extension_oid != '2.5.29.17':
++                continue
++
++            extension_value = extension_children[-1][1]
++            subject_alt_name = _der_read(extension_value)
++            other_names = []
++
++            for general_name in _der_children(subject_alt_name[1]):
++                if general_name[0] != 0xA0:
++                    continue
++
++                other_name = _der_read(general_name[1])
++                other_name_value = (
++                    other_name[1]
++                    if other_name[0] == 0x30
++                    else general_name[1]
++                )
++                other_name_children = _der_children(other_name_value)
++
++                if len(other_name_children) < 3:
++                    raise AttributeError('Malformed otherName')
++
++                type_id = _der_oid(other_name_children[0][1])
++                if type_id != str(constants.SII_CERT_TITULAR_RUT_OID):
++                    continue
++
++                value_field = other_name_children[2]
++                value_der = _der_read(value_field[1])
++                value = _get_other_name_value(value_der[1])
++
++                other_names.append(
++                    _OtherName(
++                        constants.SII_CERT_TITULAR_RUT_OID,
++                        value,
++                    ),
++                )
++
++            return _SubjectAlternativeName(
++                extension_oid,
++                other_names,
++            )
++
++    raise Exception('Certificate has no Subject Alternative Name extension')
+ 
+ 
+ def get_subject_rut_from_certificate_pfx(pfx_file_bytes: bytes, password: Optional[str]) -> Rut:
+@@ -22,24 +569,20 @@
+         private_key,
+         x509_cert,
+         additional_certs,
+-    ) = cryptography.hazmat.primitives.serialization.pkcs12.load_key_and_certificates(
++    ) = _load_key_and_certificates(
+         data=pfx_file_bytes,
+-        password=password.encode() if password is not None else None,
+-        backend=crypto_x509_backend,
+-    )
+-    # https://cryptography.io/en/latest/hazmat/primitives/asymmetric/serialization/#cryptography.hazmat.primitives.serialization.pkcs12.load_key_and_certificates  # noqa: E501
++        password=password.encode() if password is not None else b'',
++    )
+ 
+     assert x509_cert is not None
+ 
+-    subject_alt_name_ext = x509_cert.extensions.get_extension_for_class(
+-        cryptography.x509.extensions.SubjectAlternativeName,
+-    )
++    subject_alt_name_ext = _get_subject_alt_name(x509_cert)
+ 
+     # Search for the RUT in the certificate.
+     try:
+         results = [
+             x.value
+-            for x in subject_alt_name_ext.value._general_names
++            for x in subject_alt_name_ext.value
+             if hasattr(x, 'type_id') and x.type_id == constants.SII_CERT_TITULAR_RUT_OID
+         ]
+     except AttributeError as exc:

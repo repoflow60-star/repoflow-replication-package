@@ -1,0 +1,196 @@
+--- a/olclient/openlibrary.py
++++ b/olclient/openlibrary.py
+@@ -2,23 +2,132 @@
+ 
+ 
+ import json
++from collections.abc import Mapping
++from http.cookies import SimpleCookie
+ from typing import List, Dict, Optional, Any
+ 
+ import jsonschema
+ import logging
+ import os
+ import re
++import urllib3
+ from urllib.parse import urlencode
+ from urllib.request import pathname2url
+ 
+ import backoff
+-import requests
+-from requests import Response
++from urllib3.response import HTTPResponse
+ 
+ from olclient import common
+ from olclient.config import Config
+ from olclient.entity_helpers.work import get_work_helper_class
+ from olclient.utils import merge_unique_lists
++
++
++class _HTTPStatusError(urllib3.exceptions.HTTPError):
++    """HTTP error carrying the response that caused it."""
++
++    def __init__(self, response):
++        self.response = response
++        super().__init__(
++            f'HTTP status {response.status}: {getattr(response, "reason", "")}'
++        )
++
++
++def _raise_for_status(response):
++    """Raise an urllib3 error for an unsuccessful HTTP response.
++
++    urllib3 exposes the response status as ``status`` but does not provide
++    ``raise_for_status`` on ``HTTPResponse``.
++    """
++    if hasattr(response, 'raise_for_status'):
++        # This also keeps custom response objects supplied by callers usable.
++        response.raise_for_status()
++    elif getattr(response, 'status', 0) >= 400:
++        raise _HTTPStatusError(response)
++
++
++class _Urllib3Session:
++    """Small session adapter around urllib3's connection pool.
++
++    urllib3 supplies connection pooling but deliberately does not provide a
++    cookie-aware session.  This adapter keeps cookies between login and
++    subsequent requests and translates the conveniences used by the client
++    (form fields, multipart files, and query parameters).
++    """
++
++    def __init__(self):
++        self._pool = urllib3.PoolManager()
++        self.cookies = {}
++
++    def _url_with_params(self, url, params):
++        if not params:
++            return url
++        query = urlencode(
++            [(key, value) for key, value in params.items() if value is not None],
++            doseq=True,
++        )
++        if not query:
++            return url
++        if '?' not in url:
++            return f'{url}?{query}'
++        separator = '' if url.endswith(('?', '&')) else '&'
++        return f'{url}{separator}{query}'
++
++    def _update_cookies(self, response):
++        getlist = getattr(response.headers, 'getlist', None)
++        set_cookies = getlist('Set-Cookie') if getlist else []
++        if not set_cookies:
++            cookie_header = response.headers.get('Set-Cookie')
++            set_cookies = [cookie_header] if cookie_header else []
++        for header in set_cookies:
++            parsed = SimpleCookie()
++            parsed.load(header)
++            for name, morsel in parsed.items():
++                self.cookies[name] = morsel.value
++
++    def request(self, method, url, data=None, headers=None, files=None,
++                params=None, json=None, **kwargs):
++        headers = dict(headers or {})
++        url = self._url_with_params(url, params)
++        if self.cookies and not any(key.lower() == 'cookie' for key in headers):
++            headers['Cookie'] = '; '.join(
++                f'{name}={value}' for name, value in self.cookies.items()
++            )
++
++        if files is not None:
++            response = self._pool.request_encode_body(
++                method, url, fields=files, headers=headers, **kwargs
++            )
++        elif isinstance(data, Mapping):
++            response = self._pool.request_encode_body(
++                method,
++                url,
++                fields=data,
++                headers=headers,
++                encode_multipart=False,
++                **kwargs,
++            )
++        else:
++            request_kwargs = dict(kwargs)
++            if data is not None:
++                request_kwargs['body'] = data
++            if json is not None:
++                request_kwargs['json'] = json
++            response = self._pool.request(
++                method, url, headers=headers, **request_kwargs
++            )
++        self._update_cookies(response)
++        return response
++
++    def get(self, url, **kwargs):
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, **kwargs):
++        return self.request('POST', url, **kwargs)
++
++    def put(self, url, **kwargs):
++        return self.request('PUT', url, **kwargs)
++
+ 
+ logger = logging.getLogger('openlibrary')
+ 
+@@ -51,9 +160,9 @@
+     VALID_IDS = ['isbn_10', 'isbn_13', 'lccn', 'ocaid']
+     BACKOFF_KWARGS = {
+         'wait_gen': backoff.expo,
+-        'exception': requests.exceptions.RequestException,
+-        'giveup': lambda e: hasattr(e.response, 'status_code')
+-        and 400 <= e.response.status_code < 500,
++        'exception': urllib3.exceptions.HTTPError,
++        'giveup': lambda e: getattr(getattr(e, 'response', None), 'status', 0)
++        and 400 <= e.response.status < 500,
+         'max_tries': 5,
+     }
+ 
+@@ -62,15 +171,15 @@
+     WORKS_PAGINATION_OFFSET = 0
+ 
+     def __init__(self, credentials=None, base_url='https://openlibrary.org'):
+-        self.session = requests.Session()
++        self.session = _Urllib3Session()
+         self.base_url = base_url
+         credentials = credentials or Config().get_config().get('s3', None)
+         if credentials:
+             self.login(credentials)
+ 
+     def login(self, credentials):
+-        """Login to Open Library with given credentials, ensures the requests
+-        session has valid cookies for future requests.
++        """Login to Open Library with given credentials, ensuring the session
++        has valid cookies for future requests.
+         """
+ 
+         if 'username' in credentials._asdict():
+@@ -119,7 +228,7 @@
+         url = self._generate_url_from_olid(olid)
+         return self.session.put(url, data=data)
+ 
+-    def save_many(self, docs, comment) -> Response:
++    def save_many(self, docs, comment) -> HTTPResponse:
+         """
+         Uses the Open Library save_many API endpoint to
+         write any number or combination of documents (Edition, Work, or Author)
+@@ -135,7 +244,7 @@
+             f'{self.base_url}/api/save_many', json.dumps(doc_json), headers=headers
+         )
+ 
+-    def delete_many(self, ol_ids: List[str], comment: str) -> Response:
++    def delete_many(self, ol_ids: List[str], comment: str) -> HTTPResponse:
+         return self.save_many(
+             [self.Delete(ol_id) for ol_id in ol_ids],
+             comment=comment
+@@ -147,7 +256,7 @@
+     def get_ol_response(self, path):
+         """Makes best effort to perform request w/ exponential backoff"""
+         response = self.session.get(self.base_url + path)
+-        response.raise_for_status()
++        _raise_for_status(response)
+         return response
+ 
+     @property

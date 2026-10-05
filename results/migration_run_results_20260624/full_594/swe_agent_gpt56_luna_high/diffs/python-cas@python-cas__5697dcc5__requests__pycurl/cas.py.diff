@@ -1,0 +1,125 @@
+--- a/cas.py
++++ b/cas.py
+@@ -1,10 +1,87 @@
+ import datetime
++import io
+ import logging
+ from uuid import uuid4
+ 
+-import requests
++import pycurl
+ from lxml import etree
+ from six.moves.urllib import parse as urllib_parse
++
++
++class _PycurlResponse(object):
++    """Small response object exposing the HTTP response API we use."""
++
++    def __init__(self, content, status_code):
++        self.content = content
++        self.status_code = status_code
++
++    def iter_lines(self, chunk_size=8192):
++        # ``chunk_size`` is accepted for compatibility with the former
++        # HTTP client.  The complete response is already in memory because
++        # pycurl writes it to a BytesIO object before returning from
++        # ``perform``.
++        return iter(self.content.splitlines())
++
++    def close(self):
++        # The curl handle is closed by _PycurlSession once the response has
++        # been created.  Keep this method so callers can manage responses in
++        # the same way as they did with the previous HTTP client.
++        pass
++
++
++class _PycurlSession(object):
++    """Minimal session adapter for the HTTP calls made by this module."""
++
++    @staticmethod
++    def _url_with_params(url, params):
++        if not params:
++            return url
++        query = urllib_parse.urlencode(params)
++        separator = '&' if '?' in url else '?'
++        return ''.join([url, separator, query])
++
++    @staticmethod
++    def _headers(headers):
++        if not headers:
++            return []
++        return ['%s: %s' % (name, value) for name, value in headers.items()]
++
++    def _request(self, method, url, data=None, params=None, headers=None,
++                 verify=True):
++        response_body = io.BytesIO()
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, self._url_with_params(url, params))
++            curl.setopt(pycurl.WRITEFUNCTION, response_body.write)
++            curl.setopt(pycurl.SSL_VERIFYPEER, 1 if verify else 0)
++            curl.setopt(pycurl.SSL_VERIFYHOST, 2 if verify else 0)
++
++            request_headers = self._headers(headers)
++            if request_headers:
++                curl.setopt(pycurl.HTTPHEADER, request_headers)
++
++            if method == 'POST':
++                curl.setopt(pycurl.POST, 1)
++                if data is not None:
++                    if not isinstance(data, bytes):
++                        data = data.encode('utf-8')
++                    curl.setopt(pycurl.POSTFIELDS, data)
++
++            curl.perform()
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++            return _PycurlResponse(response_body.getvalue(), status_code)
++        finally:
++            curl.close()
++
++    def get(self, url, params=None, verify=True, **kwargs):
++        return self._request('GET', url, params=params, verify=verify)
++
++    def post(self, url, data=None, params=None, headers=None, verify=True,
++             **kwargs):
++        return self._request(
++            'POST', url, data=data, params=params, headers=headers,
++            verify=verify)
++
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -79,7 +156,7 @@
+         self.renew = renew
+         self.username_attribute = username_attribute
+         self.verify_ssl_certificate = verify_ssl_certificate
+-        self.session = session or requests.sessions.Session()
++        self.session = session or _PycurlSession()
+ 
+     def verify_ticket(self, ticket):
+         """Verify ticket.
+@@ -180,8 +257,13 @@
+         try:
+             page_iterator = page.iter_lines(chunk_size=8192)
+             verified = next(page_iterator).strip()
++            if isinstance(verified, bytes):
++                verified = verified.decode('utf-8')
+             if verified == 'yes':
+-                return next(page_iterator).strip(), None, None
++                username = next(page_iterator).strip()
++                if isinstance(username, bytes):
++                    username = username.decode('utf-8')
++                return username, None, None
+             else:
+                 return None, None, None
+         finally:
+@@ -384,7 +466,8 @@
+             saml_validate_url,
+             self.get_saml_assertion(ticket),
+             params=params,
+-            headers=headers)
++            headers=headers,
++            verify=self.verify_ssl_certificate)
+ 
+     @classmethod
+     def get_saml_assertion(cls, ticket):

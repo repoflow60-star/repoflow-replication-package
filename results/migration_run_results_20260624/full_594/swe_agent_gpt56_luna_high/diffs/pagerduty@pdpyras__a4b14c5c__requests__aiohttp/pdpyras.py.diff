@@ -1,0 +1,191 @@
+--- a/pdpyras.py
++++ b/pdpyras.py
+@@ -3,22 +3,111 @@
+ # See LICENSE for details.
+ 
+ # Standard libraries
++import asyncio
++import json
+ import logging
+ import sys
++import threading
+ import time
+ from copy import deepcopy
+-from datetime import datetime
++from datetime import datetime, timedelta
+ from random import random
++from types import SimpleNamespace
+ from typing import Iterator, Union
+ from warnings import warn
+ 
+-# Upstream components on which this client is based:
+-from requests import Response, Session
+-from requests import __version__ as REQUESTS_VERSION
+-
+-# HTTP client exceptions:
+-from urllib3.exceptions import HTTPError, PoolError
+-from requests.exceptions import RequestException
++# HTTP transport.  aiohttp is asynchronous, while pdpyras intentionally keeps
++# its long-standing synchronous API.  The small adapter below materializes an
++# aiohttp response before returning it to the rest of the client.
++import aiohttp
++
++AIOHTTP_VERSION = aiohttp.__version__
++# Retained for compatibility with clients that inspect the old user-agent
++# format.  The transport itself is now aiohttp (see AIOHTTP_VERSION above).
++REQUESTS_VERSION = '2.34.2'
++
++# These names were historically part of pdpyras' public surface.  Keep them as
++# aliases for aiohttp errors so callers can continue to catch transport errors
++# without requiring requests or urllib3.
++HTTPError = aiohttp.ClientError
++PoolError = aiohttp.ClientConnectionError
++RequestException = aiohttp.ClientError
++
++
++class Response:
++    """Synchronous, requests-compatible view of an aiohttp response."""
++
++    def __init__(self, status_code, body, method, url, headers, elapsed):
++        self.status_code = status_code
++        self.url = url
++        self.headers = headers
++        self.content = body
++        self.text = body.decode('utf-8', errors='replace')
++        self.encoding = 'utf-8'
++        self.elapsed = timedelta(seconds=elapsed)
++        self.request = SimpleNamespace(method=method, url=url)
++        self.ok = status_code < 400
++
++    def json(self, **kwargs):
++        return json.loads(self.text, **kwargs)
++
++
++async def _aiohttp_request(method, url, kwargs):
++    """Perform one request and eagerly read its body inside the event loop."""
++    request_kwargs = dict(kwargs)
++    # ``stream`` is a requests-only option.  Responses are read eagerly because
++    # the public pdpyras methods are synchronous and must outlive this loop.
++    request_kwargs.pop('stream', None)
++    started = time.monotonic()
++    async with aiohttp.ClientSession() as session:
++        async with session.request(method, url, **request_kwargs) as response:
++            body = await response.read()
++            return Response(
++                response.status,
++                body,
++                response.method,
++                str(response.url),
++                dict(response.headers),
++                time.monotonic() - started,
++            )
++
++
++def _run_async(coro):
++    """Run a coroutine from synchronous code, including inside an event loop."""
++    try:
++        asyncio.get_running_loop()
++    except RuntimeError:
++        return asyncio.run(coro)
++
++    # asyncio.run cannot be nested.  Running this one blocking operation in a
++    # helper thread keeps the synchronous API usable by applications that call
++    # it from an async callback as well.
++    result = []
++    error = []
++
++    def run():
++        try:
++            result.append(asyncio.run(coro))
++        except BaseException as exc:  # propagate the original transport error
++            error.append(exc)
++
++    thread = threading.Thread(target=run)
++    thread.start()
++    thread.join()
++    if error:
++        raise error[0]
++    return result[0]
++
++
++class _AiohttpSession:
++    """Transport adapter exposing the subset of Session used by PDSession."""
++
++    def request(self, method, url, **kwargs):
++        return _run_async(_aiohttp_request(method, url, kwargs))
++
++    def close(self):
++        # ClientSession instances are deliberately scoped to each request.
++        pass
+ 
+ __version__ = '5.4.0'
+ 
+@@ -862,7 +951,7 @@
+ ### CLASSES ###
+ ###############
+ 
+-class PDSession(Session):
++class PDSession:
+     """
+     Base class for making HTTP requests to PagerDuty APIs
+ 
+@@ -966,12 +1055,22 @@
+     url = ""
+ 
+     def __init__(self, api_key: str, debug=False):
+-        self.parent = super(PDSession, self)
+-        self.parent.__init__()
++        self.parent = _AiohttpSession()
++        self.headers = {}
+         self.api_key = api_key
+         self.log = logging.getLogger(__name__)
+         self.print_debug = debug
+         self.retry = {}
++
++    def close(self):
++        """Release transport resources (provided for Session compatibility)."""
++        self.parent.close()
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc_value, traceback):
++        self.close()
+ 
+     def after_set_api_key(self):
+         """
+@@ -1089,6 +1188,25 @@
+             delattr(self, '_debugHandler')
+         # else: no-op; only happens if debug is set to the same value twice
+ 
++    def get(self, url, **kwargs):
++        """Make a GET request using the synchronous aiohttp adapter."""
++        kwargs.setdefault('allow_redirects', True)
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, data=None, **kwargs):
++        """Make a POST request using the synchronous aiohttp adapter."""
++        kwargs['data'] = data
++        return self.request('POST', url, **kwargs)
++
++    def put(self, url, data=None, **kwargs):
++        """Make a PUT request using the synchronous aiohttp adapter."""
++        kwargs['data'] = data
++        return self.request('PUT', url, **kwargs)
++
++    def delete(self, url, **kwargs):
++        """Make a DELETE request using the synchronous aiohttp adapter."""
++        return self.request('DELETE', url, **kwargs)
++
+     def request(self, method, url, **kwargs) -> Response:
+         """
+         Make a generic PagerDuty API request.
+@@ -1135,7 +1253,7 @@
+             try:
+                 response = self.parent.request(method, full_url, **req_kw)
+                 self.postprocess(response)
+-            except (HTTPError, PoolError, RequestException) as e:
++            except (HTTPError, PoolError, RequestException, asyncio.TimeoutError) as e:
+                 network_attempts += 1
+                 if network_attempts > self.max_network_attempts:
+                     error_msg = f"{endpoint}: Non-transient network " \

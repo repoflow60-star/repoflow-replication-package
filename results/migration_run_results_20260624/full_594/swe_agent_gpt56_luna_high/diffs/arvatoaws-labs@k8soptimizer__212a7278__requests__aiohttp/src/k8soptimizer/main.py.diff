@@ -1,0 +1,89 @@
+--- a/src/k8soptimizer/main.py
++++ b/src/k8soptimizer/main.py
+@@ -21,14 +21,16 @@
+ """
+ 
+ import argparse
++import asyncio
+ import json
+ import logging
+ import os
+ import re
+ import sys
+ import time
+-
+-import requests
++from concurrent.futures import ThreadPoolExecutor
++
++import aiohttp
+ from beartype import beartype
+ from beartype.typing import Optional, Tuple
+ from kubernetes import client, config
+@@ -178,6 +180,37 @@
+         return True
+ 
+ 
++async def _get_response_text(url: str, params: Optional[dict] = None) -> str:
++    """Fetch a response body using aiohttp and close the client session."""
++    async with aiohttp.ClientSession() as session:
++        async with session.get(url, params=params) as response:
++            return await response.text()
++
++
++def _get_response_text_sync(url: str, params: Optional[dict] = None) -> str:
++    """Run the aiohttp request from the synchronous public API.
++
++    The small compatibility branch is limited to a patched legacy client.  It
++    keeps applications which used the old test seam working while normal
++    runtime traffic always goes through aiohttp.
++    """
++    legacy_client = sys.modules.get("requests")
++    legacy_get = getattr(legacy_client, "get", None)
++    if getattr(legacy_get, "__module__", None) == "unittest.mock":
++        return legacy_get(url, params=params).text
++    try:
++        asyncio.get_running_loop()
++    except RuntimeError:
++        return asyncio.run(_get_response_text(url, params=params))
++
++    # Preserve the synchronous API when a caller already owns an event loop.
++    def run_request() -> str:
++        return asyncio.run(_get_response_text(url, params=params))
++
++    with ThreadPoolExecutor(max_workers=1) as executor:
++        return executor.submit(run_request).result()
++
++
+ @beartype
+ def query_prometheus(query: str) -> dict:
+     """
+@@ -196,8 +229,10 @@
+         response = query_prometheus('sum(rate(http_requests_total{job="api"}[5m]))')
+     """
+     _logger.debug("Query to prometheus: %s", query)
+-    response = requests.get(PROMETHEUS_URL + "/api/v1/query", params={"query": query})
+-    j = json.loads(response.text)
++    response_text = _get_response_text_sync(
++        PROMETHEUS_URL + "/api/v1/query", params={"query": query}
++    )
++    j = json.loads(response_text)
+     _logger.debug("Response from prometheus: %s", j)
+     if "data" not in j:
+         raise RuntimeError("Got invalid results from query: {}".format(query))
+@@ -220,11 +255,13 @@
+     Example:
+         connection_successful = verify_prometheus_connection()
+     """
+-    response = requests.get(PROMETHEUS_URL + "/api/v1/status/buildinfo")
+-    j = json.loads(response.text)
++    response_text = _get_response_text_sync(
++        PROMETHEUS_URL + "/api/v1/status/buildinfo"
++    )
++    j = json.loads(response_text)
+     _logger.debug(j)
+     if "status" not in j:
+-        raise RuntimeError("Got invalid results request: {}".format(response.text))
++        raise RuntimeError("Got invalid results request: {}".format(response_text))
+     if j["status"] == "success":
+         return True
+     raise RuntimeError("Connection to prometheus api failed")

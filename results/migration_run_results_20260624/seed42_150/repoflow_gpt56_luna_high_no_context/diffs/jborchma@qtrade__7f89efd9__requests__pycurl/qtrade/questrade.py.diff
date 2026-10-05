@@ -1,0 +1,165 @@
+--- a/qtrade/questrade.py
++++ b/qtrade/questrade.py
+@@ -1,9 +1,12 @@
+ """Core module for Questrade API wrapper."""
+ 
++import json as json_lib
+ import logging
++from io import BytesIO
+ from typing import Any, Dict, List, Optional, Union
+-
+-import requests
++from urllib.parse import urlencode
++
++import pycurl
+ import yaml
+ 
+ from .utility import TokenDict, get_access_token_yaml, validate_access_token
+@@ -38,7 +41,7 @@
+     ):
+         self.access_token: TokenDict
+         self.headers = None
+-        self.session = requests.Session()
++        self.session = pycurl.Curl()
+ 
+         self.access_code = access_code
+         self.token_yaml = token_yaml
+@@ -50,8 +53,6 @@
+                 + " "
+                 + self.access_token["access_token"]
+             }
+-            # add headers to session
+-            self.session.headers.update(self.headers)
+         else:
+             self._get_access_token(save_yaml=save_yaml)
+ 
+@@ -91,9 +92,64 @@
+         else:
+             log.error("Access token not set...")
+             raise Exception("Access token not set...")
+-        resp = self.session.request(method, url, params=params, data=data, json=json, timeout=30)
+-        resp.raise_for_status()
+-        return resp.json()
++        response = self._request_bytes(
++            method,
++            url,
++            params=params,
++            data=data,
++            json_payload=json,
++        )
++        return json_lib.loads(response)
++
++    def _request_bytes(
++        self,
++        method: str,
++        url: str,
++        params: Optional[Dict] = None,
++        data: Optional[Dict] = None,
++        json_payload: Optional[Dict] = None,
++        use_session_headers: bool = True,
++    ) -> bytes:
++        """Send a request with pycurl and return its response body."""
++        if params:
++            query = urlencode(params, doseq=True)
++            url += ("&" if "?" in url else "?") + query
++
++        headers = []
++        if use_session_headers and self.headers:
++            headers.extend(f"{key}: {value}" for key, value in self.headers.items())
++
++        body = None
++        if data is not None:
++            if isinstance(data, dict):
++                body = urlencode(data, doseq=True).encode("utf-8")
++                headers.append("Content-Type: application/x-www-form-urlencoded")
++            elif isinstance(data, bytes):
++                body = data
++            else:
++                body = str(data).encode("utf-8")
++        elif json_payload is not None:
++            body = json_lib.dumps(json_payload).encode("utf-8")
++            headers.append("Content-Type: application/json")
++
++        response_buffer = BytesIO()
++        self.session.reset()
++        self.session.setopt(pycurl.URL, url)
++        self.session.setopt(pycurl.CUSTOMREQUEST, method.upper())
++        self.session.setopt(pycurl.FOLLOWLOCATION, 1)
++        self.session.setopt(pycurl.TIMEOUT, 30)
++        if headers:
++            self.session.setopt(pycurl.HTTPHEADER, headers)
++        self.session.setopt(pycurl.WRITEDATA, response_buffer)
++        if body is not None:
++            self.session.setopt(pycurl.POSTFIELDS, body)
++
++        self.session.perform()
++        status_code = self.session.getinfo(pycurl.RESPONSE_CODE)
++        if status_code >= 400:
++            raise RuntimeError(f"HTTP error {status_code}")
++
++        return response_buffer.getvalue()
+ 
+     def save_token_to_yaml(self, yaml_path: str = "access_token.yml"):
+         """Save the token payload as a yaml-file.
+@@ -131,9 +187,7 @@
+         """
+         url = TOKEN_URL + str(self.access_code)
+         log.info("Getting access token...")
+-        data = requests.get(url)
+-        data.raise_for_status()
+-        response = data.json()
++        response = json_lib.loads(self._request_bytes("get", url, use_session_headers=False))
+ 
+         # validate response
+         validate_access_token(**response)
+@@ -152,8 +206,6 @@
+             + self.access_token["access_token"]
+         }
+ 
+-        self.session.headers.update(self.headers)
+-
+         # save access token
+         if save_yaml:
+             log.info("Saving yaml file to {}...".format(yaml_path))  # pylint: disable=W1202
+@@ -191,9 +243,7 @@
+ 
+         url = TOKEN_URL + str(old_access_token["refresh_token"])
+         log.info("Refreshing access token...")
+-        data = requests.get(url)
+-        data.raise_for_status()
+-        response = data.json()
++        response = json_lib.loads(self._request_bytes("get", url, use_session_headers=False))
+ 
+         # validate response
+         validate_access_token(**response)
+@@ -211,9 +261,6 @@
+             + " "
+             + self.access_token["access_token"]
+         }
+-
+-        # update headers
+-        self.session.headers.update(self.headers)
+ 
+         # save access token
+         if from_yaml:
+@@ -606,8 +653,7 @@
+         """
+         uri = self.access_token["api_server"] + "/v1/accounts/" + str(acct_id) + "/orders"
+         log.info("Posting order...")
+-        data = self.session.post(uri, json=order_dict)
+-        data.raise_for_status()
++        self._request_bytes("post", uri, json_payload=order_dict)
+         response = self._send_message(
+             "post", "accounts/" + str(acct_id) + "/orders", json=order_dict
+         )
+@@ -755,7 +801,9 @@
+ 
+     def __del__(self):
+         """Close session when class instance is deleted."""
+-        self.session.close()
++        session = getattr(self, "session", None)
++        if session is not None:
++            session.close()
+ 
+     @staticmethod
+     def _valid_intervals():

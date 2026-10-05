@@ -1,0 +1,134 @@
+--- a/kling/kling.py
++++ b/kling/kling.py
+@@ -1,4 +1,6 @@
+ import argparse
++import asyncio
++import json
+ import os
+ import time
+ import contextlib
+@@ -6,9 +8,8 @@
+ from enum import Enum
+ from http.cookies import SimpleCookie
+ 
++import aiohttp
+ from fake_useragent import UserAgent
+-import requests
+-from requests.utils import cookiejar_from_dict
+ from rich import print
+ import threading
+ 
+@@ -18,7 +19,79 @@
+ base_url_not_cn = "https://klingai.com/"
+ 
+ 
+-def call_for_daily_check(session: requests.Session, is_cn: bool) -> bool:
++class _SyncResponse:
++    def __init__(self, status: int, content: bytes, encoding: str) -> None:
++        self.status_code = status
++        self.ok = status < 400
++        self.content = content
++        self.text = content.decode(encoding, errors="replace")
++
++    def json(self):
++        return json.loads(self.text)
++
++
++class _CookieJar(aiohttp.CookieJar):
++    def __init__(self) -> None:
++        # CookieJar construction is synchronous, while aiohttp normally gets
++        # its loop from an active async context.
++        super().__init__(loop=asyncio.new_event_loop())
++
++    def __iter__(self):
++        for morsel in super().__iter__():
++            yield morsel.key, morsel.value
++
++
++class _SyncAiohttpClient:
++    """Expose the small synchronous session API used by the generators."""
++
++    def __init__(self, cookie_jar: aiohttp.CookieJar, headers: dict) -> None:
++        self.cookies = cookie_jar
++        self.headers = headers
++        self._request_lock = threading.RLock()
++
++    def get(self, url: str, **kwargs):
++        return self._request("GET", url, **kwargs)
++
++    def post(self, url: str, **kwargs):
++        return self._request("POST", url, **kwargs)
++
++    def _request(self, method: str, url: str, **kwargs):
++        with self._request_lock:
++            coroutine = self._request_async(method, url, **kwargs)
++            try:
++                asyncio.get_running_loop()
++            except RuntimeError:
++                return asyncio.run(coroutine)
++
++            result = []
++            error = []
++
++            def run_request() -> None:
++                try:
++                    result.append(asyncio.run(coroutine))
++                except BaseException as exc:
++                    error.append(exc)
++
++            thread = threading.Thread(target=run_request)
++            thread.start()
++            thread.join()
++            if error:
++                raise error[0]
++            return result[0]
++
++    async def _request_async(self, method: str, url: str, **kwargs):
++        request_kwargs = dict(kwargs)
++        request_kwargs.setdefault("allow_redirects", True)
++        async with aiohttp.ClientSession(
++            cookie_jar=self.cookies, headers=dict(self.headers)
++        ) as session:
++            async with session.request(method, url, **request_kwargs) as response:
++                content = await response.read()
++                encoding = response.charset or "utf-8"
++                return _SyncResponse(response.status, content, encoding)
++
++
++def call_for_daily_check(session: _SyncAiohttpClient, is_cn: bool) -> bool:
+     if is_cn:
+         r = session.get(f"{base_url}api/pay/reward?activity=login_bonus_daily")
+     else:
+@@ -40,9 +113,9 @@
+ 
+ class BaseGen:
+     def __init__(self, cookie: str) -> None:
+-        self.session: requests.Session = requests.Session()
+         self.cookie = cookie
+-        self.session.cookies, is_cn = self.parse_cookie_string(self.cookie)
++        cookie_jar, is_cn = self.parse_cookie_string(self.cookie)
++        self.session = _SyncAiohttpClient(cookie_jar, {})
+         self.session.headers["user-agent"] = ua.random
+         # check the daily login
+         call_for_daily_check(self.session, is_cn)
+@@ -72,15 +145,16 @@
+         cookie = SimpleCookie()
+         cookie.load(cookie_string)
+         cookies_dict = {}
+-        cookiejar = None
+         is_cn = False
+         for key, morsel in cookie.items():
+             if key.startswith("kuaishou"):
+                 is_cn = True
+             cookies_dict[key] = morsel.value
+-            cookiejar = cookiejar_from_dict(
+-                cookies_dict, cookiejar=None, overwrite=True
+-            )
++        cookiejar = _CookieJar()
++        if cookies_dict:
++            # No response URL keeps the cookies available to the upload hosts,
++            # matching the original session-wide cookie behavior.
++            cookiejar.update_cookies(cookies_dict)
+         return cookiejar, is_cn
+ 
+     def get_account_point(self) -> float:

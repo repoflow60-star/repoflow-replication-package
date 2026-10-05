@@ -1,0 +1,158 @@
+--- a/sectxt/__init__.py
++++ b/sectxt/__init__.py
+@@ -11,10 +11,19 @@
+ from collections import defaultdict
+ from datetime import datetime, timezone
+ from typing import Optional, Union, List, DefaultDict
+-from urllib.parse import urlsplit, urlunsplit
++from urllib.parse import urljoin, urlsplit, urlunsplit
+ from pgpy_dtc import PGPMessage
+ from pgpy_dtc.errors import PGPError
+ from dateutil.relativedelta import relativedelta
++import treq
++from treq.client import HTTPClient
++from twisted.internet import task
++from twisted.internet.defer import inlineCallbacks, returnValue
++from twisted.internet.error import CertificateError
++from twisted.internet.selectreactor import SelectReactor
++from twisted.internet.ssl import ClientContextFactory
++from twisted.web.client import Agent
++from twisted.web.http_headers import Headers
+ 
+ if sys.version_info < (3, 8):
+     from typing_extensions import TypedDict
+@@ -22,11 +31,59 @@
+     from typing import TypedDict
+ 
+ import dateutil.parser
+-import requests
+ 
+ __version__ = "0.9.6"
+ 
+-s = requests.Session()
++USER_AGENT = (
++    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) "
++    "Gecko/20100101 Firefox/12.0"
++)
++
++
++def _header_value(headers, name: str) -> Optional[str]:
++    values = headers.getRawHeaders(name.encode("ascii"))
++    if not values:
++        return None
++    value = values[0]
++    if isinstance(value, bytes):
++        return value.decode("latin1")
++    return value
++
++
++def _fetch(url: str, verify: bool = True):
++    """Fetch a URL synchronously while using treq for the HTTP request."""
++    reactor = SelectReactor()
++    if verify:
++        agent = Agent(reactor)
++    else:
++        agent = Agent(reactor, contextFactory=ClientContextFactory())
++    client = HTTPClient(agent)
++
++    @inlineCallbacks
++    def fetch():
++        current_url = url
++        history = []
++        for _ in range(31):
++            response = yield client.request(
++                "GET",
++                current_url,
++                headers=Headers({
++                    b"User-Agent": [USER_AGENT.encode("ascii")]
++                }),
++                timeout=5,
++            )
++            if response.code in (301, 302, 303, 307, 308):
++                location = _header_value(response.headers, "location")
++                if location:
++                    yield treq.content(response)
++                    history.append(current_url)
++                    current_url = urljoin(current_url, location)
++                    continue
++            content = yield treq.content(response)
++            returnValue((response.code, response.headers, content, current_url, history))
++        raise RuntimeError("Too many redirects")
++
++    return task.react(lambda _: fetch(), _reactor=reactor)
+ 
+ 
+ class ErrorDict(TypedDict):
+@@ -557,35 +614,24 @@
+                 for path in [".well-known/security.txt", "security.txt"]:
+                     url = urlunsplit((scheme, self._loc, path, None, None))
+                     try:
+-                        resp = requests.get(
+-                            url,
+-                            headers={
+-                                'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                              'Gecko/20100101 Firefox/12.0'},
+-                            timeout=5
+-                        )
+-                    except requests.exceptions.SSLError:
++                        status_code, response_headers, content, response_url, history = _fetch(url)
++                    except CertificateError:
+                         if not any(d["code"] == "invalid_cert" for d in self._errors):
+                             self._add_error(
+                                 "invalid_cert",
+                                 "security.txt must be served with a valid TLS certificate.",
+                             )
+                         try:
+-                            resp = requests.get(
+-                                url,
+-                                headers={
+-                                    'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                                  'Gecko/20100101 Firefox/12.0'},
+-                                timeout=5,
+-                                verify=False
++                            status_code, response_headers, content, response_url, history = _fetch(
++                                url, verify=False
+                             )
+                         except:
+                             continue
+                     except:
+                         continue
+-                    if resp.status_code == 200:
+-                        if resp.history:
+-                            if not resp.url.endswith(path):
++                    if status_code == 200:
++                        if history:
++                            if not response_url.endswith(path):
+                                 continue
+                         self._path = path
+                         self._url = url
+@@ -603,13 +649,14 @@
+                                 "(legacy place), but must be placed under "
+                                 "the '/.well-known/' path.",
+                             )
+-                        if "content-type" not in resp.headers:
++                        content_type = _header_value(response_headers, "content-type")
++                        if content_type is None:
+                             self._add_error(
+                                 "no_content_type", "HTTP Content-Type header must be sent."
+                             )
+                         else:
+                             m = Message()
+-                            m['content-type'] = resp.headers["content-type"]
++                            m['content-type'] = content_type
+                             params = dict(m.get_params())
+                             if "text/plain" not in params:
+                                 self._add_error(
+@@ -625,9 +672,9 @@
+                                     "Charset parameter in Content-Type header must be "
+                                     "'utf-8' if present.",
+                                 )
+-                        self._content = resp.content
+-                        if resp.history:
+-                            self._urls = [resp.history[0].url, resp.url]
++                        self._content = content
++                        if history:
++                            self._urls = [history[0], response_url]
+                         else:
+                             self._urls = [url]
+                         super()._process()

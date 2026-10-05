@@ -1,0 +1,610 @@
+--- a/github_nonpublic_api/api.py
++++ b/github_nonpublic_api/api.py
+@@ -14,25 +14,55 @@
+ 
+ """An API to do things that aren't in the official public GitHub REST API."""
+ 
++import functools
++import inspect
+ import os.path
+-import functools
+ from enum import Enum
+ import re
++from typing import Optional
+ from urllib.parse import urljoin
+ 
++import aiohttp
+ import html5lib
+ import pyotp
+-import requests
+ from absl import logging
+ from configobj import ConfigObj
+-from typing import Optional
+-
+-
+-def _get_and_submit_form(
+-    session, url: str, data_callback=None, form_matcher=lambda form: True
++
++
++def _is_awaitable(value):
++    return inspect.isawaitable(value)
++
++
++async def _await_if_needed(value):
++    """Await *value* when it is awaitable, otherwise return it unchanged.
++
++    The small amount of flexibility here is useful for callers that provide a
++    session implementation for testing.  aiohttp returns awaitables for HTTP
++    calls, while a simple session double can return a response directly.
++    """
++    if _is_awaitable(value):
++        return await value
++    return value
++
++
++async def _response_text(response):
++    text = response.text
++    if callable(text):
++        text = text()
++    return await _await_if_needed(text)
++
++
++async def _raise_for_status(response):
++    # ClientResponse.raise_for_status is synchronous in aiohttp, but allowing
++    # an awaitable keeps this helper usable with asynchronous test sessions.
++    result = response.raise_for_status()
++    await _await_if_needed(result)
++
++
++def _submit_form_from_response(
++    response, url: str, data_callback, form_matcher
+ ):
+-    logging.info("Fetching URL %s", url)
+-    response = session.get(url)
++    """Parse a response and return form submission data."""
+     response.raise_for_status()
+ 
+     logging.info("Fetching URL %s", response.url)
+@@ -40,6 +70,10 @@
+         logging.info("Redirected from: %s", redirect_response.url)
+ 
+     doc = html5lib.parse(response.text, namespaceHTMLElements=False)
++    return _form_submission(response, url, data_callback, form_matcher, doc)
++
++
++def _form_submission(response, url, data_callback, form_matcher, doc):
+     forms = doc.findall(".//form")
+ 
+     submit_form = None
+@@ -65,50 +99,162 @@
+         data_callback(data)
+ 
+     logging.debug("Form data: %s", str(data))
+-
+-    submit_url = urljoin(url, action_url)
++    return urljoin(url, action_url), data
++
++
++async def _get_and_submit_form_async(
++    session, url: str, data_callback=None, form_matcher=lambda form: True,
++    first_response=None,
++):
++    logging.info("Fetching URL %s", url)
++    response = await _await_if_needed(
++        session.get(url) if first_response is None else first_response
++    )
++    await _raise_for_status(response)
++
++    logging.info("Fetching URL %s", response.url)
++    for redirect_response in response.history:
++        logging.info("Redirected from: %s", redirect_response.url)
++
++    doc = html5lib.parse(await _response_text(response), namespaceHTMLElements=False)
++    # Parse the fields before invoking the callback so an asynchronous
++    # callback (for example, one obtaining a one-time password) is supported.
++    submit_url, data = _form_submission(response, url, None, form_matcher, doc)
++    if data_callback:
++        await _await_if_needed(data_callback(data))
+     logging.info("Posting form to URL %s", submit_url)
+ 
++    response = await _await_if_needed(session.post(submit_url, data=data))
++    await _raise_for_status(response)
++    return response
++
++
++def _get_and_submit_form(
++    session, url: str, data_callback=None, form_matcher=lambda form: True
++):
++    """Get a form and submit it using either a sync test double or aiohttp.
++
++    aiohttp is asynchronous.  Returning the coroutine rather than hiding an
++    event loop lets callers use this function naturally with ``await``.  The
++    synchronous branch retains compatibility with the repository's existing
++    lightweight session doubles.
++    """
++    logging.info("Fetching URL %s", url)
++    response = session.get(url)
++    if _is_awaitable(response):
++        return _get_and_submit_form_async(
++            session, url, data_callback, form_matcher, first_response=response
++        )
++
++    submit_url, data = _submit_form_from_response(
++        response, url, data_callback, form_matcher
++    )
++    logging.info("Posting form to URL %s", submit_url)
+     response = session.post(submit_url, data=data)
+     response.raise_for_status()
+     return response
+ 
+ 
++async def _get_url_with_session_async(session, url: str, first_response=None):
++    logging.info("Fetching URL %s", url)
++    response = await _await_if_needed(
++        session.get(url) if first_response is None else first_response
++    )
++    await _raise_for_status(response)
++    return response
++
++
+ def _get_url_with_session(session, url: str):
+     logging.info("Fetching URL %s", url)
+     response = session.get(url)
++    if _is_awaitable(response):
++        return _get_url_with_session_async(session, url, first_response=response)
+     response.raise_for_status()
+     return response
++
++
++async def _create_login_session_async(
++    username: str, password: str, tfa_callback, session=None
++):
++    owns_session = session is None
++    if session is None:
++        session = aiohttp.ClientSession()
++
++    try:
++        # Clear cookies before re-authentication.
++        session.cookie_jar.clear()
++
++        def _login_callback(data):
++            data.update(dict(login=username, password=password))
++
++        await _await_if_needed(
++            _get_and_submit_form(
++                session=session,
++                url="https://github.com/login",
++                data_callback=_login_callback,
++            )
++        )
++
++        async def _tfa_callback(data):
++            otp = tfa_callback()
++            data.update(dict(otp=await _await_if_needed(otp)))
++
++        await _await_if_needed(
++            _get_and_submit_form(
++                session=session,
++                url="https://github.com/sessions/two-factor",
++                data_callback=_tfa_callback,
++            )
++        )
++        return session
++    except Exception:
++        if owns_session:
++            await session.close()
++        raise
+ 
+ 
+ def create_login_session(
+     username: str,
+     password: str,
+     tfa_callback,
+-    session: Optional[requests.Session] = None,
+-) -> requests.Session:
+-    """Create a requests.Session object with logged in GitHub cookies for the user."""
+-    session = session or requests.Session()
+-
+-    # Clear cookies before re-authentication
++    session: Optional[aiohttp.ClientSession] = None,
++):
++    """Create an aiohttp session with logged-in GitHub cookies.
++
++    The returned value is awaitable when an aiohttp session is used.  A
++    synchronous session double is also accepted so existing callers can test
++    form handling without an event loop.
++    """
++    is_async_session = isinstance(session, aiohttp.ClientSession) or (
++        session is not None and inspect.iscoroutinefunction(getattr(session, "get", None))
++    )
++    if session is None or is_async_session:
++        return _create_login_session_async(username, password, tfa_callback, session)
++
++    # Keep the old synchronous behavior for simple injected session doubles.
+     session.cookies.clear()
+ 
+     def _login_callback(data):
+         data.update(dict(login=username, password=password))
+ 
+-    _get_and_submit_form(
++    first = _get_and_submit_form(
+         session=session, url="https://github.com/login", data_callback=_login_callback
+     )
+ 
+     def _tfa_callback(data):
+         data.update(dict(otp=tfa_callback()))
+ 
+-    _get_and_submit_form(
++    second = _get_and_submit_form(
+         session=session,
+         url="https://github.com/sessions/two-factor",
+         data_callback=_tfa_callback,
+     )
+-
++    if _is_awaitable(first) or _is_awaitable(second):
++        async def finish():
++            await _await_if_needed(first)
++            await _await_if_needed(second)
++            return session
++        return finish()
+     return session
+ 
+ 
+@@ -120,6 +266,10 @@
+ _REQUEST_DORMANTUSERS_URL = (
+     "https://github.com/enterprises/{enterprise_name}/settings/billing"
+ )
++_DORMANT_REPORT_PATTERN = re.compile(
++    r"https://github.com/enterprises/[^/]+/settings/dormant-users/exports/"
++    r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
++)
+ _UPDATE_APP_INSTALL_URL = "https://github.com/organizations/{org_name}/settings/installations/{app_install_id}/permissions/update"
+ _UPDATE_SECURITY_ANALYSIS_URL = (
+     "https://github.com/organizations/{org_name}/settings/security_analysis"
+@@ -139,10 +289,11 @@
+ 
+ 
+ class Api(object):
+-    """API Endpoing for doing non-public things to GitHub.
+-
+-    Ideally these would all exist as REST API endpoints, but instead we get
+-    to pretend to be a real user.
++    """API endpoint for doing non-public things to GitHub.
++
++    aiohttp is asynchronous, so methods return an awaitable when an aiohttp
++    session is supplied (or when the session must be logged in).  Injected
++    synchronous session doubles continue to work synchronously.
+     """
+ 
+     def __init__(
+@@ -150,31 +301,52 @@
+         username: str,
+         password: str,
+         tfa_callback=None,
+-        session: Optional[requests.Session] = None,
++        session: Optional[aiohttp.ClientSession] = None,
+     ):
+-        self._session = session or create_login_session(
+-            username=username,
+-            password=password,
+-            tfa_callback=tfa_callback,
+-            session=session,
+-        )
+-
+-    def request_usage(self, enterprise_name: str, days: int = 30) -> requests.Response:
+-        """Requests a GitHub usage report.
+-
+-        Github will send an email link when the report is available.
++        self._username = username
++        self._password = password
++        self._tfa_callback = tfa_callback
++        # Login is deferred until the first request.  This avoids constructing
++        # an aiohttp ClientSession outside an event loop.
++        self._session = session
++
++    async def _ensure_session(self):
++        if self._session is None:
++            self._session = await _create_login_session_async(
++                username=self._username,
++                password=self._password,
++                tfa_callback=self._tfa_callback,
++            )
++        return self._session
++
++    def _with_session(self, operation):
++        if self._session is not None:
++            return operation(self._session)
++
++        async def run():
++            session = await self._ensure_session()
++            return await _await_if_needed(operation(session))
++
++        return run()
++
++    def request_usage(self, enterprise_name: str, days: int = 30):
++        """Request a GitHub usage report.
++
++        GitHub will send an email link when the report is available.
+         """
+ 
+         def _request_usage_callback(data):
+             data["days"] = days
+ 
+         action = f"/enterprises/{enterprise_name}/settings/metered_exports"
+-        url = url = _REQUEST_USAGE_URL.format(enterprise_name=enterprise_name)
+-        return _get_and_submit_form(
+-            session=self._session,
+-            url=url,
+-            data_callback=_request_usage_callback,
+-            form_matcher=lambda form: form.attrib.get("action") == action,
++        url = _REQUEST_USAGE_URL.format(enterprise_name=enterprise_name)
++        return self._with_session(
++            lambda session: _get_and_submit_form(
++                session=session,
++                url=url,
++                data_callback=_request_usage_callback,
++                form_matcher=lambda form: form.attrib.get("action") == action,
++            )
+         )
+ 
+     def create_organization(
+@@ -183,7 +355,7 @@
+         contact_email: str,
+         org_usage: OrganizationUsage,
+         business_name: Optional[str] = None,
+-    ) -> requests.Response:
++    ):
+         """Create the specified GitHub organization.
+ 
+         Right now, only creates free tier organizations.
+@@ -198,91 +370,110 @@
+             if org_usage == OrganizationUsage.BUSINESS:
+                 data["organization[company_name]"] = business_name
+ 
+-        return _get_and_submit_form(
+-            session=self._session,
+-            url=_CREATE_ORG_URL,
+-            data_callback=_create_org_callback,
+-            form_matcher=lambda f: f.attrib.get("id") == "org-new-form",
+-        )
+-
+-    def install_application_in_organization(
+-        self, app_name: str, org_id: int
+-    ) -> requests.Response:
+-        """Installs the specified app on the given organization."""
++        return self._with_session(
++            lambda session: _get_and_submit_form(
++                session=session,
++                url=_CREATE_ORG_URL,
++                data_callback=_create_org_callback,
++                form_matcher=lambda f: f.attrib.get("id") == "org-new-form",
++            )
++        )
++
++    def install_application_in_organization(self, app_name: str, org_id: int):
++        """Install the specified app on the given organization."""
+         url = _INSTALL_APP_URL.format(app_name=app_name, org_id=org_id)
+ 
+         def _install_app_callback(data):
+             data["install_target"] = "all"
+ 
+-        return _get_and_submit_form(
+-            session=self._session,
+-            url=url,
+-            data_callback=_install_app_callback,
+-            form_matcher=lambda form: app_name in form.attrib.get("action"),
+-        )
+-
+-    def toggle_app_suspended(
+-        self, org_name: str, app_install_id: int
+-    ) -> requests.Response:
+-        """Set this applicaiton install to be suspended or not."""
++        return self._with_session(
++            lambda session: _get_and_submit_form(
++                session=session,
++                url=url,
++                data_callback=_install_app_callback,
++                form_matcher=lambda form: app_name in (form.attrib.get("action") or ""),
++            )
++        )
++
++    def toggle_app_suspended(self, org_name: str, app_install_id: int):
++        """Set this application install to be suspended or not."""
+         url = _APP_SUSPEND_URL.format(org_name=org_name, app_install_id=app_install_id)
+-
+-        return _get_and_submit_form(
+-            session=self._session,
+-            url=url,
+-            form_matcher=lambda f: "suspended" in f.attrib.get("action"),
+-        )
+-
+-    def download_usage_report(
+-        self, enterprise_name: str, report_id: int
+-    ) -> requests.Response:
+-        """Download a usage report based on an id recieved in an email"""
++        return self._with_session(
++            lambda session: _get_and_submit_form(
++                session=session,
++                url=url,
++                form_matcher=lambda f: "suspended" in (f.attrib.get("action") or ""),
++            )
++        )
++
++    def download_usage_report(self, enterprise_name: str, report_id: int):
++        """Download a usage report based on an id received in an email."""
+         url = _USAGE_REPORT_URL.format(
+             enterprise_name=enterprise_name, report_id=report_id
+         )
+-        return _get_url_with_session(session=self._session, url=url)
+-
+-    def request_dormant_users_report(self, enterprise_name: str) -> requests.Response:
+-        """Requests a GitHub dormant users report.
+-
+-        Github will send an email link when the report is available.
++        return self._with_session(lambda session: _get_url_with_session(session, url))
++
++    def request_dormant_users_report(self, enterprise_name: str):
++        """Request a GitHub dormant users report.
++
++        GitHub will send an email link when the report is available.
+         """
+-
+         action = f"/enterprises/{enterprise_name}/settings/dormant-users/exports"
+-        url = url = _REQUEST_DORMANTUSERS_URL.format(enterprise_name=enterprise_name)
+-        return _get_and_submit_form(
+-            session=self._session,
+-            url=url,
+-            form_matcher=lambda form: form.attrib.get("action") == action,
+-        )
+-
+-    def download_dormant_users_report(self, enterprise_name: str) -> requests.Response:
+-        """Download a usage report based on an id received in an email"""
+         url = _REQUEST_DORMANTUSERS_URL.format(enterprise_name=enterprise_name)
+-        page = _get_url_with_session(session=self._session, url=url)
+-        link = re.search(
+-            r"https://github.com/enterprises/alphabet/settings/dormant-users/exports/[0-9A-Fa-f]{8}\\-[0-9A-Fa-f]{4}\\-[0-9A-Fa-f]{4}\\-[0-9A-Fa-f]{4}\\-[0-9A-Fa-f]{12}",
+-            page.content,
+-        )
++        return self._with_session(
++            lambda session: _get_and_submit_form(
++                session=session,
++                url=url,
++                form_matcher=lambda form: form.attrib.get("action") == action,
++            )
++        )
++
++    def download_dormant_users_report(self, enterprise_name: str):
++        """Download a dormant users report based on an id from an email."""
++        url = _REQUEST_DORMANTUSERS_URL.format(enterprise_name=enterprise_name)
++
++        def download(session):
++            page = _get_url_with_session(session=session, url=url)
++            if _is_awaitable(page):
++                return self._download_dormant_async(session, page)
++            content = page.content
++            if not isinstance(content, str):
++                content = content.decode()
++            return self._download_dormant_sync(session, content)
++
++        return self._with_session(download)
++
++    async def _download_dormant_async(self, session, page_awaitable):
++        page = await page_awaitable
++        content = page.content
++        if hasattr(content, "read"):
++            content = await content.read()
++        elif callable(content):
++            content = content()
++            content = await _await_if_needed(content)
++        elif hasattr(page, "read"):
++            content = await page.read()
++        if not isinstance(content, str):
++            content = content.decode()
++        return await _self_download_dormant_async(session, content)
++
++    def _download_dormant_sync(self, session, content):
++        link = _dormant_report_link(content)
+         if link is None:
+             raise ValueError("Unable to find dormant users report link in content.")
+-        return _get_url_with_session(session=self._session, url=link.group(0))
+-
+-    def approve_updated_app_permissions(
+-        self,
+-        org_name: str,
+-        app_install_id: str,
+-    ) -> requests.Response:
+-        """Approve a request for updated permissions for a GitHub app installation in an org"""
+-
+-        return _get_and_submit_form(
+-            session=self._session,
+-            url=_UPDATE_APP_INSTALL_URL.format(
+-                org_name=org_name,
+-                app_install_id=app_install_id,
+-            ),
+-            form_matcher=lambda f: f.attrib.get("class")
+-            == "js-integrations-install-form",
++        return _get_url_with_session(session=session, url=link)
++
++    def approve_updated_app_permissions(self, org_name: str, app_install_id: str):
++        """Approve a request to update a GitHub app's organization permissions."""
++        return self._with_session(
++            lambda session: _get_and_submit_form(
++                session=session,
++                url=_UPDATE_APP_INSTALL_URL.format(
++                    org_name=org_name, app_install_id=app_install_id
++                ),
++                form_matcher=lambda f: f.attrib.get("class")
++                == "js-integrations-install-form",
++            )
+         )
+ 
+     def update_security_analysis_settings(
+@@ -293,29 +484,47 @@
+     ):
+         def _form_matcher(doc, name):
+             return doc.findall(".//input[@name='%s']" % name)
+-        
++
++        def update(name, enabled):
++            def _data_callback(data):
++                data[name] = "enabled" if enabled else "disabled"
++
++            return self._with_session(
++                lambda session: _get_and_submit_form(
++                    session=session,
++                    url=_UPDATE_GHAS_SETTINGS_URL.format(org_name=org_name),
++                    form_matcher=functools.partial(_form_matcher, name=name),
++                    data_callback=_data_callback,
++                )
++            )
++
++        results = []
+         if code_scanning_autofix is not None:
+-            def _data_callback(data):
+-                data['code_scanning_autofix'] = 'enabled' if code_scanning_autofix else 'disabled'
+-            _get_and_submit_form(
+-                session=self._session,
+-                url=_UPDATE_GHAS_SETTINGS_URL.format(
+-                    org_name=org_name,
+-                ),
+-                form_matcher=functools.partial(_form_matcher, name='code_scanning_autofix'),
+-                data_callback=_data_callback
+-            )
++            results.append(update("code_scanning_autofix", code_scanning_autofix))
+         if code_scanning_autofix_third_party_tools is not None:
+-            def _data_callback(data):
+-                data['code_scanning_autofix_third_party_tools'] = 'enabled' if code_scanning_autofix_third_party_tools else 'disabled'
+-            _get_and_submit_form(
+-                session=self._session,
+-                url=_UPDATE_GHAS_SETTINGS_URL.format(
+-                    org_name=org_name,
+-                ),
+-                form_matcher=functools.partial(_form_matcher, name='code_scanning_autofix_third_party_tools'),
+-                data_callback=_data_callback
+-            )
++            results.append(
++                update(
++                    "code_scanning_autofix_third_party_tools",
++                    code_scanning_autofix_third_party_tools,
++                )
++            )
++        if any(_is_awaitable(result) for result in results):
++            async def wait_for_updates():
++                for result in results:
++                    await _await_if_needed(result)
++            return wait_for_updates()
++
++
++def _dormant_report_link(content):
++    match = _DORMANT_REPORT_PATTERN.search(content)
++    return match.group(0) if match else None
++
++
++async def _self_download_dormant_async(session, content):
++    link = _dormant_report_link(content)
++    if link is None:
++        raise ValueError("Unable to find dormant users report link in content.")
++    return await _await_if_needed(_get_url_with_session(session=session, url=link))
+ 
+ if __name__ == "__main__":
+     config = ConfigObj(os.path.expanduser("~/github.ini"), _inspec=True)

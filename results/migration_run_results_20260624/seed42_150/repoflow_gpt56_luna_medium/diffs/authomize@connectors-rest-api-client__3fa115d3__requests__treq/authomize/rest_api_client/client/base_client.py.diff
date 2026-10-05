@@ -1,0 +1,142 @@
+--- a/authomize/rest_api_client/client/base_client.py
++++ b/authomize/rest_api_client/client/base_client.py
+@@ -1,7 +1,9 @@
++import json
+ from typing import Optional
+ 
+-import requests
+-from requests import Response
++import treq
++from twisted.internet.selectreactor import SelectReactor
++from twisted.web.http_headers import Headers
+ 
+ AUTHOMIZE_API_URL = 'https://api.authomize.com'
+ 
+@@ -11,19 +13,45 @@
+         self.message = message
+ 
+ 
++class _TreqResponse:
++    def __init__(self, response, content: bytes, url: str):
++        self.status_code = response.code
++        self.reason = response.phrase.decode('latin-1')
++        self.headers = {
++            key.decode('latin-1').lower(): value[0].decode('latin-1')
++            for key, value in response.headers.getAllRawHeaders()
++        }
++        self.url = url
++        self.content = content
++
++    @property
++    def ok(self):
++        return 200 <= self.status_code < 400
++
++    @property
++    def text(self):
++        return self.content.decode('utf-8')
++
++    def json(self):
++        return json.loads(self.content)
++
++    def raise_for_status(self):
++        raise ClientError(f'{self.status_code}: {self.reason}')
++
++
+ class BaseClient:
+     def __init__(self, auth_token: str, base_url: str = AUTHOMIZE_API_URL):
+         self.auth_token = auth_token
+         self.base_url = base_url
+-        self.session = requests.Session()
+-        self.session.headers.update({'Authorization': self.authorization_header})
++        self.session = treq
++        self.headers = {'Authorization': self.authorization_header}
+ 
+     @property
+     def authorization_header(self) -> str:
+         raise NotImplementedError()
+ 
+     @staticmethod
+-    def _handle_response(response: Response):
++    def _handle_response(response: _TreqResponse):
+         if response.ok:
+             return BaseClient._handle_ok_response(response)
+         try:
+@@ -38,7 +66,7 @@
+         response.raise_for_status()
+ 
+     @staticmethod
+-    def _handle_ok_response(response: Response) -> dict:
++    def _handle_ok_response(response: _TreqResponse) -> dict:
+         if content_type := response.headers.get('content-type'):
+             if content_type.startswith('application/json'):
+                 return response.json()
+@@ -52,14 +80,50 @@
+             },
+         )
+ 
++    def _request(self, method, url, params=None, headers=None, data=None):
++        reactor = SelectReactor()
++        result = []
++        failure = []
++
++        request_headers = {
++            key: [value.encode('utf-8')]
++            for key, value in {**self.headers, **(headers or {})}.items()
++        }
++
++        def finish(response):
++            return treq.content(response).addCallback(
++                lambda content: result.append(_TreqResponse(response, content, url))
++            )
++
++        def fail(error):
++            failure.append(error)
++            return error
++
++        deferred = self.session.request(
++            method.encode('ascii'),
++            url,
++            params=params,
++            headers=Headers(request_headers),
++            data=data.encode('utf-8') if isinstance(data, str) else data,
++            reactor=reactor,
++        )
++        deferred.addCallback(finish)
++        deferred.addErrback(fail)
++        deferred.addBoth(lambda _: reactor.stop())
++        reactor.run()
++        if failure:
++            failure[0].raiseException()
++        return result[0]
++
+     def http_get(self, url, params=None):
+         url = self.base_url + url
+-        response = self.session.get(url, params=params)
++        response = self._request('GET', url, params=params)
+         return self._handle_response(response)
+ 
+     def http_post(self, url: str, body: Optional[str] = None):
+         url = self.base_url + url
+-        response = self.session.post(
++        response = self._request(
++            'POST',
+             url,
+             headers={'Content-Type': 'application/json'},
+             data=body,
+@@ -68,7 +132,8 @@
+ 
+     def http_patch(self, url: str, body: Optional[str] = None):
+         url = self.base_url + url
+-        response = self.session.patch(
++        response = self._request(
++            'PATCH',
+             url,
+             headers={'Content-Type': 'application/json'},
+             data=body,
+@@ -77,5 +142,5 @@
+ 
+     def http_delete(self, url: str, params=None):
+         url = self.base_url + url
+-        response = self.session.delete(url, params=params)
++        response = self._request('DELETE', url, params=params)
+         return self._handle_response(response)

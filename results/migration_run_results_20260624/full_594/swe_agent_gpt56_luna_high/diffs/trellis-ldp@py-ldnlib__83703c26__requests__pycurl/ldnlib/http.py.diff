@@ -1,0 +1,234 @@
+--- a/ldnlib/http.py
++++ b/ldnlib/http.py
+@@ -0,0 +1,231 @@
++"""Small HTTP response/request adapter backed by :mod:`pycurl`.
++
++The public classes in this package use a deliberately small response API.
++Keeping that subset here makes the transport implementation explicit.
++"""
++
++from io import BytesIO
++import re
++from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
++
++import pycurl
++
++
++class HTTPError(Exception):
++    """Raised when an HTTP response has a client or server error status."""
++
++    def __init__(self, status_code, url):
++        self.status_code = status_code
++        self.url = url
++        super().__init__(
++            "{} Client/Server Error for url: {}".format(status_code, url))
++
++
++class Headers(dict):
++    """A case-insensitive mapping suitable for HTTP response headers."""
++
++    def __setitem__(self, key, value):
++        super().__setitem__(key.lower(), value)
++
++    def __getitem__(self, key):
++        return super().__getitem__(key.lower())
++
++    def __contains__(self, key):
++        return super().__contains__(key.lower())
++
++    def get(self, key, default=None):
++        return super().get(key.lower(), default)
++
++
++class Response:
++    """The response attributes used by the LDN implementation."""
++
++    def __init__(self, body, headers, status_code, url):
++        self._body = body
++        self.headers = Headers()
++        for name, value in headers.items():
++            self.headers[name] = value
++        self.status_code = status_code
++        self.url = url
++        self.links = self._parse_links(self.headers.get("link", ""))
++
++    @staticmethod
++    def _parse_links(value):
++        links = {}
++        # Link values are comma-separated, but commas inside quotes or angle
++        # brackets are part of the value.  LDN link relations are normally
++        # simple, though handling those cases costs very little.
++        entries = []
++        start = 0
++        quoted = False
++        angle = False
++        for index, char in enumerate(value):
++            if char == '"':
++                quoted = not quoted
++            elif not quoted and char == '<':
++                angle = True
++            elif not quoted and char == '>':
++                angle = False
++            elif char == ',' and not quoted and not angle:
++                entries.append(value[start:index])
++                start = index + 1
++        entries.append(value[start:])
++
++        for entry in entries:
++            match = re.match(r"\s*<([^>]*)>\s*(.*)$", entry)
++            if not match:
++                continue
++            link_url, parameters = match.groups()
++            for parameter in parameters.split(';'):
++                if '=' not in parameter:
++                    continue
++                name, relation_value = parameter.split('=', 1)
++                if name.strip().lower() == 'rel':
++                    relation_value = relation_value.strip().strip('"')
++                    # RFC 8288 permits more than one relation in one rel
++                    # parameter.  Expose each relation as a separate key.
++                    for relation in relation_value.split():
++                        links[relation] = {'url': link_url}
++        return links
++
++    @property
++    def content(self):
++        return self._body
++
++    @property
++    def text(self):
++        content_type = self.headers.get('content-type', '')
++        charset_match = re.search(r'charset\s*=\s*["\']?([^;"\'\s]+)',
++                                  content_type, re.IGNORECASE)
++        encoding = charset_match.group(1) if charset_match else 'utf-8'
++        try:
++            return self._body.decode(encoding)
++        except (LookupError, UnicodeDecodeError):
++            return self._body.decode('utf-8', errors='replace')
++
++    def json(self):
++        import json
++        return json.loads(self.text)
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise HTTPError(self.status_code, self.url)
++
++
++def _add_query(url, params):
++    if not params:
++        return url
++    parsed = urlsplit(url)
++    query = parse_qsl(parsed.query, keep_blank_values=True)
++    if isinstance(params, dict):
++        params = params.items()
++    query.extend(params)
++    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path,
++                       urlencode(query, doseq=True), parsed.fragment))
++
++
++def request(method, url, headers=None, data=None, **kwargs):
++    """Perform one HTTP request using a fresh pycurl handle.
++
++    The keyword arguments intentionally mirror the handful of transport
++    arguments accepted by the original LDN API: ``headers``, ``auth``,
++    ``allow_redirects``, ``timeout``, ``verify``, ``params`` and ``proxies``.
++    """
++    params = kwargs.pop('params', None)
++    url = _add_query(url, params)
++    headers = headers or {}
++    allow_redirects = kwargs.pop('allow_redirects', True)
++    auth = kwargs.pop('auth', None)
++    timeout = kwargs.pop('timeout', None)
++    connect_timeout = kwargs.pop('connect_timeout', None)
++    verify = kwargs.pop('verify', True)
++    proxies = kwargs.pop('proxies', None)
++    cert = kwargs.pop('cert', None)
++
++    body = BytesIO()
++    response_headers = Headers()
++    status = {'code': 0}
++
++    def write_header(line):
++        if isinstance(line, bytes):
++            line = line.decode('iso-8859-1')
++        # A redirect or interim response starts a new header block.  The
++        # headers and status left at the end are those for the final response.
++        if line.startswith('HTTP/'):
++            response_headers.clear()
++            match = re.match(r'HTTP/\S+\s+(\d+)', line)
++            if match:
++                status['code'] = int(match.group(1))
++        elif ':' in line:
++            name, value = line.split(':', 1)
++            name = name.strip()
++            value = value.strip()
++            if name.lower() == 'link' and name.lower() in response_headers:
++                value = response_headers[name] + ', ' + value
++            response_headers[name] = value
++        return len(line.encode('iso-8859-1'))
++
++    curl = pycurl.Curl()
++    try:
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.WRITEFUNCTION, body.write)
++        curl.setopt(pycurl.HEADERFUNCTION, write_header)
++        curl.setopt(pycurl.FOLLOWLOCATION, bool(allow_redirects))
++
++        if method == 'HEAD':
++            curl.setopt(pycurl.NOBODY, True)
++        elif method == 'GET':
++            curl.setopt(pycurl.HTTPGET, True)
++        elif method == 'POST':
++            curl.setopt(pycurl.POST, True)
++            if data is not None:
++                if isinstance(data, str):
++                    data = data.encode('utf-8')
++                curl.setopt(pycurl.POSTFIELDS, data)
++        else:
++            curl.setopt(pycurl.CUSTOMREQUEST, method)
++            if data is not None:
++                if isinstance(data, str):
++                    data = data.encode('utf-8')
++                curl.setopt(pycurl.POSTFIELDS, data)
++
++        header_values = []
++        for name, value in headers.items():
++            header_values.append('{}: {}'.format(name, value))
++        if header_values:
++            curl.setopt(pycurl.HTTPHEADER, header_values)
++
++        if auth is not None:
++            username, password = auth
++            curl.setopt(pycurl.USERPWD, '{}:{}'.format(username, password))
++            curl.setopt(pycurl.HTTPAUTH, pycurl.HTTPAUTH_BASIC)
++        if timeout is not None:
++            curl.setopt(pycurl.TIMEOUT, timeout)
++        if connect_timeout is not None:
++            curl.setopt(pycurl.CONNECTTIMEOUT, connect_timeout)
++        if proxies:
++            # The proxy may be a mapping or a URL selected by the caller.
++            proxy = (proxies.get(urlsplit(url).scheme)
++                     if isinstance(proxies, dict) else proxies)
++            if proxy:
++                curl.setopt(pycurl.PROXY, proxy)
++        if verify is False:
++            curl.setopt(pycurl.SSL_VERIFYPEER, 0)
++            curl.setopt(pycurl.SSL_VERIFYHOST, 0)
++        elif isinstance(verify, str):
++            curl.setopt(pycurl.CAINFO, verify)
++        if cert is not None:
++            curl.setopt(pycurl.SSLCERT, cert[0] if isinstance(cert, tuple)
++                        else cert)
++            if isinstance(cert, tuple) and len(cert) > 1:
++                curl.setopt(pycurl.SSLKEY, cert[1])
++
++        curl.perform()
++        status_code = curl.getinfo(pycurl.HTTP_CODE) or status['code']
++        effective_url = url
++        if hasattr(pycurl, 'EFFECTIVE_URL'):
++            effective_url = curl.getinfo(pycurl.EFFECTIVE_URL) or url
++        return Response(body.getvalue(), response_headers, status_code,
++                        effective_url)
++    finally:
++        curl.close()

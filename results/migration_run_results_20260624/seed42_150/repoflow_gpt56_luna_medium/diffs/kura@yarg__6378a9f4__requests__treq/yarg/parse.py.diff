@@ -1,0 +1,98 @@
+--- a/yarg/parse.py
++++ b/yarg/parse.py
+@@ -23,11 +23,58 @@
+ # SOFTWARE.
+ 
+ from datetime import datetime
++from threading import Event, Lock, Thread
+ import xml.etree.ElementTree
+ 
+-import requests
++from twisted.internet import reactor
++import treq
+ 
+ from .exceptions import HTTPError
++
++
++_reactor_lock = Lock()
++_reactor_started = Event()
++
++
++def _start_reactor():
++    reactor.callWhenRunning(_reactor_started.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor():
++    if reactor.running:
++        return
++    with _reactor_lock:
++        if not reactor.running:
++            Thread(target=_start_reactor, daemon=True).start()
++    _reactor_started.wait()
++
++
++def _sync_result(value):
++    """Resolve a treq Deferred while retaining yarg's synchronous API."""
++    if not hasattr(value, 'addCallbacks'):
++        return value
++
++    _ensure_reactor()
++    result = []
++    failure = []
++    complete = Event()
++
++    def succeeded(item):
++        result.append(item)
++        complete.set()
++        return item
++
++    def failed(error):
++        failure.append(error)
++        complete.set()
++        return error
++
++    value.addCallbacks(succeeded, failed)
++    complete.wait()
++    if failure:
++        failure[0].raiseException()
++    return result[0]
+ 
+ 
+ def _get(pypi_server):
+@@ -35,14 +82,28 @@
+     Query the PyPI RSS feed and return a list
+     of XML items.
+     """
+-    response = requests.get(pypi_server)
+-    if response.status_code >= 300:
+-        raise HTTPError(status_code=response.status_code,
+-                        reason=response.reason)
+-    if hasattr(response.content, 'decode'):
+-        tree = xml.etree.ElementTree.fromstring(response.content.decode())
++    def response_content(response):
++        status_code = getattr(response, 'code',
++                              getattr(response, 'status_code', None))
++        if status_code >= 300:
++            reason = getattr(response, 'phrase',
++                             getattr(response, 'reason', None))
++            if isinstance(reason, bytes):
++                reason = reason.decode()
++            raise HTTPError(status_code=status_code, reason=reason)
++        content = response.content
++        return content() if callable(content) else content
++
++    response = treq.get(pypi_server)
++    if hasattr(response, 'addCallback'):
++        response = response.addCallback(response_content)
+     else:
+-        tree = xml.etree.ElementTree.fromstring(response.content)
++        response = response_content(response)
++    content = _sync_result(response)
++    if hasattr(content, 'decode'):
++        tree = xml.etree.ElementTree.fromstring(content.decode())
++    else:
++        tree = xml.etree.ElementTree.fromstring(content)
+     channel = tree.find('channel')
+     return channel.findall('item')
+ 

@@ -1,0 +1,139 @@
+--- a/src/epstats/server/api.py
++++ b/src/epstats/server/api.py
+@@ -1,70 +1,92 @@
++import importlib
+ import logging
+-from typing import Dict
++from typing import Any, Dict
+ 
+-import uvicorn
+-from fastapi import FastAPI
+-from fastapi.exception_handlers import (
+-    http_exception_handler,
+-    request_validation_exception_handler,
+-)
+-from fastapi.exceptions import RequestValidationError
+-from starlette.exceptions import HTTPException as StarletteHTTPException
++from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
++from sanic import Sanic
++from sanic.exceptions import SanicException
++from sanic.response import HTTPResponse
+ 
+-from .api_evaluate import get_evaluate_router
++from .api_evaluate import RequestValidationError, get_evaluate_router
+ from .api_sample_size_calculation import get_sample_size_calculation_router
+ from .api_settings import ApiSettings
+ from .json_response import DataScienceJsonResponse
+ 
+ 
+-def get_api(settings: ApiSettings, get_dao, get_executor_pool) -> FastAPI:
+-    api = FastAPI(
+-        title=settings.app_title,
+-        description=settings.app_description,
+-        version="0.2.1",
+-        default_response_class=DataScienceJsonResponse,
+-    )
++class EpStatsSanic(Sanic):
++    """Sanic application with an ASGI-friendly startup path."""
+ 
+-    @api.exception_handler(StarletteHTTPException)
+-    async def custom_http_exception_handler(request, exc):
+-        """
+-        We override default exception handler to send exception to the log.
+-        """
+-        logger = logging.getLogger("epstats")
+-        logger.error(f"HttpException status code [{exc.status_code}] detail [{exc.detail}]")
+-        return await http_exception_handler(request, exc)
++    @property
++    def dependency_overrides(self) -> dict[Any, Any]:
++        return self.ctx.dependency_overrides
+ 
+-    @api.exception_handler(RequestValidationError)
+-    async def custom_request_validation_exception_handler(request, exc):
+-        """
+-        We override default exception handler to send exception to the log.
+-        """
+-        logger = logging.getLogger("epstats")
+-        logger.exception(f"RequestValidationError: [{exc}], [{exc.body}]")
+-        return await request_validation_exception_handler(request, exc)
++    async def __call__(self, scope, receive, send):
++        # Sanic normally initializes routing signals from app.run. ASGI test
++        # clients do not always send a lifespan event, so do it on demand.
++        if scope["type"] != "lifespan" and not self.state.is_started:
++            self.asgi = True
++            await self._startup()
++        return await super().__call__(scope, receive, send)
+ 
+-    @api.get("/health", tags=["Health"])
+-    async def readiness_liveness_probe():
+-        return {"message": "ep-stats-api is ready"}
+ 
+-    api.include_router(get_evaluate_router(get_dao, get_executor_pool))
+-    api.include_router(get_sample_size_calculation_router(get_executor_pool))
++def _metrics_response() -> HTTPResponse:
++    return HTTPResponse(body=generate_latest(), content_type=CONTENT_TYPE_LATEST)
+ 
++
++def get_api(settings: ApiSettings, get_dao, get_executor_pool) -> EpStatsSanic:
++    # Include the settings identity in the registry name. This permits an
++    # application to be imported through two package aliases in test runners
++    # without Sanic's global app registry treating them as duplicates.
++    api = EpStatsSanic(f"epstats-{id(settings)}", strict_slashes=False, configure_logging=False)
++    # Retain the small testing/integration override contract used by the old
++    # dependency injection setup.
++    api.ctx.dependency_overrides = {}
++
++    @api.exception(RequestValidationError)
++    async def request_validation_exception_handler(request, exc):
++        logging.getLogger("epstats").error("RequestValidationError: %s", exc.detail)
++        return DataScienceJsonResponse({"detail": exc.detail}, status=422)
++
++    @api.exception(SanicException)
++    async def sanic_exception_handler(request, exc):
++        logging.getLogger("epstats").error(
++            "HttpException status code [%s] detail [%s]", exc.status_code, exc
++        )
++        return DataScienceJsonResponse({"detail": str(exc)}, status=exc.status_code or 500)
++
++    @api.exception(Exception)
++    async def unhandled_exception_handler(request, exc):
++        logging.getLogger("epstats").exception("Unhandled API exception", exc_info=exc)
++        return DataScienceJsonResponse({"detail": "Internal Server Error"}, status=500)
++
++    @api.get("/health")
++    async def readiness_liveness_probe(request):
++        return DataScienceJsonResponse({"message": "ep-stats-api is ready"})
++
++    @api.get("/metrics")
++    async def metrics(request):
++        return _metrics_response()
++
++    api.blueprint(get_evaluate_router(get_dao, get_executor_pool))
++    api.blueprint(get_sample_size_calculation_router(get_executor_pool))
+     return api
+ 
+ 
+ def serve(api: str, settings: ApiSettings, log_config: Dict):
++    """Run an application using Sanic's native server."""
+     logger = logging.getLogger("epstats")
+     logger.info(f"Starting {settings.app_name} in env {settings.app_env}")
+     logger.info(f"Listening on http://{settings.host}:{settings.port}")
+     logger.info(f"Starting with log level {settings.log_level}")
+     logger.info(f"Using {settings.web_workers} web server worker threads")
+-    uvicorn.run(
+-        api,
++
++    module_name, app_name = api.split(":", 1)
++    application = getattr(importlib.import_module(module_name), app_name)
++    application.run(
+         host=settings.host,
+         port=settings.port,
+-        log_level=settings.log_level,
+         workers=settings.web_workers,
+-        timeout_keep_alive=0,
+-        log_config=log_config,
+-        http="h11",
++        single_process=settings.web_workers == 1,
++        motd=False,
++        access_log=False,
+     )

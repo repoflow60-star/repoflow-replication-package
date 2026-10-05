@@ -1,0 +1,101 @@
+--- a/tinychat/llms/_pycurl.py
++++ b/tinychat/llms/_pycurl.py
+@@ -0,0 +1,98 @@
++from __future__ import annotations
++
++from queue import Queue
++from threading import Event, Thread
++
++
++class CurlStream:
++    """Small response adapter for pycurl-backed streaming requests."""
++
++    def __init__(self, curl_module, url: str, headers: dict[str, str], body: bytes):
++        self._curl_module = curl_module
++        self._body = body
++        self._chunks: Queue[bytes | None] = Queue()
++        self._headers_ready = Event()
++        self._closed = Event()
++        self._error: BaseException | None = None
++        self._line_iterator = None
++        self.status_code = 0
++
++        self._thread = Thread(
++            target=self._perform,
++            args=(url, headers),
++            daemon=True,
++        )
++        self._thread.start()
++        self._headers_ready.wait()
++
++    def _perform(self, url: str, headers: dict[str, str]) -> None:
++        curl = None
++        try:
++            curl = self._curl_module.Curl()
++            curl.setopt(self._curl_module.URL, url)
++            curl.setopt(
++                self._curl_module.HTTPHEADER,
++                [f"{name}: {value}" for name, value in headers.items()],
++            )
++            curl.setopt(self._curl_module.POST, 1)
++            curl.setopt(self._curl_module.POSTFIELDS, self._body)
++            curl.setopt(self._curl_module.HEADERFUNCTION, self._receive_header)
++            curl.setopt(self._curl_module.WRITEFUNCTION, self._receive_body)
++            curl.perform()
++        except BaseException as error:
++            self._error = error
++        finally:
++            self._headers_ready.set()
++            self._chunks.put(None)
++            if curl is not None:
++                curl.close()
++
++    def _receive_header(self, header: bytes) -> int:
++        if header.startswith(b"HTTP/"):
++            parts = header.split()
++            if len(parts) > 1:
++                try:
++                    self.status_code = int(parts[1])
++                except ValueError:
++                    self.status_code = 0
++            self._headers_ready.set()
++        return len(header)
++
++    def _receive_body(self, chunk: bytes) -> int:
++        if self._closed.is_set():
++            return 0
++        self._chunks.put(chunk)
++        return len(chunk)
++
++    def _iter_lines(self):
++        pending = b""
++        while True:
++            chunk = self._chunks.get()
++            if chunk is None:
++                if pending:
++                    yield pending.rstrip(b"\r")
++                if self._error is not None:
++                    raise self._error
++                return
++
++            pending += chunk
++            while b"\n" in pending:
++                line, pending = pending.split(b"\n", 1)
++                yield line.rstrip(b"\r")
++
++    def iter_lines(self):
++        if self._line_iterator is None:
++            self._line_iterator = self._iter_lines()
++        return self._line_iterator
++
++    def readline(self) -> bytes:
++        try:
++            return next(self.iter_lines()) + b"\n"
++        except StopIteration:
++            return b""
++
++    def __iter__(self):
++        return self.iter_lines()
++
++    def close(self) -> None:
++        self._closed.set()

@@ -1,0 +1,99 @@
+--- a/pastepwn/util/request.py
++++ b/pastepwn/util/request.py
+@@ -1,8 +1,13 @@
++import asyncio
+ import logging
++from concurrent.futures import ThreadPoolExecutor
+ from threading import Lock
++from urllib.parse import urlsplit
++from urllib.request import getproxies
+ 
+-from requests import Session, utils
+-from requests.exceptions import Timeout
++import aiohttp
++
++from pastepwn.util.network import get_ip_family
+ 
+ 
+ class Request:
+@@ -22,28 +27,72 @@
+     def __init__(self, proxies=None, headers=None):
+         if not self._initialized:
+             self.logger = logging.getLogger(__name__)
+-            self.session = Session()
+             self.proxies = proxies
+             self.headers = headers
+             self.logger.info("Using the following custom proxies: %s", proxies)
+-            system_proxies = utils.get_environ_proxies("https://example.com")
++            system_proxies = getproxies()
+             self.logger.info("Using the following system proxies: %s", system_proxies)
+             Request._initialized = True
+ 
+-    def _request_wrapper(self, data, timeout, *args, **kwargs):
++    def _proxy_for(self, url):
++        """Return the aiohttp proxy URL for a request.
++
++        The public API accepts a mapping of proxy URLs while aiohttp accepts
++        one proxy URL per request. Select the scheme-specific entry here so
++        the existing Request API remains backwards compatible.
++        """
++        if not self.proxies:
++            return None
++
++        if isinstance(self.proxies, dict):
++            scheme = urlsplit(url).scheme
++            return self.proxies.get(scheme) or self.proxies.get(f"{scheme}://") or self.proxies.get("all") or self.proxies.get("all://")
++
++        return self.proxies
++
++    async def _request(self, *args, **kwargs):
++        url = kwargs.get("url")
++        proxy = self._proxy_for(url) if url else None
++        request_kwargs = dict(kwargs)
++        request_kwargs["proxy"] = proxy
++        request_kwargs["headers"] = self._headers()
++
++        # A connector is created for each short-lived session.  This keeps the
++        # synchronous API thread-safe while still allowing enforce_ip_version
++        # to affect aiohttp DNS resolution.
++        connector = aiohttp.TCPConnector(family=get_ip_family())
++        async with aiohttp.ClientSession(connector=connector, trust_env=self.proxies is None) as session, session.request(*args, **request_kwargs) as response:
++            return (await response.read()).decode("utf-8")
++
++    @staticmethod
++    def _run(coroutine):
++        """Run an aiohttp coroutine from the existing synchronous API."""
++        try:
++            asyncio.get_running_loop()
++        except RuntimeError:
++            return asyncio.run(coroutine)
++
++        # asyncio.run cannot be nested. Calls can still be made when a caller
++        # happens to invoke this synchronous API from an async thread.
++        with ThreadPoolExecutor(max_workers=1) as executor:
++            return executor.submit(asyncio.run, coroutine).result()
++
++    def _headers(self):
+         headers = {"User-Agent": "pastepwn (https://github.com/d-Rickyy-b/pastepwn)"}
+-
+         if self.headers is not None:
+             headers.update(self.headers)
++        return headers
++
++    def _request_wrapper(self, data, timeout, *args, **kwargs):
++        kwargs["data"] = data
++        kwargs["timeout"] = timeout
+ 
+         try:
+-            response = self.session.request(*args, headers=headers, proxies=self.proxies, data=data, timeout=timeout, **kwargs)
+-        except Timeout:
++            return self._run(self._request(*args, **kwargs))
++        except asyncio.TimeoutError:
+             url = kwargs.get("url")
+             self.logger.warning("Timeout while requesting %s!", url)
+             return ""
+-
+-        return response.content.decode("utf-8")
+ 
+     def get(self, url, data=None, timeout=5):
+         return self._request_wrapper(method="GET", url=url, data=data, timeout=timeout)

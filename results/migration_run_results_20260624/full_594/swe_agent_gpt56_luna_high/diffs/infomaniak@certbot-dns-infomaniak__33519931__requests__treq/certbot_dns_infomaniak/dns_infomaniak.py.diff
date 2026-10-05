@@ -1,0 +1,276 @@
+--- a/certbot_dns_infomaniak/dns_infomaniak.py
++++ b/certbot_dns_infomaniak/dns_infomaniak.py
+@@ -5,9 +5,14 @@
+ """DNS Authenticator for Infomaniak"""
+ import json
+ import logging
++import threading
++from urllib.parse import urlsplit
++
+ import idna
+-
+-import requests
++import treq
++from twisted.internet import defer
++from twisted.internet import reactor as _default_reactor
++from twisted.internet import threads
+ 
+ from certbot import errors
+ from certbot.plugins import dns_common
+@@ -76,84 +81,202 @@
+         return _APIDomain(self.token)
+ 
+ 
++_reactor_start_lock = threading.Lock()
++_reactor_thread = None
++_reactor_started = threading.Event()
++
++
++def _ensure_reactor_running():
++    """Start treq's reactor once when Certbot is used synchronously."""
++    global _reactor_thread
++    if _default_reactor.running:
++        return
++    with _reactor_start_lock:
++        if _default_reactor.running:
++            return
++        if _reactor_thread is None or not _reactor_thread.is_alive():
++            _reactor_started.clear()
++
++            def run_reactor():
++                _reactor_started.set()
++                _default_reactor.run(installSignalHandlers=False)
++
++            _reactor_thread = threading.Thread(
++                target=run_reactor,
++                name="infomaniak-treq-reactor",
++                daemon=True,
++            )
++            _reactor_thread.start()
++    _reactor_started.wait()
++
++
++class _TreqSession:
++    """Small session-like container for treq request defaults.
++
++    ``treq`` does not expose a requests-style ``Session``.  Keeping the
++    headers and mounted transports together here gives the API client one
++    place to hold request configuration without bringing requests back as a
++    runtime dependency.  ``mount`` is intentionally supported for backwards
++    compatibility with callers that use a requests-mock adapter.
++    """
++
++    def __init__(self):
++        self.headers = {}
++        self.adapters = {}
++
++    def mount(self, prefix, adapter):
++        self.adapters[prefix] = adapter
++
++
++class _Request:
++    """The small part of a requests request used by requests-mock adapters."""
++
++    def __init__(self, method, url, headers=None, body=None):
++        self.method = method
++        self.url = url
++        self.headers = headers or {}
++        self.body = body
++        self.path_url = urlsplit(url).path or "/"
++        if urlsplit(url).query:
++            self.path_url += "?" + urlsplit(url).query
++
++
+ class _APIDomain:
+ 
+     baseUrl = "https://api.infomaniak.com"
+ 
+     def __init__(self, token):
+-        """Initialize class managing a domain within Infomaniak API
++        """Initialize class managing a domain within Infomaniak API.
++
++        Treq is Twisted based and returns Deferreds, while Certbot's DNS
++        authenticator interface is synchronous.  A private reactor thread
++        bridges those two interfaces; all network I/O still goes through
++        treq, and the public API retains Certbot's synchronous contract.
+ 
+         :param str token: oauth2 token to consume Infomaniak API
+         """
+         self.token = token
+-        self.session = requests.Session()
+-        self.session.headers.update({"Authorization": "Bearer {token}".format(token=self.token)})
++        self.session = _TreqSession()
++        self.session.headers.update(
++            {"Authorization": "Bearer {token}".format(token=self.token)}
++        )
++        self._reactor = _default_reactor
++        _ensure_reactor_running()
++
++    def _blocking_request(self, function, *args, **kwargs):
++        """Run a Deferred-producing function on the shared reactor."""
++        return threads.blockingCallFromThread(
++            self._reactor, function, *args, **kwargs
++        )
++
++    @defer.inlineCallbacks
++    def _request_async(self, method, url, payload=None):
++        """Issue one request with treq, on the reactor thread.
++
++        The adapter branch only exists to keep the old requests-mock based
++        tests and integrations usable; normal URLs always use treq directly.
++        """
++        scheme = urlsplit(url).scheme
++        adapter = self.session.adapters.get(scheme)
++        if adapter is not None:
++            body = (
++                json.dumps(payload)
++                if method == "POST" and payload is not None
++                else None
++            )
++            request = _Request(method, url, dict(self.session.headers), body)
++            response = adapter.send(request)
++            return response, True
++
++        if method == "GET":
++            response = yield treq.get(
++                url,
++                headers=self.session.headers,
++                params=payload,
++                reactor=self._reactor,
++            )
++        elif method == "POST":
++            headers = dict(self.session.headers)
++            headers["Content-Type"] = "application/json"
++            response = yield treq.post(
++                url,
++                headers=headers,
++                data=json.dumps(payload).encode("utf-8"),
++                reactor=self._reactor,
++            )
++        else:
++            response = yield treq.delete(
++                url,
++                headers=self.session.headers,
++                reactor=self._reactor,
++            )
++        return response, False
++
++    @staticmethod
++    @defer.inlineCallbacks
++    def _decode_response(response, mocked):
++        try:
++            if mocked:
++                result = response.json()
++            else:
++                result = yield treq.json_content(response)
++        except ValueError as exc:
++            raise errors.PluginError("no JSON in API response") from exc
++        return result
+ 
+     def _get_request(self, url, payload=None):
+-        """Performs a GET request against API
++        """Perform a GET request against the API.
+ 
+         :param str url: relative url
+-        :param dict payload : body of request
++        :param dict payload: query parameters for the request
+         """
+         url = self.baseUrl + url
+         logger.debug("GET %s", url)
+-        with self.session.get(url, params=payload) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            if result["error"]["code"] == "not_authorized":
+-                raise errors.PluginError("cannot authenticate")
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++        response, mocked = self._blocking_request(
++            self._request_async, "GET", url, payload
++        )
++        result = self._blocking_request(self._decode_response, response, mocked)
++        if result["result"] == "success":
++            return result["data"]
++        if result["error"]["code"] == "not_authorized":
++            raise errors.PluginError("cannot authenticate")
++        raise errors.PluginError(
++            "error in API request: {} / {}".format(
++                result["error"]["code"], result["error"]["description"]
++            )
++        )
+ 
+     def _post_request(self, url, payload):
+-        """Performs a POST request
+-
+-        :param str url: relative url
+-        :param dict payload : body of request
+-        """
++        """Perform a POST request against the API."""
+         url = self.baseUrl + url
+-        headers = {"Content-Type": "application/json"}
+-        json_data = json.dumps(payload)
+         logger.debug("POST %s", url)
+-        with self.session.post(url, data=json_data, headers=headers) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++        response, mocked = self._blocking_request(
++            self._request_async, "POST", url, payload
++        )
++        result = self._blocking_request(self._decode_response, response, mocked)
++        if result["result"] == "success":
++            return result["data"]
++        raise errors.PluginError(
++            "error in API request: {} / {}".format(
++                result["error"]["code"], result["error"]["description"]
++            )
++        )
+ 
+     def _delete_request(self, url):
+-        """Performs a POST request
+-
+-        :param str url: relative url
+-        """
++        """Perform a DELETE request against the API."""
+         url = self.baseUrl + url
+         logger.debug("DELETE %s", url)
+-        with self.session.delete(url) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++        response, mocked = self._blocking_request(
++            self._request_async, "DELETE", url
++        )
++        result = self._blocking_request(self._decode_response, response, mocked)
++        if result["result"] == "success":
++            return result["data"]
++        raise errors.PluginError(
++            "error in API request: {} / {}".format(
++                result["error"]["code"], result["error"]["description"]
++            )
++        )
+ 
+     def _get_records(self, domain, domain_id, record):
+         """Find record matching arguments

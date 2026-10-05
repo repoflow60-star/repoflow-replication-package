@@ -1,0 +1,165 @@
+--- a/smartystreets_python_sdk/requests_sender.py
++++ b/smartystreets_python_sdk/requests_sender.py
+@@ -1,12 +1,33 @@
+-from requests import Session, Request
++try:
++    from urllib.parse import urlencode
++except ImportError:
++    from urllib import urlencode
++
++from io import BytesIO
++
++import pycurl
++
+ from .response import Response
+ import smartystreets_python_sdk as smarty
+ import smartystreets_python_sdk_version as version
+ 
+ 
++class CurlRequest:
++    def __init__(self, url, params=None):
++        query = urlencode(params or {}, doseq=True)
++        if query:
++            separator = '&' if '?' in url else '?'
++            url = '{}{}{}'.format(url, separator, query)
++
++        self.url = url
++        self.headers = {}
++        self.method = 'GET'
++        self.data = None
++        self.body = None
++
++
+ class RequestsSender:
+     def __init__(self, max_timeout=None, proxy=None, ip=None):
+-        self.session = Session()
+         self.max_timeout = max_timeout or 10
+         self.proxy = proxy
+         self.debug = None
+@@ -15,18 +36,52 @@
+     def send(self, smarty_request):
+         ip = self.ip
+         request = build_request(smarty_request, ip)
+-        prepped_request = self.session.prepare_request(request)
+-        prepped_proxies = self.build_proxies()
++        proxy_settings = self.build_proxies()
+         if self.debug:
+-            print_request_data(prepped_request)
++            print_request_data(request)
+ 
+-        settings = self.session.merge_environment_settings(
+-            prepped_request.url, prepped_proxies, None, None, None
+-        )
+-        with self.session.send(prepped_request, timeout=self.max_timeout, **settings) as response:
++        body = BytesIO()
++        response_headers = []
++
++        def collect_response_header(line):
++            response_headers.append(line)
++            return len(line)
++
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, _as_bytes(request.url))
++            curl.setopt(pycurl.HTTPHEADER, _format_headers(request.headers))
++            curl.setopt(pycurl.WRITEFUNCTION, body.write)
++            curl.setopt(pycurl.HEADERFUNCTION, collect_response_header)
++            curl.setopt(pycurl.TIMEOUT, self.max_timeout)
++            curl.setopt(pycurl.FOLLOWLOCATION, 1)
++
++            if request.method == 'POST':
++                payload = request.body if request.body is not None else request.data
++                curl.setopt(pycurl.POST, 1)
++                curl.setopt(pycurl.POSTFIELDS, _as_bytes(payload))
++            else:
++                curl.setopt(pycurl.HTTPGET, 1)
++
++            if proxy_settings:
++                curl.setopt(pycurl.PROXY, self.proxy.host)
++                if self.proxy.username:
++                    credentials = '{}:{}'.format(
++                        self.proxy.username, self.proxy.password or ''
++                    )
++                    curl.setopt(pycurl.PROXYUSERPWD, credentials)
++
++            curl.perform()
++            response = Response(
++                _decode_body(body.getvalue()),
++                curl.getinfo(pycurl.RESPONSE_CODE),
++                _parse_response_headers(response_headers),
++            )
+             if self.debug:
+                 print_response_data(response)
+             return build_smarty_response(response)
++        finally:
++            curl.close()
+ 
+     def build_proxies(self):
+         if not self.proxy:
+@@ -47,7 +102,7 @@
+ 
+ def build_request(smarty_request, ip=None):
+     try:
+-        request = Request(url=smarty_request.url_prefix, params=smarty_request.parameters)
++        request = CurlRequest(url=smarty_request.url_prefix, params=smarty_request.parameters)
+         request.headers['User-Agent'] = "smartystreets (sdk:python@{})".format(version.__version__)
+         request.headers['Content-Type'] = smarty_request.content_type
+         if smarty_request.referer:
+@@ -56,6 +111,7 @@
+             request.headers['X-Forwarded-For'] = ip
+         if smarty_request.payload:
+             request.data = smarty_request.payload
++            request.body = smarty_request.payload
+             request.method = 'POST'
+         else:
+             request.method = 'GET'
+@@ -65,7 +121,8 @@
+ 
+ 
+ def build_smarty_response(inner_response, error=None):
+-    return Response(inner_response.text, inner_response.status_code, inner_response.headers, error)
++    payload = inner_response.text if hasattr(inner_response, 'text') else inner_response.payload
++    return Response(payload, inner_response.status_code, inner_response.headers, error)
+ 
+ 
+ def print_request_data(request):
+@@ -84,5 +141,38 @@
+     print('****** Response ******\r\n')
+     print(response.status_code)
+     print()
+-    print(response.text)
++    payload = response.text if hasattr(response, 'text') else response.payload
++    print(payload)
+     print('**********************\r\n')
++
++
++def _as_bytes(value):
++    if value is None:
++        return b''
++    if isinstance(value, bytes):
++        return value
++    return value.encode('utf-8')
++
++
++def _decode_body(value):
++    if isinstance(value, bytes):
++        return value.decode('utf-8', 'replace')
++    return value
++
++
++def _format_headers(headers):
++    return ['{}: {}'.format(key, value) for key, value in headers.items()]
++
++
++def _parse_response_headers(header_lines):
++    headers = {}
++    for line in header_lines:
++        if isinstance(line, bytes):
++            line = line.decode('iso-8859-1')
++        line = line.strip('\r\n')
++        if line.startswith('HTTP/'):
++            headers = {}
++        elif ':' in line:
++            key, value = line.split(':', 1)
++            headers[key.strip()] = value.strip()
++    return headers

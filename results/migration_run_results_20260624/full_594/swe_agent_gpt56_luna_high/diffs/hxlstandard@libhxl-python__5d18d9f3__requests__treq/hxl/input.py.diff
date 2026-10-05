@@ -1,0 +1,287 @@
+--- a/hxl/input.py
++++ b/hxl/input.py
+@@ -33,10 +33,176 @@
+ 
+ import abc, collections, csv, datetime, dateutil.parser, hashlib, \
+     io, io_wrapper, json, jsonpath_ng.ext, logging, \
+-    os.path, re, requests, shutil, six, sys, \
++    os.path, re, shutil, six, sys, threading, treq, \
+     tempfile, time, urllib.parse, xlrd3 as xlrd, zipfile
+ 
+ logger = logging.getLogger(__name__)
++
++
++########################################################################
++# Synchronous adapter for treq
++########################################################################
++
++# libhxl's public input API is synchronous, while treq is deliberately
++# asynchronous.  Keep the public API unchanged by running one Twisted
++# reactor in a background thread and waiting for each request to finish.
++_reactor_lock = threading.Lock()
++_reactor_thread = None
++_reactor_ready = None
++
++
++def _get_reactor():
++    """Return a running reactor suitable for synchronous treq calls."""
++    from twisted.internet import reactor
++
++    global _reactor_thread, _reactor_ready
++    with _reactor_lock:
++        if reactor.running:
++            return reactor
++        if _reactor_thread is not None:
++            # A Twisted reactor cannot be restarted after it has stopped.
++            if not _reactor_thread.is_alive():
++                raise RuntimeError("The Twisted reactor has stopped")
++            ready = _reactor_ready
++        else:
++            ready = threading.Event()
++            _reactor_ready = ready
++
++            def run_reactor():
++                reactor.callWhenRunning(ready.set)
++                reactor.run(installSignalHandlers=False)
++
++            _reactor_thread = threading.Thread(
++                target=run_reactor,
++                name="libhxl-treq-reactor",
++                daemon=True,
++            )
++            _reactor_thread.start()
++    ready.wait()
++    return reactor
++
++
++def _http_headers(response):
++    """Convert Twisted headers into the case-insensitive mapping we expose."""
++    return _HTTPHeaders({
++        key.decode("latin-1") if isinstance(key, bytes) else key:
++        (values[0].decode("latin-1") if isinstance(values[0], bytes) else values[0])
++        for key, values in response.headers.getAllRawHeaders()
++        if values
++    })
++
++
++class _HTTPHeaders(dict):
++    """Small case-insensitive HTTP header mapping."""
++
++    def _key(self, key):
++        key = key.decode("latin-1") if isinstance(key, bytes) else key
++        for existing in self:
++            if existing.lower() == key.lower():
++                return existing
++        return key
++
++    def __getitem__(self, key):
++        return super().__getitem__(self._key(key))
++
++    def get(self, key, default=None):
++        return super().get(self._key(key), default)
++
++
++class _HTTPResponse:
++    """The small subset of an HTTP response used by libhxl."""
++
++    def __init__(self, response, content):
++        self.status_code = response.code
++        self.headers = _http_headers(response)
++        self.content = content
++        self.is_redirect = (
++            response.code in (301, 302, 303, 307, 308)
++            and self.headers.get("Location") is not None
++        )
++
++    def json(self):
++        return json.loads(self.content.decode("utf-8"))
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise IOError("HTTP error {}".format(self.status_code))
++
++    def iter_content(self, chunk_size=0x1000):
++        for start in range(0, len(self.content), chunk_size):
++            yield self.content[start:start + chunk_size]
++
++    def close(self):
++        return None
++
++
++def _http_request(method, url, verify=True, headers=None, timeout=None,
++                  params=None, data=None, allow_redirects=True):
++    """Make a blocking HTTP request through treq."""
++    from twisted.internet import defer
++    from twisted.web.client import Agent
++    from twisted.internet.ssl import ClientContextFactory
++
++    reactor = _get_reactor()
++    result = []
++    finished = threading.Event()
++
++    def request_in_reactor():
++        kwargs = {
++            "headers": headers,
++            "params": params,
++            "data": data,
++            "allow_redirects": allow_redirects,
++            "timeout": timeout,
++            "reactor": reactor,
++        }
++        if not verify:
++            # ClientContextFactory deliberately does not validate server
++            # certificates, matching verify_ssl=False behaviour.
++            kwargs["agent"] = Agent(
++                reactor, contextFactory=ClientContextFactory()
++            )
++
++        @defer.inlineCallbacks
++        def fetch():
++            try:
++                response = yield treq.request(method, url, **kwargs)
++                content = yield treq.content(response)
++                defer.returnValue(_HTTPResponse(response, content))
++            except Exception as error:
++                defer.returnValue(error)
++
++        deferred = fetch()
++
++        def complete(value):
++            result.append(value)
++            finished.set()
++            return value
++
++        deferred.addCallback(complete)
++        deferred.addErrback(complete)
++
++    reactor.callFromThread(request_in_reactor)
++    finished.wait()
++    response = result[0]
++    if isinstance(response, Exception):
++        raise response
++    # Deferred failures are passed to the errback as Failure instances.
++    if hasattr(response, "raiseException"):
++        response.raiseException()
++    return response
++
++
++def _http_get(url, **kwargs):
++    return _http_request("GET", url, **kwargs)
++
++
++def _http_head(url, **kwargs):
++    return _http_request("HEAD", url, **kwargs)
++
++
++def _http_post(url, **kwargs):
++    return _http_request("POST", url, **kwargs)
+ 
+ __all__ = (
+     "data",
+@@ -621,9 +787,8 @@
+         try:
+             url = munge_url(url_or_filename, input_options)
+             logup("Trying to open remote resource", {"url": url_or_filename})
+-            response = requests.get(
++            response = _http_get(
+                 url,
+-                stream=True,
+                 verify=input_options.verify_ssl,
+                 timeout=input_options.timeout,
+                 headers=input_options.http_headers
+@@ -820,17 +985,18 @@
+ 
+ # Deprecated - will remove in future release
+ class RequestResponseIOWrapper(io.RawIOBase):
+-    """Wrapper for a Response object from the requests library.  Streaming
+-    in requests is a bit broken: for example, if you're streaming, the
+-    stream from the raw property doesn't unzip the payload.
++    """Wrapper for a buffered HTTP response.
++
++    Kept for backwards compatibility with callers that used this deprecated
++    helper before the HTTP client was migrated to treq.
+     """
+ 
+     BUFFER_SIZE = 0x1000
+-    """Size of input chunk buffer from requests.raw.iter_content"""
++    """Size of the input chunks."""
+ 
+     def __init__(self, response):
+-        """Construct a wrapper around a requests response object
+-        @param response: the HTTP response from the requests library
++        """Construct a wrapper around an HTTP response.
++        @param response: the HTTP response
+         """
+         self.response = response
+         self.buffer = None
+@@ -838,7 +1004,7 @@
+         self.iter = response.iter_content(self.BUFFER_SIZE) # iterator through the input
+ 
+     def read(self, size=-1):
+-        """Read raw byte input from the requests raw.iter_content iterator
++        """Read raw byte input from the response content iterator
+         The function will unzip zipped content.
+         @param size: the maximum number of bytes to read, or -1 for all available.
+         """
+@@ -1657,7 +1823,7 @@
+     result = re.match(GOOGLE_DRIVE_URL, url)
+     if result:
+         logup("HEAD request for Google Drive URL", {"url": url})
+-        response = requests.head(url)
++        response = _http_head(url, allow_redirects=False)
+         if response.is_redirect:
+             new_url = response.headers['Location']
+             logup("Google Drive redirect", {"url": url, "redirect": new_url})
+@@ -1752,7 +1918,7 @@
+         # CKAN resource URL
+         ckan_api_query = '{}/api/3/action/resource_show?id={}'.format(site_url, resource_id)
+         logup("Trying CKAN API call", {"url": ckan_api_query})
+-        ckan_api_result = requests.get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
++        ckan_api_result = _http_get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
+         if ckan_api_result['success']:
+             url = ckan_api_result['result']['url']
+             logup("Found candidate URL for CKAN dataset", {"url": url})
+@@ -1775,7 +1941,7 @@
+     else:
+         # CKAN dataset (package) URL
+         ckan_api_query = '{}/api/3/action/package_show?id={}'.format(site_url, dataset_id)
+-        ckan_api_result = requests.get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
++        ckan_api_result = _http_get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
+         if ckan_api_result['success']:
+             for resource in ckan_api_result['result']['resources']:
+                 url = resource['url']
+@@ -1825,7 +1991,7 @@
+         "q": "source:{}".format(asset_id)
+     }
+     logup("Trying Kobo dataset", {"url": asset_id})
+-    response = requests.get(
++    response = _http_get(
+         "https://kobo.humanitarianresponse.info/exports/",
+         verify=input_options.verify_ssl,
+         headers=input_options.http_headers,
+@@ -1861,10 +2027,10 @@
+         "hierarchy_in_labels": False,
+         "group_sep": ",",
+     }
+-    response = requests.post(
++    response = _http_post(
+         "https://kobo.humanitarianresponse.info/exports/",
+         verify=input_options.verify_ssl,
+-        headers=http_headers,
++        headers=input_options.http_headers,
+         data=params
+     )
+     logup("Generated Kobo export", {"asset_id": asset_id, "status": response.status_code})
+@@ -1881,10 +2047,10 @@
+     fail_counter = 0
+     while True:
+         logup("Getting info for Kobo export", {"url": info_url})
+-        response = requests.get(
++        response = _http_get(
+             info_url,
+             verify=input_options.verify_ssl,
+-            headers=http_headers
++            headers=input_options.http_headers
+         )
+         logup("Response for Kobo info", {"url": info_url, "status": response.status_code})
+ 

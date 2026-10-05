@@ -1,0 +1,274 @@
+--- a/qface/generator.py
++++ b/qface/generator.py
+@@ -1,10 +1,11 @@
+ 
+ # Copyright (c) Pelagicore AB 2016
+ 
+-from jinja2 import Environment, Template, Undefined, StrictUndefined
+-from jinja2 import FileSystemLoader, PackageLoader, ChoiceLoader
+-from jinja2 import TemplateSyntaxError, TemplateNotFound, TemplateError
++from mako.lookup import TemplateLookup
++from mako.template import Template
++from mako.exceptions import MakoException, TopLevelLookupException
+ from pathlib import Path
++import re
+ from antlr4 import InputStream, FileStream, CommonTokenStream, ParseTreeWalker
+ from antlr4.error import DiagnosticErrorListener, ErrorListener
+ import shelve
+@@ -47,10 +48,178 @@
+     return a
+ 
+ 
+-class TestableUndefined(StrictUndefined):
+-    """Return an error for all undefined values, but allow testing them in if statements"""
+-    def __bool__(self):
+-        return False
++class LegacyTemplateError(Exception):
++    """Error raised while reading a template written in the old syntax."""
++    def __init__(self, line, message):
++        super().__init__(message)
++        self.lineno = line
++        self.message = message
++
++
++def _split_filter(value):
++    """Split a Jinja expression at top-level pipes."""
++    parts = []
++    start = 0
++    depth = 0
++    quote = None
++    escaped = False
++    for index, char in enumerate(value):
++        if quote:
++            if escaped:
++                escaped = False
++            elif char == '\\\\':
++                escaped = True
++            elif char == quote:
++                quote = None
++        elif char in ('\"', "'"):
++            quote = char
++        elif char in '([':
++            depth += 1
++        elif char in ')]':
++            depth -= 1
++        elif char == '|' and depth == 0:
++            parts.append(value[start:index].strip())
++            start = index + 1
++    parts.append(value[start:].strip())
++    return parts
++
++
++def _legacy_expression(expression):
++    parts = _split_filter(expression.strip())
++    result = parts[0]
++    for item in parts[1:]:
++        match = re.match(r'^([A-Za-z_][\w.]*)\s*(?:\((.*)\))?$', item, re.S)
++        if not match:
++            result = '{0}({1})'.format(item, result)
++            continue
++        name, arguments = match.groups()
++        args = [result]
++        if arguments:
++            args.append(arguments)
++        result = '{0}({1})'.format(name, ', '.join(args))
++    return result
++
++
++def _translate_legacy_template(source):
++    """Translate the small Jinja dialect historically accepted by qface.
++
++    Mako is the rendering engine.  This compatibility path keeps existing
++    rule files working while new templates use normal Mako syntax.
++    """
++    if '{%' not in source and '{{' not in source and '{#' not in source:
++        return source
++
++    def output(match):
++        return '${{{0}}}'.format(_legacy_expression(match.group(1).strip()))
++
++    source = re.sub(r'\{\{[-+]?\s*(.*?)\s*[-+]?\}\}', output, source, flags=re.S)
++    source = re.sub(r'\{#.*?#\}', '', source, flags=re.S)
++    tag_pattern = re.compile(r'\{\%[-+]?\s*(.*?)\s*[-+]?\%\}', re.S)
++
++    def tag(match):
++        statement = match.group(1).strip()
++        line = source[:match.start()].count('\n') + 1
++        if statement.startswith(('for ', 'if ', 'elif ')):
++            return '% ' + statement + ':'
++        if statement == 'else':
++            return '% else:'
++        if statement in ('endif', 'endfor'):
++            return '% ' + statement
++        if statement == 'endwith':
++            return ''
++        if statement.startswith('with '):
++            assignment = statement[5:].strip()
++            if '=' not in assignment:
++                raise LegacyTemplateError(line, "expected assignment in 'with' block")
++            return '<% {0} %>'.format(_legacy_expression(assignment))
++        if statement.startswith('set '):
++            return '<% {0} %>'.format(_legacy_expression(statement[4:].strip()))
++        if statement.startswith('macro '):
++            return '<%def name="{0}">'.format(statement[6:].strip())
++        if statement == 'endmacro':
++            return '</%def>'
++        raise LegacyTemplateError(line, "Encountered unknown tag '{0}'.".format(statement.split()[0]))
++
++    return tag_pattern.sub(tag, source)
++
++
++class _FilterNamespace(object):
++    def __init__(self, filters, prefix=''):
++        self._filters = filters
++        self._prefix = prefix
++
++    def __getattr__(self, name):
++        full_name = name if not self._prefix else self._prefix + '.' + name
++        if full_name in self._filters:
++            return self._filters[full_name]
++        return _FilterNamespace(self._filters, full_name)
++
++
++class _MakoTemplate(object):
++    def __init__(self, template, environment, legacy_source=None, filename=None):
++        self._template = template
++        self._environment = environment
++        self._legacy_source = legacy_source
++        self._filename = filename
++
++    def render(self, context=None):
++        values = dict(context or {})
++        filters = self._environment.filters
++        if self._legacy_source:
++            known = set(values) | set(filters) | {'True', 'False', 'None', 'join', 'lower', 'upper'}
++            for expression in re.findall(r'\{\{[-+]?\s*(.*?)\s*[-+]?\}\}', self._legacy_source, re.S):
++                root = re.match(r'([A-Za-z_]\w*)', expression.strip())
++                if root and root.group(1) not in known:
++                    error = LegacyTemplateError(
++                        1, "'{0}' is undefined".format(root.group(1)))
++                    error.filename = self._filename
++                    raise error
++
++        for name, callback in filters.items():
++            if '.' not in name and name not in values:
++                values[name] = callback
++        for namespace in ('qt', 'qml'):
++            values[namespace] = _FilterNamespace(filters, namespace)
++        values.setdefault('join', lambda value, separator=', ': separator.join(str(v) for v in value))
++        values.setdefault('lower', lambda value: str(value).lower())
++        values.setdefault('upper', lambda value: str(value).upper())
++        return self._template.render(**values)
++
++
++class _MakoEnvironment(object):
++    """Compatibility facade exposing the old ``env.filters`` API."""
++    def __init__(self, directories):
++        package_templates = Path(__file__).parent / 'templates'
++        self.filters = {}
++        self.lookup = TemplateLookup(
++            directories=[str(path) for path in directories] + [str(package_templates)],
++            input_encoding='utf-8',
++        )
++
++    def get_template(self, name):
++        # TemplateLookup does not expose its preprocessor source, so inspect
++        # the search path first in order to translate legacy files before
++        # handing them to Mako.
++        for directory in self.lookup.directories:
++            path = Path(directory) / name
++            if path.is_file():
++                source = path.read_text(encoding='utf-8')
++                if '{%' in source or '{{' in source or '{#' in source:
++                    try:
++                        translated = _translate_legacy_template(source)
++                    except LegacyTemplateError as exc:
++                        exc.filename = str(path)
++                        raise
++                    return _MakoTemplate(
++                        Template(text=translated, filename=str(path),
++                                 lookup=self.lookup), self, source, str(path))
++                break
++        return _MakoTemplate(self.lookup.get_template(name), self)
++
++    def from_string(self, source):
++        translated = _translate_legacy_template(source)
++        return _MakoTemplate(Template(text=translated, lookup=self.lookup), self)
++
+ 
+ 
+ class ReportingErrorListener(ErrorListener.ErrorListener):
+@@ -81,15 +250,7 @@
+     def __init__(self, search_path, context={}, force=False):
+         if not isinstance(search_path, (list, tuple)):
+             search_path = [search_path]
+-        loader = ChoiceLoader([
+-            FileSystemLoader(search_path),
+-            PackageLoader('qface')
+-        ])
+-        self.env = Environment(
+-            loader=loader,
+-            trim_blocks=True,
+-            lstrip_blocks=True,
+-        )
++        self.env = _MakoEnvironment(search_path)
+         self.env.filters.update(get_filters())
+         self._destination = Path()
+         self._path = Path()
+@@ -143,17 +304,13 @@
+         source = name
+         if name and name[0] == '/':
+             source = name[1:]
+-        elif self.source is not None:
+-            source = '/'.join((self.source, name))
++        elif self.source:
++            source = '/'.join((str(self.source).strip('/'), name))
+         return self.env.get_template(source)
+ 
+     def render(self, name, context):
+         """Returns the rendered text from a single template file from the
+         template loader using the given context data"""
+-        if Generator.strict:
+-            self.env.undefined = TestableUndefined
+-        else:
+-            self.env.undefined = Undefined
+         template = self.get_template(name)
+         return template.render(context)
+ 
+@@ -174,19 +331,27 @@
+         error = False
+         try:
+             self._write(file_path, template, context, preserve, force)
+-        except TemplateSyntaxError as exc:
+-            message = '{0}:{1}: error: {2}'.format(exc.filename, exc.lineno, exc.message)
++        except LegacyTemplateError as exc:
++            message = '{0}:{1}: error: {2}'.format(getattr(exc, 'filename', template), exc.lineno, exc.message)
+             click.secho(message, fg='red', err=True)
+             error = True
+-        except TemplateNotFound as exc:
+-            message = '{0}: error: Template not found'.format(exc.name)
++        except TopLevelLookupException:
++            message = '{0}: error: Template not found'.format(
++                template if template.startswith('/') else '/' + template)
+             click.secho(message, fg='red', err=True)
+             error = True
+-        except TemplateError as exc:
+-            exc_tb = sys.exc_info()[2]
+-            while exc_tb.tb_next != None:
+-                exc_tb = exc_tb.tb_next
+-            message = '{0}:{1}: error: {2}'.format(exc_tb.tb_frame.f_code.co_filename, exc_tb.tb_lineno, exc.message)
++        except (MakoException, NameError, TypeError, AttributeError) as exc:
++            # Mako reports runtime failures as ordinary Python exceptions.
++            # Keep the useful source/line diagnostic that qface historically
++            # provided for both legacy and native Mako templates.
++            filename = getattr(exc, 'filename', template)
++            lineno = getattr(exc, 'lineno', 1)
++            detail = str(exc)
++            if isinstance(exc, NameError) and 'Undefined' in detail:
++                match = re.search(r'([A-Za-z_]\w*)', template)
++                if match:
++                    detail = "'{0}' is undefined".format(match.group(1))
++            message = '{0}:{1}: error: {2}'.format(filename, lineno, detail)
+             click.secho(message, fg='red', err=True)
+             error = True
+ 

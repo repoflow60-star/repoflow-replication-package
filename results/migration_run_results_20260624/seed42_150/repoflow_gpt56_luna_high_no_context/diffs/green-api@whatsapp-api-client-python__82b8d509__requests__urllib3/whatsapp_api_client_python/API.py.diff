@@ -1,0 +1,219 @@
+--- a/whatsapp_api_client_python/API.py
++++ b/whatsapp_api_client_python/API.py
+@@ -1,9 +1,13 @@
+ import json
+ import logging
++from urllib.parse import urlencode
+ from typing import Any, NoReturn, Optional
+ 
+-from requests import Response, Session
+-from requests.adapters import HTTPAdapter, Retry
++from urllib3 import PoolManager
++from urllib3.filepost import encode_multipart_formdata
++from urllib3.fields import RequestField
++from urllib3.response import HTTPResponse
++from urllib3.util import Retry
+ 
+ from .response import Response as GreenAPIResponse
+ from .tools import (
+@@ -49,7 +53,6 @@
+         self.idInstance = idInstance
+         self.apiTokenInstance = apiTokenInstance
+ 
+-        self.session = Session()
+         self.__prepare_session()
+ 
+         self.account = account.Account(self)
+@@ -80,12 +83,32 @@
+ 
+         try:
+             if not files:
++                headers = self.__merge_headers(
++                    self.session.headers,
++                    {"Content-Type": "application/json"}
++                    if payload is not None else None
++                )
+                 response = self.session.request(
+-                    method=method, url=url, json=payload, timeout=self.host_timeout
++                    method=method,
++                    url=url,
++                    body=(
++                        json.dumps(payload).encode("utf-8")
++                        if payload is not None else None
++                    ),
++                    headers=headers,
++                    timeout=self.host_timeout
+                 )
+             else:
++                body, content_type = self.__encode_multipart(payload, files)
+                 response = self.session.request(
+-                    method=method, url=url, data=payload, files=files, timeout=self.media_timeout
++                    method=method,
++                    url=url,
++                    body=body,
++                    headers=self.__merge_headers(
++                        self.session.headers,
++                        {"Content-Type": content_type}
++                    ),
++                    timeout=self.media_timeout
+                 )
+         except Exception as error:
+             error_message = f"Request was failed with error: {error}."
+@@ -98,10 +121,56 @@
+ 
+         self.__handle_response(response)
+ 
+-        return GreenAPIResponse(response.status_code, response.text)
++        return GreenAPIResponse(response.status, self.__response_text(response))
+ 
+     def raw_request(self, **arguments: Any) -> GreenAPIResponse:
+         try:
++            arguments = arguments.copy()
++            files = arguments.pop("files", None)
++            data = arguments.pop("data", None)
++            payload = arguments.pop("json", None)
++            params = arguments.pop("params", None)
++
++            if params:
++                if isinstance(params, bytes):
++                    query = params.decode("utf-8")
++                elif isinstance(params, str):
++                    query = params
++                else:
++                    query = urlencode(params, doseq=True)
++                separator = "&" if "?" in arguments["url"] else "?"
++                arguments["url"] = f"{arguments['url']}{separator}{query}"
++
++            if "allow_redirects" in arguments:
++                arguments["redirect"] = arguments.pop("allow_redirects")
++
++            headers = self.__merge_headers(
++                self.session.headers, arguments.get("headers")
++            )
++            if files:
++                body, content_type = self.__encode_multipart(data, files)
++                arguments["body"] = body
++                self.__set_content_type(headers, content_type)
++                arguments["headers"] = headers
++            elif data is not None:
++                if isinstance(data, (dict, list, tuple)):
++                    arguments["body"] = urlencode(data, doseq=True).encode("utf-8")
++                    self.__set_content_type(
++                        headers, "application/x-www-form-urlencoded"
++                    )
++                    arguments["headers"] = headers
++                elif isinstance(data, str):
++                    arguments["body"] = data.encode("utf-8")
++                else:
++                    arguments["body"] = data
++                arguments["headers"] = headers
++            elif payload is not None:
++                arguments["body"] = json.dumps(payload).encode("utf-8")
++                self.__set_content_type(headers, "application/json")
++                arguments["headers"] = headers
++            else:
++                arguments["headers"] = headers
++
+             response = self.session.request(**arguments)
+         except Exception as error:
+             error_message = f"Request was failed with error: {error}."
+@@ -114,17 +183,71 @@
+ 
+         self.__handle_response(response)
+ 
+-        return GreenAPIResponse(response.status_code, response.text)
+-
+-    def __handle_response(self, response: Response) -> Optional[NoReturn]:
+-        status_code = response.status_code
++        return GreenAPIResponse(response.status, self.__response_text(response))
++
++    @staticmethod
++    def __response_text(response: HTTPResponse) -> str:
++        data = response.data
++        if data is None:
++            data = response.read()
++        if isinstance(data, bytes):
++            return data.decode("utf-8", errors="replace")
++        return str(data)
++
++    @staticmethod
++    def __set_content_type(headers: dict, content_type: str) -> None:
++        if not any(key.lower() == "content-type" for key in headers):
++            headers["Content-Type"] = content_type
++
++    @staticmethod
++    def __merge_headers(
++            defaults: dict, overrides: Optional[dict]
++    ) -> dict:
++        headers = dict(defaults)
++        for key, value in (overrides or {}).items():
++            for existing_key in list(headers):
++                if existing_key.lower() == key.lower():
++                    del headers[existing_key]
++            headers[key] = value
++        return headers
++
++    @staticmethod
++    def __encode_multipart(payload: Optional[dict], files: dict) -> tuple:
++        fields = dict(payload or {})
++        for name, file_data in files.items():
++            if isinstance(file_data, tuple):
++                filename = file_data[0]
++                content = file_data[1]
++                if hasattr(content, "read"):
++                    content = content.read()
++
++                content_type = file_data[2] if len(file_data) > 2 else None
++                field = RequestField.from_tuples(
++                    name,
++                    (filename, content, content_type)
++                    if content_type is not None
++                    else (filename, content)
++                )
++                if len(file_data) > 3:
++                    field.headers.update(file_data[3])
++                fields[name] = field
++            elif hasattr(file_data, "read"):
++                fields[name] = (name, file_data.read())
++            else:
++                fields[name] = (name, file_data)
++
++        return encode_multipart_formdata(fields)
++
++    def __handle_response(self, response: HTTPResponse) -> Optional[NoReturn]:
++        status_code = response.status
++        response_text = self.__response_text(response)
+         if status_code != 200 or self.debug_mode:
+             try:
+                 data = json.dumps(
+-                    json.loads(response.text), ensure_ascii=False, indent=4
++                    json.loads(response_text), ensure_ascii=False, indent=4
+                 )
+             except json.JSONDecodeError:
+-                data = response.text
++                data = response_text
+ 
+             if status_code != 200:
+                 error_message = (
+@@ -159,8 +282,6 @@
+             self.logger.setLevel(logging.DEBUG)
+ 
+     def __prepare_session(self) -> None:
+-        self.session.headers["Connection"] = "close"
+-
+         retry = Retry(
+             total=3,
+             backoff_factor=1.0,
+@@ -168,8 +289,10 @@
+             status_forcelist=[429]
+         )
+ 
+-        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
++        self.session = PoolManager(
++            headers={"Connection": "close"},
++            retries=retry
++        )
+ 
+ 
+ class GreenAPI(GreenApi):

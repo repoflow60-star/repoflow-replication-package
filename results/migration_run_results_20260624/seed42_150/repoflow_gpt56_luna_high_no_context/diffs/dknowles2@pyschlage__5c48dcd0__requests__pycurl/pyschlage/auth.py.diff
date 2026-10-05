@@ -1,0 +1,266 @@
+--- a/pyschlage/auth.py
++++ b/pyschlage/auth.py
+@@ -2,13 +2,19 @@
+ 
+ from __future__ import annotations
+ 
++import json
++from collections.abc import Mapping
+ from functools import wraps
+-from typing import Callable
++from http import HTTPStatus
++from io import BytesIO
++from json import JSONDecodeError
++from typing import Any, Callable
++from urllib.parse import urlencode
+ 
+ from botocore.exceptions import ClientError
+ import pycognito
+ from pycognito import utils
+-import requests
++import pycurl
+ 
+ from .exceptions import NotAuthorizedError, UnknownError
+ 
+@@ -28,13 +34,87 @@
+ USER_POOL_ID = USER_POOL_REGION + "_2zhrVs9d4"
+ 
+ 
++class HttpError(Exception):
++    """Raised when a response has an unsuccessful HTTP status code."""
++
++
++class CurlResponse:
++    """Response data returned by the pycurl transport."""
++
++    def __init__(
++        self,
++        url: str,
++        status_code: int,
++        reason: str,
++        headers: dict[str, str],
++        content: bytes,
++    ) -> None:
++        self.url = url
++        self.status_code = status_code
++        self.reason = reason
++        self.headers = headers
++        self.content = content
++
++    @property
++    def ok(self) -> bool:
++        """Whether the response has a successful status code."""
++        return self.status_code < 400
++
++    @property
++    def text(self) -> str:
++        """Return the response body decoded as UTF-8."""
++        return self.content.decode("utf-8", errors="replace")
++
++    def json(self) -> Any:
++        """Decode the response body as JSON."""
++        return json.loads(self.content.decode("utf-8"))
++
++    def raise_for_status(self) -> None:
++        """Raise an error for a 4xx or 5xx response."""
++        if self.status_code >= 400:
++            message = f"{self.status_code} {self.reason}".strip()
++            raise HttpError(message)
++
++
++class _AuthRequest:
++    """Header container accepted by pycognito's request auth callable."""
++
++    def __init__(self, headers: dict[str, str]) -> None:
++        self.headers = headers
++
++
++def _capture_headers(
++    headers: dict[str, str], status: list[int], reason: list[str], line: bytes
++) -> int:
++    """Capture the final response headers emitted by libcurl."""
++    decoded = line.decode("iso-8859-1").rstrip("\r\n")
++    if decoded.startswith("HTTP/"):
++        parts = decoded.split(" ", 2)
++        try:
++            response_status = int(parts[1])
++        except (IndexError, ValueError):
++            return len(line)
++        status[:] = [response_status]
++        reason[:] = [parts[2] if len(parts) == 3 else ""]
++        headers.clear()
++    elif ":" in decoded:
++        name, value = decoded.split(":", 1)
++        name = name.strip()
++        value = value.strip()
++        if name in headers:
++            headers[name] = f"{headers[name]}, {value}"
++        else:
++            headers[name] = value
++    return len(line)
++
++
+ def _translate_auth_errors(
+     # pylint: disable=invalid-name
+-    fn: Callable[..., requests.Response],
++    fn: Callable[..., CurlResponse],
+     # pylint: enable=invalid-name
+-) -> Callable[..., requests.Response]:
++) -> Callable[..., CurlResponse]:
+     @wraps(fn)
+-    def wrapper(*args, **kwargs) -> requests.Response:
++    def wrapper(*args, **kwargs) -> CurlResponse:
+         try:
+             return fn(*args, **kwargs)
+         except ClientError as ex:
+@@ -50,19 +130,19 @@
+ 
+ def _translate_http_errors(
+     # pylint: disable=invalid-name
+-    fn: Callable[..., requests.Response],
++    fn: Callable[..., CurlResponse],
+     # pylint: enable=invalid-name
+-) -> Callable[..., requests.Response]:
++) -> Callable[..., CurlResponse]:
+     @wraps(fn)
+-    def wrapper(*args, **kwargs) -> requests.Response:
++    def wrapper(*args, **kwargs) -> CurlResponse:
+         resp = fn(*args, **kwargs)
+         try:
+             resp.raise_for_status()
+             return resp
+-        except requests.HTTPError as ex:
++        except HttpError as ex:
+             try:
+                 message = resp.json().get("message", resp.reason)
+-            except requests.JSONDecodeError:
++            except (JSONDecodeError, UnicodeDecodeError):
+                 message = resp.reason
+             raise UnknownError(message) from ex
+ 
+@@ -100,7 +180,7 @@
+         :raise pyschlage.exceptions.NotAuthorizedError: When authentication fails.
+         :raise pyschlage.exceptions.UnknownError: On other errors.
+         """
+-        self.auth(requests.Request())
++        self.auth(_AuthRequest({}))
+ 
+     @property
+     def user_id(self) -> str:
+@@ -117,15 +197,108 @@
+     @_translate_auth_errors
+     def request(
+         self, method: str, path: str, base_url: str = BASE_URL, **kwargs
+-    ) -> requests.Response:
++    ) -> CurlResponse:
+         """Performs a request against the Schlage WiFi cloud service.
+ 
+         :meta private:
+         """
+-        kwargs["auth"] = self.auth
+-        if "headers" not in kwargs:
+-            kwargs["headers"] = {}
+-        kwargs["headers"]["X-Api-Key"] = API_KEY
+-        kwargs.setdefault("timeout", _DEFAULT_TIMEOUT)
+-        # pylint: disable=missing-timeout
+-        return requests.request(method, f"{base_url}/{path.lstrip('/')}", **kwargs)
++        headers = dict(kwargs.pop("headers", {}))
++        headers["X-Api-Key"] = API_KEY
++        kwargs.pop("auth", None)
++
++        params = kwargs.pop("params", None)
++        url = f"{base_url}/{path.lstrip('/')}"
++        if params:
++            query = urlencode(
++                [(key, value) for key, value in params.items() if value is not None],
++                doseq=True,
++            )
++            if query:
++                separator = "&" if "?" in url else "?"
++                url = f"{url}{separator}{query}"
++
++        json_body = kwargs.pop("json", None)
++        data = kwargs.pop("data", None)
++        timeout = kwargs.pop("timeout", _DEFAULT_TIMEOUT)
++        verify = kwargs.pop("verify", True)
++        allow_redirects = kwargs.pop("allow_redirects", True)
++        if kwargs:
++            unexpected = next(iter(kwargs))
++            raise TypeError(
++                f"request() got an unexpected keyword argument '{unexpected}'"
++            )
++
++        body: bytes | None = None
++        if json_body is not None:
++            body = json.dumps(json_body).encode("utf-8")
++            if not any(name.lower() == "content-type" for name in headers):
++                headers["Content-Type"] = "application/json"
++        elif data is not None:
++            if isinstance(data, Mapping):
++                body = urlencode(data, doseq=True).encode("utf-8")
++                if not any(name.lower() == "content-type" for name in headers):
++                    headers["Content-Type"] = "application/x-www-form-urlencoded"
++            elif isinstance(data, str):
++                body = data.encode("utf-8")
++            else:
++                body = bytes(data)
++
++        auth_request = self.auth(_AuthRequest(headers))
++        auth_headers = getattr(auth_request, "headers", None)
++        if isinstance(auth_headers, Mapping):
++            headers = dict(auth_headers)
++
++        response_body = BytesIO()
++        response_headers: dict[str, str] = {}
++        status = [0]
++        reason = [""]
++        response_url = url
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.CUSTOMREQUEST, method.upper())
++            curl.setopt(
++                pycurl.HTTPHEADER,
++                [f"{name}: {value}" for name, value in headers.items()],
++            )
++            curl.setopt(pycurl.WRITEFUNCTION, response_body.write)
++            curl.setopt(
++                pycurl.HEADERFUNCTION,
++                lambda line: _capture_headers(
++                    response_headers, status, reason, line
++                ),
++            )
++            curl.setopt(pycurl.FOLLOWLOCATION, bool(allow_redirects))
++            if verify is False:
++                curl.setopt(pycurl.SSL_VERIFYPEER, 0)
++                curl.setopt(pycurl.SSL_VERIFYHOST, 0)
++            elif isinstance(verify, str):
++                curl.setopt(pycurl.CAINFO, verify)
++            if timeout is not None:
++                if isinstance(timeout, tuple):
++                    curl.setopt(pycurl.CONNECTTIMEOUT, timeout[0])
++                    curl.setopt(pycurl.TIMEOUT, timeout[1])
++                else:
++                    curl.setopt(pycurl.TIMEOUT, timeout)
++            if body is not None:
++                curl.setopt(pycurl.POSTFIELDS, body)
++                curl.setopt(pycurl.POSTFIELDSIZE, len(body))
++            curl.perform()
++            if not status[0]:
++                status[0] = curl.getinfo(pycurl.RESPONSE_CODE)
++            response_url = curl.getinfo(pycurl.EFFECTIVE_URL) or url
++        finally:
++            curl.close()
++
++        if not reason[0]:
++            try:
++                reason[0] = HTTPStatus(status[0]).phrase
++            except ValueError:
++                pass
++        return CurlResponse(
++            url=response_url,
++            status_code=status[0],
++            reason=reason[0],
++            headers=response_headers,
++            content=response_body.getvalue(),
++        )

@@ -1,0 +1,163 @@
+--- a/pyschlage/auth.py
++++ b/pyschlage/auth.py
+@@ -2,15 +2,20 @@
+ 
+ from __future__ import annotations
+ 
++import json
+ from functools import wraps
+-from typing import Callable
++from types import SimpleNamespace
++from typing import Callable, TypeVar
++from urllib.parse import urlencode
+ 
+ from botocore.exceptions import ClientError
+ import pycognito
+ from pycognito import utils
+-import requests
++import urllib3
++from urllib3.response import HTTPResponse
+ 
+ from .exceptions import NotAuthorizedError, UnknownError
++from .response import response_json
+ 
+ _DEFAULT_TIMEOUT = 60
+ _NOT_AUTHORIZED_ERRORS = (
+@@ -26,15 +31,16 @@
+ CLIENT_SECRET = "1kfmt18bgaig51in4j4v1j3jbe7ioqtjhle5o6knqc5dat0tpuvo"
+ USER_POOL_REGION = "us-west-2"
+ USER_POOL_ID = USER_POOL_REGION + "_2zhrVs9d4"
++_T = TypeVar("_T")
+ 
+ 
+ def _translate_auth_errors(
+     # pylint: disable=invalid-name
+-    fn: Callable[..., requests.Response],
++    fn: Callable[..., _T],
+     # pylint: enable=invalid-name
+-) -> Callable[..., requests.Response]:
++) -> Callable[..., _T]:
+     @wraps(fn)
+-    def wrapper(*args, **kwargs) -> requests.Response:
++    def wrapper(*args, **kwargs) -> _T:
+         try:
+             return fn(*args, **kwargs)
+         except ClientError as ex:
+@@ -50,21 +56,22 @@
+ 
+ def _translate_http_errors(
+     # pylint: disable=invalid-name
+-    fn: Callable[..., requests.Response],
++    fn: Callable[..., HTTPResponse],
+     # pylint: enable=invalid-name
+-) -> Callable[..., requests.Response]:
++) -> Callable[..., HTTPResponse]:
+     @wraps(fn)
+-    def wrapper(*args, **kwargs) -> requests.Response:
++    def wrapper(*args, **kwargs) -> HTTPResponse:
+         resp = fn(*args, **kwargs)
+-        try:
+-            resp.raise_for_status()
+-            return resp
+-        except requests.HTTPError as ex:
++        status = getattr(resp, "status", None)
++        if not isinstance(status, int):
++            status = getattr(resp, "status_code", None)
++        if isinstance(status, int) and status >= 400:
+             try:
+-                message = resp.json().get("message", resp.reason)
+-            except requests.JSONDecodeError:
++                message = response_json(resp).get("message", resp.reason)
++            except (AttributeError, TypeError, UnicodeDecodeError, ValueError):
+                 message = resp.reason
+-            raise UnknownError(message) from ex
++            raise UnknownError(message)
++        return resp
+ 
+     return wrapper
+ 
+@@ -91,6 +98,7 @@
+             password=password,
+             cognito=self.cognito,
+         )
++        self._http = urllib3.PoolManager()
+         self._user_id: str | None = None
+ 
+     @_translate_auth_errors
+@@ -100,7 +108,10 @@
+         :raise pyschlage.exceptions.NotAuthorizedError: When authentication fails.
+         :raise pyschlage.exceptions.UnknownError: On other errors.
+         """
+-        self.auth(requests.Request())
++        # RequestsSrpAuth is pycognito's authentication hook. Calling it with
++        # a request-shaped context refreshes the Cognito token before urllib3
++        # sends the actual request.
++        self.auth(SimpleNamespace(headers={}, body=None, url=None))
+ 
+     @property
+     def user_id(self) -> str:
+@@ -111,21 +122,56 @@
+ 
+     def _get_user_id(self) -> str:
+         resp = self.request("get", "users/@me")
+-        return resp.json()["identityId"]
++        return response_json(resp)["identityId"]
+ 
+     @_translate_http_errors
+     @_translate_auth_errors
+     def request(
+         self, method: str, path: str, base_url: str = BASE_URL, **kwargs
+-    ) -> requests.Response:
++    ) -> HTTPResponse:
+         """Performs a request against the Schlage WiFi cloud service.
+ 
+         :meta private:
+         """
+-        kwargs["auth"] = self.auth
+-        if "headers" not in kwargs:
+-            kwargs["headers"] = {}
+-        kwargs["headers"]["X-Api-Key"] = API_KEY
+-        kwargs.setdefault("timeout", _DEFAULT_TIMEOUT)
++        self.authenticate()
++        headers = kwargs.pop("headers", {})
++        headers["Authorization"] = f"Bearer {self.cognito.id_token}"
++        headers["X-Api-Key"] = API_KEY
++        timeout = kwargs.pop("timeout", _DEFAULT_TIMEOUT)
++        params = kwargs.pop("params", None)
++        url = f"{base_url}/{path.lstrip('/')}"
++        if params:
++            separator = "&" if "?" in url else "?"
++            url = f"{url}{separator}{urlencode(params, doseq=True)}"
++
++        json_body = kwargs.pop("json", None)
++        if json_body is not None:
++            headers.setdefault("Content-Type", "application/json")
++            kwargs["body"] = json.dumps(json_body).encode("utf-8")
++
++        # Keep only request options understood by urllib3. Requests accepts a
++        # wider set of session options which have no urllib3 equivalent.
++        request_options = {
++            key: kwargs.pop(key)
++            for key in (
++                "body",
++                "fields",
++                "preload_content",
++                "decode_content",
++                "redirect",
++                "assert_same_host",
++                "retries",
++                "release_conn",
++                "chunked",
++                "body_pos",
++            )
++            if key in kwargs
++        }
+         # pylint: disable=missing-timeout
+-        return requests.request(method, f"{base_url}/{path.lstrip('/')}", **kwargs)
++        return self._http.request(
++            method.upper(),
++            url,
++            headers=headers,
++            timeout=timeout,
++            **request_options,
++        )

@@ -1,0 +1,120 @@
+--- a/iconsdk/providers/http_provider.py
++++ b/iconsdk/providers/http_provider.py
+@@ -15,17 +15,28 @@
+ import json
+ import re
+ from json.decoder import JSONDecodeError
++from io import BytesIO
+ from time import time, monotonic
+ from typing import Union, Optional
+ from urllib.parse import urlparse, urlunparse
+ 
+-import requests
++import pycurl
+ from multimethod import multimethod
+ from websocket import WebSocket, WebSocketTimeoutException
+ 
+ from iconsdk.exception import JSONRPCException, URLException
+ from iconsdk.providers.provider import Provider, MonitorSpec, Monitor, MonitorTimeoutException
+ from iconsdk.utils import to_dict
++
++
++class _HTTPResponse:
++    def __init__(self, content: bytes, status_code: int):
++        self.content = content
++        self.status_code = status_code
++
++    @property
++    def ok(self) -> bool:
++        return self.status_code < 400
+ 
+ 
+ class HTTPProvider(Provider):
+@@ -119,11 +130,73 @@
+             yield key, value
+ 
+     @staticmethod
+-    def _make_post_request(request_url: str, data: dict, **kwargs) -> requests.Response:
+-        kwargs.setdefault('timeout', 10)
+-        with requests.Session() as session:
+-            response = session.post(url=request_url, data=json.dumps(data), **kwargs)
+-        return response
++    def _make_post_request(request_url: str, data: dict, **kwargs) -> _HTTPResponse:
++        timeout = kwargs.pop('timeout', 10)
++        headers = kwargs.pop('headers', {}) or {}
++        allow_redirects = kwargs.pop('allow_redirects', True)
++        verify = kwargs.pop('verify', True)
++        cert = kwargs.pop('cert', None)
++        auth = kwargs.pop('auth', None)
++        proxies = kwargs.pop('proxies', None)
++        kwargs.pop('stream', None)
++        kwargs.pop('hooks', None)
++
++        response_body = BytesIO()
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, request_url)
++            curl.setopt(pycurl.POST, 1)
++            curl.setopt(pycurl.POSTFIELDS, json.dumps(data).encode('utf-8'))
++            curl.setopt(pycurl.WRITEFUNCTION, response_body.write)
++            curl.setopt(pycurl.FOLLOWLOCATION, int(allow_redirects))
++
++            if headers:
++                if isinstance(headers, dict):
++                    headers = [f'{key}: {value}' for key, value in headers.items()]
++                curl.setopt(pycurl.HTTPHEADER, headers)
++
++            if timeout is not None:
++                if isinstance(timeout, tuple):
++                    connect_timeout, read_timeout = timeout
++                    if connect_timeout is not None:
++                        curl.setopt(pycurl.CONNECTTIMEOUT, connect_timeout)
++                    if read_timeout is not None:
++                        curl.setopt(pycurl.TIMEOUT, read_timeout)
++                else:
++                    curl.setopt(pycurl.TIMEOUT, timeout)
++
++            if isinstance(verify, str):
++                curl.setopt(pycurl.CAINFO, verify)
++            else:
++                curl.setopt(pycurl.SSL_VERIFYPEER, int(verify is not False))
++                curl.setopt(pycurl.SSL_VERIFYHOST, 2 if verify is not False else 0)
++
++            if cert:
++                if isinstance(cert, tuple):
++                    curl.setopt(pycurl.SSLCERT, cert[0])
++                    if len(cert) > 1:
++                        curl.setopt(pycurl.SSLKEY, cert[1])
++                else:
++                    curl.setopt(pycurl.SSLCERT, cert)
++
++            if auth:
++                curl.setopt(pycurl.HTTPAUTH, pycurl.HTTPAUTH_BASIC)
++                curl.setopt(pycurl.USERPWD, f'{auth[0]}:{auth[1]}')
++
++            if proxies:
++                if isinstance(proxies, str):
++                    proxy = proxies
++                else:
++                    scheme = urlparse(request_url).scheme
++                    proxy = proxies.get(scheme) or proxies.get('all')
++                if proxy:
++                    curl.setopt(pycurl.PROXY, proxy)
++
++            curl.perform()
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        finally:
++            curl.close()
++        return _HTTPResponse(response_body.getvalue(), status_code)
+ 
+     def _make_id(self) -> int:
+         return int(time())
+@@ -147,7 +220,7 @@
+             raise JSONRPCException(f'Unknown response: {raw_response}')
+ 
+     @staticmethod
+-    def _return_custom_response(response: requests.Response, full_response: bool = False) -> Union[str, list, dict]:
++    def _return_custom_response(response: _HTTPResponse, full_response: bool = False) -> Union[str, list, dict]:
+         content = json.loads(response.content)
+         if full_response:
+             return content

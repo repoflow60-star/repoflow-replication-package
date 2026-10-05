@@ -1,0 +1,151 @@
+--- a/pynubank/utils/http.py
++++ b/pynubank/utils/http.py
+@@ -1,7 +1,90 @@
+-from requests import Response
+-from requests_pkcs12 import get, post
++import json as json_module
++import threading
++
++import treq
++from twisted.internet import reactor
++from twisted.internet.ssl import CertificateOptions
++from twisted.internet.threads import blockingCallFromThread
++from twisted.web.client import Agent
++from twisted.web.http_headers import Headers
+ 
+ from pynubank import NuRequestException
++
++
++_reactor_lock = threading.Lock()
++_reactor_ready = threading.Event()
++_reactor_thread = None
++
++
++def _run_reactor():
++    reactor.callWhenRunning(_reactor_ready.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _call_in_reactor(function):
++    global _reactor_thread
++
++    with _reactor_lock:
++        if _reactor_thread is None and not reactor.running:
++            _reactor_thread = threading.Thread(target=_run_reactor, daemon=True)
++            _reactor_thread.start()
++            _reactor_ready.wait()
++
++    return blockingCallFromThread(reactor, function)
++
++
++class _ResponseAdapter:
++    def __init__(self, response, content: bytes, url: str):
++        self.status_code = response.code
++        self.url = url
++        self.headers = {}
++        for name, values in response.headers.getAllRawHeaders():
++            if isinstance(name, bytes):
++                name = name.decode('ascii')
++            value = values[0]
++            if isinstance(value, bytes):
++                value = value.decode('utf-8')
++            self.headers[name] = value
++        self._content = content
++
++    def json(self):
++        return json_module.loads(self._content.decode('utf-8'))
++
++
++def _request(method, url, headers=None, json=None, agent=None):
++    request_headers = Headers({
++        name.encode('ascii'): [value.encode('utf-8')]
++        for name, value in (headers or {}).items()
++    })
++    body = None if json is None else json_module.dumps(json).encode('utf-8')
++
++    def request():
++        request_args = {
++            'headers': request_headers,
++            'data': body,
++            'reactor': reactor,
++        }
++        if agent is not None:
++            request_args['agent'] = agent
++
++        response_deferred = treq.request(method, url, **request_args)
++
++        def read_content(response):
++            return treq.content(response).addCallback(
++                lambda content: _ResponseAdapter(response, content, url)
++            )
++
++        return response_deferred.addCallback(read_content)
++
++    return _call_in_reactor(request)
++
++
++def get(url, headers=None, agent=None):
++    return _request('GET', url, headers=headers, agent=agent)
++
++
++def post(url, json=None, headers=None, agent=None):
++    return _request('POST', url, headers=headers, json=json, agent=agent)
+ 
+ 
+ class HttpClient:
+@@ -26,24 +109,46 @@
+     def get_header(self, name: str):
+         return self._headers.get(name)
+ 
+-    @property
+-    def _cert_args(self):
+-        return {'pkcs12_data': self._cert, 'pkcs12_password': ''} if self._cert else {}
++    def _agent(self):
++        from cryptography.hazmat.primitives import serialization
++        from cryptography.hazmat.primitives.serialization import pkcs12
+ 
+-    def _handle_response(self, response: Response) -> dict:
++        private_key, certificate, additional_certificates = pkcs12.load_key_and_certificates(
++            self._cert,
++            b'',
++        )
++        if certificate is None and additional_certificates:
++            certificate = additional_certificates[0]
++
++        private_key_pem = private_key.private_bytes(
++            serialization.Encoding.PEM,
++            serialization.PrivateFormat.TraditionalOpenSSL,
++            serialization.NoEncryption(),
++        )
++        certificate_pem = certificate.public_bytes(serialization.Encoding.PEM)
++        context = CertificateOptions(privateKey=private_key_pem, certificate=certificate_pem)
++        return Agent(reactor, contextFactory=context)
++
++    def _handle_response(self, response) -> dict:
+         if response.status_code != 200:
+             raise NuRequestException(response)
+ 
+         return response.json()
+ 
+-    def raw_get(self, url: str) -> Response:
+-        return get(url, headers=self._headers, **self._cert_args)
++    def raw_get(self, url: str):
++        request_args = {'headers': self._headers}
++        if self._cert:
++            request_args['agent'] = self._agent()
++        return get(url, **request_args)
+ 
+-    def raw_post(self, url: str, json: dict) -> Response:
+-        return post(url, json=json, headers=self._headers, **self._cert_args)
++    def raw_post(self, url: str, json: dict):
++        request_args = {'json': json, 'headers': self._headers}
++        if self._cert:
++            request_args['agent'] = self._agent()
++        return post(url, **request_args)
+ 
+     def get(self, url: str) -> dict:
+         return self._handle_response(self.raw_get(url))
+ 
+     def post(self, url: str, json: dict) -> dict:
+-        return self._handle_response(post(url, json=json, headers=self._headers, **self._cert_args))
++        return self._handle_response(self.raw_post(url, json))

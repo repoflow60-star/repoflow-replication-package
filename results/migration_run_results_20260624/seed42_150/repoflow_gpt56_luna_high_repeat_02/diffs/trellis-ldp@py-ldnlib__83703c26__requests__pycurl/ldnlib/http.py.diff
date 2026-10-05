@@ -1,0 +1,194 @@
+--- a/ldnlib/http.py
++++ b/ldnlib/http.py
+@@ -0,0 +1,191 @@
++import io
++import json
++import re
++from urllib.parse import urlencode, urlsplit, urlunsplit
++
++import pycurl
++
++
++class _Headers(dict):
++    """A small case-insensitive header mapping."""
++
++    def __setitem__(self, key, value):
++        super().__setitem__(key.lower(), value)
++
++    def __getitem__(self, key):
++        return super().__getitem__(key.lower())
++
++    def __contains__(self, key):
++        return super().__contains__(key.lower())
++
++    def get(self, key, default=None):
++        return super().get(key.lower(), default)
++
++
++class _HeaderCollector:
++    def __init__(self):
++        self.headers = _Headers()
++
++    def __call__(self, line):
++        line_length = len(line)
++        line = line.decode("iso-8859-1").rstrip("\r\n")
++        if line.startswith("HTTP/"):
++            # Redirects and informational responses precede the final block.
++            self.headers = _Headers()
++        elif ":" in line:
++            name, value = line.split(":", 1)
++            name = name.strip().lower()
++            value = value.strip()
++            if name == "link" and name in self.headers:
++                value = self.headers[name] + ", " + value
++            self.headers[name] = value
++        return line_length
++
++
++def _parse_links(value):
++    links = {}
++    if not value:
++        return links
++
++    for item in value.split(","):
++        match = re.match(r"\s*<([^>]*)>\s*(.*)", item)
++        if match is None:
++            continue
++        attributes = {"url": match.group(1)}
++        for attribute in match.group(2).split(";"):
++            if "=" not in attribute:
++                continue
++            name, attribute_value = attribute.split("=", 1)
++            attribute_value = attribute_value.strip().strip('"')
++            attributes[name.strip()] = attribute_value
++        relation = attributes.get("rel")
++        if relation:
++            links[relation] = attributes
++    return links
++
++
++class _HTTPResponse:
++    def __init__(self, status_code, headers, content):
++        self.status_code = status_code
++        self.headers = headers
++        self.content = content
++        self.links = _parse_links(headers.get("link"))
++
++    @property
++    def text(self):
++        content_type = self.headers.get("content-type", "")
++        match = re.search(r"charset\s*=\s*([^;\s]+)", content_type,
++                          re.IGNORECASE)
++        encoding = match.group(1).strip('"') if match else "utf-8"
++        return self.content.decode(encoding, errors="replace")
++
++    def json(self):
++        return json.loads(self.text)
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise RuntimeError("HTTP status {}".format(self.status_code))
++
++
++def _with_params(url, params):
++    if not params:
++        return url
++    parsed = urlsplit(url)
++    query = urlencode(params, doseq=True)
++    if parsed.query:
++        query = parsed.query + "&" + query
++    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query,
++                       parsed.fragment))
++
++
++def _header_values(headers):
++    return ["{}: {}".format(name, value) for name, value in headers.items()]
++
++
++def request(method, url, **kwargs):
++    headers = kwargs.pop("headers", {}) or {}
++    params = kwargs.pop("params", None)
++    allow_redirects = kwargs.pop("allow_redirects", True)
++    timeout = kwargs.pop("timeout", None)
++    data = kwargs.pop("data", None)
++    json_data = kwargs.pop("json", None)
++    verify = kwargs.pop("verify", True)
++    auth = kwargs.pop("auth", None)
++    cookies = kwargs.pop("cookies", None)
++    proxies = kwargs.pop("proxies", None)
++    proxy = kwargs.pop("proxy", None)
++    cert = kwargs.pop("cert", None)
++
++    if json_data is not None:
++        data = json.dumps(json_data)
++    elif isinstance(data, dict):
++        data = urlencode(data, doseq=True)
++
++    if cookies:
++        cookie_value = "; ".join("{}={}".format(name, value)
++                                for name, value in cookies.items())
++        headers = dict(headers)
++        headers["Cookie"] = cookie_value
++
++    curl = pycurl.Curl()
++    body = io.BytesIO()
++    response_headers = _HeaderCollector()
++    try:
++        curl.setopt(pycurl.URL, _with_params(str(url), params))
++        curl.setopt(pycurl.WRITEFUNCTION, body.write)
++        curl.setopt(pycurl.HEADERFUNCTION, response_headers)
++        curl.setopt(pycurl.HTTPHEADER, _header_values(headers))
++        curl.setopt(pycurl.FOLLOWLOCATION, bool(allow_redirects))
++
++        method = method.upper()
++        if method == "HEAD":
++            curl.setopt(pycurl.NOBODY, True)
++            curl.setopt(pycurl.CUSTOMREQUEST, "HEAD")
++        elif method == "GET":
++            curl.setopt(pycurl.HTTPGET, True)
++        elif method == "POST":
++            curl.setopt(pycurl.POST, True)
++            if data is not None:
++                curl.setopt(pycurl.POSTFIELDS,
++                            data.encode("utf-8") if isinstance(data, str)
++                            else data)
++        else:
++            curl.setopt(pycurl.CUSTOMREQUEST, method)
++            if data is not None:
++                curl.setopt(pycurl.POSTFIELDS,
++                            data.encode("utf-8") if isinstance(data, str)
++                            else data)
++
++        if timeout is not None:
++            if isinstance(timeout, tuple):
++                curl.setopt(pycurl.CONNECTTIMEOUT, timeout[0])
++                curl.setopt(pycurl.TIMEOUT, timeout[1])
++            else:
++                curl.setopt(pycurl.TIMEOUT, timeout)
++
++        if not verify:
++            curl.setopt(pycurl.SSL_VERIFYPEER, 0)
++            curl.setopt(pycurl.SSL_VERIFYHOST, 0)
++
++        if auth:
++            curl.setopt(pycurl.USERPWD, "{}:{}".format(auth[0], auth[1]))
++
++        if cert:
++            if isinstance(cert, tuple):
++                curl.setopt(pycurl.SSLCERT, cert[0])
++                curl.setopt(pycurl.SSLKEY, cert[1])
++            else:
++                curl.setopt(pycurl.SSLCERT, cert)
++
++        if proxy is None and proxies:
++            parsed_url = urlsplit(str(url))
++            proxy = proxies.get(parsed_url.scheme)
++        if proxy:
++            curl.setopt(pycurl.PROXY, proxy)
++
++        curl.perform()
++        status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        return _HTTPResponse(status_code, response_headers.headers,
++                             body.getvalue())
++    finally:
++        curl.close()

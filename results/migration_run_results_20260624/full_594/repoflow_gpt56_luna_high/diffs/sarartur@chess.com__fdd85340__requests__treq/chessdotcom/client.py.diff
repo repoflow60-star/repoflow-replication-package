@@ -1,0 +1,165 @@
+--- a/chessdotcom/client.py
++++ b/chessdotcom/client.py
+@@ -1,14 +1,94 @@
+ import asyncio
+ import copy
++import threading
+ import time
+ import warnings
++from concurrent.futures import Future
+ from functools import wraps
+ 
+-import requests
+ from aiohttp import ClientSession
++import treq
++from twisted.internet import reactor
+ 
+ from .errors import ChessDotComClientError
+ from .response_builder import DefaultResponseBuilder
++
++
++_treq_reactor_lock = threading.Lock()
++_treq_reactor_ready = threading.Event()
++_treq_reactor_started = False
++
++
++def _ensure_treq_reactor():
++    global _treq_reactor_started
++
++    if reactor.running:
++        return
++
++    with _treq_reactor_lock:
++        if not _treq_reactor_started:
++            _treq_reactor_started = True
++            reactor.callWhenRunning(_treq_reactor_ready.set)
++            threading.Thread(
++                target=reactor.run,
++                kwargs={"installSignalHandlers": False},
++                daemon=True,
++            ).start()
++
++    _treq_reactor_ready.wait()
++
++
++def _run_treq_request(request):
++    _ensure_treq_reactor()
++    result = Future()
++
++    def invoke_request():
++        try:
++            deferred = request()
++            deferred.addCallbacks(
++                result.set_result,
++                lambda failure: result.set_exception(failure.value),
++            )
++        except BaseException as error:
++            result.set_exception(error)
++
++    reactor.callFromThread(invoke_request)
++    return result.result()
++
++
++def _response_headers(response):
++    headers = response.headers
++    if not hasattr(headers, "getAllRawHeaders"):
++        return headers
++
++    def decode(value):
++        return value.decode("latin-1") if isinstance(value, bytes) else value
++
++    return {
++        decode(name): ", ".join(decode(value) for value in values)
++        for name, values in headers.getAllRawHeaders()
++    }
++
++
++def _response_text(response, body):
++    if not isinstance(body, bytes):
++        return body
++
++    encoding = "utf-8"
++    content_type = next(
++        (
++            value
++            for name, value in _response_headers(response).items()
++            if name.lower() == "content-type"
++        ),
++        "",
++    )
++    for parameter in content_type.split(";")[1:]:
++        name, separator, value = parameter.partition("=")
++        if separator and name.strip().lower() == "charset":
++            encoding = value.strip().strip('"')
++            break
++    return body.decode(encoding, errors="replace")
+ 
+ 
+ class RateLimitHandler(object):
+@@ -48,7 +128,7 @@
+     Client for Chess.com Public API. The client is only responsible for making calls.
+ 
+     :cvar request_config: Dictionary containing extra keyword arguments for
+-        requests to the API (headers, proxy, etc).
++        HTTP calls to the API (headers, proxy, etc).
+     :cvar aio: Determines if the functions behave asynchronously.
+     :cvar :rate_limit_handler: A RateLimitHandler object.
+         See :obj:`chessdotcom.client.RateLimitHandler`.
+@@ -102,18 +182,35 @@
+         return options
+ 
+     def _do_sync_get_request(self, resource):
+-        r = requests.get(
+-            url=resource.url, **self._build_request_options(resource), timeout=30
++        options = self._build_request_options(resource)
++        options.pop("verify", None)
++
++        headers = options.get("headers")
++        if headers and not hasattr(headers, "getAllRawHeaders"):
++            options["headers"] = {
++                name: values if isinstance(values, (list, tuple)) else [values]
++                for name, values in headers.items()
++            }
++
++        response, body = _run_treq_request(
++            lambda: treq.get(url=resource.url, **options, timeout=30).addCallback(
++                lambda response: treq.content(response).addCallback(
++                    lambda body: (response, body)
++                )
++            )
+         )
+         resource.times_requested += 1
+ 
+-        if r.status_code != 200:
+-            if self.rate_limit_handler.should_try_again(r.status_code, resource):
++        text = _response_text(response, body)
++        if response.code != 200:
++            if self.rate_limit_handler.should_try_again(response.code, resource):
+                 return self._do_sync_get_request(resource)
+             raise ChessDotComClientError(
+-                status_code=r.status_code, response_text=r.text, headers=r.headers
+-            )
+-        return resource.response_builder.build(r.text)
++                status_code=response.code,
++                response_text=text,
++                headers=_response_headers(response),
++            )
++        return resource.response_builder.build(text)
+ 
+     async def _do_async_get_request(self, resource):
+         async with ClientSession(loop=self.loop_callback()) as session:
+@@ -137,12 +234,12 @@
+     Client for Chess.com Public API. The client can be initialized withe following options.
+ 
+     :ivar request_config: Dictionary containing extra keyword arguments
+-        for requests to the API (headers, proxy, etc).
++        for HTTP calls to the API (headers, proxy, etc).
+         This value will be set from Client if nothing is provided
+     :ivar aio: Determines if the functions behave asynchronously. Defaults to False
+     :ivar rate_limit_handler: A RateLimitHandler object.
+         See :obj:`chessdotcom.client.RateLimitHandler`.
+-    :ivar user_agent: A string that will be used as the User-Agent header in requests to the API.
++    :ivar user_agent: A string that will be used as the User-Agent header in HTTP calls to the API.
+         This value will override the value in request_config if provided.
+     """
+ 

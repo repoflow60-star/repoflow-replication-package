@@ -1,0 +1,111 @@
+--- a/modules/Application/PluginAdaptors/HTTPMixin.py
++++ b/modules/Application/PluginAdaptors/HTTPMixin.py
+@@ -1,6 +1,41 @@
+-import requests
+-from requests.exceptions import RequestException
++import base64
++import json
+ from abc import ABC, abstractmethod
++from threading import Event, Lock, Thread
++from urllib.parse import urlencode
++
++import treq
++from twisted.internet import reactor
++from twisted.internet.threads import blockingCallFromThread
++
++
++_reactor_lock = Lock()
++_reactor_started = Event()
++_reactor_launching = False
++
++
++def _ensure_reactor():
++    global _reactor_launching
++
++    if reactor.running:
++        return
++
++    with _reactor_lock:
++        if not reactor.running and not _reactor_started.is_set() and not _reactor_launching:
++            _reactor_launching = True
++
++            def run_reactor():
++                reactor.callWhenRunning(_reactor_started.set)
++                reactor.run(installSignalHandlers=False)
++
++            Thread(target=run_reactor, daemon=True).start()
++
++    _reactor_started.wait()
++
++
++def _call_treq(function, *args, **kwargs):
++    _ensure_reactor()
++    return blockingCallFromThread(reactor, function, *args, **kwargs)
+ 
+ 
+ class HTTPMixin(ABC):
+@@ -18,26 +53,50 @@
+                 raise Exception(f'Unsupported HTTP method {self._method()}')
+ 
+     def _get(self) -> dict:
+-        return self._process_response(requests.get(self._endpoint(), headers=self._headers(), auth=self._auth()))
++        endpoint = self._endpoint()
++        try:
++            response = _call_treq(treq.get, endpoint, headers=self._request_headers())
++        except Exception:
++            raise Exception(f'Connection failed while calling {endpoint}')
++        return self._process_response(response, endpoint)
+ 
+     def _post(self) -> dict:
++        endpoint = self._endpoint()
++        headers = self._request_headers()
+         if self._is_form_encoded():
+-            headers = self._headers()
+-            headers['Content-Type'] = 'application/x-www-form-urlencoded'
+-            return self._process_response(
+-                requests.post(self._endpoint(), data=self._data(), headers=self._headers(), auth=self._auth()))
+-        return self._process_response(
+-            requests.post(self._endpoint(), json=self._data(), headers=self._headers(), auth=self._auth()))
++            headers[b'Content-Type'] = [b'application/x-www-form-urlencoded']
++            data = urlencode(self._data()).encode()
++        else:
++            data = json.dumps(self._data()).encode()
++
++        try:
++            response = _call_treq(treq.post, endpoint, data=data, headers=headers)
++        except Exception:
++            raise Exception(f'Connection failed while calling {endpoint}')
++        return self._process_response(response, endpoint)
+ 
+     @staticmethod
+-    def _process_response(response: requests.Response) -> dict:
++    def _process_response(response, endpoint: str | None = None) -> dict:
++        endpoint = endpoint or getattr(response, 'url', '')
++        if not 200 <= response.code < 500:
++            raise Exception(f'HTTP {response.code} error while calling {endpoint}')
+         try:
+-            if 200 <= response.status_code < 500:
+-                return response.json()
+-            else:
+-                raise Exception(f"HTTP {response.status_code} error while calling {response.url}")
+-        except RequestException:
+-            raise Exception(f"Connection failed while calling {response.url}")
++            return _call_treq(treq.json_content, response)
++        except Exception:
++            raise Exception(f'Connection failed while calling {endpoint}')
++
++    def _request_headers(self) -> dict:
++        headers = {
++            name.encode() if isinstance(name, str) else name:
++                [item.encode() if isinstance(item, str) else item
++                 for item in (value if isinstance(value, (list, tuple)) else [value])]
++            for name, value in self._headers().items()
++        }
++        auth = self._auth()
++        if auth is not None:
++            credentials = f'{auth[0]}:{auth[1]}'.encode()
++            headers[b'Authorization'] = [b'Basic ' + base64.b64encode(credentials)]
++        return headers
+ 
+     @abstractmethod
+     def _method(self) -> str:

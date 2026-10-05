@@ -1,0 +1,206 @@
+--- a/cronitor/monitor.py
++++ b/cronitor/monitor.py
+@@ -3,29 +3,63 @@
+ import logging
+ import json
+ import os
+-import requests
++import base64
++import urllib3
+ from yaml.loader import SafeLoader
+ 
+ 
+ import cronitor
+ from urllib3.util.retry import Retry
+-from requests.adapters import HTTPAdapter
+ 
+ logger = logging.getLogger(__name__)
+ 
+-# https://stackoverflow.com/questions/49121365/implementing-retry-for-requests-in-python
++
++class _HTTPClient(object):
++    def __init__(self, pool=None, retries=None):
++        self._pool = pool if pool is not None else urllib3.PoolManager()
++        self._retries = retries
++
++    def request(self, method, url, **kwargs):
++        auth = kwargs.pop('auth', None)
++        params = kwargs.pop('params', None)
++        data = kwargs.pop('data', None)
++
++        headers = kwargs.get('headers')
++        if headers is not None:
++            kwargs['headers'] = {
++                key: value for key, value in headers.items()
++                if value is not None
++            }
++        if auth is not None:
++            api_key = auth[0] if isinstance(auth, (tuple, list)) else auth
++            kwargs['headers'] = _auth_headers(kwargs.get('headers'), api_key)
++        if params is not None:
++            kwargs['fields'] = _query_fields(params)
++        if data is not None:
++            kwargs['body'] = data
++        if self._retries is not None and 'retries' not in kwargs:
++            kwargs['retries'] = self._retries
++
++        return self._pool.request(method, url, **kwargs)
++
++    def get(self, url, params=None, **kwargs):
++        return self.request('GET', url, params=params, **kwargs)
++
++    def put(self, url, data=None, **kwargs):
++        return self.request('PUT', url, data=data, **kwargs)
++
++    def delete(self, url, **kwargs):
++        return self.request('DELETE', url, **kwargs)
++
++
+ def retry_session(retries, session=None, backoff_factor=0.3):
+-    session = session or requests.Session()
+     retry = Retry(
+         total=retries,
+         read=retries,
+         connect=retries,
+         backoff_factor=backoff_factor,
+     )
+-    adapter = HTTPAdapter(max_retries=retry)
+-    session.mount('http://', adapter)
+-    session.mount('https://', adapter)
+-    return session
++    return _HTTPClient(pool=session, retries=retry)
+ 
+ JSON = 'json'
+ YAML = 'yaml'
+@@ -45,10 +79,10 @@
+                         auth=(api_key, ''),
+                         headers=dict(cls._headers, **{'Content-Type': 'application/yaml', 'Cronitor-Version': api_version}),
+                         timeout=timeout)
+-        if resp.status_code == 200:
+-            return resp.text
+-        else:
+-            raise cronitor.APIError("Unexpected error %s" % resp.text)
++        if _response_status(resp) == 200:
++            return _response_text(resp)
++        else:
++            raise cronitor.APIError("Unexpected error %s" % _response_text(resp))
+ 
+     @classmethod
+     def put(cls, monitors=None, **kwargs):
+@@ -105,15 +139,15 @@
+                         headers=dict(cls._headers, **{'Content-Type': content_type, 'Cronitor-Version': api_version}),
+                         timeout=timeout)
+ 
+-        if resp.status_code == 200:
++        if _response_status(resp) == 200:
+             if request_format == YAML:
+-                return yaml.load(resp.text, Loader=SafeLoader)
++                return yaml.load(_response_text(resp), Loader=SafeLoader)
+             else:
+-                return resp.json().get('monitors', [])
+-        elif resp.status_code == 400:
+-            raise cronitor.APIValidationError(resp.text)
+-        else:
+-            raise cronitor.APIError("Unexpected error %s" % resp.text)
++                return _response_json(resp).get('monitors', [])
++        elif _response_status(resp) == 400:
++            raise cronitor.APIValidationError(_response_text(resp))
++        else:
++            raise cronitor.APIError("Unexpected error %s" % _response_text(resp))
+ 
+     def __init__(self, key, api_key=None, api_version=None, env=None):
+         self.key = key
+@@ -135,15 +169,15 @@
+         self._data = Struct(**data)
+ 
+     def delete(self):
+-        resp = requests.delete(
++        resp = self._req.delete(
+                     self._monitor_api_url(self.key),
+                     auth=(self.api_key, ''),
+                     headers=self._headers,
+                     timeout=10)
+ 
+-        if resp.status_code == 204:
++        if _response_status(resp) == 204:
+             return True
+-        elif resp.status_code == 404:
++        elif _response_status(resp) == 404:
+             raise cronitor.MonitorNotFound("Monitor '%s' not found" % self.key)
+         else:
+             raise cronitor.APIError("An unexpected error occured when deleting '%s'" % self.key)
+@@ -172,14 +206,14 @@
+         if not self.api_key:
+             raise cronitor.AuthenticationError('No api_key detected. Set cronitor.api_key or initialize Monitor with kwarg.')
+ 
+-        resp = requests.get(self._monitor_api_url(self.key),
++        resp = self._req.get(self._monitor_api_url(self.key),
+                             timeout=10,
+                             auth=(self.api_key, ''),
+                             headers=dict(self._headers, **{'Content-Type': 'application/json', 'Cronitor-Version': self.api_verion}))
+ 
+-        if resp.status_code == 404:
++        if _response_status(resp) == 404:
+             raise cronitor.MonitorNotFound("Monitor '%s' not found" % self.key)
+-        return resp.json()
++        return _response_json(resp)
+ 
+     def _clean_params(self, params):
+         metrics = None
+@@ -218,3 +252,56 @@
+ class Struct(object):
+     def __init__(self, **kwargs):
+         self.__dict__.update(kwargs)
++
++
++def _auth_headers(headers, api_key):
++    credentials = base64.b64encode('{}:'.format(api_key).encode('utf-8')).decode('ascii')
++    clean_headers = {
++        key: value for key, value in (headers or {}).items()
++        if value is not None
++    }
++    clean_headers['Authorization'] = 'Basic {}'.format(credentials)
++    return clean_headers
++
++
++def _query_fields(params):
++    fields = []
++    for key, value in params.items():
++        if value is None:
++            continue
++        if isinstance(value, (list, tuple)):
++            fields.extend((key, item) for item in value)
++        else:
++            fields.append((key, value))
++    return fields
++
++
++def _response_status(response):
++    status = getattr(response, 'status', None)
++    if isinstance(status, int):
++        return status
++    return getattr(response, 'status_code', status)
++
++
++def _response_text(response):
++    data = getattr(response, 'data', None)
++    if isinstance(data, bytes):
++        return data.decode('utf-8')
++    if isinstance(data, str):
++        return data
++    text = getattr(response, 'text', '')
++    if isinstance(text, bytes):
++        return text.decode('utf-8')
++    return text
++
++
++def _response_json(response):
++    data = getattr(response, 'data', None)
++    if isinstance(data, bytes):
++        return json.loads(data.decode('utf-8'))
++    if isinstance(data, str):
++        return json.loads(data)
++    decoder = getattr(response, 'json', None)
++    if callable(decoder):
++        return decoder()
++    return json.loads(_response_text(response))

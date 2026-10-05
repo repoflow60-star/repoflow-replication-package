@@ -1,0 +1,122 @@
+--- a/pynubank/utils/http.py
++++ b/pynubank/utils/http.py
+@@ -1,10 +1,29 @@
+-from requests import Response
+-from requests_pkcs12 import get, post
++import json as json_module
++import queue
++import threading
++from typing import Any
++
++import treq
++from twisted.internet import reactor
++from twisted.internet.ssl import CertificateOptions
++from twisted.web.client import Agent
++from twisted.web.http_headers import Headers
+ 
+ from pynubank import NuRequestException
+ 
+ 
++def get(url, headers=None, agent=None):
++    return treq.get(url, headers=headers, agent=agent)
++
++
++def post(url, data=None, headers=None, agent=None):
++    return treq.post(url, data=data, headers=headers, agent=agent)
++
++
+ class HttpClient:
++
++    _reactor_started = False
++    _reactor_lock = threading.Lock()
+ 
+     def __init__(self):
+         self._cert = None
+@@ -26,24 +45,76 @@
+     def get_header(self, name: str):
+         return self._headers.get(name)
+ 
+-    @property
+-    def _cert_args(self):
+-        return {'pkcs12_data': self._cert, 'pkcs12_password': ''} if self._cert else {}
++    @classmethod
++    def _wait(cls, value):
++        if not hasattr(value, 'addCallbacks'):
++            return value
+ 
+-    def _handle_response(self, response: Response) -> dict:
+-        if response.status_code != 200:
++        result = queue.Queue(maxsize=1)
++        with cls._reactor_lock:
++            if not cls._reactor_started:
++                cls._reactor_started = True
++                threading.Thread(
++                    target=reactor.run,
++                    kwargs={'installSignalHandlers': False},
++                    daemon=True,
++                ).start()
++
++        def finished(response):
++            result.put((True, response))
++            return response
++
++        def failed(error):
++            result.put((False, error))
++            return error
++
++        value.addCallbacks(finished, failed)
++        succeeded, response = result.get()
++        if not succeeded:
++            response.raiseException()
++        return response
++
++    @staticmethod
++    def _request_headers(headers):
++        return Headers({key.encode(): [value.encode()] for key, value in headers.items()})
++
++    def _agent(self):
++        if not self._cert:
++            return None
++
++        from cryptography.hazmat.primitives import serialization
++        from cryptography.hazmat.primitives.serialization import pkcs12
++
++        key, certificate, _ = pkcs12.load_key_and_certificates(self._cert, b'')
++        options = CertificateOptions(
++            privateKey=key.private_bytes(
++                serialization.Encoding.PEM,
++                serialization.PrivateFormat.TraditionalOpenSSL,
++                serialization.NoEncryption(),
++            ),
++            certificate=certificate.public_bytes(serialization.Encoding.PEM),
++        )
++        return Agent(reactor, contextFactory=options)
++
++    def _handle_response(self, response: Any) -> dict:
++        response = self._wait(response)
++        status_code = getattr(response, 'code', getattr(response, 'status_code', None))
++        if status_code != 200:
+             raise NuRequestException(response)
+ 
+-        return response.json()
++        if hasattr(response, 'json'):
++            return response.json()
++        return self._wait(treq.json_content(response))
+ 
+-    def raw_get(self, url: str) -> Response:
+-        return get(url, headers=self._headers, **self._cert_args)
++    def raw_get(self, url: str) -> Any:
++        return self._wait(get(url, headers=self._request_headers(self._headers), agent=self._agent()))
+ 
+-    def raw_post(self, url: str, json: dict) -> Response:
+-        return post(url, json=json, headers=self._headers, **self._cert_args)
++    def raw_post(self, url: str, json: dict) -> Any:
++        data = json_module.dumps(json).encode()
++        return self._wait(post(url, data=data, headers=self._request_headers(self._headers), agent=self._agent()))
+ 
+     def get(self, url: str) -> dict:
+         return self._handle_response(self.raw_get(url))
+ 
+     def post(self, url: str, json: dict) -> dict:
+-        return self._handle_response(post(url, json=json, headers=self._headers, **self._cert_args))
++        return self._handle_response(self.raw_post(url, json=json))

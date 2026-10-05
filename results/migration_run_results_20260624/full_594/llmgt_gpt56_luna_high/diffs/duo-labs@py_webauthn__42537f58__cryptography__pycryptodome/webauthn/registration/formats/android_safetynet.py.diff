@@ -1,0 +1,124 @@
+--- a/webauthn/registration/formats/android_safetynet.py
++++ b/webauthn/registration/formats/android_safetynet.py
+@@ -4,10 +4,9 @@
+ import json
+ from typing import List
+ 
+-from cryptography import x509
+-from cryptography.exceptions import InvalidSignature
+-from cryptography.hazmat.backends import default_backend
+-from cryptography.x509.oid import NameOID
++from Crypto.Hash import SHA256
++from Crypto.PublicKey import RSA
++from Crypto.Signature import pkcs1_15
+ 
+ from webauthn.helpers.cose import COSEAlgorithmIdentifier
+ from webauthn.helpers import (
+@@ -15,7 +14,6 @@
+     parse_cbor,
+     validate_certificate_chain,
+     verify_safetynet_timestamp,
+-    verify_signature,
+ )
+ from webauthn.helpers.exceptions import (
+     InvalidCertificateChain,
+@@ -23,6 +21,24 @@
+ )
+ from webauthn.helpers.known_root_certs import globalsign_r2, globalsign_root_ca
+ from webauthn.helpers.structs import AttestationStatement
++
++
++def _read_der_tlv(data: bytes, offset: int):
++    start = offset
++    tag = data[offset]
++    offset += 1
++
++    length = data[offset]
++    offset += 1
++
++    if length & 0x80:
++        length_bytes = length & 0x7F
++        length = int.from_bytes(data[offset : offset + length_bytes], "big")
++        offset += length_bytes
++
++    end = offset + length
++
++    return tag, data[offset:end], data[start:end], end
+ 
+ 
+ @dataclass
+@@ -149,12 +165,42 @@
+             raise InvalidRegistrationResponse(f"{err} (SafetyNet)")
+ 
+     # Verify that the leaf certificate was issued to the hostname attest.android.com
+-    attestation_cert = x509.load_der_x509_certificate(x5c[0], default_backend())
+-    cert_common_name = attestation_cert.subject.get_attributes_for_oid(
+-        NameOID.COMMON_NAME,
+-    )[0]
+-
+-    if cert_common_name.value != "attest.android.com":
++    _, certificate_value, _, _ = _read_der_tlv(x5c[0], 0)
++    _, tbs_value, _, _ = _read_der_tlv(certificate_value, 0)
++
++    tbs_fields = []
++    offset = 0
++    while offset < len(tbs_value):
++        field_tag, field_value, field_bytes, offset = _read_der_tlv(tbs_value, offset)
++        tbs_fields.append((field_tag, field_value, field_bytes))
++
++    tbs_field_index = 1 if tbs_fields[0][0] == 0xA0 else 0
++    subject = tbs_fields[tbs_field_index + 4][1]
++
++    cert_common_name = ""
++    offset = 0
++    while offset < len(subject):
++        _, rdn_value, _, offset = _read_der_tlv(subject, offset)
++
++        rdn_offset = 0
++        while rdn_offset < len(rdn_value):
++            _, atv_value, _, rdn_offset = _read_der_tlv(rdn_value, rdn_offset)
++
++            atv_fields = []
++            atv_offset = 0
++            while atv_offset < len(atv_value):
++                field_tag, field_value, field_bytes, atv_offset = _read_der_tlv(
++                    atv_value,
++                    atv_offset,
++                )
++                atv_fields.append((field_tag, field_value, field_bytes))
++
++            if atv_fields[0][1] == b"\x55\x04\x03":
++                cert_common_name = atv_fields[1][1].decode("utf-8")
++
++    attestation_cert_pub_key = RSA.import_key(tbs_fields[tbs_field_index + 5][2])
++
++    if cert_common_name != "attest.android.com":
+         raise InvalidRegistrationResponse(
+             'Certificate common name was not "attest.android.com" (SafetyNet)'
+         )
+@@ -180,19 +226,14 @@
+     if header.alg != "RS256":
+         raise InvalidRegistrationResponse(f"JWS header alg was not RS256: {header.alg} (SafetyNet")
+ 
+-    # Get cert public key bytes
+-    attestation_cert_pub_key = attestation_cert.public_key()
+-
+     try:
+-        verify_signature(
+-            public_key=attestation_cert_pub_key,
+-            signature_alg=COSEAlgorithmIdentifier.RSASSA_PKCS1_v1_5_SHA_256,
+-            signature=signature_bytes,
+-            data=verification_data,
+-        )
+-    except InvalidSignature:
++        pkcs1_15.new(attestation_cert_pub_key).verify(
++            SHA256.new(verification_data),
++            signature_bytes,
++        )
++    except (ValueError, TypeError):
+         raise InvalidRegistrationResponse(
+             "Could not verify attestation statement signature (Packed)"
+         )
+ 
+-    return True
++    return True

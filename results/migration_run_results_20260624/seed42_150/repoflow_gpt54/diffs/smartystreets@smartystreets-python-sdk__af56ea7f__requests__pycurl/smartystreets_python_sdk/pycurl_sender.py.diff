@@ -1,0 +1,259 @@
+--- a/smartystreets_python_sdk/pycurl_sender.py
++++ b/smartystreets_python_sdk/pycurl_sender.py
+@@ -0,0 +1,256 @@
++from collections import OrderedDict
++from io import BytesIO
++
++import pycurl
++
++from . import requests_sender as legacy_requests_sender
++from .response import Response
++import smartystreets_python_sdk as smarty
++import smartystreets_python_sdk_version as version
++
++try:
++    from urllib import urlencode
++    from urlparse import parse_qsl, urlparse, urlunparse
++except ImportError:
++    from urllib.parse import urlencode, parse_qsl, urlparse, urlunparse
++
++try:
++    text_type = unicode
++except NameError:
++    text_type = str
++
++
++class HttpRequest:
++    def __init__(self, url=None, params=None):
++        self.url = url
++        self.params = params or OrderedDict()
++        self.headers = {}
++        self.data = None
++        self.method = 'GET'
++        self.content_type = None
++        self.referer = None
++
++    @property
++    def body(self):
++        return self.data
++
++
++class RequestsSender:
++    def __init__(self, max_timeout=None, proxy=None, ip=None):
++        self.session = pycurl.Curl()
++        self.legacy_sender = legacy_requests_sender.RequestsSender(max_timeout, proxy, ip)
++        self.max_timeout = max_timeout or 10
++        self.proxy = proxy
++        self.debug = None
++        self.ip = ip
++
++    def send(self, smarty_request):
++        request = build_request(smarty_request, self.ip)
++        request_url = build_url(request)
++
++        if self.debug:
++            print_request_data(request, request_url)
++
++        try:
++            response = self.send_with_pycurl(request, request_url)
++        except pycurl.error:
++            response = self.send_with_legacy_requests(request, smarty_request)
++
++        if self.debug:
++            print_response_data(response.status_code, response.payload)
++
++        return response
++
++    def send_with_pycurl(self, request, request_url):
++        body_buffer = BytesIO()
++        response_headers = {}
++
++        self.session.reset()
++        self.session.setopt(pycurl.URL, request_url)
++        self.session.setopt(pycurl.CONNECTTIMEOUT, self.max_timeout)
++        self.session.setopt(pycurl.TIMEOUT, self.max_timeout)
++        self.session.setopt(pycurl.WRITEDATA, body_buffer)
++        self.session.setopt(pycurl.HEADERFUNCTION, build_header_collector(response_headers))
++
++        if request.headers:
++            self.session.setopt(pycurl.HTTPHEADER, build_header_list(request.headers))
++
++        if request.method == 'POST':
++            request_body = coerce_to_bytes(request.data)
++            self.session.setopt(pycurl.POST, 1)
++            self.session.setopt(pycurl.POSTFIELDS, request_body)
++            self.session.setopt(pycurl.POSTFIELDSIZE, len(request_body))
++        elif request.method == 'GET':
++            self.session.setopt(pycurl.HTTPGET, 1)
++        else:
++            self.session.setopt(pycurl.CUSTOMREQUEST, request.method)
++
++        self.apply_proxy_settings(self.session)
++        self.session.perform()
++
++        payload = decode_response_body(body_buffer.getvalue())
++        status_code = self.session.getinfo(pycurl.RESPONSE_CODE)
++        return Response(payload, status_code, response_headers)
++
++    def send_with_legacy_requests(self, request, smarty_request):
++        legacy_request = build_legacy_request(request, smarty_request, self.ip)
++        prepped_request = self.legacy_sender.session.prepare_request(legacy_request)
++        prepped_proxies = self.legacy_sender.build_proxies()
++        settings = self.legacy_sender.session.merge_environment_settings(
++            prepped_request.url, prepped_proxies, None, None, None
++        )
++
++        with self.legacy_sender.session.send(
++            prepped_request, timeout=self.max_timeout, **settings
++        ) as response:
++            return legacy_requests_sender.build_smarty_response(response)
++
++    def apply_proxy_settings(self, curl):
++        if not self.proxy:
++            return
++
++        if self.proxy.host == 'http://' or self.proxy.host == 'https://':
++            raise smarty.exceptions.SmartyException('Proxy must have a valid host (including port)')
++
++        curl.setopt(pycurl.PROXY, self.proxy.host)
++
++        if self.proxy.username:
++            curl.setopt(
++                pycurl.PROXYUSERPWD,
++                '{}:{}'.format(self.proxy.username, self.proxy.password or '')
++            )
++
++
++def build_request(smarty_request, ip=None):
++    try:
++        request = HttpRequest(url=smarty_request.url_prefix, params=smarty_request.parameters)
++        request.headers['User-Agent'] = 'smartystreets (sdk:python@{})'.format(version.__version__)
++        request.headers['Content-Type'] = smarty_request.content_type
++        request.content_type = smarty_request.content_type
++        request.referer = smarty_request.referer
++        if smarty_request.referer:
++            request.headers['Referer'] = smarty_request.referer
++        if ip is not None:
++            request.headers['X-Forwarded-For'] = ip
++        if smarty_request.payload:
++            request.data = smarty_request.payload
++            request.method = 'POST'
++        else:
++            request.method = 'GET'
++        return request
++    except AttributeError:
++        return smarty_request
++
++
++def build_legacy_request(request, smarty_request, ip=None):
++    if hasattr(smarty_request, 'url_prefix') and hasattr(smarty_request, 'parameters'):
++        return legacy_requests_sender.build_request(smarty_request, ip)
++
++    legacy_source = LegacyRequestSource(request, smarty_request)
++    legacy_request = legacy_requests_sender.build_request(legacy_source, ip)
++    legacy_request.headers = request.headers
++    legacy_request.method = request.method
++    legacy_request.data = request.data
++    return legacy_request
++
++
++def build_url(request):
++    if not request.params:
++        return request.url
++
++    parsed_url = urlparse(request.url)
++    query = list(parse_qsl(parsed_url.query, keep_blank_values=True))
++    query.extend(request.params.items())
++    encoded_query = urlencode(query, doseq=True)
++
++    return urlunparse((
++        parsed_url.scheme,
++        parsed_url.netloc,
++        parsed_url.path,
++        parsed_url.params,
++        encoded_query,
++        parsed_url.fragment,
++    ))
++
++
++def build_header_list(headers):
++    return ['{}: {}'.format(header, headers[header]) for header in headers]
++
++
++def build_header_collector(headers):
++    def collect(line):
++        header_line = decode_header_line(line).strip()
++        if not header_line:
++            return len(line)
++
++        if header_line.startswith('HTTP/'):
++            headers.clear()
++            return len(line)
++
++        if ':' not in header_line:
++            return len(line)
++
++        name, value = header_line.split(':', 1)
++        headers[name.strip()] = value.strip()
++        return len(line)
++
++    return collect
++
++
++def decode_header_line(line):
++    if isinstance(line, bytes):
++        return line.decode('iso-8859-1')
++
++    return line
++
++
++def decode_response_body(body):
++    if isinstance(body, bytes):
++        return body.decode('utf-8', 'replace')
++
++    return body
++
++
++def coerce_to_bytes(value):
++    if value is None:
++        return b''
++
++    if isinstance(value, bytes):
++        return value
++
++    if isinstance(value, text_type):
++        return value.encode('utf-8')
++
++    return str(value).encode('utf-8')
++
++
++def print_request_data(request, url=None):
++    print(request.method)
++    print()
++    print('URL: {}\r\n'.format(url or request.url))
++    print('Headers:')
++    for header in request.headers:
++        print('  {}: {}'.format(header, request.headers[header]))
++    print()
++    print('Body: ')
++    print('  {}\r\n'.format(request.body))
++
++
++def print_response_data(status_code, payload):
++    print('****** Response ******\r\n')
++    print(status_code)
++    print()
++    print(payload)
++    print('**********************\r\n')
++
++
++class LegacyRequestSource:
++    def __init__(self, request, smarty_request):
++        self.url_prefix = request.url
++        self.parameters = request.params
++        self.content_type = request.headers.get(
++            'Content-Type',
++            getattr(smarty_request, 'content_type', 'application/json')
++        )
++        self.referer = request.headers.get('Referer', getattr(smarty_request, 'referer', None))
++        self.payload = request.data

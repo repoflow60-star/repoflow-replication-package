@@ -1,0 +1,134 @@
+--- a/fp/fp.py
++++ b/fp/fp.py
+@@ -1,11 +1,64 @@
+ #!/usr/bin/env python3
+ 
++import asyncio
++import ipaddress
+ import random
++from urllib.parse import urlsplit
+ 
++import aiohttp
+ import lxml.html as lh
+-import requests
+ 
+ from fp.errors import FreeProxyException
++
++
++_NETWORK_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError, OSError)
++
++
++def _run_async(coroutine):
++    """Run an async operation while preserving the synchronous public API.
++
++    ``FreeProxy`` predates the move to aiohttp and its public methods are
++    synchronous.  ``asyncio.run`` is sufficient for normal callers, but it
++    cannot be called while another event loop is running (for example, from a
++    notebook).  In that case run the coroutine in a short-lived worker thread.
++    """
++    try:
++        asyncio.get_running_loop()
++    except RuntimeError:
++        return asyncio.run(coroutine)
++
++    import threading
++
++    result = []
++    error = []
++
++    def runner():
++        try:
++            result.append(asyncio.run(coroutine))
++        except BaseException as exc:  # re-raise in the calling thread
++            error.append(exc)
++
++    thread = threading.Thread(target=runner)
++    thread.start()
++    thread.join()
++    if error:
++        raise error[0]
++    return result[0]
++
++
++def _peer_host(peername):
++    """Return the host portion of an asyncio transport peer name."""
++    if isinstance(peername, tuple):
++        return peername[0]
++    return peername
++
++
++def _same_host(left, right):
++    """Compare IP addresses without making IPv4/IPv6 formatting assumptions."""
++    try:
++        return ipaddress.ip_address(left) == ipaddress.ip_address(right)
++    except (TypeError, ValueError):
++        return left == right
+ 
+ 
+ class FreeProxy:
+@@ -30,9 +83,9 @@
+ 
+     def get_proxy_list(self, repeat):
+         try:
+-            page = requests.get(self.__website(repeat))
+-            doc = lh.fromstring(page.content)
+-        except requests.exceptions.RequestException as e:
++            content = _run_async(self.__fetch(self.__website(repeat)))
++            doc = lh.fromstring(content)
++        except _NETWORK_ERRORS as e:
+             raise FreeProxyException(
+                 f'Request to {self.__website(repeat)} failed') from e
+         try:
+@@ -41,6 +94,11 @@
+                     for i in range(1, len(tr_elements)) if self.__criteria(tr_elements[i])]
+         except Exception as e:
+             raise FreeProxyException('Failed to get list of proxies') from e
++
++    async def __fetch(self, url):
++        async with aiohttp.ClientSession() as session:
++            async with session.get(url) as response:
++                return await response.read()
+ 
+     def __website(self, repeat):
+         if repeat:
+@@ -78,7 +136,7 @@
+                 working_proxy = self.__check_if_proxy_is_working(proxies)
+                 if working_proxy:
+                     return working_proxy
+-            except requests.exceptions.RequestException:
++            except _NETWORK_ERRORS:
+                 continue
+         if not working_proxy and not repeat:
+             if self.country_id is not None:
+@@ -88,9 +146,27 @@
+             'There are no working proxies at this time.')
+ 
+     def __check_if_proxy_is_working(self, proxies):
++        return _run_async(self.__check_if_proxy_is_working_async(proxies))
++
++    async def __check_if_proxy_is_working_async(self, proxies):
+         url = f'{self.schema}://{self.url}'
+-        ip = proxies[self.schema].split(':')[1][2:]
+-        with requests.get(url, proxies=proxies, timeout=self.timeout, stream=True) as r:
+-            if r.raw.connection.sock and r.raw.connection.sock.getpeername()[0] == ip:
+-                return proxies[self.schema]
++        proxy = proxies[self.schema]
++        proxy_host = urlsplit(proxy).hostname
++        async with aiohttp.ClientSession() as session:
++            async with session.get(
++                url, proxy=proxy, timeout=self.timeout
++            ) as response:
++                connection = response.connection
++                # aiohttp may release the connection as soon as a small
++                # response has been received.  The explicit ``proxy``
++                # argument still guarantees that this request used the
++                # candidate proxy in that case.
++                if connection is None:
++                    return proxy
++                transport = connection.transport
++                if transport is None:
++                    return proxy
++                peer_host = _peer_host(transport.get_extra_info('peername'))
++                if peer_host is None or _same_host(peer_host, proxy_host):
++                    return proxy
+         return

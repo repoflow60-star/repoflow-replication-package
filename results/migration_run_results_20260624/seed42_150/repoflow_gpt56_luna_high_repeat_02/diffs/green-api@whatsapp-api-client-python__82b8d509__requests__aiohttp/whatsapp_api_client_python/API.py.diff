@@ -1,0 +1,185 @@
+--- a/whatsapp_api_client_python/API.py
++++ b/whatsapp_api_client_python/API.py
+@@ -1,9 +1,13 @@
++import asyncio
++import inspect
+ import json
+ import logging
+-from typing import Any, NoReturn, Optional
+-
+-from requests import Response, Session
+-from requests.adapters import HTTPAdapter, Retry
++from typing import Any, NoReturn, Optional, Tuple
++
++import aiohttp
++
++
++Session = aiohttp.ClientSession
+ 
+ from .response import Response as GreenAPIResponse
+ from .tools import (
+@@ -49,7 +53,8 @@
+         self.idInstance = idInstance
+         self.apiTokenInstance = apiTokenInstance
+ 
+-        self.session = Session()
++        self._loop = asyncio.new_event_loop()
++        self.session = Session(loop=self._loop)
+         self.__prepare_session()
+ 
+         self.account = account.Account(self)
+@@ -80,12 +85,31 @@
+ 
+         try:
+             if not files:
+-                response = self.session.request(
+-                    method=method, url=url, json=payload, timeout=self.host_timeout
++                status_code, response_text = self.__run_request(
++                    method=method,
++                    url=url,
++                    json=payload,
++                    timeout=self.host_timeout,
+                 )
+             else:
+-                response = self.session.request(
+-                    method=method, url=url, data=payload, files=files, timeout=self.media_timeout
++                form = aiohttp.FormData()
++                if payload:
++                    for name, value in payload.items():
++                        form.add_field(name, str(value))
++                for name, file_data in files.items():
++                    file_name, file_object, content_type = file_data
++                    form.add_field(
++                        name,
++                        file_object,
++                        filename=file_name,
++                        content_type=content_type,
++                    )
++
++                status_code, response_text = self.__run_request(
++                    method=method,
++                    url=url,
++                    data=form,
++                    timeout=self.media_timeout,
+                 )
+         except Exception as error:
+             error_message = f"Request was failed with error: {error}."
+@@ -96,13 +120,16 @@
+ 
+             return GreenAPIResponse(None, error_message)
+ 
+-        self.__handle_response(response)
+-
+-        return GreenAPIResponse(response.status_code, response.text)
++        self.__handle_response(status_code, response_text)
++
++        return GreenAPIResponse(status_code, response_text)
+ 
+     def raw_request(self, **arguments: Any) -> GreenAPIResponse:
+         try:
+-            response = self.session.request(**arguments)
++            timeout = arguments.pop("timeout", self.host_timeout)
++            status_code, response_text = self.__run_request(
++                timeout=timeout, **arguments
++            )
+         except Exception as error:
+             error_message = f"Request was failed with error: {error}."
+ 
+@@ -112,19 +139,68 @@
+ 
+             return GreenAPIResponse(None, error_message)
+ 
+-        self.__handle_response(response)
+-
+-        return GreenAPIResponse(response.status_code, response.text)
+-
+-    def __handle_response(self, response: Response) -> Optional[NoReturn]:
+-        status_code = response.status_code
++        self.__handle_response(status_code, response_text)
++
++        return GreenAPIResponse(status_code, response_text)
++
++    def __run_request(self, timeout: float, **arguments: Any) -> Tuple[int, str]:
++        return self._loop.run_until_complete(
++            self.__request_async(timeout=timeout, **arguments)
++        )
++
++    async def __request_async(
++            self, timeout: float, **arguments: Any
++    ) -> Tuple[int, str]:
++        for attempt in range(4):
++            try:
++                request = self.session.request(timeout=timeout, **arguments)
++                if hasattr(request, "__aenter__") and hasattr(request, "__aexit__"):
++                    async with request as response:
++                        status_code, response_text = await self.__read_response(
++                            response
++                        )
++                else:
++                    if inspect.isawaitable(request):
++                        response = await request
++                    else:
++                        response = request
++                    status_code, response_text = await self.__read_response(response)
++            except (aiohttp.ClientError, asyncio.TimeoutError):
++                if attempt >= 3:
++                    raise
++                await asyncio.sleep(1.0 * (2 ** attempt))
++                continue
++
++            if status_code != 429 or attempt >= 3:
++                return status_code, response_text
++
++            await asyncio.sleep(1.0 * (2 ** attempt))
++
++        raise RuntimeError("Request retry loop exited unexpectedly")
++
++    async def __read_response(self, response: Any) -> Tuple[int, str]:
++        status_code = getattr(response, "status", None)
++        if not isinstance(status_code, int):
++            status_code = response.status_code
++
++        response_text = response.text
++        if callable(response_text):
++            response_text = response_text()
++        if inspect.isawaitable(response_text):
++            response_text = await response_text
++
++        return status_code, response_text
++
++    def __handle_response(
++            self, status_code: int, response_text: str
++    ) -> Optional[NoReturn]:
+         if status_code != 200 or self.debug_mode:
+             try:
+                 data = json.dumps(
+-                    json.loads(response.text), ensure_ascii=False, indent=4
++                    json.loads(response_text), ensure_ascii=False, indent=4
+                 )
+             except json.JSONDecodeError:
+-                data = response.text
++                data = response_text
+ 
+             if status_code != 200:
+                 error_message = (
+@@ -161,15 +237,11 @@
+     def __prepare_session(self) -> None:
+         self.session.headers["Connection"] = "close"
+ 
+-        retry = Retry(
+-            total=3,
+-            backoff_factor=1.0,
+-            allowed_methods=None,
+-            status_forcelist=[429]
+-        )
+-
+-        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
++    def close(self) -> None:
++        if not self.session.closed:
++            self._loop.run_until_complete(self.session.close())
++        if not self._loop.is_closed():
++            self._loop.close()
+ 
+ 
+ class GreenAPI(GreenApi):

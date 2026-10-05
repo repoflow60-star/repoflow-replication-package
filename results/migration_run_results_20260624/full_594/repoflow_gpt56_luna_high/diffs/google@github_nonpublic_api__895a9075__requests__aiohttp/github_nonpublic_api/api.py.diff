@@ -1,0 +1,208 @@
+--- a/github_nonpublic_api/api.py
++++ b/github_nonpublic_api/api.py
+@@ -14,32 +14,74 @@
+ 
+ """An API to do things that aren't in the official public GitHub REST API."""
+ 
++import asyncio
++import inspect
+ import os.path
+ import functools
+ from enum import Enum
+ import re
+ from urllib.parse import urljoin
+ 
++import aiohttp
+ import html5lib
+ import pyotp
+-import requests
+ from absl import logging
+ from configobj import ConfigObj
+ from typing import Optional
++
++
++def _resolve(value):
++    if inspect.isawaitable(value):
++        async def wait_for_value():
++            return await value
++
++        return asyncio.run(wait_for_value())
++    return value
++
++
++def _response_text(response):
++    text = getattr(response, "text", "")
++    text = text() if callable(text) else text
++    text = _resolve(text)
++    if isinstance(text, bytes):
++        return text.decode()
++    return text
++
++
++class _SynchronousAiohttpSession:
++    """Expose aiohttp requests through the module's existing sync API."""
++
++    def __init__(self):
++        self.cookies = aiohttp.CookieJar()
++
++    def _request(self, method, url, **kwargs):
++        async def request():
++            async with aiohttp.ClientSession(cookie_jar=self.cookies) as session:
++                response = await session.request(method, url, **kwargs)
++                await response.read()
++                return response
++
++        return asyncio.run(request())
++
++    def get(self, url, **kwargs):
++        return self._request("GET", url, **kwargs)
++
++    def post(self, url, **kwargs):
++        return self._request("POST", url, **kwargs)
+ 
+ 
+ def _get_and_submit_form(
+     session, url: str, data_callback=None, form_matcher=lambda form: True
+ ):
+     logging.info("Fetching URL %s", url)
+-    response = session.get(url)
++    response = _resolve(session.get(url))
+     response.raise_for_status()
+ 
+     logging.info("Fetching URL %s", response.url)
+     for redirect_response in response.history:
+         logging.info("Redirected from: %s", redirect_response.url)
+ 
+-    doc = html5lib.parse(response.text, namespaceHTMLElements=False)
++    doc = html5lib.parse(_response_text(response), namespaceHTMLElements=False)
+     forms = doc.findall(".//form")
+ 
+     submit_form = None
+@@ -69,14 +111,14 @@
+     submit_url = urljoin(url, action_url)
+     logging.info("Posting form to URL %s", submit_url)
+ 
+-    response = session.post(submit_url, data=data)
++    response = _resolve(session.post(submit_url, data=data))
+     response.raise_for_status()
+     return response
+ 
+ 
+ def _get_url_with_session(session, url: str):
+     logging.info("Fetching URL %s", url)
+-    response = session.get(url)
++    response = _resolve(session.get(url))
+     response.raise_for_status()
+     return response
+ 
+@@ -85,10 +127,10 @@
+     username: str,
+     password: str,
+     tfa_callback,
+-    session: Optional[requests.Session] = None,
+-) -> requests.Session:
+-    """Create a requests.Session object with logged in GitHub cookies for the user."""
+-    session = session or requests.Session()
++    session: Optional[aiohttp.ClientSession] = None,
++) -> aiohttp.ClientSession:
++    """Create an aiohttp session with logged in GitHub cookies for the user."""
++    session = session or _SynchronousAiohttpSession()
+ 
+     # Clear cookies before re-authentication
+     session.cookies.clear()
+@@ -150,7 +192,7 @@
+         username: str,
+         password: str,
+         tfa_callback=None,
+-        session: Optional[requests.Session] = None,
++        session: Optional[aiohttp.ClientSession] = None,
+     ):
+         self._session = session or create_login_session(
+             username=username,
+@@ -159,7 +201,7 @@
+             session=session,
+         )
+ 
+-    def request_usage(self, enterprise_name: str, days: int = 30) -> requests.Response:
++    def request_usage(self, enterprise_name: str, days: int = 30) -> aiohttp.ClientResponse:
+         """Requests a GitHub usage report.
+ 
+         Github will send an email link when the report is available.
+@@ -183,7 +225,7 @@
+         contact_email: str,
+         org_usage: OrganizationUsage,
+         business_name: Optional[str] = None,
+-    ) -> requests.Response:
++    ) -> aiohttp.ClientResponse:
+         """Create the specified GitHub organization.
+ 
+         Right now, only creates free tier organizations.
+@@ -207,7 +249,7 @@
+ 
+     def install_application_in_organization(
+         self, app_name: str, org_id: int
+-    ) -> requests.Response:
++    ) -> aiohttp.ClientResponse:
+         """Installs the specified app on the given organization."""
+         url = _INSTALL_APP_URL.format(app_name=app_name, org_id=org_id)
+ 
+@@ -223,7 +265,7 @@
+ 
+     def toggle_app_suspended(
+         self, org_name: str, app_install_id: int
+-    ) -> requests.Response:
++    ) -> aiohttp.ClientResponse:
+         """Set this applicaiton install to be suspended or not."""
+         url = _APP_SUSPEND_URL.format(org_name=org_name, app_install_id=app_install_id)
+ 
+@@ -235,14 +277,16 @@
+ 
+     def download_usage_report(
+         self, enterprise_name: str, report_id: int
+-    ) -> requests.Response:
++    ) -> aiohttp.ClientResponse:
+         """Download a usage report based on an id recieved in an email"""
+         url = _USAGE_REPORT_URL.format(
+             enterprise_name=enterprise_name, report_id=report_id
+         )
+         return _get_url_with_session(session=self._session, url=url)
+ 
+-    def request_dormant_users_report(self, enterprise_name: str) -> requests.Response:
++    def request_dormant_users_report(
++        self, enterprise_name: str
++    ) -> aiohttp.ClientResponse:
+         """Requests a GitHub dormant users report.
+ 
+         Github will send an email link when the report is available.
+@@ -256,13 +300,15 @@
+             form_matcher=lambda form: form.attrib.get("action") == action,
+         )
+ 
+-    def download_dormant_users_report(self, enterprise_name: str) -> requests.Response:
++    def download_dormant_users_report(
++        self, enterprise_name: str
++    ) -> aiohttp.ClientResponse:
+         """Download a usage report based on an id received in an email"""
+         url = _REQUEST_DORMANTUSERS_URL.format(enterprise_name=enterprise_name)
+         page = _get_url_with_session(session=self._session, url=url)
+         link = re.search(
+             r"https://github.com/enterprises/alphabet/settings/dormant-users/exports/[0-9A-Fa-f]{8}\\-[0-9A-Fa-f]{4}\\-[0-9A-Fa-f]{4}\\-[0-9A-Fa-f]{4}\\-[0-9A-Fa-f]{12}",
+-            page.content,
++            _response_text(page),
+         )
+         if link is None:
+             raise ValueError("Unable to find dormant users report link in content.")
+@@ -272,7 +318,7 @@
+         self,
+         org_name: str,
+         app_install_id: str,
+-    ) -> requests.Response:
++    ) -> aiohttp.ClientResponse:
+         """Approve a request for updated permissions for a GitHub app installation in an org"""
+ 
+         return _get_and_submit_form(
+@@ -324,4 +370,4 @@
+         username=config["username"],
+         password=config["password"],
+         tfa_callback=lambda: pyotp.TOTP(config["otp_seed"]).now(),
+-    )+    )

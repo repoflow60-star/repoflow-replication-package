@@ -1,0 +1,973 @@
+--- a/mindsdb_sql/render/sqlalchemy_render.py
++++ b/mindsdb_sql/render/sqlalchemy_render.py
+@@ -1,36 +1,59 @@
+ import re
+ import datetime as dt
+ 
+-import sqlalchemy as sa
+-from sqlalchemy.exc import SQLAlchemyError
+-from sqlalchemy.ext.compiler import compiles
+-from sqlalchemy.orm import aliased
+-from sqlalchemy.dialects import mysql, postgresql, sqlite, mssql, oracle
+-from sqlalchemy.schema import CreateTable, DropTable
+-from sqlalchemy.sql import ColumnElement
+-from sqlalchemy.sql import functions as sa_fnc
++import sqlobject
++from sqlobject.sqlbuilder import SQLExpression
+ 
+ from mindsdb_sql.parser import ast
+ 
+ 
+-sa_type_names = [
+-    key for key, val in sa.types.__dict__.items() if hasattr(val, '__module__')
+-    and val.__module__ in ('sqlalchemy.sql.sqltypes', 'sqlalchemy.sql.type_api')
+-]
++class _Dialect:
++
++    def __init__(self, name):
++        self.name = name
++
++
++class _SQLExpression(SQLExpression):
++
++    def __init__(self, value):
++        self.value = value
++
++    def __sqlrepr__(self, db):
++        return self.value
++
++    def __str__(self):
++        return self.value
++
++    def label(self, alias):
++        return _SQLExpression(
++            f'{self.value} AS {alias}'
++        )
++
++    def desc(self):
++        return _SQLExpression(
++            f'{self.value} DESC'
++        )
++
++    def asc(self):
++        return _SQLExpression(
++            f'{self.value} ASC'
++        )
+ 
+ 
+ class RenderError(Exception):
+     ...
+ 
+ 
+-# https://github.com/sqlalchemy/sqlalchemy/discussions/9483?sort=old#discussioncomment-5312979
+-class INTERVAL(ColumnElement):
++class INTERVAL(SQLExpression):
++
+     def __init__(self, info):
+         self.info = info
+-        self.type = sa.Interval()
+-
+-@compiles(INTERVAL)
+-def _compile_interval(element, compiler, **kw):
++
++    def __sqlrepr__(self, db):
++        return _compile_interval(self, db)
++
++
++def _compile_interval(element, compiler=None, **kw):
+     items = element.info.split(' ', maxsplit=1)
+     # quote first element
+     items[0] = f"'{items[0]}'"
+@@ -41,36 +64,71 @@
+ 
+     def __init__(self, dialect_name):
+         dialects = {
+-            'mysql': mysql,
+-            'postgresql': postgresql,
+-            'postgres': postgresql,
+-            'sqlite': sqlite,
+-            'mssql': mssql,
+-            'oracle': oracle,
+-            'Snowflake': oracle,
++            'mysql': 'mysql',
++            'postgresql': 'postgresql',
++            'postgres': 'postgresql',
++            'sqlite': 'sqlite',
++            'mssql': 'mssql',
++            'oracle': 'oracle',
++            'Snowflake': 'oracle',
+         }
+ 
+         if isinstance(dialect_name, str):
+-            dialect = dialects[dialect_name].dialect
+-        else:
+-            dialect = dialect_name
+-
+-        # remove double percent signs
+-        # https://docs.sqlalchemy.org/en/14/faq/sqlexpressions.html#why-are-percent-signs-being-doubled-up-when-stringifying-sql-statements
+-        self.dialect = dialect(paramstyle="named")
+-
+-        if dialect_name == 'mssql':
+-            # update version to MS_2008_VERSION for supports_multivalues_insert
+-            self.dialect.server_version_info = (10,)
+-            self.dialect._setup_version_attributes()
+-        elif dialect_name == 'mysql':
+-            # update version for support float cast
+-            self.dialect.server_version_info = (8, 0, 17)
++            dialect_name = dialects[dialect_name]
++
++        self.dialect = _Dialect(dialect_name)
+ 
+         self.types_map = {}
+-        for type_name in sa_type_names:
+-            self.types_map[type_name.upper()] = getattr(sa.types, type_name)
++        for type_name in (
++            'BIGINT',
++            'BINARY',
++            'BLOB',
++            'BOOLEAN',
++            'CHAR',
++            'DATE',
++            'DATETIME',
++            'DECIMAL',
++            'FLOAT',
++            'INTEGER',
++            'INT',
++            'JSON',
++            'NUMERIC',
++            'REAL',
++            'SMALLINT',
++            'TEXT',
++            'TIME',
++            'TIMESTAMP',
++            'TINYINT',
++            'UUID',
++            'VARCHAR',
++        ):
++            self.types_map[type_name] = type_name
++
+         self.types_map['BOOL'] = self.types_map['BOOLEAN']
++
++    def _literal(self, value):
++        if value is None:
++            return 'NULL'
++
++        if isinstance(value, bool):
++            if self.dialect.name in ('mysql', 'sqlite', 'mssql'):
++                return '1' if value else '0'
++            return 'TRUE' if value else 'FALSE'
++
++        if isinstance(value, (str, dt.date, dt.datetime, dt.timedelta)):
++            return "'{}'".format(str(value).replace("'", "''"))
++
++        return str(value)
++
++    def _identifier(self, value):
++        if value == '*':
++            return value
++        return str(value)
++
++    def _expression(self, value):
++        if isinstance(value, _SQLExpression):
++            return value
++        return _SQLExpression(str(value))
+ 
+     def to_column(self, parts):
+         # because sqlalchemy doesn't allow columns consist from parts therefore we do it manually
+@@ -81,10 +139,10 @@
+             if isinstance(i, ast.Star):
+                 p = '*'
+             else:
+-                p = str(sa.column(i).compile(dialect=self.dialect))
++                p = self._identifier(i)
+             parts2.append(p)
+ 
+-        return sa.column('.'.join(parts2), is_literal=True)
++        return _SQLExpression('.'.join(parts2))
+ 
+     def get_alias(self, alias):
+         if alias is None or len(alias.parts) == 0:
+@@ -105,11 +163,12 @@
+             t = ast.Constant(t)
+ 
+         if isinstance(t, ast.Star):
+-            col = sa.text('*')
++            col = _SQLExpression('*')
+         elif isinstance(t, ast.Last):
+             col = self.to_column(['last'])
+         elif isinstance(t, ast.Constant):
+-            col = sa.literal(t.value)
++            value = self._literal(t.value)
++            col = _SQLExpression(value)
+             if t.alias:
+                 alias = self.get_alias(t.alias)
+             else:
+@@ -124,20 +183,20 @@
+             if len(t.parts) == 1:
+                 name = t.parts[0].upper()
+                 if name == 'CURRENT_DATE':
+-                    col = sa_fnc.current_date()
++                    col = _SQLExpression('CURRENT_DATE')
+                 elif name == 'CURRENT_TIME':
+-                    col = sa_fnc.current_time()
++                    col = _SQLExpression('CURRENT_TIME')
+                 elif name == 'CURRENT_TIMESTAMP':
+-                    col = sa_fnc.current_timestamp()
++                    col = _SQLExpression('CURRENT_TIMESTAMP')
+                 elif name == 'CURRENT_USER':
+-                    col = sa_fnc.current_user()
++                    col = _SQLExpression('CURRENT_USER')
+             if col is None:
+                 col = self.to_column(t.parts)
+             if t.alias:
+                 col = col.label(self.get_alias(t.alias))
+         elif isinstance(t, ast.Select):
+             sub_stmt = self.prepare_select(t)
+-            col = sub_stmt.scalar_subquery()
++            col = _SQLExpression(f'({sub_stmt})')
+             if t.alias:
+                 alias = self.get_alias(t.alias)
+                 col = col.label(alias)
+@@ -150,29 +209,29 @@
+             col = fnc.label(alias)
+         elif isinstance(t, ast.BinaryOperation):
+             methods = {
+-                "+": "__add__",
+-                "-": "__sub__",
+-                "/": "__truediv__",
+-                "*": "__mul__",
+-                "%": "__mod__",
+-                "=": "__eq__",
+-                "!=": "__ne__",
+-                "<>": "__ne__",
+-                ">": "__gt__",
+-                "<": "__lt__",
+-                ">=": "__ge__",
+-                "<=": "__le__",
+-                "is": "is_",
+-                "is not": "is_not",
+-                "like": "like",
+-                "not like": "notlike",
+-                "in": "in_",
+-                "not in": "notin_",
+-                "||": "concat",
++                "+": "+",
++                "-": "-",
++                "/": "/",
++                "*": "*",
++                "%": "%",
++                "=": "=",
++                "!=": "<>",
++                "<>": "<>",
++                ">": ">",
++                "<": "<",
++                ">=": ">=",
++                "<=": "<=",
++                "is": "IS",
++                "is not": "IS NOT",
++                "like": "LIKE",
++                "not like": "NOT LIKE",
++                "in": "IN",
++                "not in": "NOT IN",
++                "||": "||",
+             }
+             functions = {
+-                "and": sa.and_,
+-                "or": sa.or_,
++                "and": "AND",
++                "or": "OR",
+             }
+ 
+             arg0 = self.to_expression(t.args[0])
+@@ -180,19 +239,29 @@
+ 
+             op = t.op.lower()
+             if op in ('in', 'not in'):
+-                if isinstance(arg1, sa.sql.selectable.ColumnClause):
++                if not isinstance(arg1, list):
+                     raise NotImplementedError(f'Required list argument for: {op}')
+ 
+             method = methods.get(op)
+             if method is not None:
+-                sa_op = getattr(arg0, method)
+-
+-                col = sa_op(arg1)
++                if isinstance(arg1, list):
++                    arg1 = ', '.join(str(i) for i in arg1)
++                    col = _SQLExpression(
++                        f'{arg0} {method} ({arg1})'
++                    )
++                else:
++                    col = _SQLExpression(
++                        f'{arg0} {method} {arg1}'
++                    )
+             elif t.op.lower() in functions:
+                 func = functions[t.op.lower()]
+-                col = func(arg0, arg1)
+-            else:
+-                col = arg0.op(t.op)(arg1)
++                col = _SQLExpression(
++                    f'({arg0} {func} {arg1})'
++                )
++            else:
++                col = _SQLExpression(
++                    f'{arg0} {t.op} {arg1}'
++                )
+ 
+             if t.alias:
+                 alias = self.get_alias(t.alias)
+@@ -201,13 +270,16 @@
+         elif isinstance(t, ast.UnaryOperation):
+             # not or munus
+             opmap = {
+-                "NOT": "__invert__",
+-                "-": "__neg__",
++                "NOT": "NOT ",
++                "-": "-",
+             }
+             arg = self.to_expression(t.args[0])
+ 
+             method = opmap[t.op.upper()]
+-            col = getattr(arg, method)()
++            if method == 'NOT ':
++                col = _SQLExpression(f'NOT ({arg})')
++            else:
++                col = _SQLExpression(f'{method}{arg}')
+             if t.alias:
+                 alias = self.get_alias(t.alias)
+                 col = col.label(alias)
+@@ -217,9 +289,11 @@
+             lim_down = self.to_expression(t.args[1])
+             lim_up = self.to_expression(t.args[2])
+ 
+-            col = sa.between(col0, lim_down, lim_up)
++            col = _SQLExpression(
++                f'{col0} BETWEEN {lim_down} AND {lim_up}'
++            )
+         elif isinstance(t, ast.Interval):
+-            col = INTERVAL(t.args[0])
++            col = _SQLExpression(str(INTERVAL(t.args[0])))
+             if t.alias:
+                 alias = self.get_alias(t.alias)
+                 col = col.label(alias)
+@@ -243,10 +317,18 @@
+                         col0 = col0.desc()
+                     order_by.append(col0)
+ 
+-            col = sa.over(
+-                func,
+-                partition_by=partition,
+-                order_by=order_by
++            parts = []
++            if partition:
++                parts.append(
++                    'PARTITION BY ' + ', '.join(str(i) for i in partition)
++                )
++            if order_by:
++                parts.append(
++                    'ORDER BY ' + ', '.join(str(i) for i in order_by)
++                )
++
++            col = _SQLExpression(
++                f'{func} OVER ({", ".join(parts)})'
+             )
+ 
+             if t.alias:
+@@ -255,14 +337,16 @@
+             arg = self.to_expression(t.arg)
+             type = self.get_type(t.type_name)
+             if t.precision is not None:
+-                type = type(*t.precision)
+-            col = sa.cast(arg, type)
++                type = f'{type}({", ".join(str(i) for i in t.precision)})'
++            col = _SQLExpression(
++                f'CAST({arg} AS {type})'
++            )
+ 
+             if t.alias:
+                 alias = self.get_alias(t.alias)
+                 col = col.label(alias)
+         elif isinstance(t, ast.Parameter):
+-            col = sa.column(t.value, is_literal=True)
++            col = _SQLExpression(t.value)
+             if t.alias: raise Exception()
+         elif isinstance(t, ast.Tuple):
+             col = [
+@@ -270,15 +354,15 @@
+                 for i in t.items
+             ]
+         elif isinstance(t, ast.Variable):
+-            col = sa.column(t.to_string(), is_literal=True)
++            col = _SQLExpression(t.to_string())
+         elif isinstance(t, ast.Latest):
+-            col = sa.column(t.to_string(), is_literal=True)
++            col = _SQLExpression(t.to_string())
+         elif isinstance(t, ast.Exists):
+             sub_stmt = self.prepare_select(t.query)
+-            col = sub_stmt.exists()
++            col = _SQLExpression(f'EXISTS ({sub_stmt})')
+         elif isinstance(t, ast.NotExists):
+             sub_stmt = self.prepare_select(t.query)
+-            col = ~sub_stmt.exists()
++            col = _SQLExpression(f'NOT EXISTS ({sub_stmt})')
+         elif isinstance(t, ast.Case):
+             col = self.prepare_case(t)
+         else:
+@@ -291,7 +375,8 @@
+         conditions = []
+         for condition, result in t.rules:
+             conditions.append(
+-                (self.to_expression(condition), self.to_expression(result))
++                f'WHEN {self.to_expression(condition)} '
++                f'THEN {self.to_expression(result)}'
+             )
+         default = None
+         if t.default is not None:
+@@ -301,15 +386,27 @@
+         if t.arg is not None:
+             value = self.to_expression(t.arg)
+ 
+-        return sa.case(*conditions, else_=default, value=value)
++        value_sql = ''
++        if value is not None:
++            value_sql = f' {value}'
++
++        default_sql = ''
++        if default is not None:
++            default_sql = f' ELSE {default}'
++
++        return _SQLExpression(
++            f'CASE{value_sql} {" ".join(conditions)}{default_sql} END'
++        )
+ 
+     def to_function(self, t):
+-        op = getattr(sa.func, t.op)
++        op = t.op
+         if t.from_arg is not None:
+             arg = t.args[0].to_string()
+             from_arg = self.to_expression(t.from_arg)
+ 
+-            fnc = op(arg, from_arg)
++            fnc = _SQLExpression(
++                f'{op}({arg} FROM {from_arg})'
++            )
+         else:
+             args = [
+                 self.to_expression(i)
+@@ -317,14 +414,17 @@
+             ]
+             if t.distinct:
+                 # set first argument to distinct
+-                args[0] = args[0].distinct()
+-            fnc = op(*args)
++                args[0] = _SQLExpression(
++                    f'DISTINCT {args[0]}'
++                )
++            fnc = _SQLExpression(
++                f'{op}({", ".join(str(i) for i in args)})'
++            )
+         return fnc
+ 
+     def get_type(self, typename):
+         # TODO how to get type
+         if not isinstance(typename, str):
+-            # sqlalchemy type
+             return typename
+ 
+         typename = typename.upper()
+@@ -332,8 +432,7 @@
+             typename = 'BIGINT'
+         if re.match('^FLOAT[\d]*$', typename):
+             typename = 'FLOAT'
+-        type = self.types_map[typename]
+-        return type
++        return self.types_map.get(typename, typename)
+ 
+     def prepare_join(self, join):
+         # join tree to table list
+@@ -382,17 +481,26 @@
+         if isinstance(node, ast.Identifier):
+             schema, table_name = self.get_table_name(node)
+ 
+-            table = sa.table(table_name, schema=schema)
++            if schema is not None:
++                table = f'{schema}.{table_name}'
++            else:
++                table = table_name
+ 
+             if node.alias:
+-                table = aliased(table, name=self.get_alias(node.alias))
++                table = f'{table} AS {self.get_alias(node.alias)}'
++
++            table = _SQLExpression(table)
+ 
+         elif isinstance(node, (ast.Select, ast.Union, ast.Intersect, ast.Except)):
+             sub_stmt = self.prepare_select(node)
+             alias = None
+             if node.alias:
+                 alias = self.get_alias(node.alias)
+-            table = sub_stmt.subquery(alias)
++
++            table = f'({sub_stmt})'
++            if alias:
++                table = f'{table} AS {alias}'
++            table = _SQLExpression(table)
+ 
+         else:
+             # TODO tests are failing
+@@ -409,8 +517,16 @@
+             col = self.to_expression(t)
+             cols.append(col)
+ 
+-        query = sa.select(*cols)
+-
++        distinct = ''
++        if node.distinct:
++            distinct = 'DISTINCT '
++
++        query = (
++            f'SELECT {distinct}'
++            f'{", ".join(str(i) for i in cols)}'
++        )
++
++        ctes = []
+         if node.cte is not None:
+             for cte in node.cte:
+                 if cte.columns is not None and len(cte.columns) > 0:
+@@ -418,11 +534,12 @@
+ 
+                 stmt = self.prepare_select(cte.query)
+                 alias = cte.name
+-
+-                query = query.add_cte(stmt.cte(self.get_alias(alias), nesting=True))
+-
+-        if node.distinct:
+-            query = query.distinct()
++                ctes.append(
++                    f'{self.get_alias(alias)} AS ({stmt})'
++                )
++
++        if ctes:
++            query = f'WITH {", ".join(ctes)} {query}'
+ 
+         if node.from_table is not None:
+             from_table = node.from_table
+@@ -431,73 +548,77 @@
+                 join_list = self.prepare_join(from_table)
+                 # first table
+                 table = self.to_table(join_list[0]['table'])
+-                query = query.select_from(table)
++                query = f'{query} FROM {table}'
+ 
+                 # other tables
+                 for item in join_list[1:]:
+                     table = self.to_table(item['table'])
+                     if item['is_implicit']:
+                         # add to from clause
+-                        query = query.select_from(table)
++                        query = f'{query}, {table}'
+                     else:
+                         if item['condition'] is None:
+                             # otherwise, sqlalchemy raises "Don't know how to join to ..."
+-                            condition = sa.text('1=1')
++                            condition = '1=1'
+                         else:
+                             condition = self.to_expression(item['condition'])
+ 
+                         join_type = item['join_type']
+-                        method = 'join'
+-                        is_full = False
+                         if join_type == 'LEFT JOIN':
+-                            method = 'outerjoin'
+-                        if join_type == 'FULL JOIN':
+-                            is_full = True
++                            join_type = 'LEFT JOIN'
++                        elif join_type == 'FULL JOIN':
++                            join_type = 'FULL JOIN'
++                        elif join_type == 'RIGHT JOIN':
++                            join_type = 'RIGHT JOIN'
++                        else:
++                            join_type = 'JOIN'
+ 
+                         # perform join
+-                        query = getattr(query, method)(
+-                            table,
+-                            condition,
+-                            full=is_full
++                        query = (
++                            f'{query} {join_type} {table} '
++                            f'ON {condition}'
+                         )
+             elif isinstance(from_table, ast.Union):
+                 alias = None
+                 if from_table.alias:
+                     alias = self.get_alias(from_table.alias)
+-                table = self.prepare_union(from_table).subquery(alias)
+-                query = query.select_from(table)
++                table = self.prepare_union(from_table)
++                table = f'({table})'
++                if alias:
++                    table = f'{table} AS {alias}'
++                query = f'{query} FROM {table}'
+ 
+             elif isinstance(from_table, ast.Select):
+                 table = self.to_table(from_table)
+-                query = query.select_from(table)
++                query = f'{query} FROM {table}'
+ 
+             elif isinstance(from_table, ast.Identifier):
+                 table = self.to_table(from_table)
+-                query = query.select_from(table)
++                query = f'{query} FROM {table}'
+ 
+             elif isinstance(from_table, ast.NativeQuery):
+                 alias = None
+                 if from_table.alias:
+                     alias = from_table.alias.parts[-1]
+-                table = sa.text(from_table.query).columns().subquery(alias)
+-                query = query.select_from(table)
++                table = f'({from_table.query})'
++                if alias:
++                    table = f'{table} AS {alias}'
++                query = f'{query} FROM {table}'
+             else:
+                 raise NotImplementedError(f'Select from {from_table}')
+ 
+         if node.where is not None:
+-            query = query.filter(
+-                self.to_expression(node.where)
+-            )
++            query = f'{query} WHERE {self.to_expression(node.where)}'
+ 
+         if node.group_by is not None:
+             cols = [
+                 self.to_expression(i)
+                 for i in node.group_by
+             ]
+-            query = query.group_by(*cols)
++            query = f'{query} GROUP BY {", ".join(str(i) for i in cols)}'
+ 
+         if node.having is not None:
+-            query = query.having(self.to_expression(node.having))
++            query = f'{query} HAVING {self.to_expression(node.having)}'
+ 
+         if node.order_by is not None:
+             order_by = []
+@@ -508,39 +629,41 @@
+                 elif f.direction.upper() == 'ASC':
+                     col0 = col0.asc()
+                 if f.nulls.upper() == 'NULLS FIRST':
+-                    col0 = sa.nullsfirst(col0)
++                    col0 = _SQLExpression(f'{col0} NULLS FIRST')
+                 elif f.nulls.upper() == 'NULLS LAST':
+-                    col0 = sa.nullslast(col0)
++                    col0 = _SQLExpression(f'{col0} NULLS LAST')
+                 order_by.append(col0)
+ 
+-            query = query.order_by(*order_by)
++            query = f'{query} ORDER BY {", ".join(str(i) for i in order_by)}'
+ 
+         if node.limit is not None:
+-            query = query.limit(node.limit.value)
++            query = f'{query} LIMIT {node.limit.value}'
+ 
+         if node.offset is not None:
+-            query = query.offset(node.offset.value)
++            query = f'{query} OFFSET {node.offset.value}'
+ 
+         if node.mode is not None:
+             if node.mode == 'FOR UPDATE':
+-                query = query.with_for_update()
++                query = f'{query} FOR UPDATE'
+             else:
+                 raise NotImplementedError(f'Select mode: {node.mode}')
+ 
+-        return query
++        return _SQLExpression(query)
+ 
+     def prepare_union(self, from_table):
+         step1 = self.prepare_select(from_table.left)
+         step2 = self.prepare_select(from_table.right)
+ 
+         if isinstance(from_table, ast.Except):
+-            func = sa.except_ if from_table.unique else sa.except_all
++            func = 'EXCEPT' if from_table.unique else 'EXCEPT ALL'
+         elif isinstance(from_table, ast.Intersect):
+-            func = sa.intersect if from_table.unique else sa.intersect_all
++            func = 'INTERSECT' if from_table.unique else 'INTERSECT ALL'
+         else:
+-            func = sa.union if from_table.unique else sa.union_all
+-
+-        return func(step1, step2)
++            func = 'UNION' if from_table.unique else 'UNION ALL'
++
++        return _SQLExpression(
++            f'{step1} {func} {step2}'
++        )
+ 
+     def prepare_create_table(self, ast_query):
+         columns = []
+@@ -549,38 +672,36 @@
+             default = None
+             if col.default is not None:
+                 if isinstance(col.default, str):
+-                    default = sa.text(col.default)
++                    default = col.default
+ 
+             if isinstance(col.type, str) and col.type.lower() == 'serial':
+                 col.is_primary_key = True
+                 col.type = 'INT'
+ 
+-            kwargs = {
+-                'primary_key': col.is_primary_key,
+-                'server_default': default,
+-            }
+-            if col.nullable is not None:
+-                kwargs['nullable'] = col.nullable
+-
+-            columns.append(
+-                sa.Column(
+-                    col.name,
+-                    self.get_type(col.type),
+-                    **kwargs
+-                )
+-            )
++            column = [
++                col.name,
++                self.get_type(col.type),
++            ]
++
++            if col.is_primary_key:
++                column.append('PRIMARY KEY')
++
++            if col.nullable is False:
++                column.append('NOT NULL')
++
++            if default is not None:
++                column.append(f'DEFAULT {default}')
++
++            columns.append(' '.join(str(i) for i in column))
+ 
+         schema, table_name = self.get_table_name(ast_query.name)
+ 
+-        metadata = sa.MetaData()
+-        table = sa.Table(
+-            table_name,
+-            metadata,
+-            schema=schema,
+-            *columns
+-        )
+-
+-        return CreateTable(table)
++        if schema is not None:
++            table_name = f'{schema}.{table_name}'
++
++        return _SQLExpression(
++            f'CREATE TABLE {table_name} ({", ".join(columns)})'
++        )
+ 
+     def prepare_drop_table(self, ast_query):
+         if len(ast_query.tables) != 1:
+@@ -588,44 +709,44 @@
+ 
+         schema, table_name = self.get_table_name(ast_query.tables[0])
+ 
+-        metadata = sa.MetaData()
+-        table = sa.Table(
+-            table_name,
+-            metadata,
+-            schema=schema
+-        )
+-        return DropTable(table, if_exists=ast_query.if_exists)
++        if schema is not None:
++            table_name = f'{schema}.{table_name}'
++
++        if ast_query.if_exists:
++            return _SQLExpression(
++                f'DROP TABLE IF EXISTS {table_name}'
++            )
++
++        return _SQLExpression(
++            f'DROP TABLE {table_name}'
++        )
+ 
+     def prepare_insert(self, ast_query, with_params=False):
+         params = None
+         schema, table_name = self.get_table_name(ast_query.table)
+ 
++        if schema is not None:
++            table_name = f'{schema}.{table_name}'
++
+         names = []
+         columns = []
+ 
+         if ast_query.columns is None:
+             raise NotImplementedError('Columns is required in insert query')
+         for col in ast_query.columns:
+-            columns.append(
+-                sa.Column(
+-                    col.name,
+-                    # self.get_type(col.type)
+-                )
+-            )
++            columns.append(col.name)
+             # check doubles
+             if col.name in names:
+                 raise RenderError(f'Columns name double: {col.name}')
+             names.append(col.name)
+ 
+-        table = sa.table(table_name, schema=schema, *columns)
+-
+         if ast_query.values is not None:
+             values = []
+ 
+             if ast_query.is_plain and with_params:
+ 
+                 for i in range(len(ast_query.columns)):
+-                    values.append(sa.column('%s', is_literal=True))
++                    values.append('%s')
+ 
+                 values = [values]
+                 params = ast_query.values
+@@ -638,11 +759,23 @@
+                     ]
+                     values.append(row)
+ 
+-            stmt = table.insert().values(values)
++            rows = []
++            for row in values:
++                rows.append(
++                    '(' + ', '.join(str(i) for i in row) + ')'
++                )
++
++            stmt = _SQLExpression(
++                f'INSERT INTO {table_name} '
++                f'({", ".join(names)}) VALUES {", ".join(rows)}'
++            )
+         else:
+             # is insert from subselect
+             subquery = self.prepare_select(ast_query.from_select)
+-            stmt = table.insert().from_select(names, subquery)
++            stmt = _SQLExpression(
++                f'INSERT INTO {table_name} '
++                f'({", ".join(names)}) {subquery}'
++            )
+ 
+         return stmt, params
+ 
+@@ -652,38 +785,40 @@
+ 
+         schema, table_name = self.get_table_name(ast_query.table)
+ 
+-        columns = []
+-
+-        to_update = {}
++        if schema is not None:
++            table_name = f'{schema}.{table_name}'
++
++        to_update = []
+         for col, value in ast_query.update_columns.items():
+-            columns.append(
+-                sa.Column(
+-                    col,
+-                )
+-            )
+-
+-            to_update[col] = self.to_expression(value)
+-
+-        table = sa.table(table_name, schema=schema, *columns)
+-
+-        stmt = table.update().values(**to_update)
++            to_update.append(
++                f'{col} = {self.to_expression(value)}'
++            )
++
++        stmt = _SQLExpression(
++            f'UPDATE {table_name} SET {", ".join(to_update)}'
++        )
+ 
+         if ast_query.where is not None:
+-            stmt = stmt.where(self.to_expression(ast_query.where))
++            stmt = _SQLExpression(
++                f'{stmt} WHERE {self.to_expression(ast_query.where)}'
++            )
+ 
+         return stmt
+ 
+     def prepare_delete(self, ast_query: ast.Delete):
+         schema, table_name = self.get_table_name(ast_query.table)
+ 
+-        columns = []
+-
+-        table = sa.table(table_name, schema=schema, *columns)
+-
+-        stmt = table.delete()
++        if schema is not None:
++            table_name = f'{schema}.{table_name}'
++
++        stmt = _SQLExpression(
++            f'DELETE FROM {table_name}'
++        )
+ 
+         if ast_query.where is not None:
+-            stmt = stmt.where(self.to_expression(ast_query.where))
++            stmt = _SQLExpression(
++                f'{stmt} WHERE {self.to_expression(ast_query.where)}'
++            )
+ 
+         return stmt
+ 
+@@ -724,19 +859,17 @@
+         :return: sql query and parameters
+         """
+ 
+-        if isinstance(ast_query, (ast.CreateTable, ast.DropTables)):
+-            render_func = render_ddl_query
+-        else:
+-            render_func = render_dml_query
+-
+         try:
+             stmt, params = self.get_query(ast_query, with_params=with_params)
+ 
+-            sql = render_func(stmt, self.dialect)
++            if isinstance(stmt, _SQLExpression):
++                sql = str(stmt)
++            else:
++                sql = str(stmt)
+ 
+             return sql, params
+ 
+-        except (SQLAlchemyError, NotImplementedError) as e:
++        except (NotImplementedError, KeyError, ValueError) as e:
+             if not with_failback:
+                 raise e
+ 
+@@ -747,26 +880,8 @@
+ 
+ 
+ def render_dml_query(statement, dialect):
+-
+-    class LiteralCompiler(dialect.statement_compiler):
+-
+-        def render_literal_value(self, value, type_):
+-
+-            if isinstance(value, (str, dt.date, dt.datetime, dt.timedelta)):
+-                return "'{}'".format(str(value).replace("'", "''"))
+-
+-            return super(LiteralCompiler, self).render_literal_value(value, type_)
+-
+-    return str(LiteralCompiler(dialect, statement, compile_kwargs={'literal_binds': True}))
++    return str(statement)
+ 
+ 
+ def render_ddl_query(statement, dialect):
+-    class LiteralCompiler(dialect.ddl_compiler):
+-
+-        def render_literal_value(self, value, type_):
+-            if isinstance(value, (str, dt.date, dt.datetime, dt.timedelta)):
+-                return "'{}'".format(str(value).replace("'", "''"))
+-
+-            return super(LiteralCompiler, self).render_literal_value(value, type_)
+-
+-    return str(LiteralCompiler(dialect, statement, compile_kwargs={'literal_binds': True}))
++    return str(statement)

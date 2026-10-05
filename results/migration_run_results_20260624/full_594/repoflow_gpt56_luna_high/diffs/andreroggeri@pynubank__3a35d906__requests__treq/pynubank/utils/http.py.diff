@@ -1,0 +1,160 @@
+--- a/pynubank/utils/http.py
++++ b/pynubank/utils/http.py
+@@ -1,7 +1,76 @@
+-from requests import Response
+-from requests_pkcs12 import get, post
++from threading import Event, Lock, Thread
++
++import treq
++from OpenSSL import crypto
++from cryptography.hazmat.primitives.serialization import pkcs12
++from twisted.internet import reactor, ssl
++from twisted.internet.defer import Deferred
++from twisted.web.client import Agent
++from treq.client import HTTPClient as TreqClient
+ 
+ from pynubank import NuRequestException
++
++
++get = treq.get
++post = treq.post
++
++_reactor_lock = Lock()
++_reactor_ready = Event()
++_reactor_thread = None
++
++
++def _run_reactor():
++    _reactor_ready.set()
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor():
++    global _reactor_thread
++
++    if reactor.running:
++        return
++
++    with _reactor_lock:
++        if reactor.running:
++            return
++        if _reactor_thread is None:
++            _reactor_thread = Thread(target=_run_reactor, daemon=True)
++            _reactor_thread.start()
++        _reactor_ready.wait()
++
++
++def _call_in_reactor(function, *args, **kwargs):
++    _ensure_reactor()
++    completed = Event()
++    result = []
++    error = []
++
++    def succeed(value):
++        result.append(value)
++        completed.set()
++        return value
++
++    def fail(failure):
++        error.append(getattr(failure, 'value', failure))
++        completed.set()
++        return failure
++
++    def invoke():
++        try:
++            deferred = function(*args, **kwargs)
++            if isinstance(deferred, Deferred):
++                deferred.addCallbacks(succeed, fail)
++            else:
++                succeed(deferred)
++        except Exception as ex:
++            error.append(ex)
++            completed.set()
++
++    reactor.callFromThread(invoke)
++    completed.wait()
++    if error:
++        raise error[0]
++    return result[0]
+ 
+ 
+ class HttpClient:
+@@ -26,24 +95,65 @@
+     def get_header(self, name: str):
+         return self._headers.get(name)
+ 
+-    @property
+-    def _cert_args(self):
+-        return {'pkcs12_data': self._cert, 'pkcs12_password': ''} if self._cert else {}
++    def _get_treq_client(self):
++        if not self._cert:
++            return None
+ 
+-    def _handle_response(self, response: Response) -> dict:
+-        if response.status_code != 200:
+-            raise NuRequestException(response)
++        private_key, certificate, _ = pkcs12.load_key_and_certificates(self._cert, b'')
++        context = ssl.CertificateOptions(
++            privateKey=crypto.PKey.from_cryptography_key(private_key),
++            certificate=crypto.X509.from_cryptography(certificate),
++        )
++        return TreqClient(Agent(reactor, contextFactory=context))
+ 
+-        return response.json()
++    def _request(self, method, url, **kwargs):
++        client = self._get_treq_client()
++        if client is not None:
++            request = getattr(client, method)
++        else:
++            request = get if method == 'get' else post
++        return _call_in_reactor(request, url, **kwargs)
+ 
+-    def raw_get(self, url: str) -> Response:
+-        return get(url, headers=self._headers, **self._cert_args)
++    @staticmethod
++    def status_code(response):
++        return getattr(response, 'status_code', getattr(response, 'code', None))
+ 
+-    def raw_post(self, url: str, json: dict) -> Response:
+-        return post(url, json=json, headers=self._headers, **self._cert_args)
++    @staticmethod
++    def header(response, name):
++        headers = getattr(response, 'headers', None)
++        if headers is None:
++            return None
++
++        if hasattr(headers, 'get'):
++            value = headers.get(name)
++        else:
++            value = headers.getRawHeaders(name)
++        if isinstance(value, (list, tuple)):
++            value = value[0] if value else None
++        if isinstance(value, bytes):
++            value = value.decode()
++        return value
++
++    def response_json(self, response):
++        response_json = getattr(response, 'json', None)
++        if callable(response_json):
++            return response_json()
++        return _call_in_reactor(treq.json_content, response)
++
++    def _handle_response(self, response, url=None) -> dict:
++        if self.status_code(response) != 200:
++            raise NuRequestException(response, url=url)
++
++        return self.response_json(response)
++
++    def raw_get(self, url: str):
++        return self._request('get', url, headers=self._headers)
++
++    def raw_post(self, url: str, json: dict):
++        return self._request('post', url, json=json, headers=self._headers)
+ 
+     def get(self, url: str) -> dict:
+-        return self._handle_response(self.raw_get(url))
++        return self._handle_response(self.raw_get(url), url=url)
+ 
+     def post(self, url: str, json: dict) -> dict:
+-        return self._handle_response(post(url, json=json, headers=self._headers, **self._cert_args))
++        return self._handle_response(self.raw_post(url, json=json), url=url)

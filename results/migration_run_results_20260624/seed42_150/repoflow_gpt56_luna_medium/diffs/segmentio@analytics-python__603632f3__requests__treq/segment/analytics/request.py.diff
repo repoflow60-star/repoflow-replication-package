@@ -1,0 +1,102 @@
+--- a/segment/analytics/request.py
++++ b/segment/analytics/request.py
+@@ -3,14 +3,61 @@
+ from gzip import GzipFile
+ import logging
+ import json
++import threading
+ from dateutil.tz import tzutc
+-from requests.auth import HTTPBasicAuth
+-from requests import sessions
++import treq
++from twisted.internet import reactor
+ 
+ from segment.analytics.version import VERSION
+ from segment.analytics.utils import remove_trailing_slash
+ 
+-_session = sessions.Session()
++_reactor_lock = threading.Lock()
++
++
++def _start_reactor():
++    if reactor.running:
++        return
++    with _reactor_lock:
++        if not reactor.running:
++            threading.Thread(
++                target=reactor.run,
++                kwargs={'installSignalHandlers': False},
++                daemon=True,
++            ).start()
++
++
++def _request(method, url, data, headers, timeout):
++    """Run treq's Deferred request without changing the sync API."""
++    _start_reactor()
++    result = {}
++    completed = threading.Event()
++
++    def finish(response, body=None):
++        result['response'] = response
++        result['body'] = body
++        completed.set()
++
++    def failed(error):
++        result['error'] = error.value
++        completed.set()
++
++    deferred = treq.request(method, url, data=data, headers=headers)
++    deferred.addCallback(lambda response: treq.content(response).addCallback(
++        lambda body: finish(response, body)))
++    deferred.addErrback(failed)
++    if not completed.wait(timeout):
++        raise TimeoutError('request timed out')
++    if 'error' in result:
++        raise result['error']
++    return result['response'], result['body']
++
++
++def _response_json(body):
++    return json.loads(body.decode('utf-8'))
++
++
++def _response_text(body):
++    return body.decode('utf-8', errors='replace')
+ 
+ 
+ def post(write_key, host=None, gzip=False, timeout=15, proxies=None, oauth_manager=None, **kwargs):
+@@ -50,27 +97,26 @@
+ 
+     if proxies:
+         kwargs['proxies'] = proxies
+-    res = None
+     try:
+-        res = _session.post(url, data=data, headers=headers, timeout=timeout)
++        res, response_body = _request('POST', url, data, headers, timeout)
+     except Exception as e:
+         log.error(e)
+         raise e
+         
+-    if res.status_code == 200:
++    if res.code == 200:
+         log.debug('data uploaded successfully')
+         return res
+ 
+-    if oauth_manager and res.status_code in [400, 401, 403]:
++    if oauth_manager and res.code in [400, 401, 403]:
+         oauth_manager.clear_token()
+ 
+     try:
+-        payload = res.json()
++        payload = _response_json(response_body)
+         log.debug('received response: %s', payload)
+-        raise APIError(res.status_code, payload['code'], payload['message'])
++        raise APIError(res.code, payload['code'], payload['message'])
+     except ValueError:
+-        log.error('Unknown error: [%s] %s', res.status_code, res.reason)
+-        raise APIError(res.status_code, 'unknown', res.text)
++        log.error('Unknown error: [%s] %s', res.code, res.phrase)
++        raise APIError(res.code, 'unknown', _response_text(response_body))
+ 
+ 
+ class APIError(Exception):

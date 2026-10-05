@@ -1,0 +1,127 @@
+--- a/pyschlage/auth.py
++++ b/pyschlage/auth.py
+@@ -2,13 +2,16 @@
+ 
+ from __future__ import annotations
+ 
++import json
+ from functools import wraps
+ from typing import Callable
++from urllib.parse import urlencode
+ 
+ from botocore.exceptions import ClientError
+ import pycognito
+ from pycognito import utils
+-import requests
++import urllib3
++from urllib3.response import HTTPResponse
+ 
+ from .exceptions import NotAuthorizedError, UnknownError
+ 
+@@ -28,13 +31,20 @@
+ USER_POOL_ID = USER_POOL_REGION + "_2zhrVs9d4"
+ 
+ 
++class _AuthRequest:
++    """Request headers passed to pycognito's authentication hook."""
++
++    def __init__(self, headers: dict[str, str]) -> None:
++        self.headers = headers
++
++
+ def _translate_auth_errors(
+     # pylint: disable=invalid-name
+-    fn: Callable[..., requests.Response],
++    fn: Callable[..., HTTPResponse],
+     # pylint: enable=invalid-name
+-) -> Callable[..., requests.Response]:
++) -> Callable[..., HTTPResponse]:
+     @wraps(fn)
+-    def wrapper(*args, **kwargs) -> requests.Response:
++    def wrapper(*args, **kwargs) -> HTTPResponse:
+         try:
+             return fn(*args, **kwargs)
+         except ClientError as ex:
+@@ -50,19 +60,22 @@
+ 
+ def _translate_http_errors(
+     # pylint: disable=invalid-name
+-    fn: Callable[..., requests.Response],
++    fn: Callable[..., HTTPResponse],
+     # pylint: enable=invalid-name
+-) -> Callable[..., requests.Response]:
++) -> Callable[..., HTTPResponse]:
+     @wraps(fn)
+-    def wrapper(*args, **kwargs) -> requests.Response:
++    def wrapper(*args, **kwargs) -> HTTPResponse:
+         resp = fn(*args, **kwargs)
+         try:
+-            resp.raise_for_status()
++            if resp.status >= 400:
++                raise urllib3.exceptions.HTTPError(
++                    f"{resp.status} {resp.reason}"
++                )
+             return resp
+-        except requests.HTTPError as ex:
++        except urllib3.exceptions.HTTPError as ex:
+             try:
+-                message = resp.json().get("message", resp.reason)
+-            except requests.JSONDecodeError:
++                message = json.loads(resp.data).get("message", resp.reason)
++            except (json.JSONDecodeError, UnicodeDecodeError):
+                 message = resp.reason
+             raise UnknownError(message) from ex
+ 
+@@ -100,7 +113,7 @@
+         :raise pyschlage.exceptions.NotAuthorizedError: When authentication fails.
+         :raise pyschlage.exceptions.UnknownError: On other errors.
+         """
+-        self.auth(requests.Request())
++        self.auth(_AuthRequest({}))
+ 
+     @property
+     def user_id(self) -> str:
+@@ -111,21 +124,35 @@
+ 
+     def _get_user_id(self) -> str:
+         resp = self.request("get", "users/@me")
+-        return resp.json()["identityId"]
++        return json.loads(resp.data)["identityId"]
+ 
+     @_translate_http_errors
+     @_translate_auth_errors
+     def request(
+         self, method: str, path: str, base_url: str = BASE_URL, **kwargs
+-    ) -> requests.Response:
++    ) -> HTTPResponse:
+         """Performs a request against the Schlage WiFi cloud service.
+ 
+         :meta private:
+         """
+-        kwargs["auth"] = self.auth
+-        if "headers" not in kwargs:
+-            kwargs["headers"] = {}
+-        kwargs["headers"]["X-Api-Key"] = API_KEY
++        headers = dict(kwargs.pop("headers", {}) or {})
++        headers["X-Api-Key"] = API_KEY
++        auth_request = self.auth(_AuthRequest(headers))
++        headers = auth_request.headers
+         kwargs.setdefault("timeout", _DEFAULT_TIMEOUT)
+-        # pylint: disable=missing-timeout
+-        return requests.request(method, f"{base_url}/{path.lstrip('/')}", **kwargs)
++
++        params = kwargs.pop("params", None)
++        url = f"{base_url}/{path.lstrip('/')}"
++        if params:
++            url += ("&" if "?" in url else "?") + urlencode(params, doseq=True)
++
++        payload = kwargs.pop("json", None)
++        if payload is not None:
++            kwargs["body"] = json.dumps(payload).encode("utf-8")
++            if not any(key.lower() == "content-type" for key in headers):
++                headers["Content-Type"] = "application/json"
++
++        # Requests does not retry failed connections by default.
++        kwargs.setdefault("retries", False)
++        kwargs["headers"] = headers
++        return urllib3.request(method, url, **kwargs)

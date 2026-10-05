@@ -1,0 +1,128 @@
+--- a/tinychat/llms/together.py
++++ b/tinychat/llms/together.py
+@@ -1,11 +1,94 @@
+ import json
++import queue
++import threading
+ from typing import Generator
+ 
+-import requests
++import pycurl
+ from sseclient import SSEClient
+ 
+ from tinychat.llms.base import BaseLLMClient
+ from tinychat.settings import TOGETHER_API_KEY_NAME
++
++
++class _PycurlEventSource:
++    def __init__(self, url: str, headers: list[str], data: bytes) -> None:
++        self._url = url
++        self._headers = headers
++        self._data = data
++        self._chunks = queue.Queue()
++        self._headers_received = threading.Event()
++        self._closed = False
++        self.status_code = None
++        self.error = None
++
++        self._thread = threading.Thread(target=self._perform)
++        self._thread.daemon = True
++        self._thread.start()
++        self._headers_received.wait()
++
++    def _header(self, header: bytes) -> int:
++        if header.startswith(b"HTTP/"):
++            parts = header.split()
++            if len(parts) > 1:
++                try:
++                    self.status_code = int(parts[1])
++                    if not 100 <= self.status_code < 200:
++                        self._headers_received.set()
++                except ValueError:
++                    pass
++        return len(header)
++
++    def _write(self, chunk: bytes) -> int:
++        if self._closed:
++            return 0
++        self._chunks.put(chunk)
++        return len(chunk)
++
++    def _perform(self) -> None:
++        curl = None
++        try:
++            curl = pycurl.Curl()
++            curl.setopt(pycurl.URL, self._url)
++            curl.setopt(pycurl.HTTPHEADER, self._headers)
++            curl.setopt(pycurl.POST, 1)
++            curl.setopt(pycurl.POSTFIELDS, self._data)
++            curl.setopt(pycurl.HEADERFUNCTION, self._header)
++            curl.setopt(pycurl.WRITEFUNCTION, self._write)
++            curl.perform()
++        except Exception as error:
++            self.error = error
++        finally:
++            if curl is not None:
++                curl.close()
++            self._headers_received.set()
++            self._chunks.put(None)
++
++    def __iter__(self):
++        while True:
++            chunk = self._chunks.get()
++            if chunk is None:
++                if self.error is not None:
++                    raise self.error
++                return
++            yield chunk
++
++    def iter_content(self, chunk_size: int = 1, decode_unicode: bool = False):
++        for chunk in self:
++            if chunk_size is None:
++                chunks = [chunk]
++            else:
++                chunks = [
++                    chunk[index : index + chunk_size]
++                    for index in range(0, len(chunk), chunk_size)
++                ]
++            for content in chunks:
++                if decode_unicode:
++                    yield content.decode("utf-8")
++                else:
++                    yield content
++
++    def close(self) -> None:
++        self._closed = True
+ 
+ 
+ class TogetherClient(BaseLLMClient):
+@@ -31,13 +114,19 @@
+             "temperature": self.temperature,
+             "stream": True,
+         }
+-        response = requests.post(
++        headers = [
++            f"{key}: {value}"
++            for key, value in self.default_headers().items()  # type: ignore
++        ]
++        response = _PycurlEventSource(
+             self.TOGHETER_COMPLETION_API_URL,
+-            headers=self.default_headers(),  # type: ignore
+-            json=data,
+-            stream=True,
++            headers,
++            json.dumps(data).encode("utf-8"),
+         )
++        if response.status_code is None and response.error is not None:
++            raise response.error
+         if response.status_code != 200:
++            response.close()
+             raise ValueError(
+                 f"Server responded with an error. Status Code: {response.status_code}"
+             )
+@@ -88,4 +177,4 @@
+                     response_piece = json_load["content"]
+                     lm_response += response_piece
+                     yield response_piece
+-        self._messages.append({"role": "assistant", "content": lm_response})
++        self._messages.append({"role": "assistant", "content": lm_response})

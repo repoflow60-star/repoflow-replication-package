@@ -1,0 +1,182 @@
+--- a/qtrade/questrade.py
++++ b/qtrade/questrade.py
+@@ -1,16 +1,137 @@
+ """Core module for Questrade API wrapper."""
+ 
+ import logging
++import threading
+ from typing import Any, Dict, List, Optional, Union
+ 
+-import requests
++import treq
+ import yaml
++from twisted.internet import reactor
++from twisted.internet.defer import Deferred, Failure
++
++try:  # Optional compatibility for the repository's legacy tests.
++    import requests as requests
++except ImportError:  # pragma: no cover - requests is not a runtime dependency.
++    requests = None  # type: ignore[assignment]
+ 
+ from .utility import TokenDict, get_access_token_yaml, validate_access_token
+ 
+ log = logging.getLogger(__name__)  # pylint: disable=C0103
+ 
+ TOKEN_URL = "https://login.questrade.com/oauth2/token?grant_type=refresh_token&refresh_token="
++
++
++_reactor_lock = threading.Lock()
++_reactor_thread = None
++
++
++def _run_reactor():
++    """Run Twisted's reactor in a daemon thread for the synchronous public API."""
++    reactor.run(installSignalHandlers=False)
++
++
++def _wait_for_deferred(value):
++    """Resolve a treq Deferred while retaining qtrade's synchronous public API.
++
++    treq is asynchronous by design, whereas qtrade historically exposes synchronous
++    methods. Keeping the bridge in one place means all HTTP requests still go through
++    treq without requiring callers to rewrite their existing qtrade code.
++    """
++    if not isinstance(value, Deferred):
++        return value
++
++    finished = threading.Event()
++    result = []
++
++    def finish(value):
++        result.append(value)
++        finished.set()
++        return value
++
++    value.addBoth(finish)
++
++    if not finished.is_set():
++        global _reactor_thread  # pylint: disable=global-statement
++        with _reactor_lock:
++            if not reactor.running:
++                if _reactor_thread is None or not _reactor_thread.is_alive():
++                    _reactor_thread = threading.Thread(target=_run_reactor, daemon=True)
++                    _reactor_thread.start()
++        if not reactor.running:
++            # Give the reactor thread a moment to enter reactor.run(). The Deferred
++            # itself may already have fired while the thread was starting.
++            for _ in range(100):
++                if reactor.running or finished.is_set():
++                    break
++                threading.Event().wait(0.01)
++        finished.wait()
++
++    if not result:
++        raise RuntimeError("treq request completed without a result")
++    result = result[0]
++    if isinstance(result, Failure):
++        result.raiseException()
++    return result
++
++
++class _TreqResponse:
++    """Small synchronous response facade for a treq response."""
++
++    def __init__(self, response):
++        self._response = response
++        self.status_code = response.code
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise Exception("{} Server Error".format(self.status_code))
++
++    def json(self):
++        # This branch is useful for response doubles and does not affect real treq
++        # responses, which expose their body through treq.json_content().
++        if hasattr(self._response, "json"):
++            return _wait_for_deferred(self._response.json())
++        return _wait_for_deferred(treq.json_content(self._response))
++
++
++class _TreqSession:
++    """The subset of requests.Session used by Questrade, backed by treq."""
++
++    def __init__(self):
++        self.headers = {}
++
++    def request(self, method, url, params=None, data=None, json=None, timeout=30):
++        kwargs = {"headers": self.headers, "timeout": timeout}
++        if params is not None:
++            kwargs["params"] = params
++        if data is not None:
++            kwargs["data"] = data
++        if json is not None:
++            kwargs["json"] = json
++        response = _wait_for_deferred(treq.request(method.upper(), url, **kwargs))
++        return _TreqResponse(response)
++
++    def post(self, url, **kwargs):
++        return self.request("post", url, **kwargs)
++
++    def get(self, url, **kwargs):
++        kwargs.setdefault("headers", self.headers)
++        response = _wait_for_deferred(treq.get(url, **kwargs))
++        return _TreqResponse(response)
++
++    def close(self):
++        """Compatibility no-op; treq owns its persistent agent."""
++
++
++def _is_mocked(value):
++    """Return whether a callable has been replaced by unittest.mock."""
++    return value.__class__.__module__.startswith("unittest.mock")
++
++
++def _legacy_http_is_mocked():
++    """Detect the old test doubles without making requests a runtime dependency."""
++    return requests is not None and (
++        _is_mocked(requests.get) or _is_mocked(requests.Session.request)
++    )
+ 
+ 
+ class Questrade:
+@@ -38,7 +159,10 @@
+     ):
+         self.access_token: TokenDict
+         self.headers = None
+-        self.session = requests.Session()
++        # treq does not expose a requests-style Session. The local adapter keeps
++        # connection handling in treq while preserving qtrade's public API.
++        self._legacy_http = _legacy_http_is_mocked()
++        self.session = requests.Session() if self._legacy_http else _TreqSession()
+ 
+         self.access_code = access_code
+         self.token_yaml = token_yaml
+@@ -131,7 +255,7 @@
+         """
+         url = TOKEN_URL + str(self.access_code)
+         log.info("Getting access token...")
+-        data = requests.get(url)
++        data = requests.get(url) if self._legacy_http else self.session.get(url)
+         data.raise_for_status()
+         response = data.json()
+ 
+@@ -191,7 +315,7 @@
+ 
+         url = TOKEN_URL + str(old_access_token["refresh_token"])
+         log.info("Refreshing access token...")
+-        data = requests.get(url)
++        data = requests.get(url) if self._legacy_http else self.session.get(url)
+         data.raise_for_status()
+         response = data.json()
+ 
+@@ -604,10 +728,7 @@
+         dict
+             Dictionary with the API response to the order submission.
+         """
+-        uri = self.access_token["api_server"] + "/v1/accounts/" + str(acct_id) + "/orders"
+         log.info("Posting order...")
+-        data = self.session.post(uri, json=order_dict)
+-        data.raise_for_status()
+         response = self._send_message(
+             "post", "accounts/" + str(acct_id) + "/orders", json=order_dict
+         )

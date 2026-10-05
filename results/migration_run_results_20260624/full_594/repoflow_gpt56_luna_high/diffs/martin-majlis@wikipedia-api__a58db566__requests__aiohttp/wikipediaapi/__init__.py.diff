@@ -1,0 +1,131 @@
+--- a/wikipediaapi/__init__.py
++++ b/wikipediaapi/__init__.py
+@@ -8,14 +8,16 @@
+ 
+ __version__ = (0, 7, 1)
+ 
++import asyncio
+ from collections import defaultdict
+ from enum import IntEnum
+ import logging
+ import re
++import threading
+ from typing import Any, Optional, Union
+ from urllib import parse
+ 
+-import requests
++import aiohttp
+ 
+ USER_AGENT = (
+     "Wikipedia-API/"
+@@ -140,15 +142,14 @@
+         """
+         Constructs Wikipedia object for extracting information Wikipedia.
+ 
+-        :param user_agent: HTTP User-Agent used in requests
++        :param user_agent: HTTP User-Agent used in HTTP calls
+                 https://meta.wikimedia.org/wiki/User-Agent_policy
+         :param language: Language mutation of Wikipedia -
+                 http://meta.wikimedia.org/wiki/List_of_Wikipedias
+         :param extract_format: Format used for extractions
+                 :class:`ExtractFormat` object.
+         :param headers:  Headers sent as part of HTTP request
+-        :param kwargs: Optional parameters used in -
+-                http://docs.python-requests.org/en/master/api/#requests.request
++        :param kwargs: Optional parameters used in the HTTP request
+ 
+         Examples:
+ 
+@@ -188,14 +189,61 @@
+             self.extract_format,
+         )
+ 
+-        self._session = requests.Session()
+-        self._session.headers.update(default_headers)
+         self._request_kwargs = kwargs
++
++        self._loop = asyncio.new_event_loop()
++        self._session = None
++        self._session_error = []
++        self._session_ready = threading.Event()
++
++        def run_session_loop():
++            asyncio.set_event_loop(self._loop)
++            try:
++                async def create_session():
++                    return aiohttp.ClientSession(headers=default_headers)
++
++                self._session = self._loop.run_until_complete(create_session())
++            except BaseException as exc:
++                self._session_error.append(exc)
++            finally:
++                self._session_ready.set()
++
++            if self._session_error:
++                self._loop.close()
++                return
++
++            self._loop.run_forever()
++            self._loop.run_until_complete(self._session.close())
++            self._loop.close()
++
++        self._session_thread = threading.Thread(
++            target=run_session_loop,
++            name="wikipediaapi-aiohttp",
++            daemon=True,
++        )
++        self._session_thread.start()
++        self._session_ready.wait()
++        if self._session_error:
++            raise self._session_error[0]
+ 
+     def __del__(self) -> None:
+         """Closes session."""
+-        if hasattr(self, "_session") and self._session:
+-            self._session.close()
++        session = getattr(self, "_session", None)
++        loop = getattr(self, "_loop", None)
++        thread = getattr(self, "_session_thread", None)
++        if session is None or loop is None or thread is None:
++            return
++
++        try:
++            if loop.is_running():
++                future = asyncio.run_coroutine_threadsafe(session.close(), loop)
++                future.result()
++                loop.call_soon_threadsafe(loop.stop)
++            if thread.is_alive():
++                thread.join(timeout=1.0)
++        except BaseException:
++            # Destructors must not mask the exception that triggered cleanup.
++            pass
+ 
+     def page(
+         self,
+@@ -526,8 +574,24 @@
+         )
+         params["format"] = "json"
+         params["redirects"] = 1
+-        r = self._session.get(base_url, params=params, **self._request_kwargs)
+-        return r.json()
++        request_kwargs = dict(self._request_kwargs)
++        proxies = request_kwargs.pop("proxies", None)
++        if proxies and "proxy" not in request_kwargs:
++            if isinstance(proxies, dict):
++                request_kwargs["proxy"] = proxies.get("https") or proxies.get("http")
++            else:
++                request_kwargs["proxy"] = proxies
++
++        async def request_json():
++            async with self._session.get(
++                base_url,
++                params=params,
++                **request_kwargs,
++            ) as response:
++                return await response.json(content_type=None)
++
++        future = asyncio.run_coroutine_threadsafe(request_json(), self._loop)
++        return future.result()
+ 
+     def _build_extracts(self, extract, page: "WikipediaPage") -> str:
+         """Constructs summary of given page."""

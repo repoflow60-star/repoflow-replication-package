@@ -1,0 +1,202 @@
+--- a/webauthn/registration/formats/packed.py
++++ b/webauthn/registration/formats/packed.py
+@@ -1,22 +1,136 @@
+ import hashlib
+ from typing import List
+ 
+-from cryptography import x509
+-from cryptography.exceptions import InvalidSignature
+-from cryptography.hazmat.backends import default_backend
++from Crypto.Hash import SHA256, SHA384, SHA512
++from Crypto.PublicKey import ECC, RSA
++from Crypto.Signature import DSS, eddsa, pkcs1_15, pss
++from Crypto.Util.asn1 import DerSequence
++from Crypto.Util.number import bytes_to_long
+ 
+ from webauthn.helpers import (
+-    decode_credential_public_key,
+-    decoded_public_key_to_cryptography,
+     parse_cbor,
+     validate_certificate_chain,
+-    verify_signature,
+ )
+ from webauthn.helpers.exceptions import (
+     InvalidCertificateChain,
+     InvalidRegistrationResponse,
+ )
+ from webauthn.helpers.structs import AttestationStatement
++
++
++def _public_key_from_certificate(certificate_bytes: bytes):
++    certificate = DerSequence()
++    certificate.decode(certificate_bytes)
++
++    tbs_certificate = DerSequence()
++    tbs_certificate.decode(certificate[0])
++
++    if isinstance(tbs_certificate[0], bytes) and tbs_certificate[0][0] == 0xA0:
++        subject_public_key_info = tbs_certificate[6]
++    else:
++        subject_public_key_info = tbs_certificate[5]
++
++    try:
++        return RSA.import_key(subject_public_key_info)
++    except (TypeError, ValueError):
++        return ECC.import_key(subject_public_key_info)
++
++
++def _public_key_from_cose(credential_public_key: bytes):
++    cose_key = parse_cbor(credential_public_key)
++    key_type = cose_key[1]
++
++    if key_type == 2:
++        return RSA.construct(
++            (
++                bytes_to_long(cose_key[-1]),
++                bytes_to_long(cose_key[-2]),
++            )
++        )
++
++    if key_type == 2:
++        curve = {
++            1: "P-256",
++            2: "P-384",
++            3: "P-521",
++        }[cose_key[-1]]
++
++        return ECC.construct(
++            curve=curve,
++            point_x=bytes_to_long(cose_key[-2]),
++            point_y=bytes_to_long(cose_key[-3]),
++        )
++
++    if key_type == 1:
++        curve = cose_key[-1]
++        public_key_bytes = cose_key[-2]
++
++        if curve == 6:
++            algorithm_identifier = b"\x30\x05\x06\x03\x2b\x65\x70"
++        elif curve == 7:
++            algorithm_identifier = b"\x30\x05\x06\x03\x2b\x65\x71"
++        else:
++            raise ValueError("Unsupported OKP curve")
++
++        subject_public_key_info = (
++            algorithm_identifier
++            + b"\x03"
++            + bytes([len(public_key_bytes) + 1])
++            + b"\x00"
++            + public_key_bytes
++        )
++
++        return ECC.import_key(
++            b"\x30"
++            + bytes([len(subject_public_key_info)])
++            + subject_public_key_info
++        )
++
++    raise ValueError("Unsupported COSE key type")
++
++
++def _verify_signature(
++    *,
++    public_key,
++    signature_alg: int,
++    signature: bytes,
++    data: bytes,
++) -> None:
++    if signature_alg in (-257, -258, -259):
++        hash_alg = {
++            -257: SHA256,
++            -258: SHA384,
++            -259: SHA512,
++        }[signature_alg]
++
++        hash_value = hash_alg.new(data)
++        pkcs1_15.new(public_key).verify(hash_value, signature)
++    elif signature_alg in (-37, -38, -39):
++        hash_alg = {
++            -37: SHA256,
++            -38: SHA384,
++            -39: SHA512,
++        }[signature_alg]
++
++        hash_value = hash_alg.new(data)
++        pss.new(public_key, salt_bytes=hash_value.digest_size).verify(
++            hash_value, signature
++        )
++    elif signature_alg in (-7, -35, -36):
++        hash_alg = {
++            -7: SHA256,
++            -35: SHA384,
++            -36: SHA512,
++        }[signature_alg]
++
++        hash_value = hash_alg.new(data)
++        DSS.new(public_key, "fips-186-3", encoding="der").verify(
++            hash_value, signature
++        )
++    elif signature_alg == -8:
++        eddsa.new(public_key).verify(data, signature)
++    else:
++        raise ValueError("Unsupported signature algorithm")
+ 
+ 
+ def verify_packed(
+@@ -64,43 +178,40 @@
+             raise InvalidRegistrationResponse(f"{err} (Packed)")
+ 
+         attestation_cert_bytes = attestation_statement.x5c[0]
+-        attestation_cert = x509.load_der_x509_certificate(
+-            attestation_cert_bytes, default_backend()
+-        )
+-        attestation_cert_pub_key = attestation_cert.public_key()
++        attestation_cert_pub_key = _public_key_from_certificate(attestation_cert_bytes)
+ 
+         try:
+-            verify_signature(
++            _verify_signature(
+                 public_key=attestation_cert_pub_key,
+                 signature_alg=attestation_statement.alg,
+                 signature=attestation_statement.sig,
+                 data=verification_data,
+             )
+-        except InvalidSignature:
++        except (TypeError, ValueError):
+             raise InvalidRegistrationResponse(
+                 "Could not verify attestation statement signature (Packed)"
+             )
+     else:
+         # Self Attestation
+-        decoded_pub_key = decode_credential_public_key(credential_public_key)
+-
+-        if decoded_pub_key.alg != attestation_statement.alg:
++        decoded_pub_key = parse_cbor(credential_public_key)
++
++        if decoded_pub_key[3] != attestation_statement.alg:
+             raise InvalidRegistrationResponse(
+-                f"Credential public key alg {decoded_pub_key.alg} did not equal attestation statement alg {attestation_statement.alg}"
+-            )
+-
+-        public_key = decoded_public_key_to_cryptography(decoded_pub_key)
++                f"Credential public key alg {decoded_pub_key[3]} did not equal attestation statement alg {attestation_statement.alg}"
++            )
++
++        public_key = _public_key_from_cose(credential_public_key)
+ 
+         try:
+-            verify_signature(
++            _verify_signature(
+                 public_key=public_key,
+                 signature_alg=attestation_statement.alg,
+                 signature=attestation_statement.sig,
+                 data=verification_data,
+             )
+-        except InvalidSignature:
++        except (TypeError, ValueError):
+             raise InvalidRegistrationResponse(
+                 "Could not verify attestation statement signature (Packed|Self)"
+             )
+ 
+-    return True
++    return True

@@ -1,0 +1,115 @@
+--- a/segment/analytics/request.py
++++ b/segment/analytics/request.py
+@@ -1,16 +1,83 @@
+ from datetime import date, datetime
+ from io import BytesIO
+ from gzip import GzipFile
++import asyncio
+ import logging
+ import json
++import threading
++
++import aiohttp
+ from dateutil.tz import tzutc
+-from requests.auth import HTTPBasicAuth
+-from requests import sessions
+ 
+ from segment.analytics.version import VERSION
+ from segment.analytics.utils import remove_trailing_slash
+ 
+-_session = sessions.Session()
++
++class _HttpResult:
++    """Buffered result used to retain the existing synchronous response API."""
++
++    def __init__(self, status_code, headers, body, reason):
++        self.status_code = status_code
++        self.headers = headers
++        self._body = body
++        self.reason = reason
++
++    def json(self, **kwargs):
++        return json.loads(self.text, **kwargs)
++
++    @property
++    def text(self):
++        return self._body.decode('utf-8', errors='replace')
++
++
++async def _request_async(method, url, data, headers, timeout, proxy):
++    client_timeout = aiohttp.ClientTimeout(total=timeout) if timeout is not None else None
++    async with aiohttp.ClientSession() as session:
++        async with session.request(
++            method,
++            url,
++            data=data,
++            headers=headers,
++            timeout=client_timeout,
++            proxy=proxy,
++        ) as response:
++            body = await response.read()
++            return _HttpResult(response.status, response.headers, body, response.reason)
++
++
++def _run_async(coroutine_factory):
++    """Run an aiohttp operation while keeping this module's sync API."""
++    try:
++        asyncio.get_running_loop()
++    except RuntimeError:
++        return asyncio.run(coroutine_factory())
++
++    result = []
++    error = []
++
++    def run_in_thread():
++        try:
++            result.append(asyncio.run(coroutine_factory()))
++        except BaseException as exc:
++            error.append(exc)
++
++    thread = threading.Thread(target=run_in_thread)
++    thread.start()
++    thread.join()
++    if error:
++        raise error[0]
++    return result[0]
++
++
++def _request(method, url, data=None, headers=None, timeout=15, proxies=None):
++    proxy = None
++    if isinstance(proxies, dict):
++        proxy = proxies.get('https') or proxies.get('http')
++    elif proxies:
++        proxy = proxies
++    return _run_async(
++        lambda: _request_async(method, url, data, headers, timeout, proxy)
++    )
+ 
+ 
+ def post(write_key, host=None, gzip=False, timeout=15, proxies=None, oauth_manager=None, **kwargs):
+@@ -42,17 +109,16 @@
+             gz.write(data.encode('utf-8'))
+         data = buf.getvalue()
+ 
+-    kwargs = {
+-        "data": data,
+-        "headers": headers,
+-        "timeout": 15,
+-    }
+-
+-    if proxies:
+-        kwargs['proxies'] = proxies
+     res = None
+     try:
+-        res = _session.post(url, data=data, headers=headers, timeout=timeout)
++        res = _request(
++            'POST',
++            url,
++            data=data,
++            headers=headers,
++            timeout=timeout,
++            proxies=proxies,
++        )
+     except Exception as e:
+         log.error(e)
+         raise e

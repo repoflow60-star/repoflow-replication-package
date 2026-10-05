@@ -1,0 +1,270 @@
+--- a/cas.py
++++ b/cas.py
+@@ -2,9 +2,93 @@
+ import logging
+ from uuid import uuid4
+ 
+-import requests
++import treq
+ from lxml import etree
+ from six.moves.urllib import parse as urllib_parse
++from twisted.internet.defer import Deferred
++
++
++def _is_deferred(value):
++    """Return whether *value* is a Twisted Deferred.
++
++    ``treq`` is asynchronous, while the ``session`` argument has historically
++    accepted requests-like objects.  Keeping this check in one place lets
++    callers continue to use a synchronous custom session and also supports the
++    Deferreds returned by treq.
++    """
++    return isinstance(value, Deferred)
++
++
++def _response_status(response):
++    """Get an HTTP status from either a requests or treq response."""
++    return getattr(response, 'status_code', getattr(response, 'code', None))
++
++
++def _response_body(response):
++    """Get a response body from either a requests or treq response."""
++    content = response.content
++    return content() if callable(content) else content
++
++
++def _close_response(response):
++    """Close requests responses; treq responses have no close method."""
++    close = getattr(response, 'close', None)
++    if close is not None:
++        close()
++
++
++def _read_response(response):
++    """Read and close a response, returning a value or a Deferred."""
++    body = _response_body(response)
++    if _is_deferred(body):
++        def close_response(result):
++            _close_response(response)
++            return result
++
++        body.addBoth(close_response)
++        return body
++
++    _close_response(response)
++    return body
++
++
++def _session_request(session, method, url, *args, **kwargs):
++    """Call a requests-like or treq session.
++
++    ``verify`` and ``stream`` are requests options and are not accepted by
++    treq.  The default session below handles TLS verification when it is
++    constructed, so those options must not be forwarded to treq.
++    """
++    is_treq = (getattr(session, '_is_treq_session', False) is True or
++               isinstance(session, treq.client.HTTPClient) or
++               session is treq)
++    if is_treq:
++        kwargs.pop('verify', None)
++        kwargs.pop('stream', None)
++    return getattr(session, method)(url, *args, **kwargs)
++
++
++class _TreqSession(object):
++    """Small requests-session-compatible facade backed by treq."""
++
++    _is_treq_session = True
++
++    def __init__(self, verify_ssl_certificate=True):
++        from twisted.internet import reactor
++        from twisted.web.client import Agent
++
++        if verify_ssl_certificate:
++            agent = Agent(reactor)
++        else:
++            from twisted.internet import ssl
++            agent = Agent(reactor, contextFactory=ssl.CertificateOptions(verify=False))
++        self._client = treq.client.HTTPClient(agent)
++
++    def get(self, url, **kwargs):
++        return self._client.get(url, **kwargs)
++
++    def post(self, url, data=None, **kwargs):
++        return self._client.post(url, data=data, **kwargs)
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -79,7 +163,8 @@
+         self.renew = renew
+         self.username_attribute = username_attribute
+         self.verify_ssl_certificate = verify_ssl_certificate
+-        self.session = session or requests.sessions.Session()
++        self.session = (session if session is not None else
++                        _TreqSession(verify_ssl_certificate))
+ 
+     def verify_ticket(self, ticket):
+         """Verify ticket.
+@@ -140,10 +225,22 @@
+         Raises:
+             CASError: Non 200 http code or bad XML body.
+         """
+-        response = self.session.get(self.get_proxy_url(pgt), verify=self.verify_ssl_certificate)
+-        if response.status_code == 200:
+-            from lxml import etree
+-            root = etree.fromstring(response.content)
++        response = _session_request(
++            self.session, 'get', self.get_proxy_url(pgt),
++            verify=self.verify_ssl_certificate)
++
++        def parse_proxy_response(response):
++            status = _response_status(response)
++            if status != 200:
++                raise CASError("Bad http code %s" % status)
++
++            body = _read_response(response)
++            if _is_deferred(body):
++                return body.addCallback(parse_proxy_body)
++            return parse_proxy_body(body)
++
++        def parse_proxy_body(body):
++            root = etree.fromstring(body)
+             tickets = root.xpath(
+                 "//cas:proxyTicket",
+                 namespaces={"cas": "http://www.yale.edu/tp/cas"}
+@@ -156,7 +253,11 @@
+             )
+             if len(errors) == 1:
+                 raise CASError(errors[0].attrib['code'], errors[0].text)
+-        raise CASError("Bad http code %s" % response.status_code)
++            raise CASError("Bad http code 200")
++
++        if _is_deferred(response):
++            return response.addCallback(parse_proxy_response)
++        return parse_proxy_response(response)
+ 
+ 
+ class CASClientV1(CASClientBase):
+@@ -172,20 +273,36 @@
+         params = [('ticket', ticket), ('service', self.service_url)]
+         url = (urllib_parse.urljoin(self.server_url, 'validate') + '?' +
+                urllib_parse.urlencode(params))
+-        page = self.session.get(
+-            url,
++        page = _session_request(
++            self.session, 'get', url,
+             stream=True,
+-            verify=self.verify_ssl_certificate
+-        )
+-        try:
+-            page_iterator = page.iter_lines(chunk_size=8192)
+-            verified = next(page_iterator).strip()
+-            if verified == 'yes':
+-                return next(page_iterator).strip(), None, None
+-            else:
+-                return None, None, None
+-        finally:
+-            page.close()
++            verify=self.verify_ssl_certificate)
++
++        def parse_page(page):
++            if hasattr(page, 'iter_lines'):
++                try:
++                    page_iterator = page.iter_lines(chunk_size=8192)
++                    verified = next(page_iterator).strip()
++                    if verified in ('yes', b'yes'):
++                        return next(page_iterator).strip(), None, None
++                    return None, None, None
++                finally:
++                    _close_response(page)
++
++            body = _read_response(page)
++            if _is_deferred(body):
++                return body.addCallback(parse_lines)
++            return parse_lines(body)
++
++        def parse_lines(body):
++            lines = body.splitlines()
++            if lines and lines[0].strip() in ('yes', b'yes'):
++                return (lines[1].strip() if len(lines) > 1 else None), None, None
++            return None, None, None
++
++        if _is_deferred(page):
++            return page.addCallback(parse_page)
++        return parse_page(page)
+ 
+ 
+ class CASClientV2(CASClientBase):
+@@ -202,6 +319,8 @@
+     def verify_ticket(self, ticket):
+         """Verifies CAS 2.0+/3.0+ XML-based authentication ticket and returns extended attributes"""
+         response = self.get_verification_response(ticket)
++        if _is_deferred(response):
++            return response.addCallback(self.verify_response)
+         return self.verify_response(response)
+ 
+     def get_verification_response(self, ticket):
+@@ -212,15 +331,13 @@
+         if self.proxy_callback:
+             params.update({'pgtUrl': self.proxy_callback})
+         base_url = urllib_parse.urljoin(self.server_url, self.url_suffix)
+-        page = self.session.get(
+-            base_url,
++        page = _session_request(
++            self.session, 'get', base_url,
+             params=params,
+-            verify=self.verify_ssl_certificate
+-        )
+-        try:
+-            return page.content
+-        finally:
+-            page.close()
++            verify=self.verify_ssl_certificate)
++        if _is_deferred(page):
++            return page.addCallback(_read_response)
++        return _read_response(page)
+ 
+     @classmethod
+     def parse_attributes_xml_element(cls, element):
+@@ -335,10 +452,15 @@
+ 
+         page = self.fetch_saml_validation(ticket)
+ 
+-        try:
++        def parse_page(page):
++            response = _read_response(page)
++            if _is_deferred(response):
++                return response.addCallback(parse_response)
++            return parse_response(response)
++
++        def parse_response(response):
+             user = None
+             attributes = {}
+-            response = page.content
+             tree = ElementTree.fromstring(response)
+             # Find the authentication status
+             success = tree.find('.//' + SAML_1_0_PROTOCOL_NS + 'StatusCode')
+@@ -362,8 +484,10 @@
+                     else:
+                         attributes[at.attrib['AttributeName']] = values[0].text
+             return user, attributes, None
+-        finally:
+-            page.close()
++
++        if _is_deferred(page):
++            return page.addCallback(parse_page)
++        return parse_page(page)
+ 
+     def fetch_saml_validation(self, ticket):
+         """We do the SAML validation"""
+@@ -380,8 +504,8 @@
+         saml_validate_url = urllib_parse.urljoin(
+             self.server_url, 'samlValidate',
+         )
+-        return self.session.post(
+-            saml_validate_url,
++        return _session_request(
++            self.session, 'post', saml_validate_url,
+             self.get_saml_assertion(ticket),
+             params=params,
+             headers=headers)

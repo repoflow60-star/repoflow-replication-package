@@ -1,0 +1,157 @@
+--- a/pyschlage/_http.py
++++ b/pyschlage/_http.py
+@@ -0,0 +1,154 @@
++"""Small HTTP response/request adapter implemented with pycurl."""
++
++from __future__ import annotations
++
++from io import BytesIO
++import json as json_module
++from typing import Any, Callable, Mapping
++from urllib.parse import urlencode
++
++import pycurl
++
++
++class HTTPError(Exception):
++    """Raised when an HTTP response has an error status."""
++
++    def __init__(self, response: HTTPResponse) -> None:
++        self.response = response
++        super().__init__(f"{response.status_code} {response.reason}".strip())
++
++
++class HTTPRequest:
++    """Request shape required by pycognito's requests auth callable."""
++
++    def __init__(
++        self,
++        method: str = "",
++        url: str = "",
++        headers: Mapping[str, str] | None = None,
++        body: bytes | None = None,
++    ) -> None:
++        self.method = method
++        self.url = url
++        self.headers = dict(headers or {})
++        self.body = body
++
++
++class HTTPResponse:
++    """Response object exposing the subset used by pyschlage."""
++
++    def __init__(
++        self,
++        content: bytes,
++        status_code: int,
++        reason: str,
++        headers: Mapping[str, str],
++    ) -> None:
++        self.content = content
++        self.status_code = status_code
++        self.reason = reason
++        self.headers = dict(headers)
++
++    @property
++    def text(self) -> str:
++        """Returns the response body decoded as UTF-8."""
++        return self.content.decode("utf-8")
++
++    def json(self) -> Any:
++        """Decodes the response body as JSON."""
++        return json_module.loads(self.content)
++
++    def raise_for_status(self) -> None:
++        """Raises HTTPError for client and server error responses."""
++        if self.status_code >= 400:
++            raise HTTPError(self)
++
++
++def _append_params(url: str, params: Any) -> str:
++    if not params:
++        return url
++    query = urlencode(params, doseq=True)
++    separator = "&" if "?" in url else "?"
++    return f"{url}{separator}{query}"
++
++
++def _header_value(value: Any) -> str:
++    if isinstance(value, bytes):
++        return value.decode("latin-1")
++    return str(value)
++
++
++def request(method: str, url: str, **kwargs: Any) -> HTTPResponse:
++    """Perform an HTTP request using a pycurl handle."""
++    supported = {"auth", "data", "headers", "json", "params", "timeout"}
++    unexpected = set(kwargs) - supported
++    if unexpected:
++        name = sorted(unexpected)[0]
++        raise TypeError(f"unexpected request argument: {name}")
++
++    headers = {
++        str(key): _header_value(value)
++        for key, value in (kwargs.get("headers") or {}).items()
++    }
++    url = _append_params(url, kwargs.get("params"))
++    payload: bytes | None = None
++    if kwargs.get("json") is not None:
++        payload = json_module.dumps(kwargs["json"]).encode("utf-8")
++        if not any(key.lower() == "content-type" for key in headers):
++            headers["Content-Type"] = "application/json"
++    elif kwargs.get("data") is not None:
++        data = kwargs["data"]
++        if isinstance(data, bytes):
++            payload = data
++        elif isinstance(data, str):
++            payload = data.encode("utf-8")
++        elif isinstance(data, Mapping):
++            payload = urlencode(data, doseq=True).encode("utf-8")
++        else:
++            payload = bytes(data)
++
++    auth: Callable[[HTTPRequest], HTTPRequest] | None = kwargs.get("auth")
++    prepared = HTTPRequest(method.upper(), url, headers, payload)
++    if auth is not None:
++        authenticated = auth(prepared)
++        if authenticated is not None:
++            prepared = authenticated
++        headers = prepared.headers
++        payload = getattr(prepared, "body", payload)
++
++    body = BytesIO()
++    response_headers: dict[str, str] = {}
++    status_line = ""
++
++    def receive_header(raw_header: bytes) -> int:
++        nonlocal status_line
++        line = raw_header.decode("latin-1").strip()
++        if line.startswith("HTTP/"):
++            status_line = line
++        elif ":" in line:
++            key, value = line.split(":", 1)
++            response_headers[key.strip()] = value.strip()
++        return len(raw_header)
++
++    curl = pycurl.Curl()
++    try:
++        curl.setopt(pycurl.URL, prepared.url)
++        curl.setopt(pycurl.CUSTOMREQUEST, prepared.method)
++        curl.setopt(
++            pycurl.HTTPHEADER,
++            [f"{key}: {_header_value(value)}" for key, value in headers.items()],
++        )
++        curl.setopt(pycurl.WRITEFUNCTION, body.write)
++        curl.setopt(pycurl.HEADERFUNCTION, receive_header)
++        if kwargs.get("timeout") is not None:
++            curl.setopt(pycurl.TIMEOUT, kwargs["timeout"])
++        if payload is not None:
++            curl.setopt(pycurl.POSTFIELDS, payload)
++        curl.perform()
++        status_code = int(curl.getinfo(pycurl.RESPONSE_CODE))
++    finally:
++        curl.close()
++
++    parts = status_line.split(" ", 2)
++    reason = parts[2] if len(parts) == 3 else ""
++    return HTTPResponse(body.getvalue(), status_code, reason, response_headers)

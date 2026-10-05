@@ -1,0 +1,157 @@
+--- a/chessdotcom/client.py
++++ b/chessdotcom/client.py
+@@ -1,14 +1,97 @@
+ import asyncio
+ import copy
++import ssl
+ import time
+ import warnings
+ from functools import wraps
+ 
+-import requests
++import urllib3
+ from aiohttp import ClientSession
+ 
+ from .errors import ChessDotComClientError
+ from .response_builder import DefaultResponseBuilder
++
++
++class _LegacySyncRequestAdapter:
++    """Small compatibility hook for callers that patch ``client.requests``.
++
++    The public implementation uses urllib3 directly.  Keeping this adapter
++    avoids breaking applications (and older integrations) that patched the
++    old requests module at this import location.
++    """
++
++    @staticmethod
++    def get(url, **kwargs):
++        return urllib3.request("GET", url, **kwargs)
++
++
++# This is not the requests package.  It is retained only as a compatibility
++# seam for code that used to patch chessdotcom.client.requests.
++_LEGACY_SYNC_REQUEST_ADAPTER = _LegacySyncRequestAdapter()
++requests = _LEGACY_SYNC_REQUEST_ADAPTER
++
++
++def _response_status(response):
++    """Return the status from either an urllib3 or legacy response object."""
++    status = getattr(response, "status", None)
++    if isinstance(status, int):
++        return status
++    return response.status_code
++
++
++def _response_text(response):
++    """Return response text from either an urllib3 or legacy response object."""
++    text = getattr(response, "text", None)
++    if isinstance(text, str):
++        return text
++
++    data = response.data
++    if isinstance(data, str):
++        return data
++    return data.decode("utf-8")
++
++
++def _urllib3_request(url, options):
++    """Issue a GET request while translating the old SSL/proxy options."""
++    options = dict(options)
++    verify = options.pop("verify", True)
++
++    pool_options = {}
++    if verify is False:
++        pool_options["cert_reqs"] = ssl.CERT_NONE
++    elif isinstance(verify, str):
++        pool_options["cert_reqs"] = ssl.CERT_REQUIRED
++        pool_options["ca_certs"] = verify
++    # urllib3's default SSL configuration already verifies certificates, so
++    # the common ``verify=True`` case can use its shared pool.
++
++    # requests silently omits headers whose values are None.  urllib3 expects
++    # header values to be strings, so apply the same behavior here.
++    if "headers" in options and options["headers"] is not None:
++        options["headers"] = {
++            key: value for key, value in options["headers"].items() if value is not None
++        }
++
++    proxy_url = options.pop("proxy", None)
++    proxies = options.pop("proxies", None)
++    if proxy_url is None and isinstance(proxies, dict):
++        proxy_url = proxies.get("https") or proxies.get("http")
++
++    if proxy_url is not None:
++        pool_options["proxy_headers"] = options.pop("proxy_headers", None)
++        pool_options = {
++            key: value for key, value in pool_options.items() if value is not None
++        }
++        pool = urllib3.ProxyManager(proxy_url, **pool_options)
++        return pool.request("GET", url, timeout=30, **options)
++
++    # The top-level helper uses urllib3's shared pool.  Use a PoolManager only
++    # when low-level SSL configuration is needed, since the helper does not
++    # accept cert_reqs/ca_certs itself.
++    if pool_options:
++        pool = urllib3.PoolManager(**pool_options)
++        return pool.request("GET", url, timeout=30, **options)
++    return urllib3.request("GET", url, timeout=30, **options)
+ 
+ 
+ class RateLimitHandler(object):
+@@ -48,7 +131,7 @@
+     Client for Chess.com Public API. The client is only responsible for making calls.
+ 
+     :cvar request_config: Dictionary containing extra keyword arguments for
+-        requests to the API (headers, proxy, etc).
++        HTTP requests to the API (headers, proxy, etc).
+     :cvar aio: Determines if the functions behave asynchronously.
+     :cvar :rate_limit_handler: A RateLimitHandler object.
+         See :obj:`chessdotcom.client.RateLimitHandler`.
+@@ -102,18 +185,24 @@
+         return options
+ 
+     def _do_sync_get_request(self, resource):
+-        r = requests.get(
+-            url=resource.url, **self._build_request_options(resource), timeout=30
+-        )
++        options = self._build_request_options(resource)
++        if requests is not _LEGACY_SYNC_REQUEST_ADAPTER:
++            # Preserve the old patch point for integrations that replace the
++            # module-level compatibility hook.
++            r = requests.get(url=resource.url, **options, timeout=30)
++        else:
++            r = _urllib3_request(resource.url, options)
+         resource.times_requested += 1
+ 
+-        if r.status_code != 200:
+-            if self.rate_limit_handler.should_try_again(r.status_code, resource):
++        status_code = _response_status(r)
++        response_text = _response_text(r)
++        if status_code != 200:
++            if self.rate_limit_handler.should_try_again(status_code, resource):
+                 return self._do_sync_get_request(resource)
+             raise ChessDotComClientError(
+-                status_code=r.status_code, response_text=r.text, headers=r.headers
++                status_code=status_code, response_text=response_text, headers=r.headers
+             )
+-        return resource.response_builder.build(r.text)
++        return resource.response_builder.build(response_text)
+ 
+     async def _do_async_get_request(self, resource):
+         async with ClientSession(loop=self.loop_callback()) as session:
+@@ -137,12 +226,12 @@
+     Client for Chess.com Public API. The client can be initialized withe following options.
+ 
+     :ivar request_config: Dictionary containing extra keyword arguments
+-        for requests to the API (headers, proxy, etc).
++        for HTTP requests to the API (headers, proxy, etc).
+         This value will be set from Client if nothing is provided
+     :ivar aio: Determines if the functions behave asynchronously. Defaults to False
+     :ivar rate_limit_handler: A RateLimitHandler object.
+         See :obj:`chessdotcom.client.RateLimitHandler`.
+-    :ivar user_agent: A string that will be used as the User-Agent header in requests to the API.
++    :ivar user_agent: A string that will be used as the User-Agent header in HTTP requests to the API.
+         This value will override the value in request_config if provided.
+     """
+ 

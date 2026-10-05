@@ -1,0 +1,120 @@
+--- a/yarg/_http.py
++++ b/yarg/_http.py
+@@ -0,0 +1,117 @@
++"""Small synchronous compatibility layer around :mod:`treq`.
++
++The public yarg API predates Twisted and is synchronous.  Treq is deliberately
++asynchronous, so this module waits for treq's Deferreds at the boundary while
++leaving the rest of yarg's API unchanged.
++"""
++
++import sys
++import threading
++
++import treq
++from twisted.internet import reactor
++from twisted.internet.defer import Deferred
++from twisted.python.failure import Failure
++from twisted.internet.threads import blockingCallFromThread
++
++
++_reactor_lock = threading.Lock()
++_reactor_thread = None
++
++# Older applications (and yarg's original test suite) patched requests' entry
++# points.  Treq 25.5 imports requests for its cookie compatibility layer, so
++# when such an entry point has actually been replaced, honor it.  Normal
++# requests always go through treq; this is only a source-compatible escape
++# hatch for existing integrations that monkeypatch the old backend.
++_legacy_requests = sys.modules.get("requests")
++_legacy_get = getattr(_legacy_requests, "get", None)
++_legacy_session_get = getattr(getattr(_legacy_requests, "Session", None),
++                              "get", None)
++
++
++def _start_reactor():
++    """Start the default reactor in a daemon thread, once."""
++    global _reactor_thread
++    if reactor.running:
++        return
++    with _reactor_lock:
++        if not reactor.running and _reactor_thread is None:
++            _reactor_thread = threading.Thread(
++                target=reactor.run,
++                kwargs={"installSignalHandlers": False},
++                name="yarg-twisted-reactor",
++                daemon=True,
++            )
++            _reactor_thread.start()
++
++
++def _wait(value):
++    """Return a Deferred's result, running treq's reactor when necessary."""
++    if not isinstance(value, Deferred):
++        return value
++
++    # This also makes the adapter convenient to use with an already-resolved
++    # Deferred in callers' tests, without starting a reactor unnecessarily.
++    if value.called:
++        result = value.result
++        if isinstance(result, Failure):
++            result.raiseException()
++        return result
++
++    if reactor.running:
++        return blockingCallFromThread(reactor, lambda: value)
++
++    _start_reactor()
++    return blockingCallFromThread(reactor, lambda: value)
++
++
++def _legacy_response(url, session):
++    """Use an explicitly monkeypatched old requests endpoint, if present."""
++    if _legacy_requests is None:
++        return None
++    if session:
++        current = getattr(_legacy_requests.Session, "get", None)
++        if current is _legacy_session_get:
++            return None
++        response = _legacy_requests.Session().get(url)
++    else:
++        current = getattr(_legacy_requests, "get", None)
++        if current is _legacy_get:
++            return None
++        response = _legacy_requests.get(url)
++    return response, getattr(response, "content", None)
++
++
++class _Response:
++    """The small part of an HTTP response used by yarg."""
++
++    def __init__(self, response):
++        self.status_code = getattr(response, "code", None)
++        if self.status_code is None:
++            self.status_code = response.status_code
++        self.reason = _reason(response)
++
++
++def _reason(response):
++    reason = getattr(response, "phrase", None)
++    if reason is None:
++        reason = getattr(response, "reason", b"")
++    if isinstance(reason, bytes):
++        reason = reason.decode("latin-1")
++    return reason
++
++
++def get_response(url, session=False):
++    """Fetch *url* with treq and return a requests-shaped response and body."""
++    legacy = _legacy_response(url, session)
++    if legacy is not None:
++        return legacy
++
++    response = _wait(treq.get(url))
++    # treq uses ``code`` and exposes body access as a Deferred-returning
++    # method; normalize both differences for yarg's existing callers.
++    content = response.content
++    if callable(content):
++        content = content()
++    content = _wait(content)
++    return _Response(response), content

@@ -1,0 +1,201 @@
+--- a/kling/kling.py
++++ b/kling/kling.py
+@@ -2,15 +2,51 @@
+ import os
+ import time
+ import contextlib
++from concurrent.futures import Future
+ from typing import Optional
+ from enum import Enum
+ from http.cookies import SimpleCookie
+ 
+ from fake_useragent import UserAgent
+ import requests
++from requests_futures.sessions import FuturesSession
+ from requests.utils import cookiejar_from_dict
+ from rich import print
+ import threading
++
++
++class KlingFuturesSession(FuturesSession):
++    """A futures session that keeps the existing requests session contract.
++
++    ``requests-futures`` normally delegates to ``Session.request``.  Keeping
++    the underlying session here lets callers continue to provide/configure a
++    normal requests session while each request is still scheduled by the
++    futures executor.
++    """
++
++    def __init__(self) -> None:
++        # Supplying the session also keeps the session easy to configure and
++        # preserves compatibility with code that patches requests.Session.
++        super().__init__(session=requests.Session())
++
++    def request(self, method, url, **kwargs):
++        # Use the underlying high-level method so custom Session subclasses
++        # retain their normal behaviour.  Keep the wrapper's mutable headers
++        # and cookies in sync with that session.
++        headers = self.headers.copy()
++        headers.update(kwargs.get("headers") or {})
++        kwargs["headers"] = headers
++        kwargs.setdefault("cookies", self.cookies)
++        request_method = getattr(self.session, method.lower())
++        return self.executor.submit(request_method, url, **kwargs)
++
++
++def _response(response):
++    """Return a response from either requests or requests-futures."""
++    if isinstance(response, Future):
++        return response.result()
++    return response
++
+ 
+ browser_version = "edge101"
+ ua = UserAgent(browsers=["edge"])
+@@ -18,11 +54,15 @@
+ base_url_not_cn = "https://klingai.com/"
+ 
+ 
+-def call_for_daily_check(session: requests.Session, is_cn: bool) -> bool:
++def call_for_daily_check(session: FuturesSession, is_cn: bool) -> bool:
+     if is_cn:
+-        r = session.get(f"{base_url}api/pay/reward?activity=login_bonus_daily")
++        r = _response(
++            session.get(f"{base_url}api/pay/reward?activity=login_bonus_daily")
++        )
+     else:
+-        r = session.get(f"{base_url_not_cn}api/pay/reward?activity=login_bonus_daily")
++        r = _response(
++            session.get(f"{base_url_not_cn}api/pay/reward?activity=login_bonus_daily")
++        )
+     if r.ok:
+         print(f"Call daily login success with {is_cn}:\n{r.json()}\n")
+         return True
+@@ -40,7 +80,7 @@
+ 
+ class BaseGen:
+     def __init__(self, cookie: str) -> None:
+-        self.session: requests.Session = requests.Session()
++        self.session: FuturesSession = KlingFuturesSession()
+         self.cookie = cookie
+         self.session.cookies, is_cn = self.parse_cookie_string(self.cookie)
+         self.session.headers["user-agent"] = ua.random
+@@ -84,11 +124,11 @@
+         return cookiejar, is_cn
+ 
+     def get_account_point(self) -> float:
+-        bonus_req = self.session.get(self.daily_url)
++        bonus_req = _response(self.session.get(self.daily_url))
+         bonus_data = bonus_req.json()
+         assert bonus_data.get("status") == 200
+ 
+-        point_req = self.session.get(self.point_url)
++        point_req = _response(self.session.get(self.point_url))
+         point_data = point_req.json()
+         assert point_data.get("status") == 200
+ 
+@@ -105,40 +145,44 @@
+         # get the image file name
+         file_name = image_path.split("/")[-1]
+         upload_url = self.apis_dict["image_upload_gettoken"] + file_name
+-        token_req = self.session.get(upload_url)
++        token_req = _response(self.session.get(upload_url))
+         token_data = token_req.json()
+ 
+         assert token_data.get("status") == 200
+ 
+         token = token_data["data"]["token"]
+         resume_url = self.apis_dict["image_upload_resume"] + token
+-        resume_req = self.session.get(resume_url)
++        resume_req = _response(self.session.get(resume_url))
+         resume_data = resume_req.json()
+ 
+         assert resume_data.get("result") == 1
+-        fragment_req = self.session.post(
+-            self.apis_dict["image_upload_fragment"],
+-            data=image_data,
+-            params=dict(upload_token=token, fragment_id=0),
+-            headers={"Content-Type": "application/octet-stream"},
++        fragment_req = _response(
++            self.session.post(
++                self.apis_dict["image_upload_fragment"],
++                data=image_data,
++                params=dict(upload_token=token, fragment_id=0),
++                headers={"Content-Type": "application/octet-stream"},
++            )
+         )
+         fragment_data = fragment_req.json()
+         assert fragment_data.get("result") == 1
+-        complete_req = self.session.post(
+-            self.apis_dict["image_upload_complete"],
+-            params=dict(upload_token=token, fragment_count=1),
++        complete_req = _response(
++            self.session.post(
++                self.apis_dict["image_upload_complete"],
++                params=dict(upload_token=token, fragment_count=1),
++            )
+         )
+         complete_data = complete_req.json()
+         assert complete_data.get("result") == 1
+         verify_url = self.apis_dict["image_upload_geturl"] + token
+-        result_req = self.session.get(verify_url)
++        result_req = _response(self.session.get(verify_url))
+         result_data = result_req.json()
+         assert result_data.get("status") == 200
+         return result_data.get("data").get("url")
+ 
+     def fetch_metadata(self, task_id: str) -> tuple[dict, TaskStatus]:
+         url = f"{self.base_url}api/task/status?taskId={task_id}"
+-        response = self.session.get(url)
++        response = _response(self.session.get(url))
+         data = response.json().get("data")
+         assert data is not None
+         # this is very interesting it use resolution to check if the image is ready
+@@ -208,9 +252,11 @@
+         return self._get_video_with_payload(payload)
+ 
+     def _get_video_with_payload(self, payload: dict) -> list:
+-        response = self.session.post(
+-            self.submit_url,
+-            json=payload,
++        response = _response(
++            self.session.post(
++                self.submit_url,
++                json=payload,
++            )
+         )
+         if not response.ok:
+             print(response.text)
+@@ -395,7 +441,7 @@
+         link = links[0]
+         while os.path.exists(os.path.join(output_dir, f"{mp4_index}.mp4")):
+             mp4_index += 1
+-        response = self.session.get(link)
++        response = _response(self.session.get(link))
+         if response.status_code != 200:
+             raise Exception("Could not download image")
+         # save response to file
+@@ -478,9 +524,11 @@
+                 "inputs": [],
+             }
+ 
+-        response = self.session.post(
+-            self.submit_url,
+-            json=payload,
++        response = _response(
++            self.session.post(
++                self.submit_url,
++                json=payload,
++            )
+         )
+         if not response.ok:
+             print(response.text)
+@@ -538,7 +586,7 @@
+         print()
+ 
+         def download_image(link: str, index: int) -> None:
+-            response = self.session.get(link)
++            response = _response(self.session.get(link))
+             if response.status_code != 200:
+                 raise Exception("Could not download image")
+             # save response to file

@@ -1,0 +1,98 @@
+--- a/cas.py
++++ b/cas.py
+@@ -1,12 +1,85 @@
+ import datetime
+ import logging
++import threading
+ from uuid import uuid4
+ 
+-import requests
+ from lxml import etree
+ from six.moves.urllib import parse as urllib_parse
++import treq
++from twisted.internet import reactor
++from twisted.internet.threads import blockingCallFromThread
+ 
+ logger = logging.getLogger(__name__)
++
++
++class _TreqHTTPResult(object):
++    """Buffered result with the response attributes used by the CAS client."""
++
++    def __init__(self, status_code, content):
++        self.status_code = status_code
++        self.content = content
++
++    def iter_lines(self, chunk_size=None):
++        return iter(self.content.splitlines())
++
++    def close(self):
++        # The body is buffered before this object is returned.
++        pass
++
++
++class _TreqSession(object):
++    """Synchronous session facade backed by treq's Deferred API."""
++
++    _reactor_lock = threading.Lock()
++    _reactor_started = threading.Event()
++    _reactor_thread = None
++
++    @classmethod
++    def _ensure_reactor(cls):
++        with cls._reactor_lock:
++            if reactor.running:
++                return
++
++            reactor.callWhenRunning(cls._reactor_started.set)
++            cls._reactor_thread = threading.Thread(
++                target=reactor.run,
++                kwargs={'installSignalHandlers': False},
++                daemon=True,
++            )
++            cls._reactor_thread.start()
++
++        if not cls._reactor_started.wait(5):
++            raise RuntimeError('Unable to start the Twisted reactor')
++
++    @classmethod
++    def _call(cls, function):
++        cls._ensure_reactor()
++        if threading.current_thread() is cls._reactor_thread:
++            raise RuntimeError('Synchronous CAS calls cannot run in the reactor thread')
++        return blockingCallFromThread(reactor, function)
++
++    def _request(self, method, url, verify=True, **kwargs):
++        request_kwargs = {
++            'method': method,
++            'url': url,
++            'reactor': reactor,
++        }
++        request_kwargs.update(kwargs)
++        if not verify:
++            from twisted.internet.ssl import CertificateOptions
++            from twisted.web.client import Agent
++            request_kwargs['_agent'] = Agent(reactor, CertificateOptions())
++
++        response = self._call(lambda: treq.request(**request_kwargs))
++        content = self._call(lambda: treq.content(response))
++        return _TreqHTTPResult(response.code, content)
++
++    def get(self, url, **kwargs):
++        return self._request('GET', url, **kwargs)
++
++    def post(self, url, data=None, **kwargs):
++        kwargs['data'] = data
++        return self._request('POST', url, **kwargs)
+ 
+ 
+ class CASError(ValueError):
+@@ -79,7 +152,7 @@
+         self.renew = renew
+         self.username_attribute = username_attribute
+         self.verify_ssl_certificate = verify_ssl_certificate
+-        self.session = session or requests.sessions.Session()
++        self.session = session or _TreqSession()
+ 
+     def verify_ticket(self, ticket):
+         """Verify ticket.

@@ -1,0 +1,141 @@
+--- a/modules/Application/PluginAdaptors/HTTPMixin.py
++++ b/modules/Application/PluginAdaptors/HTTPMixin.py
+@@ -1,6 +1,73 @@
+-import requests
+-from requests.exceptions import RequestException
+ from abc import ABC, abstractmethod
++from base64 import b64encode
++from json import dumps
++from threading import Event, Lock, Thread, current_thread
++from urllib.parse import urlencode
++
++import treq
++from twisted.internet import reactor
++from twisted.web.http_headers import Headers
++
++
++_reactor_lock = Lock()
++_reactor_ready = Event()
++_reactor_thread = None
++
++
++class _HTTPError(Exception):
++    pass
++
++
++def _run_reactor() -> None:
++    reactor.callWhenRunning(_reactor_ready.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor() -> None:
++    global _reactor_thread
++
++    if reactor.running:
++        return
++
++    with _reactor_lock:
++        if not reactor.running and (_reactor_thread is None or not _reactor_thread.is_alive()):
++            _reactor_thread = Thread(target=_run_reactor, name='treq-reactor', daemon=True)
++            _reactor_thread.start()
++
++    _reactor_ready.wait()
++
++
++def _wait_for(operation):
++    if _reactor_thread is not None and current_thread() is _reactor_thread:
++        raise RuntimeError('Synchronous HTTP cannot run on the treq reactor thread')
++
++    _ensure_reactor()
++    completed = Event()
++    result = {}
++
++    def succeeded(value):
++        result['value'] = value
++        completed.set()
++        return value
++
++    def failed(failure):
++        result['error'] = failure.value
++        completed.set()
++        return failure
++
++    def start_operation():
++        try:
++            operation().addCallbacks(succeeded, failed)
++        except Exception as exception:
++            result['error'] = exception
++            completed.set()
++
++    reactor.callFromThread(start_operation)
++    completed.wait()
++
++    if 'error' in result:
++        raise result['error']
++    return result['value']
+ 
+ 
+ class HTTPMixin(ABC):
+@@ -18,26 +85,50 @@
+                 raise Exception(f'Unsupported HTTP method {self._method()}')
+ 
+     def _get(self) -> dict:
+-        return self._process_response(requests.get(self._endpoint(), headers=self._headers(), auth=self._auth()))
++        endpoint = self._endpoint()
++        return self._process_response(self._request(endpoint), endpoint)
+ 
+     def _post(self) -> dict:
++        endpoint = self._endpoint()
++        headers = self._headers()
+         if self._is_form_encoded():
+-            headers = self._headers()
+             headers['Content-Type'] = 'application/x-www-form-urlencoded'
+-            return self._process_response(
+-                requests.post(self._endpoint(), data=self._data(), headers=self._headers(), auth=self._auth()))
+-        return self._process_response(
+-            requests.post(self._endpoint(), json=self._data(), headers=self._headers(), auth=self._auth()))
++            data = urlencode(self._data()).encode()
++        else:
++            headers.setdefault('Content-Type', 'application/json')
++            data = dumps(self._data()).encode()
++
++        return self._process_response(self._request(endpoint, headers, data), endpoint)
++
++    def _request(self, endpoint: str, headers: dict | None = None, data: bytes | None = None):
++        raw_headers = headers if headers is not None else self._headers()
++        request_headers = Headers()
++        for key, value in raw_headers.items():
++            request_headers.addRawHeader(str(key).encode(), str(value).encode())
++
++        auth = self._auth()
++        if auth is not None:
++            credentials = f'{auth[0]}:{auth[1]}'.encode()
++            request_headers.addRawHeader(
++                b'Authorization', f'Basic {b64encode(credentials).decode()}'.encode())
++
++        try:
++            return _wait_for(
++                lambda: treq.request(self._method(), endpoint, headers=request_headers, data=data))
++        except Exception as exception:
++            raise Exception(f'Connection failed while calling {endpoint}') from exception
+ 
+     @staticmethod
+-    def _process_response(response: requests.Response) -> dict:
++    def _process_response(response, endpoint: str) -> dict:
+         try:
+-            if 200 <= response.status_code < 500:
+-                return response.json()
++            if 200 <= response.code < 500:
++                return _wait_for(lambda: treq.json_content(response))
+             else:
+-                raise Exception(f"HTTP {response.status_code} error while calling {response.url}")
+-        except RequestException:
+-            raise Exception(f"Connection failed while calling {response.url}")
++                raise _HTTPError(f'HTTP {response.code} error while calling {endpoint}')
++        except _HTTPError:
++            raise
++        except Exception as exception:
++            raise Exception(f'Connection failed while calling {endpoint}') from exception
+ 
+     @abstractmethod
+     def _method(self) -> str:

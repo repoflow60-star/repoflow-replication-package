@@ -1,0 +1,114 @@
+--- a/tinychat/llms/together.py
++++ b/tinychat/llms/together.py
+@@ -1,11 +1,23 @@
+ import json
+-from typing import Generator
++from typing import AsyncGenerator
+ 
+-import requests
+-from sseclient import SSEClient
++import treq
++from twisted.internet.defer import DeferredQueue
++from twisted.internet.protocol import Protocol
+ 
+ from tinychat.llms.base import BaseLLMClient
+ from tinychat.settings import TOGETHER_API_KEY_NAME
++
++
++class _SSEProtocol(Protocol):
++    def __init__(self) -> None:
++        self.queue = DeferredQueue()
++
++    def dataReceived(self, data: bytes) -> None:
++        self.queue.put(data)
++
++    def connectionLost(self, reason) -> None:
++        self.queue.put(None)
+ 
+ 
+ class TogetherClient(BaseLLMClient):
+@@ -23,7 +35,9 @@
+         self.model_name = model_name
+         self.temperature = temperature
+ 
+-    def perform_stream_request(self, messages: list[dict]) -> SSEClient:
++    async def perform_stream_request(
++        self, messages: list[dict]
++    ) -> AsyncGenerator[str, None]:
+         # info: https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events
+         data = {
+             "model": self.model_name,
+@@ -31,17 +45,41 @@
+             "temperature": self.temperature,
+             "stream": True,
+         }
+-        response = requests.post(
++        response = await treq.post(
+             self.TOGHETER_COMPLETION_API_URL,
+             headers=self.default_headers(),  # type: ignore
+             json=data,
+-            stream=True,
++            unbuffered=True,
+         )
+-        if response.status_code != 200:
++        if response.code != 200:
+             raise ValueError(
+-                f"Server responded with an error. Status Code: {response.status_code}"
++                f"Server responded with an error. Status Code: {response.code}"
+             )
+-        return SSEClient(event_source=response)  # type: ignore
++
++        protocol = _SSEProtocol()
++        response.deliverBody(protocol)
++        event_buffer = b""
++
++        while True:
++            chunk = await protocol.queue.get()
++            if chunk is None:
++                break
++
++            event_buffer += chunk
++            event_buffer = event_buffer.replace(b"\r\n", b"\n").replace(
++                b"\r", b"\n"
++            )
++
++            while b"\n\n" in event_buffer:
++                event, event_buffer = event_buffer.split(b"\n\n", 1)
++                event_data = b"\n".join(
++                    line[6:] if line.startswith(b"data: ") else line[5:]
++                    for line in event.split(b"\n")
++                    if line.startswith(b"data:")
++                ).decode()
++
++                if event_data:
++                    yield event_data
+ 
+ 
+ class TogetherHandler:
+@@ -66,7 +104,9 @@
+                 string_conversation += f"LLM: {message['content']}"
+         return string_conversation
+ 
+-    def stream_response(self, user_input: str) -> Generator[str, None, None]:
++    async def stream_response(
++        self, user_input: str
++    ) -> AsyncGenerator[str, None]:
+         """
+         Yield stream responses from the client as they are received.
+ 
+@@ -81,11 +121,11 @@
+         self._messages.append({"role": "user", "content": user_input})
+         stream = self._client.perform_stream_request(self._messages)
+         lm_response = ""
+-        for event in stream.events():  # type: ignore
+-            if event.data != "[DONE]":
+-                json_load = json.loads(event.data)["choices"][0]["delta"]
++        async for event_data in stream:
++            if event_data != "[DONE]":
++                json_load = json.loads(event_data)["choices"][0]["delta"]
+                 if "content" in json_load.keys():
+                     response_piece = json_load["content"]
+                     lm_response += response_piece
+                     yield response_piece
+-        self._messages.append({"role": "assistant", "content": lm_response})
++        self._messages.append({"role": "assistant", "content": lm_response})

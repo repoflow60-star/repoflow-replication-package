@@ -1,0 +1,263 @@
+--- a/git_pw/api.py
++++ b/git_pw/api.py
+@@ -2,7 +2,9 @@
+ Simple wrappers around request methods.
+ """
+ 
++import asyncio
+ from functools import update_wrapper
++import json
+ import logging
+ import os.path
+ import re
+@@ -10,8 +12,8 @@
+ import tempfile
+ import typing as ty
+ 
++import aiohttp
+ import click
+-import requests
+ 
+ import git_pw
+ from git_pw import config
+@@ -22,18 +24,15 @@
+ Filters = ty.List[ty.Tuple[str, str]]
+ 
+ 
+-class HTTPTokenAuth(requests.auth.AuthBase):
+-    """Attaches HTTP Token Authentication to the given Request object."""
++class HTTPTokenAuth:
++    """Add token authentication to an HTTP header mapping."""
+ 
+     def __init__(self, token: str):
+         self.token = token
+ 
+-    def __call__(
+-        self,
+-        r: requests.PreparedRequest,
+-    ) -> requests.PreparedRequest:
+-        r.headers['Authorization'] = self._token_auth_str(self.token)
+-        return r
++    def __call__(self, headers: ty.MutableMapping[str, str]):
++        headers['Authorization'] = self._token_auth_str(self.token)
++        return headers
+ 
+     @staticmethod
+     def _token_auth_str(token: str) -> str:
+@@ -41,11 +40,82 @@
+         return 'Token {}'.format(token.strip())
+ 
+ 
+-def _get_auth(optional: bool = False) -> ty.Optional[requests.auth.AuthBase]:
++class _Response:
++    """Small synchronous response facade for an eagerly-read aiohttp response.
++
++    The command modules have a synchronous API, while aiohttp responses are
++    tied to the event loop and client session that created them.  Reading the
++    body before closing the session lets us retain the existing synchronous
++    API without leaking sessions or event loops.
++    """
++
++    def __init__(self, content: bytes, status_code: int, headers):
++        self.content = content
++        self.status_code = status_code
++        self.headers = headers
++
++    def json(self):
++        return json.loads(self.content)
++
++    def iter_content(self, chunk_size: int):
++        for offset in range(0, len(self.content), chunk_size):
++            yield self.content[offset : offset + chunk_size]
++
++
++class _RequestError(aiohttp.ClientError):
++    """An aiohttp error carrying the response facade used by error handling."""
++
++    def __init__(self, response: _Response):
++        super().__init__(
++            'HTTP status {}'.format(response.status_code),
++        )
++        self.response = response
++
++
++def _run(coro):
++    """Run one HTTP coroutine from the synchronous command interface."""
++    return asyncio.run(coro)
++
++
++async def _request(
++    method: str,
++    url: str,
++    params: ty.Optional[Filters] = None,
++    data: ty.Optional[ty.List[ty.Tuple[str, ty.Any]]] = None,
++) -> _Response:
++    """Make a request with aiohttp and return a session-independent
++    response.
++    """
++    auth = _get_auth(optional=method == 'GET')
++    headers = _get_headers()
++
++    # Omit None values explicitly: the previous client omitted them while
++    # aiohttp rejects them.
++    request_params = [
++        (key, value) for key, value in (params or []) if value is not None
++    ]
++
++    async with aiohttp.ClientSession(auth=auth, headers=headers) as session:
++        async with session.request(
++            method,
++            url,
++            params=request_params,
++            data=data,
++        ) as response:
++            content = await response.read()
++            result = _Response(content, response.status, response.headers)
++            if response.status >= 400:
++                raise _RequestError(result)
++            return result
++
++
++def _get_auth(optional: bool = False) -> ty.Optional[aiohttp.BasicAuth]:
+     if CONF.token:
+-        return HTTPTokenAuth(CONF.token)
++        # Token authentication is sent as a header; aiohttp's ``auth``
++        # argument is intentionally limited to HTTP Basic authentication.
++        return None
+     elif CONF.username and CONF.password:
+-        return requests.auth.HTTPBasicAuth(CONF.username, CONF.password)
++        return aiohttp.BasicAuth(CONF.username, CONF.password)
+     elif not optional:
+         LOG.error('Authentication information missing')
+         LOG.error(
+@@ -57,9 +127,12 @@
+ 
+ 
+ def _get_headers() -> ty.Dict[str, str]:
+-    return {
++    headers = {
+         'User-Agent': 'git-pw ({})'.format(git_pw.__version__),
+     }
++    if CONF.token:
++        HTTPTokenAuth(CONF.token)(headers)
++    return headers
+ 
+ 
+ def _get_server() -> str:
+@@ -107,11 +180,12 @@
+ 
+ def _handle_error(
+     operation: str,
+-    exc: requests.exceptions.RequestException,
++    exc: aiohttp.ClientError,
+ ) -> None:
+-    if exc.response is not None and exc.response.content:
++    response = getattr(exc, 'response', None)
++    if response is not None and response.content:
+         # server errors should always be reported
+-        if exc.response.status_code in range(500, 512):  # 5xx Server Error
++        if response.status_code in range(500, 512):  # 5xx Server Error
+             LOG.error(
+                 'Server error. Please report this issue to '
+                 'https://github.com/getpatchwork/patchwork'
+@@ -119,10 +193,10 @@
+             raise
+ 
+         # we make the assumption that all responses will be JSON encoded
+-        if exc.response.status_code == 404:
++        if response.status_code == 404:
+             LOG.error('Resource not found')
+         else:
+-            LOG.error(exc.response.json())
++            LOG.error(response.json())
+     else:
+         LOG.error(
+             'Failed to %s resource. Is your configuration '
+@@ -140,23 +214,13 @@
+     url: str,
+     params: ty.Optional[Filters] = None,
+     stream: bool = False,
+-) -> requests.Response:
++) -> _Response:
+     """Make GET request and handle errors."""
+     LOG.debug('GET %s', url)
+ 
+     try:
+-        # TODO(stephenfin): We only use a subset of the types possible for
+-        # 'params' (namely a list of tuples) but it doesn't seem possible to
+-        # indicate this
+-        rsp = requests.get(
+-            url,
+-            auth=_get_auth(optional=True),
+-            headers=_get_headers(),
+-            stream=stream,
+-            params=params,
+-        )  # type: ignore
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++        rsp = _run(_request('GET', url, params=params))
++    except aiohttp.ClientError as exc:
+         _handle_error('fetch', exc)
+ 
+     LOG.debug('Got response')
+@@ -167,16 +231,13 @@
+ def _post(
+     url: str,
+     data: ty.List[ty.Tuple[str, ty.Any]],
+-) -> requests.Response:
++) -> _Response:
+     """Make POST request and handle errors."""
+     LOG.debug('POST %s, data=%r', url, data)
+ 
+     try:
+-        rsp = requests.post(
+-            url, auth=_get_auth(), headers=_get_headers(), data=data
+-        )
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++        rsp = _run(_request('POST', url, data=data))
++    except aiohttp.ClientError as exc:
+         _handle_error('create', exc)
+ 
+     LOG.debug('Got response')
+@@ -187,19 +248,13 @@
+ def _patch(
+     url: str,
+     data: ty.List[ty.Tuple[str, ty.Any]],
+-) -> requests.Response:
++) -> _Response:
+     """Make PATCH request and handle errors."""
+     LOG.debug('PATCH %s, data=%r', url, data)
+ 
+     try:
+-        rsp = requests.patch(
+-            url,
+-            auth=_get_auth(),
+-            headers=_get_headers(),
+-            data=data,
+-        )
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++        rsp = _run(_request('PATCH', url, data=data))
++    except aiohttp.ClientError as exc:
+         _handle_error('update', exc)
+ 
+     LOG.debug('Got response')
+@@ -207,14 +262,13 @@
+     return rsp
+ 
+ 
+-def _delete(url: str) -> requests.Response:
++def _delete(url: str) -> _Response:
+     """Make DELETE request and handle errors."""
+     LOG.debug('DELETE %s', url)
+ 
+     try:
+-        rsp = requests.delete(url, auth=_get_auth(), headers=_get_headers())
+-        rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++        rsp = _run(_request('DELETE', url))
++    except aiohttp.ClientError as exc:
+         _handle_error('delete', exc)
+ 
+     LOG.debug('Got response')

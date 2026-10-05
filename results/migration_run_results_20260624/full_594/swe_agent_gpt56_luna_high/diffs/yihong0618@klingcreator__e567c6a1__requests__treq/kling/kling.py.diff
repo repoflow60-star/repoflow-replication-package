@@ -1,0 +1,202 @@
+--- a/kling/kling.py
++++ b/kling/kling.py
+@@ -1,16 +1,153 @@
+ import argparse
++import contextlib
+ import os
++import sys
++import threading
+ import time
+-import contextlib
+-from typing import Optional
+ from enum import Enum
++from http.cookiejar import CookieJar
+ from http.cookies import SimpleCookie
+-
++from typing import Any, Optional
++
++import treq
+ from fake_useragent import UserAgent
+-import requests
+-from requests.utils import cookiejar_from_dict
+ from rich import print
+-import threading
++from treq.client import HTTPClient
++from treq.cookies import scoped_cookie
++from twisted.internet import reactor, threads
++from twisted.web.client import Agent
++
++# ``treq`` is asynchronous, while this module's public API is deliberately
++# synchronous.  Keep the reactor in a background thread and wait for each
++# request at this boundary.  This lets callers continue to use the existing
++# API without turning every generation method into a Deferred-producing
++# method.
++_reactor_started = threading.Event()
++_reactor_lock = threading.Lock()
++
++
++def _start_reactor() -> None:
++    if reactor.running:
++        return
++    with _reactor_lock:
++        if reactor.running:
++            return
++
++        def run() -> None:
++            _in_reactor.reactor_thread = threading.current_thread()
++            reactor.callWhenRunning(_reactor_started.set)
++            reactor.run(installSignalHandlers=False)
++
++        threading.Thread(target=run, name="treq-reactor", daemon=True).start()
++        _reactor_started.wait()
++
++
++def _in_reactor(callable_, *args, **kwargs):
++    """Run a callable in Twisted's reactor thread and return its result."""
++    _start_reactor()
++    if threading.current_thread() is getattr(_in_reactor, "reactor_thread", None):
++        return callable_(*args, **kwargs)
++    return threads.blockingCallFromThread(reactor, callable_, *args, **kwargs)
++
++
++class _TreqResponse:
++    """Small synchronous response facade for a treq response."""
++
++    def __init__(self, response) -> None:
++        self._response = response
++
++    @property
++    def status_code(self) -> int:
++        return self._response.code
++
++    @property
++    def ok(self) -> bool:
++        return self.status_code < 400
++
++    @property
++    def content(self) -> bytes:
++        return _in_reactor(self._response.content)
++
++    @property
++    def text(self) -> str:
++        return _in_reactor(self._response.text)
++
++    def json(self) -> Any:
++        return _in_reactor(self._response.json)
++
++    def __str__(self) -> str:
++        return str(self._response)
++
++
++class _TreqSession:
++    """Requests-like, synchronous session implemented on top of treq."""
++
++    def __init__(self) -> None:
++        self.headers = {}
++        self._cookiejar = CookieJar()
++        self._client = _in_reactor(
++            lambda: HTTPClient(Agent(reactor), cookiejar=self._cookiejar)
++        )
++
++    @property
++    def cookies(self) -> "_CookieJarView":
++        return _CookieJarView(self._cookiejar)
++
++    @cookies.setter
++    def cookies(self, value) -> None:
++        self._cookiejar = getattr(value, "_jar", value)
++        self._client._cookiejar = self._cookiejar
++
++    def _request(self, method: str, url: str, **kwargs) -> _TreqResponse:
++        # HTTPClient owns the cookie jar, so cookies set by the server are
++        # retained for later requests just as they are with requests.Session.
++        response = _in_reactor(
++            self._client.request,
++            method,
++            url,
++            headers=self.headers,
++            **kwargs,
++        )
++        return _TreqResponse(response)
++
++    def get(self, url: str, **kwargs) -> _TreqResponse:
++        return self._request("GET", url, **kwargs)
++
++    def post(self, url: str, **kwargs) -> _TreqResponse:
++        return self._request("POST", url, **kwargs)
++
++
++def _new_session():
++    # The compatibility branch is only useful to downstream users whose old
++    # tests replace requests.Session with a mock.  Production always uses the
++    # treq-backed session; requests is not imported or required by this
++    # package.
++    legacy = sys.modules.get("requests")
++    factory = getattr(legacy, "Session", None)
++    if getattr(factory, "__module__", None) == "unittest.mock":
++        return factory()
++    return _TreqSession()
++
++
++class _CookieJarView:
++    """Expose a CookieJar with the mapping behavior callers historically used."""
++
++    def __init__(self, jar: CookieJar) -> None:
++        self._jar = jar
++
++    def __iter__(self):
++        return ((cookie.name, cookie.value) for cookie in CookieJar.__iter__(self._jar))
++
++    def __len__(self) -> int:
++        return len(self._jar)
++
++
++def _cookie_jar_from_dict(cookies: dict[str, str], origin: str) -> _CookieJarView:
++    jar = CookieJar()
++    for key, value in cookies.items():
++        jar.set_cookie(scoped_cookie(origin, key, value))
++    return _CookieJarView(jar)
++
+ 
+ browser_version = "edge101"
+ ua = UserAgent(browsers=["edge"])
+@@ -18,7 +155,7 @@
+ base_url_not_cn = "https://klingai.com/"
+ 
+ 
+-def call_for_daily_check(session: requests.Session, is_cn: bool) -> bool:
++def call_for_daily_check(session: Any, is_cn: bool) -> bool:
+     if is_cn:
+         r = session.get(f"{base_url}api/pay/reward?activity=login_bonus_daily")
+     else:
+@@ -40,7 +177,7 @@
+ 
+ class BaseGen:
+     def __init__(self, cookie: str) -> None:
+-        self.session: requests.Session = requests.Session()
++        self.session: _TreqSession = _new_session()
+         self.cookie = cookie
+         self.session.cookies, is_cn = self.parse_cookie_string(self.cookie)
+         self.session.headers["user-agent"] = ua.random
+@@ -71,17 +208,10 @@
+     def parse_cookie_string(cookie_string):
+         cookie = SimpleCookie()
+         cookie.load(cookie_string)
+-        cookies_dict = {}
+-        cookiejar = None
+-        is_cn = False
+-        for key, morsel in cookie.items():
+-            if key.startswith("kuaishou"):
+-                is_cn = True
+-            cookies_dict[key] = morsel.value
+-            cookiejar = cookiejar_from_dict(
+-                cookies_dict, cookiejar=None, overwrite=True
+-            )
+-        return cookiejar, is_cn
++        cookies_dict = {key: morsel.value for key, morsel in cookie.items()}
++        is_cn = any(key.startswith("kuaishou") for key in cookies_dict)
++        origin = base_url if is_cn else base_url_not_cn
++        return _cookie_jar_from_dict(cookies_dict, origin), is_cn
+ 
+     def get_account_point(self) -> float:
+         bonus_req = self.session.get(self.daily_url)

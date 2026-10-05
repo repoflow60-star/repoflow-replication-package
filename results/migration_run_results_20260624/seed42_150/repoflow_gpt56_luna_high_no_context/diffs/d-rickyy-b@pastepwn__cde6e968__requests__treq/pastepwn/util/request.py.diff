@@ -1,0 +1,230 @@
+--- a/pastepwn/util/request.py
++++ b/pastepwn/util/request.py
+@@ -1,8 +1,91 @@
++import base64
+ import logging
+-from threading import Lock
+-
+-from requests import Session, utils
+-from requests.exceptions import Timeout
++from threading import Event, Lock, Thread
++from urllib.parse import unquote, urlsplit
++from urllib.request import getproxies, proxy_bypass
++
++import treq
++from twisted.internet import reactor
++from twisted.internet.defer import CancelledError
++from twisted.internet.endpoints import HostnameEndpoint
++from twisted.internet.error import TimeoutError
++from twisted.web.client import ProxyAgent
++from twisted.web.http_headers import Headers
++
++
++_reactor_lock = Lock()
++_reactor_ready = Event()
++_reactor_thread = None
++_reactor_error = None
++
++
++def _run_reactor():
++    global _reactor_error
++
++    try:
++        reactor.callWhenRunning(_reactor_ready.set)
++        reactor.run(installSignalHandlers=False)
++    except Exception as error:
++        _reactor_error = error
++    finally:
++        _reactor_ready.set()
++
++
++def _ensure_reactor_running():
++    global _reactor_error, _reactor_thread
++
++    if reactor.running:
++        return
++
++    with _reactor_lock:
++        if reactor.running:
++            return
++
++        if _reactor_thread is None or not _reactor_thread.is_alive():
++            _reactor_ready.clear()
++            _reactor_error = None
++            _reactor_thread = Thread(target=_run_reactor, daemon=True)
++            _reactor_thread.start()
++
++    _reactor_ready.wait()
++    if _reactor_error is not None:
++        raise _reactor_error
++    if not reactor.running:
++        raise RuntimeError("The Twisted reactor is not running")
++
++
++def _make_headers(headers):
++    values = {}
++    for name, value in headers.items():
++        header_values = value if isinstance(value, (list, tuple)) else [value]
++        encoded_name = name if isinstance(name, bytes) else name.encode("ascii")
++        values[encoded_name] = [
++            item if isinstance(item, bytes) else str(item).encode("utf-8")
++            for item in header_values
++        ]
++    return Headers(values)
++
++
++def _host_matches_no_proxy(hostname, port, no_proxy):
++    hostname = hostname.lower()
++    for entry in no_proxy.split(","):
++        entry = entry.strip().lower()
++        if not entry:
++            continue
++        if entry == "*":
++            return True
++
++        entry_host = entry
++        entry_port = None
++        if entry.count(":") == 1:
++            entry_host, entry_port = entry.rsplit(":", 1)
++        if entry_port and str(port) != entry_port:
++            continue
++
++        entry_host = entry_host.lstrip(".").strip("[]")
++        if hostname == entry_host or hostname.endswith("." + entry_host):
++            return True
++    return False
+ 
+ 
+ class Request:
+@@ -22,28 +105,126 @@
+     def __init__(self, proxies=None, headers=None):
+         if not self._initialized:
+             self.logger = logging.getLogger(__name__)
+-            self.session = Session()
+             self.proxies = proxies
+             self.headers = headers
+             self.logger.info("Using the following custom proxies: %s", proxies)
+-            system_proxies = utils.get_environ_proxies("https://example.com")
++            system_proxies = getproxies()
+             self.logger.info("Using the following system proxies: %s", system_proxies)
+             Request._initialized = True
+ 
++    def _proxy_agent(self, url, headers):
++        proxies = getproxies()
++        custom_proxies = {}
++        if self.proxies is not None:
++            custom_proxies = {str(key).lower(): value for key, value in self.proxies.items()}
++            proxies.update(custom_proxies)
++        proxies = {str(key).lower(): value for key, value in proxies.items()}
++
++        parsed_url = urlsplit(url)
++        hostname = parsed_url.hostname
++        if hostname is None:
++            return None
++        if self.proxies is None and proxy_bypass(hostname):
++            return None
++
++        no_proxy_values = custom_proxies if self.proxies is not None else proxies
++        no_proxy = no_proxy_values.get("no_proxy") or no_proxy_values.get("no")
++        if no_proxy and _host_matches_no_proxy(hostname, parsed_url.port, no_proxy):
++            return None
++
++        proxy = proxies.get(parsed_url.scheme.lower()) or proxies.get("all")
++        if not proxy:
++            return None
++
++        parsed_proxy = urlsplit(proxy)
++        if parsed_proxy.hostname is None:
++            return None
++
++        proxy_port = parsed_proxy.port or (443 if parsed_proxy.scheme == "https" else 80)
++        endpoint = HostnameEndpoint(reactor, parsed_proxy.hostname, proxy_port)
++        if parsed_proxy.username is not None:
++            credentials = "%s:%s" % (
++                unquote(parsed_proxy.username),
++                unquote(parsed_proxy.password or ""),
++            )
++            encoded_credentials = base64.b64encode(credentials.encode("utf-8")).decode("ascii")
++            headers["Proxy-Authorization"] = "Basic " + encoded_credentials
++        return ProxyAgent(endpoint)
++
+     def _request_wrapper(self, data, timeout, *args, **kwargs):
+         headers = {"User-Agent": "pastepwn (https://github.com/d-Rickyy-b/pastepwn)"}
+ 
+         if self.headers is not None:
+             headers.update(self.headers)
+ 
++        response_body = []
++        response_error = []
++        deferred_ref = []
++        cancel_requested = Event()
++        completed = Event()
++
++        def on_body(body):
++            response_body.append(body)
++            completed.set()
++            return body
++
++        def on_error(failure):
++            response_error.append(failure)
++            completed.set()
++
++        agent = self._proxy_agent(kwargs.get("url", ""), headers)
++        request_kwargs = dict(kwargs)
++        request_kwargs.update(
++            data=data,
++            headers=_make_headers(headers),
++            timeout=timeout,
++        )
++        if agent is not None:
++            request_kwargs["agent"] = agent
++
++        def start_request():
++            if cancel_requested.is_set():
++                completed.set()
++                return
++            try:
++                deferred = treq.request(*args, **request_kwargs)
++                deferred_ref.append(deferred)
++                deferred.addCallback(treq.content)
++                deferred.addCallbacks(on_body, on_error)
++                if cancel_requested.is_set():
++                    deferred.cancel()
++            except Exception as error:
++                response_error.append(error)
++                completed.set()
++
+         try:
+-            response = self.session.request(*args, headers=headers, proxies=self.proxies, data=data, timeout=timeout, **kwargs)
+-        except Timeout:
++            _ensure_reactor_running()
++            reactor.callFromThread(start_request)
++        except (CancelledError, TimeoutError):
+             url = kwargs.get("url")
+             self.logger.warning("Timeout while requesting %s!", url)
+             return ""
+ 
+-        return response.content.decode("utf-8")
++        if not completed.wait(timeout):
++            cancel_requested.set()
++            if deferred_ref:
++                reactor.callFromThread(deferred_ref[0].cancel)
++            url = kwargs.get("url")
++            self.logger.warning("Timeout while requesting %s!", url)
++            return ""
++
++        if response_error:
++            error = response_error[0]
++            failure = getattr(error, "value", error)
++            if isinstance(failure, (CancelledError, TimeoutError)):
++                url = kwargs.get("url")
++                self.logger.warning("Timeout while requesting %s!", url)
++                return ""
++            if hasattr(error, "raiseException"):
++                error.raiseException()
++            raise failure
++
++        return response_body[0].decode("utf-8")
+ 
+     def get(self, url, data=None, timeout=5):
+         return self._request_wrapper(method="GET", url=url, data=data, timeout=timeout)

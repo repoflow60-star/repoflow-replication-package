@@ -1,0 +1,244 @@
+--- a/hxl/input.py
++++ b/hxl/input.py
+@@ -33,10 +33,106 @@
+ 
+ import abc, collections, csv, datetime, dateutil.parser, hashlib, \
+     io, io_wrapper, json, jsonpath_ng.ext, logging, \
+-    os.path, re, requests, shutil, six, sys, \
++    os.path, pycurl, re, shutil, six, sys, \
+     tempfile, time, urllib.parse, xlrd3 as xlrd, zipfile
+ 
+ logger = logging.getLogger(__name__)
++
++
++class _PycurlResponse:
++    """Response data collected from a pycurl request."""
++
++    def __init__(self, status_code, headers, content):
++        self.status_code = status_code
++        self.headers = headers
++        self.content = content
++        self.is_redirect = status_code in (301, 302, 303, 307, 308)
++
++    def iter_content(self, chunk_size=1):
++        """Yield the response body in chunks compatible with the old wrapper."""
++        for offset in range(0, len(self.content), chunk_size):
++            yield self.content[offset:offset + chunk_size]
++
++    def json(self):
++        return json.loads(self.content.decode('utf-8-sig'))
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise IOError("HTTP error {}".format(self.status_code))
++
++
++def _pycurl_request(url, method='GET', verify_ssl=True, timeout=None,
++                    headers=None, params=None, data=None,
++                    allow_redirects=True):
++    """Perform an HTTP request through pycurl."""
++    if params:
++        parsed_url = urllib.parse.urlsplit(url)
++        query = urllib.parse.urlencode(params, doseq=True)
++        if parsed_url.query:
++            query = '{}&{}'.format(parsed_url.query, query)
++        url = urllib.parse.urlunsplit((
++            parsed_url.scheme,
++            parsed_url.netloc,
++            parsed_url.path,
++            query,
++            parsed_url.fragment
++        ))
++
++    response_body = io.BytesIO()
++    response_headers = {}
++
++    def collect_headers(line):
++        if isinstance(line, bytes):
++            line = line.decode('iso-8859-1')
++        line = line.strip()
++        if not line:
++            return
++        if line.upper().startswith('HTTP/'):
++            response_headers.clear()
++        elif ':' in line:
++            name, value = line.split(':', 1)
++            response_headers[name.lower()] = value.strip()
++
++    curl = pycurl.Curl()
++    try:
++        try:
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.WRITEFUNCTION, response_body.write)
++            curl.setopt(pycurl.HEADERFUNCTION, collect_headers)
++            curl.setopt(pycurl.FOLLOWLOCATION, int(bool(allow_redirects)))
++            curl.setopt(pycurl.SSL_VERIFYPEER, int(bool(verify_ssl)))
++            curl.setopt(pycurl.SSL_VERIFYHOST, 2 if verify_ssl else 0)
++            curl.setopt(pycurl.ACCEPT_ENCODING, '')
++            if timeout is not None:
++                curl.setopt(pycurl.TIMEOUT, timeout)
++            if headers:
++                curl.setopt(
++                    pycurl.HTTPHEADER,
++                    ['{}: {}'.format(name, value) for name, value in headers.items()]
++                )
++
++            method = method.upper()
++            if method == 'HEAD':
++                curl.setopt(pycurl.NOBODY, 1)
++            elif method == 'POST':
++                curl.setopt(pycurl.POST, 1)
++                if data is not None:
++                    if isinstance(data, dict):
++                        data = urllib.parse.urlencode(data, doseq=True)
++                    curl.setopt(pycurl.POSTFIELDS, data)
++            else:
++                curl.setopt(pycurl.HTTPGET, 1)
++
++            curl.perform()
++        except pycurl.error as error:
++            # Keep connection and timeout failures IOError-compatible for callers.
++            raise IOError(str(error)) from error
++
++        status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        return _PycurlResponse(status_code, response_headers, response_body.getvalue())
++    finally:
++        curl.close()
++
+ 
+ __all__ = (
+     "data",
+@@ -621,10 +717,9 @@
+         try:
+             url = munge_url(url_or_filename, input_options)
+             logup("Trying to open remote resource", {"url": url_or_filename})
+-            response = requests.get(
++            response = _pycurl_request(
+                 url,
+-                stream=True,
+-                verify=input_options.verify_ssl,
++                verify_ssl=input_options.verify_ssl,
+                 timeout=input_options.timeout,
+                 headers=input_options.http_headers
+             )
+@@ -820,17 +915,17 @@
+ 
+ # Deprecated - will remove in future release
+ class RequestResponseIOWrapper(io.RawIOBase):
+-    """Wrapper for a Response object from the requests library.  Streaming
+-    in requests is a bit broken: for example, if you're streaming, the
+-    stream from the raw property doesn't unzip the payload.
++    """Wrapper for an HTTP response object.  Streaming in some HTTP clients
++    is a bit broken: for example, a streamed raw property may not unzip the
++    payload.
+     """
+ 
+     BUFFER_SIZE = 0x1000
+-    """Size of input chunk buffer from requests.raw.iter_content"""
++    """Size of input chunk buffer from the response content iterator"""
+ 
+     def __init__(self, response):
+-        """Construct a wrapper around a requests response object
+-        @param response: the HTTP response from the requests library
++        """Construct a wrapper around an HTTP response object.
++        @param response: the HTTP response
+         """
+         self.response = response
+         self.buffer = None
+@@ -838,7 +933,7 @@
+         self.iter = response.iter_content(self.BUFFER_SIZE) # iterator through the input
+ 
+     def read(self, size=-1):
+-        """Read raw byte input from the requests raw.iter_content iterator
++        """Read raw byte input from the response content iterator
+         The function will unzip zipped content.
+         @param size: the maximum number of bytes to read, or -1 for all available.
+         """
+@@ -1644,7 +1739,7 @@
+     """
+ 
+     #
+-    # Stage 1: unpack indirect links (requires extra HTTP requests)
++    # Stage 1: unpack indirect links (requires extra HTTP calls)
+     #
+ 
+     # Is it a CKAN resource? (Assumes the v.3 API for now)
+@@ -1657,9 +1752,9 @@
+     result = re.match(GOOGLE_DRIVE_URL, url)
+     if result:
+         logup("HEAD request for Google Drive URL", {"url": url})
+-        response = requests.head(url)
++        response = _pycurl_request(url, method='HEAD', allow_redirects=False)
+         if response.is_redirect:
+-            new_url = response.headers['Location']
++            new_url = response.headers['location']
+             logup("Google Drive redirect", {"url": url, "redirect": new_url})
+             logger.info("Following Google Drive redirect to %s", new_url)
+             url = new_url
+@@ -1752,7 +1847,11 @@
+         # CKAN resource URL
+         ckan_api_query = '{}/api/3/action/resource_show?id={}'.format(site_url, resource_id)
+         logup("Trying CKAN API call", {"url": ckan_api_query})
+-        ckan_api_result = requests.get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
++        ckan_api_result = _pycurl_request(
++            ckan_api_query,
++            verify_ssl=input_options.verify_ssl,
++            headers=input_options.http_headers
++        ).json()
+         if ckan_api_result['success']:
+             url = ckan_api_result['result']['url']
+             logup("Found candidate URL for CKAN dataset", {"url": url})
+@@ -1775,7 +1874,11 @@
+     else:
+         # CKAN dataset (package) URL
+         ckan_api_query = '{}/api/3/action/package_show?id={}'.format(site_url, dataset_id)
+-        ckan_api_result = requests.get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
++        ckan_api_result = _pycurl_request(
++            ckan_api_query,
++            verify_ssl=input_options.verify_ssl,
++            headers=input_options.http_headers
++        ).json()
+         if ckan_api_result['success']:
+             for resource in ckan_api_result['result']['resources']:
+                 url = resource['url']
+@@ -1825,9 +1928,9 @@
+         "q": "source:{}".format(asset_id)
+     }
+     logup("Trying Kobo dataset", {"url": asset_id})
+-    response = requests.get(
++    response = _pycurl_request(
+         "https://kobo.humanitarianresponse.info/exports/",
+-        verify=input_options.verify_ssl,
++        verify_ssl=input_options.verify_ssl,
+         headers=input_options.http_headers,
+         params=params
+     )
+@@ -1861,10 +1964,11 @@
+         "hierarchy_in_labels": False,
+         "group_sep": ",",
+     }
+-    response = requests.post(
++    response = _pycurl_request(
+         "https://kobo.humanitarianresponse.info/exports/",
+-        verify=input_options.verify_ssl,
+-        headers=http_headers,
++        method='POST',
++        verify_ssl=input_options.verify_ssl,
++        headers=input_options.http_headers,
+         data=params
+     )
+     logup("Generated Kobo export", {"asset_id": asset_id, "status": response.status_code})
+@@ -1881,10 +1985,10 @@
+     fail_counter = 0
+     while True:
+         logup("Getting info for Kobo export", {"url": info_url})
+-        response = requests.get(
++        response = _pycurl_request(
+             info_url,
+-            verify=input_options.verify_ssl,
+-            headers=http_headers
++            verify_ssl=input_options.verify_ssl,
++            headers=input_options.http_headers
+         )
+         logup("Response for Kobo info", {"url": info_url, "status": response.status_code})
+ 

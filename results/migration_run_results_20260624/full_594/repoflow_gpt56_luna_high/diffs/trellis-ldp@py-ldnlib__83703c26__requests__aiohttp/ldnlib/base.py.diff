@@ -1,0 +1,87 @@
+--- a/ldnlib/base.py
++++ b/ldnlib/base.py
+@@ -1,5 +1,10 @@
+ from rdflib import Graph, URIRef
+-import requests
++
++import asyncio
++from concurrent.futures import ThreadPoolExecutor
++import re
++
++import aiohttp
+ 
+ 
+ class BaseLDN(object):
+@@ -14,18 +19,64 @@
+     def __init__(self, **kwargs):
+         self.accept_headers = kwargs.get('accept_headers', self.ACCEPT_HEADERS)
+ 
++    @staticmethod
++    def _aiohttp_kwargs(kwargs):
++        request_kwargs = dict(kwargs)
++        auth = request_kwargs.get('auth')
++        if isinstance(auth, tuple):
++            request_kwargs['auth'] = aiohttp.BasicAuth(*auth)
++
++        if request_kwargs.pop('verify', True) is False:
++            request_kwargs['ssl'] = False
++        return request_kwargs
++
++    @staticmethod
++    def _run(coroutine):
++        # The public API is synchronous, so isolate aiohttp's event loop from
++        # both synchronous callers and callers that already have a loop.
++        with ThreadPoolExecutor(max_workers=1) as executor:
++            return executor.submit(asyncio.run, coroutine).result()
++
++    @staticmethod
++    def _response_links(headers):
++        links = {}
++        if hasattr(headers, 'getall'):
++            values = headers.getall('Link', ())
++        else:
++            value = headers.get('Link')
++            values = () if value is None else (value,)
++
++        for value in values:
++            for match in re.finditer(
++                    r'<([^>]*)>\s*;\s*rel=(?:"([^"]+)"|([^;\s,]+))',
++                    value):
++                relation = match.group(2) or match.group(3)
++                for rel in relation.split():
++                    links[rel] = {'url': match.group(1)}
++        return links
++
++    async def _request(self, method, url, raise_for_status=True, **kwargs):
++        request_kwargs = self._aiohttp_kwargs(kwargs)
++        async with aiohttp.ClientSession() as session:
++            async with session.request(method, url, **request_kwargs) as response:
++                if raise_for_status:
++                    response.raise_for_status()
++                return (response.status, response.headers,
++                        self._response_links(response.headers),
++                        await response.text())
++
+     def __discover_head(self, target, **kwargs):
+-        r = requests.head(target, **kwargs)
+-        r.raise_for_status()
+-        if self.LDP_INBOX in r.links:
+-            return r.links[self.LDP_INBOX].get('url')
++        _, _, links, _ = self._run(
++            self._request('HEAD', target, **kwargs))
++        if self.LDP_INBOX in links:
++            return links[self.LDP_INBOX].get('url')
+ 
+     def __discover_get(self, target, **kwargs):
+-        r = requests.get(target, **kwargs)
+-        r.raise_for_status()
++        _, headers, _, text = self._run(
++            self._request('GET', target, **kwargs))
+         # TODO -- check for HTML
+-        g = Graph().parse(data=r.text, format=self.content_type_to_mime_type(
+-            r.headers['content-type']))
++        g = Graph().parse(data=text, format=self.content_type_to_mime_type(
++            headers['content-type']))
+ 
+         for (subject, inbox) in g[:URIRef(self.LDP_INBOX)]:
+             return str(inbox)

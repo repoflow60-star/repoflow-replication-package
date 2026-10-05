@@ -1,0 +1,91 @@
+--- a/modules/Application/PluginAdaptors/HTTPMixin.py
++++ b/modules/Application/PluginAdaptors/HTTPMixin.py
+@@ -1,6 +1,13 @@
+-import requests
+-from requests.exceptions import RequestException
++import base64
++import json
++import threading
+ from abc import ABC, abstractmethod
++from urllib.parse import urlencode
++
++import treq
++from twisted.internet import defer, reactor
++from twisted.internet.threads import blockingCallFromThread
++from twisted.web.http_headers import Headers
+ 
+ 
+ class HTTPMixin(ABC):
+@@ -18,26 +25,58 @@
+                 raise Exception(f'Unsupported HTTP method {self._method()}')
+ 
+     def _get(self) -> dict:
+-        return self._process_response(requests.get(self._endpoint(), headers=self._headers(), auth=self._auth()))
++        return self._request('GET')
+ 
+     def _post(self) -> dict:
+         if self._is_form_encoded():
+             headers = self._headers()
+             headers['Content-Type'] = 'application/x-www-form-urlencoded'
+-            return self._process_response(
+-                requests.post(self._endpoint(), data=self._data(), headers=self._headers(), auth=self._auth()))
+-        return self._process_response(
+-            requests.post(self._endpoint(), json=self._data(), headers=self._headers(), auth=self._auth()))
++            return self._request('POST', urlencode(self._data()).encode(), headers)
++        headers = self._headers()
++        headers['Content-Type'] = 'application/json'
++        return self._request('POST', json.dumps(self._data()).encode(), headers)
+ 
+-    @staticmethod
+-    def _process_response(response: requests.Response) -> dict:
+-        try:
+-            if 200 <= response.status_code < 500:
+-                return response.json()
+-            else:
+-                raise Exception(f"HTTP {response.status_code} error while calling {response.url}")
+-        except RequestException:
+-            raise Exception(f"Connection failed while calling {response.url}")
++    def _request(self, method: str, body: bytes | None = None, headers: dict | None = None) -> dict:
++        request_headers = dict(headers or self._headers())
++        auth = self._auth()
++        if auth:
++            credentials = ':'.join(auth).encode()
++            request_headers['Authorization'] = f'Basic {base64.b64encode(credentials).decode()}'
++
++        treq_headers = Headers({
++            key.encode(): [str(value).encode()]
++            for key, value in request_headers.items()
++        })
++
++        @defer.inlineCallbacks
++        def perform_request():
++            try:
++                response = yield treq.request(
++                    method,
++                    self._endpoint(),
++                    headers=treq_headers,
++                    data=body,
++                )
++                if not 200 <= response.code < 500:
++                    raise Exception(f'HTTP {response.code} error while calling {self._endpoint()}')
++                content = yield treq.content(response)
++                return json.loads(content)
++            except Exception as error:
++                if str(error).startswith('HTTP '):
++                    raise
++                raise Exception(f'Connection failed while calling {self._endpoint()}') from error
++
++        if not reactor.running:
++            ready = threading.Event()
++            reactor.callWhenRunning(ready.set)
++            threading.Thread(
++                target=reactor.run,
++                kwargs={'installSignalHandlers': False},
++                daemon=True,
++            ).start()
++            ready.wait()
++
++        return blockingCallFromThread(reactor, perform_request)
+ 
+     @abstractmethod
+     def _method(self) -> str:

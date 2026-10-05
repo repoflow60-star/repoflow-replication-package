@@ -1,0 +1,237 @@
+--- a/github_nonpublic_api/api.py
++++ b/github_nonpublic_api/api.py
+@@ -17,15 +17,131 @@
+ import os.path
+ import functools
+ from enum import Enum
++import io
+ import re
+-from urllib.parse import urljoin
++from urllib.parse import urlencode, urljoin
++from typing import Any, Optional
+ 
+ import html5lib
++import pycurl
+ import pyotp
+-import requests
+ from absl import logging
+ from configobj import ConfigObj
+-from typing import Optional
++
++
++class _CurlResult:
++    """Response data returned by a request made with pycurl."""
++
++    def __init__(self, content, status_code, url, headers, history):
++        self.content = content
++        self.status_code = status_code
++        self.url = url
++        self.headers = headers
++        self.history = history
++
++    @property
++    def text(self):
++        content_type = self.headers.get("Content-Type", "")
++        encoding_match = re.search(r"charset=([\w.-]+)", content_type, re.IGNORECASE)
++        encoding = encoding_match.group(1) if encoding_match else "utf-8"
++        return self.content.decode(encoding, errors="replace")
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise RuntimeError(
++                "HTTP error %s while requesting %s" % (self.status_code, self.url)
++            )
++
++
++class _CurlRedirect:
++    def __init__(self, url):
++        self.url = url
++
++
++class _HeaderCollector:
++    def __init__(self):
++        self.headers = {}
++        self.redirect_urls = []
++        self._status_code = 0
++
++    def __call__(self, line):
++        line_length = len(line)
++        line = line.rstrip(b"\r\n")
++        if line.startswith(b"HTTP/"):
++            self.headers = {}
++            parts = line.split()
++            try:
++                self._status_code = int(parts[1])
++            except (IndexError, ValueError):
++                self._status_code = 0
++            return line_length
++
++        separator = line.find(b":")
++        if separator > 0:
++            name = line[:separator].decode("iso-8859-1")
++            value = line[separator + 1 :].strip().decode("iso-8859-1")
++            self.headers[name] = value
++            if 300 <= self._status_code < 400 and name.lower() == "location":
++                self.redirect_urls.append(value)
++        return line_length
++
++
++class _CurlCookies:
++    def __init__(self, session):
++        self._session = session
++
++    def clear(self):
++        self._session._curl.setopt(pycurl.COOKIELIST, "ALL")
++
++
++class _PyCurlSession:
++    """A synchronous, cookie-preserving HTTP session backed by pycurl."""
++
++    def __init__(self):
++        self._curl = pycurl.Curl()
++        self._curl.setopt(pycurl.COOKIEFILE, "")
++        self.cookies = _CurlCookies(self)
++
++    def _request(self, url, data=None):
++        body = io.BytesIO()
++        header_collector = _HeaderCollector()
++
++        self._curl.setopt(pycurl.URL, url)
++        self._curl.setopt(pycurl.FOLLOWLOCATION, 1)
++        self._curl.setopt(pycurl.WRITEFUNCTION, body.write)
++        self._curl.setopt(pycurl.HEADERFUNCTION, header_collector)
++
++        if data is None:
++            self._curl.setopt(pycurl.POST, 0)
++            self._curl.setopt(pycurl.HTTPGET, 1)
++        else:
++            self._curl.setopt(pycurl.HTTPGET, 0)
++            self._curl.setopt(pycurl.POST, 1)
++            self._curl.setopt(pycurl.POSTFIELDS, urlencode(data, doseq=True))
++
++        self._curl.perform()
++        response_url = self._curl.getinfo(pycurl.EFFECTIVE_URL) or url
++        history = [
++            _CurlRedirect(urljoin(url, redirect_url))
++            for redirect_url in header_collector.redirect_urls
++        ]
++        return _CurlResult(
++            content=body.getvalue(),
++            status_code=self._curl.getinfo(pycurl.RESPONSE_CODE),
++            url=response_url,
++            headers=header_collector.headers,
++            history=history,
++        )
++
++    def get(self, url):
++        return self._request(url)
++
++    def post(self, url, data=None):
++        return self._request(url, data=data)
++
++    def close(self):
++        self._curl.close()
++
+ 
+ 
+ def _get_and_submit_form(
+@@ -85,10 +201,10 @@
+     username: str,
+     password: str,
+     tfa_callback,
+-    session: Optional[requests.Session] = None,
+-) -> requests.Session:
+-    """Create a requests.Session object with logged in GitHub cookies for the user."""
+-    session = session or requests.Session()
++    session: Optional[Any] = None,
++) -> Any:
++    """Create a pycurl-backed session with logged in GitHub cookies for the user."""
++    session = session or _PyCurlSession()
+ 
+     # Clear cookies before re-authentication
+     session.cookies.clear()
+@@ -150,7 +266,7 @@
+         username: str,
+         password: str,
+         tfa_callback=None,
+-        session: Optional[requests.Session] = None,
++        session: Optional[Any] = None,
+     ):
+         self._session = session or create_login_session(
+             username=username,
+@@ -159,7 +275,7 @@
+             session=session,
+         )
+ 
+-    def request_usage(self, enterprise_name: str, days: int = 30) -> requests.Response:
++    def request_usage(self, enterprise_name: str, days: int = 30) -> Any:
+         """Requests a GitHub usage report.
+ 
+         Github will send an email link when the report is available.
+@@ -183,7 +299,7 @@
+         contact_email: str,
+         org_usage: OrganizationUsage,
+         business_name: Optional[str] = None,
+-    ) -> requests.Response:
++    ) -> Any:
+         """Create the specified GitHub organization.
+ 
+         Right now, only creates free tier organizations.
+@@ -207,7 +323,7 @@
+ 
+     def install_application_in_organization(
+         self, app_name: str, org_id: int
+-    ) -> requests.Response:
++    ) -> Any:
+         """Installs the specified app on the given organization."""
+         url = _INSTALL_APP_URL.format(app_name=app_name, org_id=org_id)
+ 
+@@ -223,7 +339,7 @@
+ 
+     def toggle_app_suspended(
+         self, org_name: str, app_install_id: int
+-    ) -> requests.Response:
++    ) -> Any:
+         """Set this applicaiton install to be suspended or not."""
+         url = _APP_SUSPEND_URL.format(org_name=org_name, app_install_id=app_install_id)
+ 
+@@ -235,14 +351,14 @@
+ 
+     def download_usage_report(
+         self, enterprise_name: str, report_id: int
+-    ) -> requests.Response:
++    ) -> Any:
+         """Download a usage report based on an id recieved in an email"""
+         url = _USAGE_REPORT_URL.format(
+             enterprise_name=enterprise_name, report_id=report_id
+         )
+         return _get_url_with_session(session=self._session, url=url)
+ 
+-    def request_dormant_users_report(self, enterprise_name: str) -> requests.Response:
++    def request_dormant_users_report(self, enterprise_name: str) -> Any:
+         """Requests a GitHub dormant users report.
+ 
+         Github will send an email link when the report is available.
+@@ -256,7 +372,7 @@
+             form_matcher=lambda form: form.attrib.get("action") == action,
+         )
+ 
+-    def download_dormant_users_report(self, enterprise_name: str) -> requests.Response:
++    def download_dormant_users_report(self, enterprise_name: str) -> Any:
+         """Download a usage report based on an id received in an email"""
+         url = _REQUEST_DORMANTUSERS_URL.format(enterprise_name=enterprise_name)
+         page = _get_url_with_session(session=self._session, url=url)
+@@ -272,7 +388,7 @@
+         self,
+         org_name: str,
+         app_install_id: str,
+-    ) -> requests.Response:
++    ) -> Any:
+         """Approve a request for updated permissions for a GitHub app installation in an org"""
+ 
+         return _get_and_submit_form(
+@@ -324,4 +440,4 @@
+         username=config["username"],
+         password=config["password"],
+         tfa_callback=lambda: pyotp.TOTP(config["otp_seed"]).now(),
+-    )+    )

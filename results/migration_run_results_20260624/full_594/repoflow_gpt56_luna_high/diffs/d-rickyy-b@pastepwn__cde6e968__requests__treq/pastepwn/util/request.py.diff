@@ -1,0 +1,116 @@
+--- a/pastepwn/util/request.py
++++ b/pastepwn/util/request.py
+@@ -1,8 +1,14 @@
+ import logging
+-from threading import Lock
++from threading import Event, Lock, Thread
++from urllib.parse import urlencode, urlsplit
+ 
+-from requests import Session, utils
+-from requests.exceptions import Timeout
++import treq
++from treq.client import HTTPClient
++from twisted.internet import defer, error, reactor
++from twisted.internet.endpoints import HostnameEndpoint
++from twisted.internet.threads import blockingCallFromThread
++from twisted.web.client import Agent, ProxyAgent
++from twisted.web.http_headers import Headers
+ 
+ 
+ class Request:
+@@ -22,13 +28,67 @@
+     def __init__(self, proxies=None, headers=None):
+         if not self._initialized:
+             self.logger = logging.getLogger(__name__)
+-            self.session = Session()
+             self.proxies = proxies
+             self.headers = headers
+             self.logger.info("Using the following custom proxies: %s", proxies)
+-            system_proxies = utils.get_environ_proxies("https://example.com")
+-            self.logger.info("Using the following system proxies: %s", system_proxies)
++            self._reactor = reactor
++            self._reactor_ready = Event()
++            self._reactor_thread = Thread(target=self._run_reactor, name="PastePwnReactor", daemon=True)
++            self._reactor_thread.start()
++            self._reactor_ready.wait()
++            self._system_proxies = self._get_system_proxies()
++            self.logger.info("Using the following system proxies: %s", self._system_proxies)
+             Request._initialized = True
++
++    def _run_reactor(self):
++        self._reactor.callWhenRunning(self._reactor_ready.set)
++        self._reactor.run(installSignalHandlers=False)
++
++    @staticmethod
++    def _get_system_proxies():
++        from urllib.request import getproxies
++
++        return getproxies()
++
++    def _agent(self, url):
++        parsed_url = urlsplit(url)
++        proxies = self.proxies if self.proxies is not None else self._system_proxies
++        proxy = None if proxies is None else proxies.get(parsed_url.scheme)
++        if proxy is None and proxies is not None:
++            proxy = proxies.get(f"{parsed_url.scheme}://")
++
++        if proxy:
++            parsed_proxy = urlsplit(proxy if "://" in proxy else f"//{proxy}")
++            endpoint = HostnameEndpoint(self._reactor, parsed_proxy.hostname, parsed_proxy.port or 80)
++            return ProxyAgent(self._reactor, endpoint)
++
++        return Agent(self._reactor)
++
++    @staticmethod
++    def _headers(headers):
++        return Headers({key: [str(value)] for key, value in headers.items()})
++
++    @staticmethod
++    def _body(data, headers):
++        if isinstance(data, dict):
++            headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
++            return urlencode(data, doseq=True).encode("utf-8")
++        if isinstance(data, str):
++            return data.encode("utf-8")
++        return data
++
++    @defer.inlineCallbacks
++    def _perform_request(self, method, url, data, timeout, headers):
++        client = HTTPClient(self._agent(url))
++        response = yield client.request(
++            method,
++            url,
++            headers=self._headers(headers),
++            data=self._body(data, headers),
++            timeout=timeout,
++        )
++        body = yield treq.content(response)
++        defer.returnValue(body)
+ 
+     def _request_wrapper(self, data, timeout, *args, **kwargs):
+         headers = {"User-Agent": "pastepwn (https://github.com/d-Rickyy-b/pastepwn)"}
+@@ -37,13 +97,21 @@
+             headers.update(self.headers)
+ 
+         try:
+-            response = self.session.request(*args, headers=headers, proxies=self.proxies, data=data, timeout=timeout, **kwargs)
+-        except Timeout:
++            response = blockingCallFromThread(
++                self._reactor,
++                self._perform_request,
++                kwargs["method"],
++                kwargs["url"],
++                data,
++                timeout,
++                headers,
++            )
++        except error.TimeoutError:
+             url = kwargs.get("url")
+             self.logger.warning("Timeout while requesting %s!", url)
+             return ""
+ 
+-        return response.content.decode("utf-8")
++        return response.decode("utf-8")
+ 
+     def get(self, url, data=None, timeout=5):
+         return self._request_wrapper(method="GET", url=url, data=data, timeout=timeout)

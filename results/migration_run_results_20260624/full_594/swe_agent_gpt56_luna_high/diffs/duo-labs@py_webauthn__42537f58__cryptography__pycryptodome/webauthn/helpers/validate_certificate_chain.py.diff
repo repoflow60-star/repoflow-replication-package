@@ -1,0 +1,117 @@
+--- a/webauthn/helpers/validate_certificate_chain.py
++++ b/webauthn/helpers/validate_certificate_chain.py
+@@ -1,8 +1,7 @@
++import os
++import subprocess
++import tempfile
+ from typing import List, Optional
+-
+-from cryptography.hazmat.backends import default_backend
+-from cryptography.x509 import load_der_x509_certificate
+-from OpenSSL.crypto import X509, X509Store, X509StoreContext, X509StoreContextError
+ 
+ from .exceptions import InvalidCertificateChain
+ from .pem_cert_bytes_to_open_ssl_x509 import pem_cert_bytes_to_open_ssl_x509
+@@ -31,44 +30,68 @@
+     if len(x5c) < 1:
+         raise InvalidCertificateChain("x5c was empty")
+ 
+-    # Prepare leaf cert
++    # pyOpenSSL provides the platform-independent X.509 chain validator.  It
++    # is imported lazily so the package can still operate with only
++    # PyCryptodome installed (pyOpenSSL itself has a cryptography dependency).
+     try:
+-        leaf_cert_bytes = x5c[0]
+-        leaf_cert_crypto = load_der_x509_certificate(leaf_cert_bytes, default_backend())
+-        leaf_cert = X509().from_cryptography(leaf_cert_crypto)
+-    except Exception as err:
+-        raise InvalidCertificateChain(f"Could not prepare leaf cert: {err}")
++        from OpenSSL.crypto import (
++            FILETYPE_ASN1,
++            X509Store,
++            X509StoreContext,
++            X509StoreContextError,
++            load_certificate,
++        )
+ 
+-    # Prepare any intermediate certs
+-    try:
+-        # May be an empty array, that's fine
+-        intermediate_certs_bytes = x5c[1:]
+-        intermediate_certs_crypto = [
+-            load_der_x509_certificate(cert, default_backend()) for cert in intermediate_certs_bytes
+-        ]
+-        intermediate_certs = [X509().from_cryptography(cert) for cert in intermediate_certs_crypto]
+-    except Exception as err:
+-        raise InvalidCertificateChain(f"Could not prepare intermediate certs: {err}")
++        try:
++            leaf_cert = load_certificate(FILETYPE_ASN1, x5c[0])
++        except Exception as err:
++            raise InvalidCertificateChain(f"Could not prepare leaf cert: {err}")
++        try:
++            intermediate_certs = [load_certificate(FILETYPE_ASN1, cert) for cert in x5c[1:]]
++        except Exception as err:
++            raise InvalidCertificateChain(f"Could not prepare intermediate certs: {err}")
++        try:
++            root_certs_store = X509Store()
++            for cert in pem_root_certs_bytes:
++                root_certs_store.add_cert(pem_cert_bytes_to_open_ssl_x509(cert))
++        except Exception as err:
++            raise InvalidCertificateChain(f"Could not prepare root certs: {err}")
+ 
+-    # Prepare a collection of possible root certificates
+-    root_certs_store = X509Store()
+-    try:
+-        for cert in pem_root_certs_bytes:
+-            root_certs_store.add_cert(pem_cert_bytes_to_open_ssl_x509(cert))
+-    except Exception as err:
+-        raise InvalidCertificateChain(f"Could not prepare root certs: {err}")
++        context = X509StoreContext(
++            store=root_certs_store, certificate=leaf_cert, chain=intermediate_certs
++        )
++        try:
++            context.verify_certificate()
++        except X509StoreContextError:
++            raise InvalidCertificateChain("Certificate chain could not be validated")
++        return True
++    except ImportError:
++        return _validate_with_openssl_cli(x5c, pem_root_certs_bytes)
+ 
+-    # Load certs into a "context" for validation
+-    context = X509StoreContext(
+-        store=root_certs_store,
+-        certificate=leaf_cert,
+-        chain=intermediate_certs,
+-    )
+ 
+-    # Validate the chain (will raise if it can't)
+-    try:
+-        context.verify_certificate()
+-    except X509StoreContextError:
++def _validate_with_openssl_cli(x5c: List[bytes], roots: List[bytes]) -> bool:
++    """Fallback for installations without pyOpenSSL."""
++    import base64
++
++    def pem(data: bytes, label: str) -> bytes:
++        encoded = base64.b64encode(data).decode("ascii")
++        lines = "\n".join(encoded[i : i + 64] for i in range(0, len(encoded), 64))
++        return f"-----BEGIN {label}-----\n{lines}\n-----END {label}-----\n".encode()
++
++    with tempfile.TemporaryDirectory() as directory:
++        leaf = os.path.join(directory, "leaf.pem")
++        root = os.path.join(directory, "roots.pem")
++        chain = os.path.join(directory, "chain.pem")
++        with open(leaf, "wb") as output:
++            output.write(pem(x5c[0], "CERTIFICATE"))
++        with open(root, "wb") as output:
++            output.write(b"".join(roots))
++        with open(chain, "wb") as output:
++            output.write(b"".join(pem(cert, "CERTIFICATE") for cert in x5c[1:]))
++        result = subprocess.run(
++            ["openssl", "verify", "-CAfile", root, "-untrusted", chain, leaf],
++            capture_output=True,
++        )
++    if result.returncode != 0:
+         raise InvalidCertificateChain("Certificate chain could not be validated")
+-
+     return True

@@ -1,0 +1,503 @@
+--- a/maproulette/api/maproulette_server.py
++++ b/maproulette/api/maproulette_server.py
+@@ -1,9 +1,12 @@
+-"""This module contains the basic methods that handle API calls to the MapRoulette API. It uses the requests library to
++"""This module contains the basic methods that handle API calls to the MapRoulette API. It uses the treq library to
+ accomplish this."""
+ 
+-import requests
++import treq
+ import json
+-import time
++from twisted.internet import reactor, ssl
++from twisted.internet.defer import inlineCallbacks, returnValue
++from twisted.internet.task import deferLater
++from twisted.web.client import Agent
+ from .errors import HttpError, InvalidJsonError, ConnectionUnavailableError, UnauthorizedError, NotFoundError
+ 
+ 
+@@ -15,12 +18,33 @@
+         self.headers = configuration.headers
+         self.certs = configuration.certs
+         self.verify = configuration.verify
+-        if self.__check_health():
+-            self.session = requests.Session()
+-            self.session.headers = self.headers
+-            self.session.verify = self.verify
+-            self.session.cert = self.certs
+-
++        if self.certs:
++            if isinstance(self.certs, (tuple, list)):
++                self.agent = Agent(
++                    reactor,
++                    contextFactory=ssl.CertificateOptions(
++                        privateKey=ssl.KeyPair.load(self.certs[1]),
++                        certificate=ssl.Certificate.load(self.certs[0]),
++                        verify=self.verify
++                    )
++                )
++            else:
++                context_factory = ssl.PrivateCertificate.load(self.certs).options()
++                context_factory.verify = self.verify
++                self.agent = Agent(
++                    reactor,
++                    contextFactory=context_factory
++                )
++        elif self.verify is False:
++            self.agent = Agent(
++                reactor,
++                contextFactory=ssl.CertificateOptions(verify=False)
++            )
++        else:
++            self.agent = Agent(reactor)
++        self._health = self.__check_health()
++
++    @inlineCallbacks
+     def __check_health(self, retries=3, delay=5):
+         """Checks health of connection to host by pinging the URL set in the configuration
+ 
+@@ -30,25 +54,25 @@
+         """
+         for i in range(retries):
+             try:
+-                response = requests.get(
++                response = yield treq.get(
+                     self.base_url + '/ping',
+                     headers=self.headers,
+-                    verify=self.verify,
+-                    cert=self.certs
++                    agent=self.agent
+                 )
+-                if not response.ok:
++                if response.code >= 400:
+                     print(f"Unsuccessful connection. Retrying in {str(delay)} seconds")
+-                    time.sleep(delay)
++                    yield deferLater(reactor, delay, lambda: None)
+                 else:
+-                    return True
+-            except requests.exceptions.ConnectionError:
++                    returnValue(True)
++            except Exception:
+                 print(f"Connection not available. Attempt {str(i+1)} out of {str(retries)}")
+-                time.sleep(delay)
++                yield deferLater(reactor, delay, lambda: None)
+ 
+         raise ConnectionUnavailableError(
+             message='Specified server unavailable'
+         )
+ 
++    @inlineCallbacks
+     def get(self, endpoint, params=None):
+         """Method that completes a GET request to the MapRoulette API
+ 
+@@ -57,39 +81,40 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.get(
+-            self.url + endpoint,
+-            params=params
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 404:
++        yield self._health
++        try:
++            response = yield treq.get(
++                self.url + endpoint,
++                params=params,
++                headers=self.headers,
++                agent=self.agent
++            )
++        except Exception as e:
++            raise ConnectionUnavailableError(e) from None
++        if response.code >= 400:
++            if response.code == 404:
+                 raise NotFoundError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(
+-                message=self.parse_response_message(e.response),
+-                status=e.response.status_code
+-            ) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
+-
++                    message=(yield self.parse_response_message(response)),
++                    status=response.code
++                ) from None
++            else:
++                raise HttpError(
++                    message=(yield self.parse_response_message(response)),
++                    status=response.code
++                ) from None
++        try:
++            data = yield treq.json_content(response)
++            returnValue({
++                "data": data,
++                "status": response.code
++            })
++        except ValueError:
++            returnValue({
++                "data": (yield treq.text_content(response)),
++                "status": response.code
++            })
++
++    @inlineCallbacks
+     def post(self, endpoint, body=None, params=None):
+         """Method that completes a POST request to the MapRoulette API
+ 
+@@ -99,42 +124,46 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.post(
+-            self.url + endpoint,
+-            params=params,
+-            json=body
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 400:
++        yield self._health
++        try:
++            response = yield treq.post(
++                self.url + endpoint,
++                params=params,
++                json=body,
++                headers=self.headers,
++                agent=self.agent
++            )
++        except Exception as e:
++            raise ConnectionUnavailableError(e) from None
++        if response.code >= 400:
++            if response.code == 400:
+                 raise InvalidJsonError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            elif e.response.status_code == 401:
++                    message=(yield self.parse_response_message(response)),
++                    status=response.code
++                ) from None
++            elif response.code == 401:
+                 raise UnauthorizedError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(e) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
+-
++                    message=(yield self.parse_response_message(response)),
++                    status=response.code
++                ) from None
++            else:
++                raise HttpError(
++                    message=(yield self.parse_response_message(response)),
++                    status=response.code
++                ) from None
++        try:
++            data = yield treq.json_content(response)
++            returnValue({
++                "data": data,
++                "status": response.code
++            })
++        except ValueError:
++            returnValue({
++                "data": (yield treq.text_content(response)),
++                "status": response.code
++            })
++
++    @inlineCallbacks
+     def put(self, endpoint, body=None, params=None):
+         """Method that completes a PUT request to the MapRoulette API
+ 
+@@ -144,42 +173,46 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.put(
+-            self.url + endpoint,
+-            params=params,
+-            json=body
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 400:
++        yield self._health
++        try:
++            response = yield treq.put(
++                self.url + endpoint,
++                params=params,
++                json=body,
++                headers=self.headers,
++                agent=self.agent
++            )
++        except Exception as e:
++            raise ConnectionUnavailableError(e) from None
++        if response.code >= 400:
++            if response.code == 400:
+                 raise InvalidJsonError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            elif e.response.status_code == 401:
++                    message=(yield self.parse_response_message(response)),
++                    status=response.code
++                ) from None
++            elif response.code == 401:
+                 raise UnauthorizedError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(e) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
+-
++                    message=(yield self.parse_response_message(response)),
++                    status=response.code
++                ) from None
++            else:
++                raise HttpError(
++                    message=(yield self.parse_response_message(response)),
++                    status=response.code
++                ) from None
++        try:
++            data = yield treq.json_content(response)
++            returnValue({
++                "data": data,
++                "status": response.code
++            })
++        except ValueError:
++            returnValue({
++                "data": (yield treq.text_content(response)),
++                "status": response.code
++            })
++
++    @inlineCallbacks
+     def put_file(self, endpoint, body=None, params=None):
+         """Method that completes a multipart PUT request to the MapRoulette API
+ 
+@@ -189,42 +222,46 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.put(
+-            self.url + endpoint,
+-            params=params,
+-            files=body
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 400:
++        yield self._health
++        try:
++            response = yield treq.put(
++                self.url + endpoint,
++                params=params,
++                files=body,
++                headers=self.headers,
++                agent=self.agent
++            )
++        except Exception as e:
++            raise ConnectionUnavailableError(e) from None
++        if response.code >= 400:
++            if response.code == 400:
+                 raise InvalidJsonError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            elif e.response.status_code == 401:
++                    message=(yield self.parse_response_message(response)),
++                    status=response.code
++                ) from None
++            elif response.code == 401:
+                 raise UnauthorizedError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(e) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
+-
++                    message=(yield self.parse_response_message(response)),
++                    status=response.code
++                ) from None
++            else:
++                raise HttpError(
++                    message=(yield self.parse_response_message(response)),
++                    status=response.code
++                ) from None
++        try:
++            data = yield treq.json_content(response)
++            returnValue({
++                "data": data,
++                "status": response.code
++            })
++        except ValueError:
++            returnValue({
++                "data": (yield treq.text_content(response)),
++                "status": response.code
++            })
++
++    @inlineCallbacks
+     def delete(self, endpoint, params=None):
+         """Method that completes a DELETE request to the MapRoulette API
+ 
+@@ -233,40 +270,43 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.delete(
+-            self.url + endpoint,
+-            params=params
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 401:
++        yield self._health
++        try:
++            response = yield treq.delete(
++                self.url + endpoint,
++                params=params,
++                headers=self.headers,
++                agent=self.agent
++            )
++        except Exception as e:
++            raise ConnectionUnavailableError(e) from None
++        if response.code >= 400:
++            if response.code == 401:
+                 raise UnauthorizedError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            elif e.response.status_code == 404:
++                    message=(yield self.parse_response_message(response)),
++                    status=response.code
++                ) from None
++            elif response.code == 404:
+                 raise NotFoundError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(e) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
++                    message=(yield self.parse_response_message(response)),
++                    status=response.code
++                ) from None
++            else:
++                raise HttpError(
++                    message=(yield self.parse_response_message(response)),
++                    status=response.code
++                ) from None
++        try:
++            data = yield treq.json_content(response)
++            returnValue({
++                "data": data,
++                "status": response.code
++            })
++        except ValueError:
++            returnValue({
++                "data": (yield treq.text_content(response)),
++                "status": response.code
++            })
+ 
+     @staticmethod
+     def is_json(input_object):
+@@ -283,13 +323,15 @@
+             return False
+ 
+     @staticmethod
++    @inlineCallbacks
+     def parse_response_message(response):
+         """Method to determine the message body from a response object. Will return None if message cannot be parsed.
+ 
+-        :param response: the Requests response object
++        :param response: the treq response object
+         :returns: the response message if parsable, otherwise None
+         """
+         try:
+-            return json.loads(response.text)['message']
++            response_text = yield treq.text_content(response)
++            returnValue(json.loads(response_text)['message'])
+         except (ValueError, KeyError):
+-            return None
++            returnValue(None)

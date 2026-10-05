@@ -1,0 +1,111 @@
+--- a/iconsdk/providers/http_provider.py
++++ b/iconsdk/providers/http_provider.py
+@@ -12,20 +12,68 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import asyncio
+ import json
+ import re
+ from json.decoder import JSONDecodeError
++from threading import Thread
+ from time import time, monotonic
+-from typing import Union, Optional
++from typing import Any, Union, Optional
+ from urllib.parse import urlparse, urlunparse
+ 
+-import requests
++import aiohttp
+ from multimethod import multimethod
+ from websocket import WebSocket, WebSocketTimeoutException
+ 
+ from iconsdk.exception import JSONRPCException, URLException
+ from iconsdk.providers.provider import Provider, MonitorSpec, Monitor, MonitorTimeoutException
+ from iconsdk.utils import to_dict
++
++
++class _AiohttpResponse:
++    """Small response snapshot used after an aiohttp response is closed."""
++
++    def __init__(self, status: int, content: bytes):
++        self.status = status
++        self.content = content
++
++    @property
++    def ok(self) -> bool:
++        return 200 <= self.status < 400
++
++
++def _run_async(coro):
++    """Run an aiohttp coroutine from the SDK's synchronous public API.
++
++    ``IconService`` and ``Provider`` predate aiohttp and intentionally expose
++    synchronous methods.  ``asyncio.run`` is sufficient for normal callers,
++    but cannot be used while another event loop is running (for example from
++    a notebook).  In that case the request is run on a short-lived helper
++    thread with its own event loop.
++    """
++    try:
++        asyncio.get_running_loop()
++    except RuntimeError:
++        return asyncio.run(coro)
++
++    result = []
++    error = []
++
++    def run_in_thread():
++        try:
++            result.append(asyncio.run(coro))
++        except BaseException as exc:  # preserve the original exception type
++            error.append(exc)
++
++    thread = Thread(target=run_in_thread)
++    thread.start()
++    thread.join()
++    if error:
++        raise error[0]
++    return result[0]
++
++
++
+ 
+ 
+ class HTTPProvider(Provider):
+@@ -119,11 +167,24 @@
+             yield key, value
+ 
+     @staticmethod
+-    def _make_post_request(request_url: str, data: dict, **kwargs) -> requests.Response:
++    async def _async_make_post_request(request_url: str, data: dict, **kwargs) -> _AiohttpResponse:
++        kwargs = dict(kwargs)
+         kwargs.setdefault('timeout', 10)
+-        with requests.Session() as session:
+-            response = session.post(url=request_url, data=json.dumps(data), **kwargs)
+-        return response
++
++        # ``verify`` is a requests option.  Keep accepting it for callers
++        # using the old HTTPProvider API, translating it to aiohttp's SSL
++        # option instead of passing an unsupported keyword to aiohttp.
++        verify = kwargs.pop('verify', None)
++        if verify is False and 'ssl' not in kwargs:
++            kwargs['ssl'] = False
++
++        async with aiohttp.ClientSession() as session:
++            async with session.post(url=request_url, json=data, **kwargs) as response:
++                return _AiohttpResponse(response.status, await response.read())
++
++    @staticmethod
++    def _make_post_request(request_url: str, data: dict, **kwargs) -> _AiohttpResponse:
++        return _run_async(HTTPProvider._async_make_post_request(request_url, data, **kwargs))
+ 
+     def _make_id(self) -> int:
+         return int(time())
+@@ -147,7 +208,7 @@
+             raise JSONRPCException(f'Unknown response: {raw_response}')
+ 
+     @staticmethod
+-    def _return_custom_response(response: requests.Response, full_response: bool = False) -> Union[str, list, dict]:
++    def _return_custom_response(response: Any, full_response: bool = False) -> Union[str, list, dict]:
+         content = json.loads(response.content)
+         if full_response:
+             return content

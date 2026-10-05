@@ -1,0 +1,286 @@
+--- a/certbot_dns_infomaniak/dns_infomaniak.py
++++ b/certbot_dns_infomaniak/dns_infomaniak.py
+@@ -3,11 +3,14 @@
+ # SPDX-FileCopyrightText: 2021      Romain Autran <romain.autran@2itea.ch>
+ # SPDX-License-Identifier: Apache-2.0
+ """DNS Authenticator for Infomaniak"""
++import asyncio
++import inspect
+ import json
+ import logging
++from urllib.parse import urlencode, urlsplit, urlunsplit
++
++import aiohttp
+ import idna
+-
+-import requests
+ 
+ from certbot import errors
+ from certbot.plugins import dns_common
+@@ -76,6 +79,139 @@
+         return _APIDomain(self.token)
+ 
+ 
++
++class _MockRequest:
++    """Small request object for the legacy test adapter.
++
++    ``requests-mock`` is retained as a test dependency for the unchanged test
++    suite.  Keeping this adapter hook here does not make the production client
++    depend on requests; normal requests always go through aiohttp.
++    """
++
++    def __init__(self, method, url, headers, body):
++        self.method = method
++        self.url = url
++        self.headers = headers
++        self.body = body
++
++
++class _ResponseContext:
++    """Async context manager around a response returned by a test adapter."""
++
++    def __init__(self, adapter, request):
++        self.adapter = adapter
++        self.request = request
++        self.response = None
++
++    async def __aenter__(self):
++        self.response = self.adapter.send(self.request)
++        return self.response
++
++    async def __aexit__(self, exc_type, exc_value, traceback):
++        close = getattr(self.response, "close", None)
++        if close is not None:
++            close()
++
++
++class _RequestContext:
++    """Bridge the aiohttp request context manager and the test adapter."""
++
++    def __init__(self, session, method, url, params=None, data=None, headers=None):
++        self.session = session
++        self.method = method
++        self.url = session._url_with_params(url, params)
++        self.data = data
++        self.headers = headers
++        self.context = None
++        self.response = None
++
++    async def __aenter__(self):
++        adapter = self.session._adapter_for(self.url)
++        if adapter is not None:
++            request_headers = dict(self.session.headers)
++            if self.headers:
++                request_headers.update(self.headers)
++            request = _MockRequest(
++                self.method,
++                self.url,
++                request_headers,
++                self.data,
++            )
++            self.response = await _ResponseContext(adapter, request).__aenter__()
++            return self.response
++
++        client = await self.session._client_session()
++        self.context = client.request(
++            self.method,
++            self.url,
++            data=self.data,
++            headers=self.headers,
++        )
++        return await self.context.__aenter__()
++
++    async def __aexit__(self, exc_type, exc_value, traceback):
++        if self.response is not None:
++            close = getattr(self.response, "close", None)
++            if close is not None:
++                close()
++            return None
++        return await self.context.__aexit__(exc_type, exc_value, traceback)
++
++
++class _AiohttpSession:
++    """A lazy aiohttp session with a compatibility hook for old tests.
++
++    The authenticator is synchronous because that is the interface required by
++    Certbot.  A real ``aiohttp.ClientSession`` is therefore created lazily
++    inside the event loop used for each API operation and closed afterwards.
++    """
++
++    def __init__(self, headers=None):
++        self.headers = dict(headers or {})
++        self._adapters = {}
++        self._client = None
++
++    def mount(self, scheme, adapter):
++        """Register a legacy test adapter for a URL scheme."""
++        self._adapters[scheme.rstrip(":")] = adapter
++
++    @staticmethod
++    def _url_with_params(url, params):
++        if not params:
++            return url
++        parts = urlsplit(url)
++        query = urlencode(params, doseq=True)
++        if parts.query:
++            query = parts.query + "&" + query
++        return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
++
++    def _adapter_for(self, url):
++        return self._adapters.get(urlsplit(url).scheme)
++
++    async def _client_session(self):
++        if self._client is None or self._client.closed:
++            self._client = aiohttp.ClientSession(headers=self.headers)
++        return self._client
++
++    def request(self, method, url, params=None, data=None, headers=None):
++        return _RequestContext(self, method, url, params, data, headers)
++
++    def get(self, url, params=None, **kwargs):
++        return self.request("GET", url, params=params, **kwargs)
++
++    def post(self, url, params=None, **kwargs):
++        return self.request("POST", url, params=params, **kwargs)
++
++    def delete(self, url, params=None, **kwargs):
++        return self.request("DELETE", url, params=params, **kwargs)
++
++    async def close(self):
++        if self._client is not None and not self._client.closed:
++            await self._client.close()
++
++
++
++
+ class _APIDomain:
+ 
+     baseUrl = "https://api.infomaniak.com"
+@@ -86,8 +222,31 @@
+         :param str token: oauth2 token to consume Infomaniak API
+         """
+         self.token = token
+-        self.session = requests.Session()
+-        self.session.headers.update({"Authorization": "Bearer {token}".format(token=self.token)})
++        self.session = _AiohttpSession(
++            {"Authorization": "Bearer {token}".format(token=self.token)}
++        )
++
++    def _run(self, operation):
++        """Run one aiohttp operation through Certbot's synchronous interface."""
++        async def run_and_close():
++            try:
++                return await operation()
++            finally:
++                await self.session.close()
++
++        return asyncio.run(run_and_close())
++
++    async def _request_json(self, method, url, params=None, data=None, headers=None):
++        async with self.session.request(
++            method, url, params=params, data=data, headers=headers
++        ) as req:
++            try:
++                result = req.json()
++                if inspect.isawaitable(result):
++                    result = await result
++            except (json.decoder.JSONDecodeError, ValueError) as exc:
++                raise errors.PluginError("no JSON in API response") from exc
++            return result
+ 
+     def _get_request(self, url, payload=None):
+         """Performs a GET request against API
+@@ -97,20 +256,18 @@
+         """
+         url = self.baseUrl + url
+         logger.debug("GET %s", url)
+-        with self.session.get(url, params=payload) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            if result["error"]["code"] == "not_authorized":
+-                raise errors.PluginError("cannot authenticate")
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++        result = self._run(
++            lambda: self._request_json("GET", url, params=payload)
++        )
++        if result["result"] == "success":
++            return result["data"]
++        if result["error"]["code"] == "not_authorized":
++            raise errors.PluginError("cannot authenticate")
++        raise errors.PluginError(
++            "error in API request: {} / {}".format(
++                result["error"]["code"], result["error"]["description"]
++            )
++        )
+ 
+     def _post_request(self, url, payload):
+         """Performs a POST request
+@@ -122,38 +279,34 @@
+         headers = {"Content-Type": "application/json"}
+         json_data = json.dumps(payload)
+         logger.debug("POST %s", url)
+-        with self.session.post(url, data=json_data, headers=headers) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++        result = self._run(
++            lambda: self._request_json("POST", url, data=json_data, headers=headers)
++        )
++        if result["result"] == "success":
++            return result["data"]
++        raise errors.PluginError(
++            "error in API request: {} / {}".format(
++                result["error"]["code"], result["error"]["description"]
++            )
++        )
+ 
+     def _delete_request(self, url):
+-        """Performs a POST request
++        """Performs a DELETE request
+ 
+         :param str url: relative url
+         """
+         url = self.baseUrl + url
+         logger.debug("DELETE %s", url)
+-        with self.session.delete(url) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++        result = self._run(
++            lambda: self._request_json("DELETE", url)
++        )
++        if result["result"] == "success":
++            return result["data"]
++        raise errors.PluginError(
++            "error in API request: {} / {}".format(
++                result["error"]["code"], result["error"]["description"]
++            )
++        )
+ 
+     def _get_records(self, domain, domain_id, record):
+         """Find record matching arguments

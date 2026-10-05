@@ -1,0 +1,354 @@
+--- a/distgen/generator.py
++++ b/distgen/generator.py
+@@ -1,7 +1,11 @@
+ import os
++import re
+ import sys
+-import jinja2
+ import functools
++
++from mako.exceptions import TopLevelLookupException
++from mako.lookup import TemplateLookup
++from mako.template import Template
+ 
+ from distgen.err import fatal
+ from distgen.pathmanager import PathManager
+@@ -9,6 +13,232 @@
+ from distgen.project import AbstractProject
+ from distgen.commands import Commands
+ from distgen.multispec import Multispec, MultispecError
++
++
++class _MakoMapping(dict):
++    """Keep attribute access for mappings used by existing templates."""
++
++    def __getattr__(self, name):
++        return self.get(name)
++
++
++def _mako_value(value):
++    if isinstance(value, dict):
++        return _MakoMapping({key: _mako_value(item)
++                             for key, item in value.items()})
++    if isinstance(value, list):
++        return [_mako_value(item) for item in value]
++    if isinstance(value, tuple):
++        return tuple(_mako_value(item) for item in value)
++    return value
++
++
++def _mako_context(values):
++    return {key: _mako_value(value) for key, value in values.items()}
++
++
++def _render_command(commands, cmdinfo):
++    if isinstance(cmdinfo, dict):
++        cmd_type = cmdinfo.get('type')
++        action = cmdinfo.get('action')
++        packages = cmdinfo.get('packages')
++    else:
++        cmd_type = cmdinfo.type
++        action = cmdinfo.action
++        packages = getattr(cmdinfo, 'packages', None)
++    if cmd_type == 'pkg':
++        if action in ['install', 'reinstall', 'update']:
++            return commands.pkginstaller[action](packages)
++        return commands.pkginstaller[action]()
++    if cmd_type == 'shell':
++        return action
++    return ''
++
++
++def _mako_expression(expression):
++    expression = expression.strip()
++    expression = re.sub(r'\.from\b', "['from']", expression)
++    expression = re.sub(r'([^|]+?)\s+is\s+defined\b',
++                        r'(\1) is not None', expression)
++
++    dictsort = re.match(r'^(.*?)\s*\|\s*dictsort$', expression)
++    if dictsort:
++        return 'sorted(({0}).items())'.format(dictsort.group(1))
++
++    join = re.match(r'^(.*?)\s*\|\s*join\((.*)\)$', expression)
++    if join:
++        return '({0}).join({1})'.format(join.group(2), join.group(1))
++
++    replace = re.match(r'^(.*?)\s*\|\s*replace\((.*)\)$', expression)
++    if replace:
++        return '({0}).replace({1})'.format(replace.group(1), replace.group(2))
++
++    return expression
++
++
++def _mako_branch_expression(branch):
++    pieces = []
++    position = 0
++    expression = re.compile(r'{{-?\s*(.*?)\s*-?}}', re.S)
++    for match in expression.finditer(branch):
++        if match.start() != position:
++            pieces.append(repr(branch[position:match.start()]))
++        pieces.append('str({0})'.format(_mako_expression(match.group(1))))
++        position = match.end()
++    if position != len(branch):
++        pieces.append(repr(branch[position:]))
++    return ' + '.join(pieces) or "''"
++
++
++def _mako_template_source(source, trim_blocks=False, lstrip_blocks=False):
++    """Translate the small legacy syntax accepted by distgen to Mako."""
++    if '{{' not in source and '{%' not in source:
++        return source
++
++    inline_if = re.compile(
++        r'{%-?\s*if\s+(.*?)\s*-?%}(.*?){%-?\s*else\s*-?%}'
++        r'(.*?){%-?\s*endif\s*-?%}',
++        re.S,
++    )
++    while inline_if.search(source):
++        source = inline_if.sub(
++            lambda match: '${({0}) if ({1}) else ({2})}'.format(
++                _mako_branch_expression(match.group(2)),
++                _mako_expression(match.group(1)),
++                _mako_branch_expression(match.group(3)),
++            ),
++            source,
++        )
++
++    token = re.compile(r'({{\-?[\s\S]*?\-?}}|{%\-?[\s\S]*?\-?%})')
++    output = []
++    position = 0
++    trim_next = False
++    trim_newline = False
++    for match in token.finditer(source):
++        text = source[position:match.start()]
++        if trim_next:
++            text = text.lstrip()
++            trim_next = False
++        elif trim_newline and text.startswith('\n'):
++            text = text[1:]
++        trim_newline = False
++
++        raw = match.group(0)
++        left_trim = raw.startswith('{{-') or raw.startswith('{%-')
++        right_trim = raw.endswith('-}}') or raw.endswith('-%}')
++        if left_trim:
++            text = text.rstrip()
++
++        statement = None
++        if raw.startswith('{%'):
++            statement = raw[2:-2].strip('- ').strip()
++            if lstrip_blocks:
++                text = re.sub(r'(^|\n)[ \t]+$', r'\1', text)
++
++        if raw.startswith('{{'):
++            output.append(text + '${' +
++                         _mako_expression(raw[2:-2].strip('- ')) + '}')
++        else:
++            if statement.startswith('extends '):
++                output.append(text + '<%inherit file=' + statement[8:] + '/>')
++            elif statement.startswith('include '):
++                output.append(text + '<%include file=' + statement[8:] + '/>')
++            elif statement.startswith('import ') and ' as ' in statement:
++                imported, name = statement[7:].split(' as ', 1)
++                imported = imported.split(' with context', 1)[0].strip()
++                if imported.startswith('"container/"'):
++                    imported = '"container/${container.name}/parts.tpl"'
++                output.append(
++                    text + '<%namespace name="{0}" file={1}/>'.format(
++                        name.strip(), imported))
++            elif statement.startswith('macro '):
++                output.append(text + '<%def name="' +
++                              statement[6:].strip() + '">')
++            elif statement == 'endmacro':
++                output.append(text + '</%def>')
++            elif statement.startswith('block '):
++                output.append(text + '<%block name="' +
++                              statement[6:].strip() + '">')
++            elif statement == 'endblock':
++                output.append(text + '</%block>')
++            elif statement.startswith('set '):
++                output.append(text + '<% ' + statement[4:] + ' %>')
++            elif statement.startswith('if '):
++                output.append(text + '% if ' +
++                              _mako_expression(statement[3:]) + ':')
++            elif statement.startswith('elif '):
++                output.append(text + '% elif ' +
++                              _mako_expression(statement[5:]) + ':')
++            elif statement == 'else':
++                output.append(text + '% else:')
++            elif statement == 'endif':
++                output.append(text + '% endif')
++            elif statement.startswith('for '):
++                target, iterable = statement[4:].split(' in ', 1)
++                output.append(text + '% for {0} in {1}:'.format(
++                    target, _mako_expression(iterable)))
++            elif statement == 'endfor':
++                output.append(text + '% endfor')
++            else:
++                output.append(text)
++
++        position = match.end()
++        if right_trim:
++            trim_next = True
++        elif trim_blocks and raw.startswith('{%'):
++            trim_newline = True
++
++    if trim_next:
++        output.append(source[position:].lstrip())
++    else:
++        output.append(source[position:])
++    return ''.join(output)
++
++
++def _mako_inline_source(source, **template_args):
++    translated = _mako_template_source(source, **template_args)
++    if translated == source and not any(
++            marker in source for marker in ('${', '<%', '% ')):
++        return None
++    return translated
++
++
++class _MakoEnvironment(object):
++    def __init__(self, directories, **template_args):
++        trim_blocks = template_args.pop('trim_blocks', False)
++        lstrip_blocks = template_args.pop('lstrip_blocks', False)
++        self.trim_blocks = trim_blocks
++        self.lstrip_blocks = lstrip_blocks
++        self.preprocessor = functools.partial(
++            _mako_template_source,
++            trim_blocks=trim_blocks,
++            lstrip_blocks=lstrip_blocks,
++        )
++        self.lookup = TemplateLookup(
++            directories=directories,
++            input_encoding='utf-8',
++            preprocessor=self.preprocessor,
++            **template_args
++        )
++
++    def get_template(self, name):
++        inline = _mako_inline_source(
++            name, trim_blocks=self.trim_blocks,
++            lstrip_blocks=self.lstrip_blocks)
++        if inline is not None:
++            return Template(text=inline, lookup=self.lookup,
++                            preprocessor=self.preprocessor)
++
++        try:
++            return self.lookup.get_template(name)
++        except TopLevelLookupException:
++            path = os.path.abspath(name)
++            if not os.path.isfile(path):
++                raise
++            return Template(filename=path, lookup=self.lookup,
++                            input_encoding='utf-8',
++                            preprocessor=self.preprocessor)
+ 
+ try:
+     from importlib.machinery import SourceFileLoader, SourcelessFileLoader
+@@ -26,7 +256,7 @@
+     pm_tpl = None
+     pm_spc = None
+ 
+-    def __init__(self, global_jinja_args=None):
++    def __init__(self, global_template_args=None):
+         here = os.path.dirname(os.path.abspath(__file__))
+         self.pm_cfg = PathManager(
+             [os.path.join(here, "distconf"),
+@@ -41,10 +271,7 @@
+         )
+ 
+         self.pm_spc = PathManager([])
+-        self.jinjaenv_args = {'keep_trailing_newline': True}
+-
+-        if global_jinja_args:
+-            self.jinjaenv_args.update(global_jinja_args)
++        self.template_args = global_template_args or {}
+ 
+     def load_project(self, project):
+         self.project = self._load_project_from_dir(project)
+@@ -52,38 +279,8 @@
+             self.project = AbstractProject()
+         self.project.directory = project
+ 
+-        def file_load(name):
+-            """
+-            The default FileSystemLoader doesn't load files specified
+-            by absolute paths or paths that include '..' - therefore
+-            we provide a custom fallback function that handles this.
+-            """
+-            name = os.path.abspath(name)
+-            try:
+-                with open(name, 'rb') as f:
+-                    return f.read().decode('utf-8')
+-            except Exception:
+-                raise jinja2.TemplateNotFound(name)
+-
+-        def string_load(name):
+-            """
+-            Allow specifying a string instead of template to be able
+-            to return expanded config/specs/...
+-            """
+-            if name.startswith(('{{', '{%')):
+-                return name
+-            raise jinja2.TemplateNotFound(name)
+-
+-        loader = jinja2.ChoiceLoader([
+-            jinja2.FileSystemLoader(self.pm_tpl.get_path()),
+-            jinja2.FunctionLoader(string_load),
+-            jinja2.FunctionLoader(file_load),
+-        ])
+-
+-        self.project.tplgen = jinja2.Environment(
+-            loader=loader,
+-            **self.jinjaenv_args
+-        )
++        self.project.tplgen = _MakoEnvironment(
++            self.pm_tpl.get_path(), **self.template_args)
+ 
+         self.project.abstract_initialize()
+ 
+@@ -203,7 +400,12 @@
+                 _changed, s[i] = self._rerender_spec(s[i], **kwargs)
+                 changed |= _changed
+         elif isinstance(s, str):
+-            new_spec = jinja2.Template(s).render(**kwargs)
++            source = _mako_inline_source(s)
++            if source is None:
++                new_spec = s
++            else:
++                new_spec = Template(text=source).render(
++                    **_mako_context(kwargs))
+             changed = s != new_spec
+             s = new_spec
+         else:
+@@ -312,11 +514,12 @@
+ 
+         try:
+             tpl = self.project.tplgen.get_template(template)
+-        except jinja2.exceptions.TemplateNotFound as err:
++        except TopLevelLookupException as err:
+             fatal("Can not find template {0}".format(err))
+ 
+         self.project.inst_finish(specfiles, template, sysconfig, spec)
+ 
++        commands = Commands(cmd_cfg, sysconfig)
+         rendering_kwargs = {
+             'config': sysconfig,
+             'macros': sysconfig['macros'],
+@@ -324,7 +527,8 @@
+             'container': {'name': 'docker'},
+             'spec': spec,
+             'project': self.project,
+-            'commands': Commands(cmd_cfg, sysconfig),
++            'commands': commands,
++            'command': functools.partial(_render_command, commands),
+             'env': os.environ,
+         }
+ 
+@@ -334,4 +538,4 @@
+             **rendering_kwargs
+         )
+ 
+-        output.write(tpl.render(**rendering_kwargs).encode('utf-8'))
++        output.write(tpl.render(**_mako_context(rendering_kwargs)).encode('utf-8'))

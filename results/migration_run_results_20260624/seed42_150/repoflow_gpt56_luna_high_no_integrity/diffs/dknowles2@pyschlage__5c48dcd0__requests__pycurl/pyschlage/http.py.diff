@@ -1,0 +1,144 @@
+--- a/pyschlage/http.py
++++ b/pyschlage/http.py
+@@ -0,0 +1,141 @@
++"""Small synchronous HTTP adapter backed by pycurl."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++import json as json_module
++from io import BytesIO
++from typing import Any
++from urllib.parse import urlencode
++
++import pycurl
++
++
++class HTTPError(Exception):
++    """Raised when an HTTP response has an unsuccessful status code."""
++
++
++@dataclass
++class HTTPRequest:
++    """Request object accepted by pycognito's requests-style auth handler."""
++
++    method: str = "GET"
++    url: str = ""
++    headers: dict[str, str] = field(default_factory=dict)
++    body: bytes | str | None = None
++
++
++@dataclass
++class HTTPResponse:
++    """Response object exposing the subset of the requests API we use."""
++
++    status_code: int
++    content: bytes
++    headers: dict[str, str]
++    reason: str = ""
++
++    @property
++    def text(self) -> str:
++        """Return the response body as text."""
++        return self.content.decode("utf-8", errors="replace")
++
++    def json(self) -> Any:
++        """Decode the response body as JSON."""
++        return json_module.loads(self.text)
++
++    def raise_for_status(self) -> None:
++        """Raise HTTPError for a 4xx or 5xx response."""
++        if self.status_code >= 400:
++            message = f"{self.status_code} {self.reason}".strip()
++            raise HTTPError(message)
++
++
++def _append_params(url: str, params: Any) -> str:
++    if not params:
++        return url
++    query = urlencode(params, doseq=True)
++    separator = "&" if "?" in url else "?"
++    return f"{url}{separator}{query}"
++
++
++def _header_callback(
++    response_headers: dict[str, str], status: list[str]
++):
++    def callback(line: bytes) -> int:
++        decoded = line.decode("iso-8859-1").strip("\r\n")
++        if decoded.startswith("HTTP/"):
++            parts = decoded.split(" ", 2)
++            status[:] = [parts[2] if len(parts) == 3 else ""]
++        elif ":" in decoded:
++            name, value = decoded.split(":", 1)
++            response_headers[name.strip()] = value.strip()
++        return len(line)
++
++    return callback
++
++
++def request(method: str, url: str, **kwargs: Any) -> HTTPResponse:
++    """Perform one HTTP request using libcurl."""
++    headers = dict(kwargs.get("headers") or {})
++    url = _append_params(url, kwargs.get("params"))
++
++    body = kwargs.get("json")
++    if body is not None:
++        body = json_module.dumps(body).encode("utf-8")
++        headers.setdefault("Content-Type", "application/json")
++    elif kwargs.get("data") is not None:
++        body = kwargs["data"]
++        if isinstance(body, dict):
++            body = urlencode(body).encode("utf-8")
++        elif isinstance(body, str):
++            body = body.encode("utf-8")
++
++    auth = kwargs.get("auth")
++    if auth is not None:
++        auth_request = auth(
++            HTTPRequest(
++                method=method.upper(), url=url, headers=headers, body=body
++            )
++        )
++        if auth_request is not None:
++            headers = dict(auth_request.headers)
++            if body is None:
++                body = auth_request.body
++
++    response_body = BytesIO()
++    response_headers: dict[str, str] = {}
++    status_reason = [""]
++    curl = pycurl.Curl()
++    try:
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.CUSTOMREQUEST, method.upper())
++        curl.setopt(
++            pycurl.HTTPHEADER,
++            [f"{name}: {value}" for name, value in headers.items()],
++        )
++        curl.setopt(pycurl.WRITEFUNCTION, response_body.write)
++        curl.setopt(
++            pycurl.HEADERFUNCTION,
++            _header_callback(response_headers, status_reason),
++        )
++
++        timeout = kwargs.get("timeout")
++        if isinstance(timeout, tuple):
++            curl.setopt(pycurl.CONNECTTIMEOUT, int(timeout[0]))
++            curl.setopt(pycurl.TIMEOUT, int(timeout[1]))
++        elif timeout is not None:
++            curl.setopt(pycurl.TIMEOUT, int(timeout))
++
++        if body is not None:
++            curl.setopt(pycurl.POSTFIELDS, body)
++
++        curl.perform()
++        response = HTTPResponse(
++            status_code=curl.getinfo(pycurl.RESPONSE_CODE),
++            content=response_body.getvalue(),
++            headers=response_headers,
++            reason=status_reason[0],
++        )
++        return response
++    finally:
++        curl.close()

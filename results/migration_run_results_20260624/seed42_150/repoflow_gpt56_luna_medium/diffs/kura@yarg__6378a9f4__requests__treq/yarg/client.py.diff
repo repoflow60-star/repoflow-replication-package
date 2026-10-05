@@ -1,0 +1,100 @@
+--- a/yarg/client.py
++++ b/yarg/client.py
+@@ -23,13 +23,62 @@
+ # SOFTWARE.
+ 
+ 
+-import requests
++from threading import Event, Lock, Thread
++
++from twisted.internet import reactor
++import treq
+ 
+ from .exceptions import HTTPError
+ from .package import json2package
+ 
+ 
+-session = requests.Session()
++_reactor_lock = Lock()
++_reactor_started = Event()
++
++
++def _start_reactor():
++    reactor.callWhenRunning(_reactor_started.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor():
++    if reactor.running:
++        return
++    with _reactor_lock:
++        if not reactor.running:
++            Thread(target=_start_reactor, daemon=True).start()
++    _reactor_started.wait()
++
++
++def _sync_result(value):
++    """Resolve a treq Deferred while retaining yarg's synchronous API."""
++    if not hasattr(value, 'addCallbacks'):
++        return value
++
++    _ensure_reactor()
++    result = []
++    failure = []
++    complete = Event()
++
++    def succeeded(item):
++        result.append(item)
++        complete.set()
++        return item
++
++    def failed(error):
++        failure.append(error)
++        complete.set()
++        return error
++
++    value.addCallbacks(succeeded, failed)
++    complete.wait()
++    if failure:
++        failure[0].raiseException()
++    return result[0]
++
++
++# Keep the existing session.get seam while using treq for the transport.
++session = treq
+ 
+ 
+ def get(package_name, pypi_server="https://pypi.python.org/pypi/"):
+@@ -46,12 +95,26 @@
+     """
+     if not pypi_server.endswith("/"):
+         pypi_server = pypi_server + "/"
++    def response_content(response):
++        status_code = getattr(response, 'code',
++                              getattr(response, 'status_code', None))
++        if status_code >= 300:
++            reason = getattr(response, 'phrase',
++                             getattr(response, 'reason', None))
++            if isinstance(reason, bytes):
++                reason = reason.decode()
++            raise HTTPError(status_code=status_code, reason=reason)
++        content = response.content
++        return content() if callable(content) else content
++
+     response = session.get("{0}{1}/json".format(pypi_server,
+                                                 package_name))
+-    if response.status_code >= 300:
+-        raise HTTPError(status_code=response.status_code,
+-                        reason=response.reason)
+-    if hasattr(response.content, 'decode'):
+-        return json2package(response.content.decode())
++    if hasattr(response, 'addCallback'):
++        response = response.addCallback(response_content)
+     else:
+-        return json2package(response.content)
++        response = response_content(response)
++    content = _sync_result(response)
++    if hasattr(content, 'decode'):
++        return json2package(content.decode())
++    else:
++        return json2package(content)

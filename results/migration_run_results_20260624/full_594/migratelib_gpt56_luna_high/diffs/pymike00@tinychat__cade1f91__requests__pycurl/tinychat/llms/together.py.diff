@@ -1,0 +1,114 @@
+--- a/tinychat/llms/together.py
++++ b/tinychat/llms/together.py
+@@ -1,11 +1,95 @@
++import codecs
+ import json
++import queue
++import threading
+ from typing import Generator
+ 
+-import requests
++import pycurl
+ from sseclient import SSEClient
+ 
+ from tinychat.llms.base import BaseLLMClient
+ from tinychat.settings import TOGETHER_API_KEY_NAME
++
++
++class _PycurlResponse:
++    def __init__(self, url: str, headers: dict, data: str) -> None:
++        self.status_code = 0
++        self.encoding = "utf-8"
++        self._chunks = queue.Queue()
++        self._headers_received = threading.Event()
++        self._error = None
++
++        self._curl = pycurl.Curl()
++        self._curl.setopt(pycurl.URL, url)
++        self._curl.setopt(
++            pycurl.HTTPHEADER,
++            [f"{key}: {value}" for key, value in headers.items()],
++        )
++        self._curl.setopt(pycurl.POST, 1)
++        self._curl.setopt(pycurl.POSTFIELDS, data)
++        self._curl.setopt(pycurl.HEADERFUNCTION, self._header_callback)
++        self._curl.setopt(pycurl.WRITEFUNCTION, self._write_callback)
++
++        self._thread = threading.Thread(target=self._perform)
++        self._thread.daemon = True
++        self._thread.start()
++        self._headers_received.wait()
++
++    def _header_callback(self, header: bytes) -> int:
++        line = header.decode("iso-8859-1")
++        if line.startswith("HTTP/"):
++            try:
++                self.status_code = int(line.split()[1])
++            except (IndexError, ValueError):
++                self.status_code = 0
++
++        if line in ("\r\n", "\n") and self.status_code != 100:
++            self._headers_received.set()
++
++        return len(header)
++
++    def _write_callback(self, chunk: bytes) -> int:
++        self._chunks.put(chunk)
++        return len(chunk)
++
++    def _perform(self) -> None:
++        try:
++            self._curl.perform()
++            self.status_code = self._curl.getinfo(pycurl.RESPONSE_CODE)
++        except Exception as error:
++            self._error = error
++        finally:
++            self._headers_received.set()
++            self._chunks.put(None)
++            self._curl.close()
++
++    def iter_content(self, chunk_size: int = 1, decode_unicode: bool = False):
++        decoder = (
++            codecs.getincrementaldecoder(self.encoding)()
++            if decode_unicode
++            else None
++        )
++
++        while True:
++            chunk = self._chunks.get()
++            if chunk is None:
++                if self._error is not None:
++                    raise self._error
++                if decoder is not None:
++                    decoded_chunk = decoder.decode(b"", final=True)
++                    if decoded_chunk:
++                        yield decoded_chunk
++                return
++
++            if decoder is not None:
++                decoded_chunk = decoder.decode(chunk)
++                if decoded_chunk:
++                    yield decoded_chunk
++            else:
++                yield chunk
++
++    def __iter__(self):
++        return self.iter_content()
+ 
+ 
+ class TogetherClient(BaseLLMClient):
+@@ -31,11 +115,10 @@
+             "temperature": self.temperature,
+             "stream": True,
+         }
+-        response = requests.post(
++        response = _PycurlResponse(
+             self.TOGHETER_COMPLETION_API_URL,
+-            headers=self.default_headers(),  # type: ignore
+-            json=data,
+-            stream=True,
++            self.default_headers(),  # type: ignore
++            json.dumps(data),
+         )
+         if response.status_code != 200:
+             raise ValueError(

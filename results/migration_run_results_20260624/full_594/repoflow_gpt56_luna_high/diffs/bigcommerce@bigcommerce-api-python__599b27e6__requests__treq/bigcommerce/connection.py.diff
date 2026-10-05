@@ -1,0 +1,158 @@
+--- a/bigcommerce/connection.py
++++ b/bigcommerce/connection.py
+@@ -6,6 +6,7 @@
+ import base64
+ import hashlib
+ import hmac
++import threading
+ 
+ try:
+     from urllib import urlencode
+@@ -13,8 +14,9 @@
+     from urllib.parse import urlencode
+ 
+ import logging
+-import requests
+ import jwt
++import treq
++from twisted.internet import reactor
+ 
+ from json import dumps, loads
+ from math import ceil
+@@ -23,6 +25,109 @@
+ from bigcommerce.exception import *
+ 
+ log = logging.getLogger("bigcommerce.connection")
++
++
++_reactor_thread = None
++_reactor_ready = threading.Event()
++_reactor_lock = threading.Lock()
++
++
++def _start_reactor():
++    global _reactor_thread
++    with _reactor_lock:
++        if reactor.running:
++            _reactor_ready.set()
++        elif _reactor_thread is None:
++            _reactor_thread = threading.Thread(
++                target=reactor.run,
++                kwargs={'installSignalHandlers': False}
++            )
++            _reactor_thread.daemon = True
++            reactor.callWhenRunning(_reactor_ready.set)
++            _reactor_thread.start()
++    _reactor_ready.wait()
++
++
++def _decode_header_value(value):
++    if isinstance(value, bytes):
++        return value.decode('latin1')
++    return str(value)
++
++
++class _TreqResponse(object):
++    """Synchronous response view used by the existing response handling code."""
++
++    def __init__(self, response, content):
++        self.status_code = response.code
++        self.reason = _decode_header_value(response.phrase)
++        self.content = content
++        self.headers = {}
++        for name, values in response.headers.getAllRawHeaders():
++            name = _decode_header_value(name)
++            self.headers[name] = ', '.join(_decode_header_value(value) for value in values)
++
++    def json(self):
++        return loads(self.content)
++
++
++class _TreqSession(object):
++    """A blocking session facade over treq's Deferred-based request API."""
++
++    def __init__(self):
++        self.auth = None
++        self.headers = {}
++
++    def request(self, method, url, data=None, timeout=None, headers=None):
++        request_headers = dict(self.headers)
++        if headers:
++            request_headers.update(headers)
++        if self.auth:
++            credentials = '%s:%s' % self.auth
++            encoded = base64.b64encode(credentials.encode('utf-8')).decode('ascii')
++            request_headers.setdefault('Authorization', 'Basic ' + encoded)
++
++        if isinstance(data, str):
++            data = data.encode('utf-8')
++        elif isinstance(data, dict) and request_headers.get('Content-Type') == \
++                'application/x-www-form-urlencoded':
++            data = urlencode(data).encode('utf-8')
++
++        _start_reactor()
++        result = []
++        completed = threading.Event()
++
++        def fail_request(failure):
++            result.append(failure)
++            completed.set()
++            return failure
++
++        def finish(response, content):
++            result.append(_TreqResponse(response, content))
++            completed.set()
++
++        def read_content(response):
++            content = treq.content(response)
++            content.addCallback(lambda body: finish(response, body))
++            return content
++
++        def make_request():
++            try:
++                deferred = treq.request(method, url, data=data,
++                                         timeout=timeout, headers=request_headers)
++            except Exception as error:
++                result.append(error)
++                completed.set()
++                return
++            deferred.addCallback(read_content)
++            deferred.addErrback(fail_request)
++
++        reactor.callFromThread(make_request)
++        completed.wait()
++        if isinstance(result[0], _TreqResponse):
++            return result[0]
++        if hasattr(result[0], 'raiseException'):
++            result[0].raiseException()
++        raise result[0]
+ 
+ 
+ class Connection(object):
+@@ -39,7 +144,7 @@
+         log.info("API Host: %s/%s" % (self.host, self.api_path))
+ 
+         # set up the session
+-        self._session = requests.Session()
++        self._session = _TreqSession()
+         self._session.auth = auth
+         self._session.headers = {"Accept": "application/json"}
+ 
+@@ -196,7 +301,7 @@
+         self.timeout = 7.0  # can attach to session?
+         self.rate_limiting_management = rate_limiting_management
+ 
+-        self._session = requests.Session()
++        self._session = _TreqSession()
+         self._session.headers = {"Accept": "application/json",
+                                  "Accept-Encoding": "gzip"}
+         if access_token and store_hash:
+@@ -300,7 +405,7 @@
+         self.timeout = 7.0  # can attach to session?
+         self.rate_limiting_management = rate_limiting_management
+ 
+-        self._session = requests.Session()
++        self._session = _TreqSession()
+         self._session.headers = {"Accept": "application/json",
+                                  "Accept-Encoding": "gzip"}
+         if access_token and store_hash:

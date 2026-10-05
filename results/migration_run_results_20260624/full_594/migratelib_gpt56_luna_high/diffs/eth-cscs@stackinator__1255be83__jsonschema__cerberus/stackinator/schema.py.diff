@@ -1,0 +1,210 @@
+--- a/stackinator/schema.py
++++ b/stackinator/schema.py
+@@ -1,36 +1,177 @@
+ import json
+ import pathlib
+ 
+-import jsonschema
++from cerberus import Validator
+ import yaml
+ 
+ prefix = pathlib.Path(__file__).parent.resolve()
+ 
+-# create a validator that will insert optional fields with their default values
+-# if they have not been provided.
++
++def _resolve_schema(schema, root):
++    while isinstance(schema, dict) and "$ref" in schema:
++        reference = schema["$ref"]
++
++        if not reference.startswith("#/"):
++            break
++
++        resolved = root
++        for part in reference[2:].split("/"):
++            part = part.replace("~1", "/").replace("~0", "~")
++            resolved = resolved[part]
++
++        schema = dict(resolved)
++        schema.update(
++            {
++                key: value
++                for key, value in schema.items()
++                if key != "$ref"
++            }
++        )
++
++    return schema
+ 
+ 
+-def extend_with_default(validator_class):
+-    validate_properties = validator_class.VALIDATORS["properties"]
++def _additional_properties(schema, root):
++    if "additionalProperties" not in schema:
++        return True
+ 
+-    def set_defaults(validator, properties, instance, schema):
+-        # if instance is none, it's not possible to set any default for any sub-property
+-        if instance is not None:
+-            for property, subschema in properties.items():
+-                if "default" in subschema:
+-                    instance.setdefault(property, subschema["default"])
++    additional_properties = schema["additionalProperties"]
+ 
+-        for error in validate_properties(
+-            validator,
+-            properties,
+-            instance,
+-            schema,
+-        ):
+-            yield error
++    if isinstance(additional_properties, bool):
++        return additional_properties
+ 
+-    return jsonschema.validators.extend(
+-        validator_class,
+-        {"properties": set_defaults},
++    return _convert_rule(additional_properties, root)
++
++
++def _convert_object_schema(schema, root):
++    schema = _resolve_schema(schema, root)
++    properties = schema.get("properties", {})
++    required = schema.get("required", [])
++    converted = {}
++
++    for property, subschema in properties.items():
++        converted[property] = _convert_rule(subschema, root)
++
++        if property in required:
++            converted[property]["required"] = True
++
++    dependencies = schema.get("dependencies", {})
++
++    for property, dependency in dependencies.items():
++        if property in converted and isinstance(dependency, list):
++            converted[property]["dependencies"] = dependency
++
++    return converted
++
++
++def _convert_rule(schema, root):
++    schema = _resolve_schema(schema, root)
++    rule = {}
++    json_type = schema.get("type")
++
++    if isinstance(json_type, list):
++        type_schema = dict(schema)
++        del type_schema["type"]
++
++        default = type_schema.pop("default", None)
++        has_default = "default" in schema
++
++        rule["anyof"] = []
++
++        for type_name in json_type:
++            subschema = dict(type_schema)
++            subschema["type"] = type_name
++            rule["anyof"].append(_convert_rule(subschema, root))
++
++        if has_default:
++            rule["default"] = default
++
++        return rule
++
++    type_mapping = {
++        "array": "list",
++        "boolean": "boolean",
++        "integer": "integer",
++        "number": "number",
++        "null": "none",
++        "object": "dict",
++        "string": "string",
++    }
++
++    if json_type in type_mapping:
++        rule["type"] = type_mapping[json_type]
++
++    if json_type == "object" or "properties" in schema:
++        rule["schema"] = _convert_object_schema(schema, root)
++        rule["allow_unknown"] = _additional_properties(schema, root)
++
++    if json_type == "array" and "items" in schema:
++        items = schema["items"]
++
++        if isinstance(items, dict):
++            rule["schema"] = _convert_rule(items, root)
++        elif isinstance(items, list):
++            rule["items"] = [
++                _convert_rule(item, root)
++                for item in items
++            ]
++
++    rules = {
++        "minLength": "minlength",
++        "maxLength": "maxlength",
++        "minItems": "min",
++        "maxItems": "max",
++        "minimum": "min",
++        "maximum": "max",
++        "pattern": "regex",
++        "uniqueItems": "unique",
++    }
++
++    for json_rule, cerberus_rule in rules.items():
++        if json_rule in schema:
++            rule[cerberus_rule] = schema[json_rule]
++
++    if "enum" in schema:
++        rule["allowed"] = schema["enum"]
++
++    if "const" in schema:
++        rule["allowed"] = [schema["const"]]
++
++    if "default" in schema:
++        rule["default"] = schema["default"]
++
++    if "anyOf" in schema:
++        rule["anyof"] = [
++            _convert_rule(subschema, root)
++            for subschema in schema["anyOf"]
++        ]
++
++    if "oneOf" in schema:
++        rule["oneof"] = [
++            _convert_rule(subschema, root)
++            for subschema in schema["oneOf"]
++        ]
++
++    if "allOf" in schema:
++        rule["allof"] = [
++            _convert_rule(subschema, root)
++            for subschema in schema["allOf"]
++        ]
++
++    if "not" in schema:
++        rule["noneof"] = [
++            _convert_rule(schema["not"], root)
++        ]
++
++    return rule
++
++
++def validator(schema):
++    schema = _resolve_schema(schema, schema)
++
++    return Validator(
++        _convert_object_schema(schema, schema),
++        allow_unknown=_additional_properties(schema, schema),
+     )
+ 
+ 
+@@ -41,8 +182,6 @@
+     return res
+ 
+ 
+-validator = extend_with_default(jsonschema.Draft7Validator)
+-
+ # load recipe yaml schema
+ config_schema = json.load(open(prefix / "schema/config.json"))
+ config_validator = validator(config_schema)

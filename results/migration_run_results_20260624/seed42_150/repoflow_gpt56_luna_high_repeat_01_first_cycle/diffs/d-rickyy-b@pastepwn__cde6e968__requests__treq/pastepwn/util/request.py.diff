@@ -1,0 +1,139 @@
+--- a/pastepwn/util/request.py
++++ b/pastepwn/util/request.py
+@@ -1,8 +1,89 @@
+ import logging
+-from threading import Lock
++import socket
++from threading import Event, Lock, Thread
++from urllib.parse import urlsplit
++from urllib.request import getproxies
+ 
+-from requests import Session, utils
+-from requests.exceptions import Timeout
++import treq
++from twisted.internet import reactor
++from twisted.internet.endpoints import TCP4ClientEndpoint, TCP6ClientEndpoint
++from twisted.internet.error import TimeoutError as TwistedTimeoutError
++from twisted.internet.threads import blockingCallFromThread
++from twisted.web.client import Agent, ProxyAgent
++
++from .network import get_ip_family
++
++
++_reactor_start_lock = Lock()
++_reactor_ready = Event()
++_reactor_thread_started = False
++
++
++class _EndpointFactory:
++    def __init__(self, timeout):
++        self.timeout = timeout
++
++    def endpointForURI(self, uri):
++        host = uri.host.decode("ascii") if isinstance(uri.host, bytes) else uri.host
++        scheme = uri.scheme.decode("ascii") if isinstance(uri.scheme, bytes) else uri.scheme
++        port = uri.port or (443 if scheme == "https" else 80)
++        addresses = socket.getaddrinfo(host, port, get_ip_family(), socket.SOCK_STREAM)
++        family, _, _, _, address = addresses[0]
++        endpoint_type = TCP6ClientEndpoint if family == socket.AF_INET6 else TCP4ClientEndpoint
++        return endpoint_type(reactor, address[0], port, timeout=self.timeout)
++
++
++def _start_reactor():
++    """Run Twisted once in a background thread for the synchronous API."""
++    global _reactor_thread_started
++
++    if reactor.running:
++        return
++
++    with _reactor_start_lock:
++        if reactor.running or _reactor_thread_started:
++            return
++
++        _reactor_thread_started = True
++
++        def run_reactor():
++            _reactor_ready.set()
++            reactor.run(installSignalHandlers=False)
++
++        Thread(target=run_reactor, name="PastePwnTreqReactor", daemon=True).start()
++        _reactor_ready.wait()
++
++
++def _agent_for(url, proxies, timeout):
++    proxy = None
++    if proxies is not None:
++        parsed_url = urlsplit(url)
++        proxy = proxies.get(parsed_url.scheme) or proxies.get("all")
++
++    if proxy:
++        parsed_proxy = urlsplit(proxy)
++        proxy_host = parsed_proxy.hostname
++        proxy_port = parsed_proxy.port or 80
++        proxy_addresses = socket.getaddrinfo(proxy_host, proxy_port, get_ip_family(), socket.SOCK_STREAM)
++        family, _, _, _, address = proxy_addresses[0]
++        endpoint_type = TCP6ClientEndpoint if family == socket.AF_INET6 else TCP4ClientEndpoint
++        proxy_endpoint = endpoint_type(reactor, address[0], proxy_port, timeout=timeout)
++        return ProxyAgent(reactor, proxy_endpoint)
++
++    return Agent.usingEndpointFactory(reactor, _EndpointFactory(timeout))
++
++
++def _request_content(method, url, headers, data, timeout, proxies):
++    agent = _agent_for(url, proxies, timeout)
++    request = treq.request(method, url, headers=headers, data=data, timeout=timeout, agent=agent)
++    return request.addCallback(treq.content)
++
++
++def _headers_for_treq(headers):
++    return {
++        str(name).encode("ascii"): [str(value).encode("utf-8")]
++        for name, value in headers.items()
++    }
+ 
+ 
+ class Request:
+@@ -22,11 +103,10 @@
+     def __init__(self, proxies=None, headers=None):
+         if not self._initialized:
+             self.logger = logging.getLogger(__name__)
+-            self.session = Session()
+             self.proxies = proxies
+             self.headers = headers
+             self.logger.info("Using the following custom proxies: %s", proxies)
+-            system_proxies = utils.get_environ_proxies("https://example.com")
++            system_proxies = getproxies()
+             self.logger.info("Using the following system proxies: %s", system_proxies)
+             Request._initialized = True
+ 
+@@ -37,13 +117,26 @@
+             headers.update(self.headers)
+ 
+         try:
+-            response = self.session.request(*args, headers=headers, proxies=self.proxies, data=data, timeout=timeout, **kwargs)
+-        except Timeout:
+-            url = kwargs.get("url")
++            url = kwargs.pop("url")
++            method = kwargs.pop("method")
++            proxies = self.proxies if self.proxies is not None else getproxies()
++            treq_headers = _headers_for_treq(headers)
++            _start_reactor()
++            response_content = blockingCallFromThread(
++                reactor,
++                _request_content,
++                method,
++                url,
++                treq_headers,
++                data,
++                timeout,
++                proxies,
++            )
++        except TwistedTimeoutError:
+             self.logger.warning("Timeout while requesting %s!", url)
+             return ""
+ 
+-        return response.content.decode("utf-8")
++        return response_content.decode("utf-8")
+ 
+     def get(self, url, data=None, timeout=5):
+         return self._request_wrapper(method="GET", url=url, data=data, timeout=timeout)

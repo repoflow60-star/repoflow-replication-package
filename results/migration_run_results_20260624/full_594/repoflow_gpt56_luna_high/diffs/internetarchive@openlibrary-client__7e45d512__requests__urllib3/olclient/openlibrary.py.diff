@@ -1,0 +1,317 @@
+--- a/olclient/openlibrary.py
++++ b/olclient/openlibrary.py
+@@ -8,12 +8,12 @@
+ import logging
+ import os
+ import re
+-from urllib.parse import urlencode
++from urllib.parse import urlencode, urljoin
+ from urllib.request import pathname2url
+ 
+ import backoff
+-import requests
+-from requests import Response
++import urllib3
++from urllib3.response import HTTPResponse
+ 
+ from olclient import common
+ from olclient.config import Config
+@@ -51,9 +51,10 @@
+     VALID_IDS = ['isbn_10', 'isbn_13', 'lccn', 'ocaid']
+     BACKOFF_KWARGS = {
+         'wait_gen': backoff.expo,
+-        'exception': requests.exceptions.RequestException,
+-        'giveup': lambda e: hasattr(e.response, 'status_code')
+-        and 400 <= e.response.status_code < 500,
++        'exception': urllib3.exceptions.HTTPError,
++        'giveup': lambda e: 400 <= getattr(
++            getattr(e, 'response', None), 'status', 0
++        ) < 500,
+         'max_tries': 5,
+     }
+ 
+@@ -62,15 +63,102 @@
+     WORKS_PAGINATION_OFFSET = 0
+ 
+     def __init__(self, credentials=None, base_url='https://openlibrary.org'):
+-        self.session = requests.Session()
++        self.session = urllib3.PoolManager()
++        self.cookies = {}
+         self.base_url = base_url
+         credentials = credentials or Config().get_config().get('s3', None)
+         if credentials:
+             self.login(credentials)
+ 
++    def _request(self, method, url, data=None, headers=None, files=None, params=None):
++        """Send a request through urllib3 while retaining session cookies."""
++        request_headers = dict(headers or {})
++        if self.cookies and not any(
++            key.lower() == 'cookie' for key in request_headers
++        ):
++            request_headers['Cookie'] = '; '.join(
++                f'{name}={value}' for name, value in self.cookies.items()
++            )
++
++        if params:
++            query = urlencode(params, doseq=True)
++            separator = '&' if '?' in url else '?'
++            url = f'{url}{separator}{query}'
++
++        request_kwargs = {}
++        if request_headers:
++            request_kwargs['headers'] = request_headers
++        if files is not None:
++            request_kwargs['fields'] = files
++        elif isinstance(data, dict):
++            request_kwargs['fields'] = data
++            request_kwargs['encode_multipart'] = False
++        elif data is not None:
++            request_kwargs['body'] = data
++
++        request_method = getattr(self.session, method.lower())
++        response = request_method(url, **request_kwargs)
++
++        response_headers = getattr(response, 'headers', None)
++        cookie_headers = []
++        getlist = getattr(response_headers, 'getlist', None)
++        if callable(getlist):
++            values = getlist('Set-Cookie')
++            if isinstance(values, str):
++                cookie_headers = [values]
++            elif isinstance(values, (list, tuple)):
++                cookie_headers = list(values)
++        if not cookie_headers:
++            get_header = getattr(response_headers, 'get', None)
++            cookie_header = get_header('Set-Cookie') if callable(get_header) else None
++            if cookie_header:
++                cookie_headers = [cookie_header]
++        for cookie_header in cookie_headers:
++            cookie_pair = cookie_header.split(';', 1)[0]
++            if '=' in cookie_pair:
++                name, value = cookie_pair.split('=', 1)
++                self.cookies[name] = value
++        return response
++
++    @staticmethod
++    def _response_json(response):
++        response_json = getattr(response, 'json', None)
++        if callable(response_json):
++            return response_json()
++        return json.loads(response.data)
++
++    @staticmethod
++    def _raise_for_status(response):
++        raise_for_status = getattr(response, 'raise_for_status', None)
++        if callable(raise_for_status):
++            raise_for_status()
++        elif response.status >= 400:
++            error = urllib3.exceptions.HTTPError(
++                f'HTTP status {response.status}'
++            )
++            error.response = response
++            raise error
++
++    @staticmethod
++    def _response_url(response, fallback):
++        response_url = getattr(response, 'url', None)
++        if isinstance(response_url, str) and response_url:
++            return response_url
++        geturl = getattr(response, 'geturl', None)
++        if callable(geturl):
++            response_url = geturl()
++            if response_url:
++                return response_url
++        response_headers = getattr(response, 'headers', None)
++        get_header = getattr(response_headers, 'get', None)
++        location = get_header('Location') if callable(get_header) else None
++        if location:
++            return urljoin(fallback, location)
++        return fallback
++
+     def login(self, credentials):
+-        """Login to Open Library with given credentials, ensures the requests
+-        session has valid cookies for future requests.
++        """Login to Open Library with given credentials, ensuring the HTTP
++        session has valid cookies for future HTTP operations.
+         """
+ 
+         if 'username' in credentials._asdict():
+@@ -86,11 +174,11 @@
+         @backoff.on_exception(on_giveup=err, **self.BACKOFF_KWARGS)
+         def _login(url, headers, data):
+             """Makes best effort to perform request w/ exponential backoff"""
+-            return self.session.post(url, data=data, headers=headers)
++            return self._request('POST', url, data=data, headers=headers)
+ 
+         _ = _login(url, headers, data)
+ 
+-        if not self.session.cookies:
++        if not self.cookies:
+             raise ValueError("No cookie set")
+ 
+     def validate(self, doc, schema_name):
+@@ -117,9 +205,9 @@
+         """
+         data = json.dumps({'type': {'key': '/type/delete'}, '_comment': comment})
+         url = self._generate_url_from_olid(olid)
+-        return self.session.put(url, data=data)
+-
+-    def save_many(self, docs, comment) -> Response:
++        return self._request('PUT', url, data=data)
++
++    def save_many(self, docs, comment) -> HTTPResponse:
+         """
+         Uses the Open Library save_many API endpoint to
+         write any number or combination of documents (Edition, Work, or Author)
+@@ -131,11 +219,14 @@
+             '42-comment': comment,
+         }
+         doc_json = [doc.json() for doc in docs]
+-        return self.session.post(
+-            f'{self.base_url}/api/save_many', json.dumps(doc_json), headers=headers
++        return self._request(
++            'POST',
++            f'{self.base_url}/api/save_many',
++            data=json.dumps(doc_json),
++            headers=headers,
+         )
+ 
+-    def delete_many(self, ol_ids: List[str], comment: str) -> Response:
++    def delete_many(self, ol_ids: List[str], comment: str) -> HTTPResponse:
+         return self.save_many(
+             [self.Delete(ol_id) for ol_id in ol_ids],
+             comment=comment
+@@ -146,8 +237,8 @@
+     @backoff.on_exception(on_giveup=err, **BACKOFF_KWARGS)  # type: ignore
+     def get_ol_response(self, path):
+         """Makes best effort to perform request w/ exponential backoff"""
+-        response = self.session.get(self.base_url + path)
+-        response.raise_for_status()
++        response = self._request('GET', self.base_url + path)
++        self._raise_for_status(response)
+         return response
+ 
+     @property
+@@ -258,7 +349,8 @@
+             def add_bookcover(self, cover_url):
+                 """Adds a cover image to this edition"""
+                 url = f'{self.OL.base_url}/books/{self.olid}/-/add-cover'
+-                r = self.OL.session.post(
++                r = self.OL._request(
++                    'POST',
+                     url, files={'file': '', 'url': cover_url, 'upload': 'submit'}
+                 )
+                 return r
+@@ -274,9 +366,10 @@
+                     "url": (None, "https://"),
+                     "upload": (None, "Submit")
+                 }
+-                return self.OL.session.post(
++                return self.OL._request(
++                    'POST',
+                     f'{self.OL.base_url}/books/{self.olid}/-/add-cover',
+-                    files=form_data_body
++                    files=form_data_body,
+                 )
+ 
+             def save(self, comment):
+@@ -284,7 +377,7 @@
+                 body = self.json()
+                 body['_comment'] = comment
+                 url = self.OL.base_url + f'/books/{self.olid}.json'
+-                return self.OL.session.put(url, json.dumps(body))
++                return self.OL._request('PUT', url, data=json.dumps(body))
+ 
+             @classmethod
+             def create(cls, book, work_olid, debug=False):
+@@ -378,7 +471,7 @@
+                 response = cls.OL.get_ol_response(path)
+ 
+                 try:
+-                    data = response.json()
++                    data = cls.OL._response_json(response)
+                     data['title'] = data.get('title', None)
+                     edition = cls(**cls.ol_edition_json_to_book_args(data))
+                     return edition
+@@ -462,7 +555,7 @@
+                 response = cls.OL.get_ol_response(path)
+ 
+                 try:
+-                    results = response.json()
++                    results = cls.OL._response_json(response)
+                 except ValueError as e:
+                     logger.exception(e)
+                     return None
+@@ -517,7 +610,7 @@
+                 body = self.json()
+                 body['_comment'] = comment
+                 url = self.OL.base_url + f'/authors/{self.olid}.json'
+-                return self.OL.session.put(url, json.dumps(body))
++                return self.OL._request('PUT', url, data=json.dumps(body))
+ 
+             def works(self, limit=OL.WORKS_LIMIT, offset=OL.WORKS_PAGINATION_OFFSET):
+                 """Returns a list of OpenLibrary Works associated with an OpenLibrary Author.
+@@ -556,7 +649,7 @@
+ 
+                 try:
+                     response = self.OL.get_ol_response(path)
+-                    return response.json()
++                    return self.OL._response_json(response)
+                 except Exception as e:
+                     logger.exception(e)
+                     raise Exception("Author API failed to return json")
+@@ -580,7 +673,7 @@
+                 path = f'/authors/{olid}.json'
+                 r = cls.OL.get_ol_response(path)
+                 try:
+-                    data = r.json()
++                    data = cls.OL._response_json(r)
+                     olid = cls.OL._extract_olid_from_url(
+                         data.pop('key', ''), url_type='authors'
+                     )
+@@ -627,10 +720,10 @@
+                     @backoff.on_exception(on_giveup=err, **cls.OL.BACKOFF_KWARGS)
+                     def _get_matching_authors_by_name(url):
+                         """Makes best effort to perform request w/ exponential backoff"""
+-                        return cls.OL.session.get(url)
++                        return cls.OL._request('GET', url)
+ 
+                     response = _get_matching_authors_by_name(url)
+-                    author_matches = response.json()
++                    author_matches = cls.OL._response_json(response)
+                     return author_matches
+                 return []
+ 
+@@ -691,7 +784,7 @@
+                 body = self.json()
+                 body['_comment'] = comment
+                 url = self.OL._generate_url_from_olid(self.olid)
+-                return self.OL.session.put(url, json.dumps(body))
++                return self.OL._request('PUT', url, data=json.dumps(body))
+ 
+         return Delete
+ 
+@@ -738,7 +831,7 @@
+                 body = self.json()
+                 body['_comment'] = comment
+                 url = self.OL._generate_url_from_olid(self.olid)
+-                return self.OL.session.put(url, json.dumps(body))
++                return self.OL._request('PUT', url, data=json.dumps(body))
+ 
+         return Redirect
+ 
+@@ -848,10 +941,12 @@
+         @backoff.on_exception(on_giveup=err, **self.BACKOFF_KWARGS)
+         def _create_book_post(url, data=data):
+             """Makes best effort to perform request w/ exponential backoff"""
+-            return self.session.post(url, data=data)
++            return self._request('POST', url, data=data)
+ 
+         response = _create_book_post(url, data=data)
+-        _olid = self._extract_olid_from_url(response.url, url_type="books")
++        _olid = self._extract_olid_from_url(
++            self._response_url(response, url), url_type="books"
++        )
+         if _olid == 'add':
+             raise ValueError('Creation failed, book may already exist!')
+         return self.Edition.get(_olid)

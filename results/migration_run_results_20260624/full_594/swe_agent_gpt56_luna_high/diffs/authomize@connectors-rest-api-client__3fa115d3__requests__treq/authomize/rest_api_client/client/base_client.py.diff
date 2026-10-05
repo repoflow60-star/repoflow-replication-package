@@ -1,0 +1,210 @@
+--- a/authomize/rest_api_client/client/base_client.py
++++ b/authomize/rest_api_client/client/base_client.py
+@@ -1,13 +1,15 @@
+-from typing import Optional
++import json
++from typing import Any, Optional
+ 
+-import requests
+-from requests import Response
++import treq
++from twisted.internet.defer import inlineCallbacks, returnValue
+ 
+ AUTHOMIZE_API_URL = 'https://api.authomize.com'
+ 
+ 
+ class ClientError(Exception):
+     def __init__(self, message):
++        super().__init__(message)
+         self.message = message
+ 
+ 
+@@ -15,67 +17,145 @@
+     def __init__(self, auth_token: str, base_url: str = AUTHOMIZE_API_URL):
+         self.auth_token = auth_token
+         self.base_url = base_url
+-        self.session = requests.Session()
+-        self.session.headers.update({'Authorization': self.authorization_header})
++        # treq is deliberately stateless.  Keep the headers on the client so
++        # every request gets the same authentication header.
++        self.headers = {'Authorization': self.authorization_header}
+ 
+     @property
+     def authorization_header(self) -> str:
+         raise NotImplementedError()
+ 
+     @staticmethod
+-    def _handle_response(response: Response):
+-        if response.ok:
+-            return BaseClient._handle_ok_response(response)
++    def _response_headers(response: Any) -> Any:
++        """Return response headers for both treq responses and test doubles."""
++        return getattr(response, 'headers', {})
++
++    @classmethod
++    def _content_type(cls, response: Any) -> Optional[str]:
++        headers = cls._response_headers(response)
+         try:
+-            response_json = response.json()
+-            detail = response_json.get('detail')
+-            if 400 <= response.status_code < 500:
+-                response.reason = response.text
+-        except Exception:
++            values = headers.getRawHeaders('content-type')
++        except (AttributeError, KeyError):
++            try:
++                values = headers.get('content-type')
++            except AttributeError:
++                values = None
++        if not values:
++            return None
++        if isinstance(values, (str, bytes)):
++            values = [values]
++        value = values[0]
++        return value.decode('latin1') if isinstance(value, bytes) else value
++
++    @staticmethod
++    def _response_url(response: Any) -> Optional[str]:
++        request = getattr(response, 'request', None)
++        url = getattr(request, 'absoluteURI', None) if request is not None else None
++        if url is None:
++            url = getattr(response, 'url', None)
++        if isinstance(url, bytes):
++            return url.decode('ascii', errors='replace')
++        return url
++
++    @classmethod
++    @inlineCallbacks
++    def _handle_response(cls, response: Any):
++        """Consume a treq response and return its decoded JSON payload.
++
++        Treq exposes a Deferred for both the response and its body.  Keeping
++        response handling here means all generated endpoint
++        methods can continue to share the same behavior while returning a
++        Deferred to callers.
++        """
++        code = getattr(response, 'code', None)
++        if code is not None and 200 <= code < 300:
++            result = yield cls._handle_ok_response(response)
++            returnValue(result)
++
++        body = yield treq.content(response)
++        try:
++            response_json = json.loads(body.decode('utf-8'))
++            detail = response_json.get('detail') if isinstance(response_json, dict) else None
++        except (UnicodeDecodeError, TypeError, ValueError):
+             detail = None
++
+         if detail:
+             raise ClientError(str(detail))
+-        response.raise_for_status()
+ 
+-    @staticmethod
+-    def _handle_ok_response(response: Response) -> dict:
+-        if content_type := response.headers.get('content-type'):
+-            if content_type.startswith('application/json'):
+-                return response.json()
+-
++        reason = getattr(response, 'phrase', None)
++        if isinstance(reason, bytes):
++            reason = reason.decode('latin1', errors='replace')
++        if 400 <= (code or 0) < 500:
++            reason = body.decode('utf-8', errors='replace')
+         raise ClientError(
+             message={
+-                'status_code': response.status_code,
+-                'url': response.url,
+-                'message': 'Unexpected response from API',
+-                'raw': response.content,
++                'status_code': code,
++                'url': cls._response_url(response),
++                'message': reason or 'HTTP request failed',
++                'raw': body,
+             },
+         )
+ 
+-    def http_get(self, url, params=None):
+-        url = self.base_url + url
+-        response = self.session.get(url, params=params)
+-        return self._handle_response(response)
++    @classmethod
++    @inlineCallbacks
++    def _handle_ok_response(cls, response: Any) -> Any:
++        content_type = cls._content_type(response)
++        if content_type and content_type.startswith('application/json'):
++            result = yield treq.json_content(response)
++            returnValue(result)
+ 
+-    def http_post(self, url: str, body: Optional[str] = None):
+-        url = self.base_url + url
+-        response = self.session.post(
+-            url,
+-            headers={'Content-Type': 'application/json'},
+-            data=body,
++        raw = yield treq.content(response)
++        raise ClientError(
++            message={
++                'status_code': getattr(response, 'code', None),
++                'url': cls._response_url(response),
++                'message': 'Unexpected response from API',
++                'raw': raw,
++            },
+         )
+-        return self._handle_response(response)
+ 
+-    def http_patch(self, url: str, body: Optional[str] = None):
+-        url = self.base_url + url
+-        response = self.session.patch(
+-            url,
+-            headers={'Content-Type': 'application/json'},
+-            data=body,
++    def _headers(self, content_type: Optional[str] = None):
++        headers = dict(self.headers)
++        if content_type:
++            headers['Content-Type'] = content_type
++        return headers
++
++    @inlineCallbacks
++    def http_get(self, url, params=None) -> Any:
++        response = yield treq.get(
++            self.base_url + url,
++            headers=self._headers(),
++            params=params,
+         )
+-        return self._handle_response(response)
++        result = yield self._handle_response(response)
++        returnValue(result)
+ 
+-    def http_delete(self, url: str, params=None):
+-        url = self.base_url + url
+-        response = self.session.delete(url, params=params)
+-        return self._handle_response(response)
++    @inlineCallbacks
++    def http_post(self, url: str, body: Optional[str] = None) -> Any:
++        response = yield treq.post(
++            self.base_url + url,
++            headers=self._headers('application/json'),
++            data=body.encode('utf-8') if body is not None else None,
++        )
++        result = yield self._handle_response(response)
++        returnValue(result)
++
++    @inlineCallbacks
++    def http_patch(self, url: str, body: Optional[str] = None) -> Any:
++        response = yield treq.patch(
++            self.base_url + url,
++            headers=self._headers('application/json'),
++            data=body.encode('utf-8') if body is not None else None,
++        )
++        result = yield self._handle_response(response)
++        returnValue(result)
++
++    @inlineCallbacks
++    def http_delete(self, url: str, params=None) -> Any:
++        response = yield treq.delete(
++            self.base_url + url,
++            headers=self._headers(),
++            params=params,
++        )
++        result = yield self._handle_response(response)
++        returnValue(result)

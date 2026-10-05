@@ -1,0 +1,144 @@
+--- a/sectxt/__init__.py
++++ b/sectxt/__init__.py
+@@ -15,6 +15,11 @@
+ from pgpy_dtc import PGPMessage
+ from pgpy_dtc.errors import PGPError
+ from dateutil.relativedelta import relativedelta
++from twisted.internet import reactor
++from twisted.internet._sslverify import CertificateError
++from twisted.internet.defer import inlineCallbacks, returnValue
++from twisted.web._newclient import ResponseNeverReceived
++from twisted.web.client import Agent, ClientContextFactory
+ 
+ if sys.version_info < (3, 8):
+     from typing_extensions import TypedDict
+@@ -22,11 +27,11 @@
+     from typing import TypedDict
+ 
+ import dateutil.parser
+-import requests
++import treq
+ 
+ __version__ = "0.9.6"
+ 
+-s = requests.Session()
++s = treq
+ 
+ 
+ class ErrorDict(TypedDict):
+@@ -90,7 +95,7 @@
+         self.recommend_unknown_fields = recommend_unknown_fields
+         self.is_local = is_local
+         self._line_no: Optional[int] = None
+-        self._process()
++        self._process_deferred = self._process()
+ 
+     def _process(self) -> None:
+         self._content_str = self._get_str(self._content)
+@@ -545,47 +550,58 @@
+         self._url: Optional[str] = None
+         super().__init__(b'', recommend_unknown_fields=recommend_unknown_fields, is_local=is_local)
+ 
++    @inlineCallbacks
+     def _process(self) -> None:
+         if self.is_local:
+             security_txt_file = open(self._loc, mode="rb")
+             self._content = security_txt_file.read()
+             security_txt_file.close()
+             super()._process()
++            returnValue(None)
+         else:
+             security_txt_found = False
+             for scheme in ["https", "http"]:
+                 for path in [".well-known/security.txt", "security.txt"]:
+                     url = urlunsplit((scheme, self._loc, path, None, None))
+                     try:
+-                        resp = requests.get(
++                        resp = yield s.get(
+                             url,
+                             headers={
+                                 'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+                                               'Gecko/20100101 Firefox/12.0'},
+-                            timeout=5
++                            timeout=5,
++                            allow_redirects=True
+                         )
+-                    except requests.exceptions.SSLError:
++                    except (ResponseNeverReceived, CertificateError):
+                         if not any(d["code"] == "invalid_cert" for d in self._errors):
+                             self._add_error(
+                                 "invalid_cert",
+                                 "security.txt must be served with a valid TLS certificate.",
+                             )
+                         try:
+-                            resp = requests.get(
++                            resp = yield s.get(
+                                 url,
+                                 headers={
+                                     'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+                                                   'Gecko/20100101 Firefox/12.0'},
+                                 timeout=5,
+-                                verify=False
++                                allow_redirects=True,
++                                agent=Agent(
++                                    reactor,
++                                    contextFactory=ClientContextFactory()
++                                )
+                             )
+                         except:
+                             continue
+                     except:
+                         continue
+-                    if resp.status_code == 200:
+-                        if resp.history:
+-                            if not resp.url.endswith(path):
++                    if resp.code == 200:
++                        history = getattr(resp, "history", [])
++                        response_url = resp.request.absoluteURI
++                        if isinstance(response_url, bytes):
++                            response_url = response_url.decode("utf-8")
++                        if history:
++                            if not response_url.endswith(path):
+                                 continue
+                         self._path = path
+                         self._url = url
+@@ -603,13 +619,16 @@
+                                 "(legacy place), but must be placed under "
+                                 "the '/.well-known/' path.",
+                             )
+-                        if "content-type" not in resp.headers:
++                        if not resp.headers.hasHeader("content-type"):
+                             self._add_error(
+                                 "no_content_type", "HTTP Content-Type header must be sent."
+                             )
+                         else:
+                             m = Message()
+-                            m['content-type'] = resp.headers["content-type"]
++                            content_type = resp.headers.getRawHeaders("content-type")[0]
++                            if isinstance(content_type, bytes):
++                                content_type = content_type.decode("latin-1")
++                            m['content-type'] = content_type
+                             params = dict(m.get_params())
+                             if "text/plain" not in params:
+                                 self._add_error(
+@@ -625,9 +644,12 @@
+                                     "Charset parameter in Content-Type header must be "
+                                     "'utf-8' if present.",
+                                 )
+-                        self._content = resp.content
+-                        if resp.history:
+-                            self._urls = [resp.history[0].url, resp.url]
++                        self._content = yield resp.content()
++                        if history:
++                            first_url = history[0].request.absoluteURI
++                            if isinstance(first_url, bytes):
++                                first_url = first_url.decode("utf-8")
++                            self._urls = [first_url, response_url]
+                         else:
+                             self._urls = [url]
+                         super()._process()
+@@ -637,3 +659,4 @@
+                     break
+             if not security_txt_found:
+                 self._add_error("no_security_txt", "security.txt could not be located.")
++            returnValue(None)

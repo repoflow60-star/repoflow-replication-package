@@ -1,0 +1,210 @@
+--- a/ldnlib/base.py
++++ b/ldnlib/base.py
+@@ -1,5 +1,69 @@
++from io import BytesIO
++import json
++import re
++from urllib.parse import urlencode, urlsplit
++
++import pycurl
+ from rdflib import Graph, URIRef
+-import requests
++
++
++class _CaseInsensitiveHeaders(dict):
++
++    def __setitem__(self, key, value):
++        key = key.lower()
++        if key in self:
++            value = '{}, {}'.format(self[key], value)
++        super().__setitem__(key, value)
++
++    def __getitem__(self, key):
++        return super().__getitem__(key.lower())
++
++    def __contains__(self, key):
++        return super().__contains__(key.lower())
++
++    def get(self, key, default=None):
++        return super().get(key.lower(), default)
++
++
++class _Response(object):
++
++    def __init__(self, status_code, headers, content):
++        self.status_code = status_code
++        self.headers = headers
++        self.content = content
++
++    @property
++    def text(self):
++        content_type = self.headers.get('content-type', '')
++        match = re.search(r'charset\s*=\s*["\']?([^;"\'\s]+)',
++                          content_type, re.IGNORECASE)
++        encoding = match.group(1) if match else 'utf-8'
++        try:
++            return self.content.decode(encoding, errors='replace')
++        except LookupError:
++            return self.content.decode('utf-8', errors='replace')
++
++    def json(self):
++        return json.loads(self.text)
++
++    @property
++    def links(self):
++        links = {}
++        header = self.headers.get('link', '')
++        for match in re.finditer(r'<([^>]*)>\s*((?:;[^,]*)*)', header):
++            relation = re.search(
++                r'(?:^|;)\s*rel\s*=\s*'
++                r'(?:(?:"([^"]+)")|(?:\'([^\']+)\')|([^;\s]+))',
++                match.group(2), re.IGNORECASE)
++            if relation is not None:
++                rel = next(value for value in relation.groups()
++                           if value is not None)
++                links[rel] = {'url': match.group(1)}
++        return links
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise RuntimeError('HTTP error {}'.format(self.status_code))
+ 
+ 
+ class BaseLDN(object):
+@@ -14,14 +78,134 @@
+     def __init__(self, **kwargs):
+         self.accept_headers = kwargs.get('accept_headers', self.ACCEPT_HEADERS)
+ 
++    def _request(self, method, url, **kwargs):
++        params = kwargs.pop('params', None)
++        if params:
++            if isinstance(params, (str, bytes)):
++                query = params.decode('utf-8') if isinstance(params, bytes) \
++                    else params
++            else:
++                values = params.items() if hasattr(params, 'items') else params
++                query = urlencode([(key, value) for key, value in values
++                                   if value is not None], doseq=True)
++            if query:
++                base, separator, fragment = url.partition('#')
++                joiner = '&' if '?' in base else '?'
++                url = '{}{}{}{}{}'.format(
++                    base, joiner, query, separator, fragment)
++
++        headers = dict(kwargs.pop('headers', {}) or {})
++        allow_redirects = kwargs.pop('allow_redirects', True)
++        auth = kwargs.pop('auth', None)
++        timeout = kwargs.pop('timeout', None)
++        verify = kwargs.pop('verify', True)
++        cert = kwargs.pop('cert', None)
++        proxies = kwargs.pop('proxies', None)
++        data = kwargs.pop('data', None)
++
++        json_data = False
++        json_value = kwargs.pop('json', None)
++        if data is None and json_value is not None:
++            data = json.dumps(json_value)
++            json_data = True
++
++        form_data = isinstance(data, (dict, list, tuple))
++        if form_data:
++            data = urlencode(data, doseq=True)
++        if json_data or form_data:
++            if not any(key.lower() == 'content-type' for key in headers):
++                headers['content-type'] = (
++                    'application/json' if json_data else
++                    'application/x-www-form-urlencoded')
++
++        curl = pycurl.Curl()
++        body = BytesIO()
++        header_lines = []
++
++        def receive_headers(line):
++            header_lines.append(line)
++            return len(line)
++
++        try:
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.CUSTOMREQUEST, method.upper())
++            curl.setopt(pycurl.FOLLOWLOCATION, bool(allow_redirects))
++            curl.setopt(pycurl.WRITEFUNCTION, body.write)
++            curl.setopt(pycurl.HEADERFUNCTION, receive_headers)
++
++            request_headers = []
++            for key, value in headers.items():
++                if isinstance(value, (tuple, list)):
++                    value = ', '.join(value)
++                request_headers.append('{}: {}'.format(key, value))
++            if request_headers:
++                curl.setopt(pycurl.HTTPHEADER, request_headers)
++
++            if method.upper() == 'HEAD':
++                curl.setopt(pycurl.NOBODY, True)
++            if data is not None:
++                if isinstance(data, str):
++                    data = data.encode('utf-8')
++                curl.setopt(pycurl.POSTFIELDS, data)
++            elif method.upper() == 'POST':
++                curl.setopt(pycurl.POSTFIELDS, b'')
++            if auth is not None:
++                curl.setopt(pycurl.USERPWD,
++                            '{}:{}'.format(auth[0], auth[1]))
++            if timeout is not None:
++                if isinstance(timeout, (tuple, list)):
++                    if timeout[0] is not None:
++                        curl.setopt(pycurl.CONNECTTIMEOUT, timeout[0])
++                    if timeout[1] is not None:
++                        curl.setopt(pycurl.TIMEOUT, timeout[1])
++                else:
++                    curl.setopt(pycurl.TIMEOUT, timeout)
++            if verify is False:
++                curl.setopt(pycurl.SSL_VERIFYPEER, False)
++                curl.setopt(pycurl.SSL_VERIFYHOST, 0)
++            elif isinstance(verify, str):
++                curl.setopt(pycurl.CAINFO, verify)
++            if cert is not None:
++                if isinstance(cert, (tuple, list)):
++                    curl.setopt(pycurl.SSLCERT, cert[0])
++                    if len(cert) > 1:
++                        curl.setopt(pycurl.SSLKEY, cert[1])
++                else:
++                    curl.setopt(pycurl.SSLCERT, cert)
++            if proxies:
++                scheme = urlsplit(url).scheme
++                proxy = proxies.get(scheme) or proxies.get('all')
++                if proxy:
++                    curl.setopt(pycurl.PROXY, proxy)
++
++            curl.perform()
++
++            response_headers = _CaseInsensitiveHeaders()
++            for raw_line in header_lines:
++                if isinstance(raw_line, bytes):
++                    line = raw_line.decode('iso-8859-1')
++                else:
++                    line = raw_line
++                line = line.rstrip('\r\n')
++                if line.startswith('HTTP/'):
++                    response_headers.clear()
++                elif ':' in line:
++                    key, value = line.split(':', 1)
++                    response_headers[key.strip()] = value.strip()
++
++            return _Response(curl.getinfo(pycurl.RESPONSE_CODE),
++                             response_headers, body.getvalue())
++        finally:
++            curl.close()
++
+     def __discover_head(self, target, **kwargs):
+-        r = requests.head(target, **kwargs)
++        r = self._request('HEAD', target, **kwargs)
+         r.raise_for_status()
+         if self.LDP_INBOX in r.links:
+             return r.links[self.LDP_INBOX].get('url')
+ 
+     def __discover_get(self, target, **kwargs):
+-        r = requests.get(target, **kwargs)
++        r = self._request('GET', target, **kwargs)
+         r.raise_for_status()
+         # TODO -- check for HTML
+         g = Graph().parse(data=r.text, format=self.content_type_to_mime_type(

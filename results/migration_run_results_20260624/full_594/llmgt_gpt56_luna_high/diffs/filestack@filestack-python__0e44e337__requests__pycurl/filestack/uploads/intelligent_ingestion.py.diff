@@ -1,0 +1,133 @@
+--- a/filestack/uploads/intelligent_ingestion.py
++++ b/filestack/uploads/intelligent_ingestion.py
+@@ -7,12 +7,12 @@
+ import logging
+ import functools
+ import threading
+-from urllib3.util.retry import Retry
++import json
++import time
++import pycurl
+ from concurrent.futures import ThreadPoolExecutor
+ 
+ from base64 import b64encode
+-
+-from filestack.utils import requests
+ 
+ from filestack import config
+ 
+@@ -31,6 +31,37 @@
+ NUM_THREADS = multiprocessing.cpu_count()
+ 
+ lock = threading.Lock()
++
++
++def _curl_request(url, method, data=None, headers=None):
++    response = io.BytesIO()
++    curl = pycurl.Curl()
++
++    try:
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.WRITEFUNCTION, response.write)
++
++        if headers:
++            if isinstance(headers, dict):
++                headers = ['{}: {}'.format(key, value) for key, value in headers.items()]
++            curl.setopt(pycurl.HTTPHEADER, headers)
++
++        if method == 'POST':
++            curl.setopt(pycurl.POST, 1)
++            curl.setopt(pycurl.POSTFIELDS, data)
++            curl.setopt(pycurl.POSTFIELDSIZE, len(data))
++        elif method == 'PUT':
++            upload_data = io.BytesIO(data)
++            curl.setopt(pycurl.UPLOAD, 1)
++            curl.setopt(pycurl.READFUNCTION, upload_data.read)
++            curl.setopt(pycurl.INFILESIZE, len(data))
++
++        curl.perform()
++        status = curl.getinfo(pycurl.RESPONSE_CODE)
++    finally:
++        curl.close()
++
++    return status, response.getvalue()
+ 
+ 
+ def decrease_chunk_size():
+@@ -69,9 +100,9 @@
+ 
+         try:
+             url = 'https://{}/multipart/upload'.format(start_response['location_url'])
+-            api_resp = requests.post(url, json=payload).json()
+-            s3_resp = requests.put(api_resp['url'], headers=api_resp['headers'], data=chunk_data)
+-            if not s3_resp.ok:
++            api_resp = json.loads(_curl_request(url, 'POST', json.dumps(payload).encode('utf-8'), {'Content-Type': 'application/json'})[1])
++            s3_resp, s3_content = _curl_request(api_resp['url'], 'PUT', chunk_data, api_resp['headers'])
++            if s3_resp >= 400:
+                 raise Exception('Incorrect S3 response')
+             offset += len(chunk_data)
+             chunk_data = part_bytes.read(CHUNK_SIZE)
+@@ -88,7 +119,7 @@
+     payload.update({'size': filesize})
+ 
+     url = 'https://{}/multipart/commit'.format(start_response['location_url'])
+-    requests.post(url, json=payload)
++    _curl_request(url, 'POST', json.dumps(payload).encode('utf-8'), {'Content-Type': 'application/json'})
+ 
+ 
+ def upload(apikey, filepath, file_obj, storage, params=None, security=None):
+@@ -119,7 +150,7 @@
+             'signature': security.signature
+         })
+ 
+-    start_response = requests.post(config.MULTIPART_START_URL, json=payload).json()
++    start_response = json.loads(_curl_request(config.MULTIPART_START_URL, 'POST', json.dumps(payload).encode('utf-8'), {'Content-Type': 'application/json'})[1])
+     parts = [
+         {
+             'seek_point': seek_point,
+@@ -147,12 +178,36 @@
+         payload['upload_tags'] = params.pop('upload_tags')
+ 
+     complete_url = 'https://{}/multipart/complete'.format(start_response['location_url'])
+-    session = requests.Session()
+-    retries = Retry(total=7, backoff_factor=0.2, status_forcelist=[202], allowed_methods=frozenset(['POST']))
+-    session.mount('http://', requests.adapters.HTTPAdapter(max_retries=retries))
+-    response = session.post(complete_url, json=payload, headers=config.HEADERS)
+-    if response.status_code != 200:
+-        log.error('Did not receive a correct complete response: %s. Content %s', response, response.content)
+-        raise Exception('Invalid complete response: {}'.format(response.content))
+-
+-    return response.json()
++    complete_headers = config.HEADERS.copy()
++    if not any(key.lower() == 'content-type' for key in complete_headers):
++        complete_headers['Content-Type'] = 'application/json'
++
++    retries = 0
++    while True:
++        try:
++            response_status, response_content = _curl_request(
++                complete_url,
++                'POST',
++                json.dumps(payload).encode('utf-8'),
++                complete_headers
++            )
++        except pycurl.error:
++            if retries >= 7:
++                raise
++            if retries:
++                time.sleep(0.2 * (2 ** retries))
++            retries += 1
++            continue
++
++        if response_status == 202 and retries < 7:
++            if retries:
++                time.sleep(0.2 * (2 ** retries))
++            retries += 1
++            continue
++        break
++
++    if response_status != 200:
++        log.error('Did not receive a correct complete response: %s. Content %s', response_status, response_content)
++        raise Exception('Invalid complete response: {}'.format(response_content))
++
++    return json.loads(response_content)

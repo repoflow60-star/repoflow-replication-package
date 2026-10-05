@@ -1,0 +1,101 @@
+--- a/fp/fp.py
++++ b/fp/fp.py
+@@ -3,9 +3,28 @@
+ import random
+ 
+ import lxml.html as lh
+-import requests
++import treq
++
++from twisted.internet import defer, protocol, reactor
++from twisted.internet.endpoints import TCP4ClientEndpoint
++from twisted.web.client import PotentialDataLoss, ProxyAgent, ResponseDone
++from urllib.parse import urlparse
+ 
+ from fp.errors import FreeProxyException
++
++
++class _ResponseProtocol(protocol.Protocol):
++    def __init__(self, deferred):
++        self.deferred = deferred
++
++    def dataReceived(self, data):
++        pass
++
++    def connectionLost(self, reason):
++        if reason.check(ResponseDone, PotentialDataLoss):
++            self.deferred.callback(self.transport.getPeer().host)
++        else:
++            self.deferred.errback(reason)
+ 
+ 
+ class FreeProxy:
+@@ -28,11 +47,13 @@
+         self.schema = 'https' if https else 'http'
+         self.url = url
+ 
++    @defer.inlineCallbacks
+     def get_proxy_list(self, repeat):
+         try:
+-            page = requests.get(self.__website(repeat))
+-            doc = lh.fromstring(page.content)
+-        except requests.exceptions.RequestException as e:
++            response = yield treq.get(self.__website(repeat))
++            page = yield response.content()
++            doc = lh.fromstring(page)
++        except Exception as e:
+             raise FreeProxyException(
+                 f'Request to {self.__website(repeat)} failed') from e
+         try:
+@@ -66,31 +87,43 @@
+         ).lower() == 'yes'
+         return country_criteria and elite_criteria and anonym_criteria and google_criteria and https_criteria
+ 
++    @defer.inlineCallbacks
+     def get(self, repeat=False):
+         '''Returns a working proxy that matches the specified parameters.'''
+-        proxy_list = self.get_proxy_list(repeat)
++        proxy_list = yield self.get_proxy_list(repeat)
+         if self.random:
+             random.shuffle(proxy_list)
+         working_proxy = None
+         for proxy_address in proxy_list:
+             proxies = {self.schema: f'http://{proxy_address}'}
+             try:
+-                working_proxy = self.__check_if_proxy_is_working(proxies)
++                working_proxy = yield self.__check_if_proxy_is_working(proxies)
+                 if working_proxy:
+                     return working_proxy
+-            except requests.exceptions.RequestException:
++            except Exception:
+                 continue
+         if not working_proxy and not repeat:
+             if self.country_id is not None:
+                 self.country_id = None
+-            return self.get(repeat=True)
++            return (yield self.get(repeat=True))
+         raise FreeProxyException(
+             'There are no working proxies at this time.')
+ 
++    @defer.inlineCallbacks
+     def __check_if_proxy_is_working(self, proxies):
+         url = f'{self.schema}://{self.url}'
+         ip = proxies[self.schema].split(':')[1][2:]
+-        with requests.get(url, proxies=proxies, timeout=self.timeout, stream=True) as r:
+-            if r.raw.connection.sock and r.raw.connection.sock.getpeername()[0] == ip:
+-                return proxies[self.schema]
+-        return
++        proxy = urlparse(proxies[self.schema])
++        agent = ProxyAgent(
++            reactor,
++            TCP4ClientEndpoint(reactor, proxy.hostname, proxy.port))
++        response = yield treq.get(
++            url,
++            agent=agent,
++            timeout=self.timeout)
++        response_deferred = defer.Deferred()
++        response.deliverBody(_ResponseProtocol(response_deferred))
++        peer = yield response_deferred
++        if peer == ip:
++            return proxies[self.schema]
++        return

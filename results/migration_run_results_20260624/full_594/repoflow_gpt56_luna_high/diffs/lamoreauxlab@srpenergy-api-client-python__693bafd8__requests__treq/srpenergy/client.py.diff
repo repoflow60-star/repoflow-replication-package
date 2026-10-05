@@ -1,0 +1,273 @@
+--- a/srpenergy/client.py
++++ b/srpenergy/client.py
+@@ -5,13 +5,118 @@
+ """
+ 
+ from datetime import datetime, timedelta
++from http.cookies import SimpleCookie
+ import re
++import threading
+ from urllib.parse import unquote
+ 
+ from dateutil.parser import parse
+-import requests
++from twisted.internet import defer, reactor
++from twisted.internet.threads import blockingCallFromThread
++import treq
+ 
+ BASE_USAGE_URL = "https://myaccount.srpnet.com/myaccountapi/api/"
++
++_reactor_lock = threading.Lock()
++_reactor_ready = threading.Event()
++_reactor_thread = None
++
++
++def _start_reactor():
++    """Run the Twisted reactor used by the synchronous public API."""
++    global _reactor_thread  # pylint: disable=global-statement
++
++    if reactor.running:
++        return
++
++    with _reactor_lock:
++        if reactor.running:
++            return
++
++        if _reactor_thread is None:
++
++            def run_reactor():
++                reactor.callWhenRunning(_reactor_ready.set)
++                reactor.run(installSignalHandlers=False)
++
++            _reactor_thread = threading.Thread(
++                target=run_reactor,
++                name="srpenergy-treq-reactor",
++                daemon=True,
++            )
++            _reactor_thread.start()
++
++    _reactor_ready.wait()
++
++
++def _run_deferred(operation):
++    """Execute a Deferred without changing the client's synchronous API."""
++    _start_reactor()
++    return blockingCallFromThread(reactor, operation)
++
++
++def _cookie_header(response, current=""):
++    """Merge response cookies into the Cookie header for the next request."""
++    cookies = SimpleCookie()
++    if current:
++        cookies.load(current)
++
++    for raw_cookie in response.headers.getRawHeaders(b"set-cookie") or []:
++        if isinstance(raw_cookie, bytes):
++            raw_cookie = raw_cookie.decode("latin-1")
++        cookies.load(raw_cookie)
++
++    return "; ".join(
++        f"{name}={morsel.value}" for name, morsel in cookies.items()
++    )
++
++
++@defer.inlineCallbacks
++def _validate_request(username, password):
++    """Perform the credential request with treq."""
++    response = yield treq.post(
++        BASE_USAGE_URL + "/login/authorize",
++        data={"username": username, "password": password},
++    )
++    data = yield treq.json_content(response)
++    return defer.returnValue(data["message"] == "Log in successful.")
++
++
++@defer.inlineCallbacks
++def _usage_request(accountid, username, password, str_startdate, str_enddate):
++    """Fetch hourly usage with treq and the API's cookie-based session."""
++    response = yield treq.post(
++        BASE_USAGE_URL + "login/authorize",
++        data={"username": username, "password": password},
++    )
++    cookie_header = _cookie_header(response)
++    yield treq.content(response)
++
++    response = yield treq.get(
++        BASE_USAGE_URL + "login/antiforgerytoken",
++        headers={b"Cookie": [cookie_header.encode("latin-1")]},
++    )
++    cookie_header = _cookie_header(response, cookie_header)
++    yield treq.content(response)
++    cookies = SimpleCookie()
++    cookies.load(cookie_header)
++    xsrf_token = unquote(cookies["xsrf-token"].value)
++
++    response = yield treq.get(
++        BASE_USAGE_URL
++        + "usage/hourlydetail?billaccount="
++        + accountid
++        + "&beginDate="
++        + str_startdate
++        + "&endDate="
++        + str_enddate,
++        headers={
++            b"x-xsrf-token": [xsrf_token.encode("latin-1")],
++            b"Cookie": [cookie_header.encode("latin-1")],
++        },
++    )
++    data = yield treq.json_content(response)
++    return defer.returnValue(data["hourlyUsageList"])
+ 
+ 
+ def get_pretty_date(date_part):
+@@ -187,18 +292,9 @@
+ 
+         """
+         try:
+-
+-            with requests.Session() as session:
+-
+-                response = session.post(
+-                    BASE_USAGE_URL + "/login/authorize",
+-                    data={"username": self.username, "password": self.password},
+-                )
+-                data = response.json()
+-
+-                valid = data["message"] == "Log in successful."
+-
+-                return valid
++            return _run_deferred(
++                lambda: _validate_request(self.username, self.password)
++            )
+ 
+         except Exception:  # pylint: disable=W0703
+             return False
+@@ -272,75 +368,61 @@
+             str_startdate = startdate.strftime("%m-%d-%Y")
+             str_enddate = enddate.strftime("%m-%d-%Y")
+ 
+-            with requests.Session() as session:
+-
+-                response = session.post(
+-                    BASE_USAGE_URL + "login/authorize",
+-                    data={"username": self.username, "password": self.password},
++            hourly_usage_list = _run_deferred(
++                lambda: _usage_request(
++                    self.accountid,
++                    self.username,
++                    self.password,
++                    str_startdate,
++                    str_enddate,
+                 )
+-
+-                response = session.get(BASE_USAGE_URL + "login/antiforgerytoken")
+-                xsrf_token = unquote(response.cookies["xsrf-token"])
+-
+-                response = session.get(
+-                    BASE_USAGE_URL
+-                    + "usage/hourlydetail?billaccount="
+-                    + self.accountid
+-                    + "&beginDate="
+-                    + str_startdate
+-                    + "&endDate="
+-                    + str_enddate,
+-                    headers={"x-xsrf-token": xsrf_token},
++            )
++
++            usage = []
++            for row in hourly_usage_list:
++
++                total_kwh = row["totalKwh"]
++                if total_kwh == 0:
++                    # Build the total_kwh from separate fields for EZ-3.
++                    total_kwh = (
++                        row["onPeakKwh"]
++                        + row["offPeakKwh"]
++                        + row["shoulderKwh"]
++                        + row["superOffPeakKwh"]
++                    )
++
++                total_cost = row["totalCost"]
++                if total_cost == 0:
++                    # Build the total_cost from separate fields for EZ-3.
++                    total_cost = (
++                        row["onPeakCost"]
++                        + row["offPeakCost"]
++                        + row["shoulderCost"]
++                        + row["superOffPeakCost"]
++                    )
++
++                # Check if on Time of Use Plan
++                if is_tou:
++
++                    rate, is_peak = get_rate(row["date"])
++
++                    if is_peak:
++                        total_kwh = row["onPeakKwh"]
++                    else:
++                        total_kwh = row["offPeakKwh"]
++
++                    total_cost = total_kwh * rate
++
++                values = (
++                    get_pretty_date(row["date"]),
++                    get_pretty_time(row["date"]),
++                    row["date"],
++                    total_kwh,
++                    round(total_cost, 2),
+                 )
+-
+-                data = response.json()
+-                hourly_usage_list = data["hourlyUsageList"]
+-
+-                usage = []
+-                for row in hourly_usage_list:
+-
+-                    total_kwh = row["totalKwh"]
+-                    if total_kwh == 0:
+-                        # Build the total_kwh from separate fields for EZ-3.
+-                        total_kwh = (
+-                            row["onPeakKwh"]
+-                            + row["offPeakKwh"]
+-                            + row["shoulderKwh"]
+-                            + row["superOffPeakKwh"]
+-                        )
+-
+-                    total_cost = row["totalCost"]
+-                    if total_cost == 0:
+-                        # Build the total_cost from separate fields for EZ-3.
+-                        total_cost = (
+-                            row["onPeakCost"]
+-                            + row["offPeakCost"]
+-                            + row["shoulderCost"]
+-                            + row["superOffPeakCost"]
+-                        )
+-
+-                    # Check if on Time of Use Plan
+-                    if is_tou:
+-
+-                        rate, is_peak = get_rate(row["date"])
+-
+-                        if is_peak:
+-                            total_kwh = row["onPeakKwh"]
+-                        else:
+-                            total_kwh = row["offPeakKwh"]
+-
+-                        total_cost = total_kwh * rate
+-
+-                    values = (
+-                        get_pretty_date(row["date"]),
+-                        get_pretty_time(row["date"]),
+-                        row["date"],
+-                        total_kwh,
+-                        round(total_cost, 2),
+-                    )
+-                    usage.append(values)
+-
+-                return usage
++                usage.append(values)
++
++            return usage
+ 
+         except Exception as ex:
+             raise ex

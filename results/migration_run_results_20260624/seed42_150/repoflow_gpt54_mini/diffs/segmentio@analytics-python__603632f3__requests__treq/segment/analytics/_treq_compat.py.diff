@@ -1,0 +1,218 @@
+--- a/segment/analytics/_treq_compat.py
++++ b/segment/analytics/_treq_compat.py
+@@ -0,0 +1,215 @@
++import asyncio
++from http.client import responses as http_responses
++import json
++import threading
++
++from twisted.internet import asyncioreactor
++from twisted.web.client import Agent, ProxyAgent
++
++
++_loop = None
++_loop_thread = None
++_loop_ready = threading.Event()
++_loop_error = None
++_loop_lock = threading.Lock()
++
++
++class CaseInsensitiveHeaders(dict):
++    @staticmethod
++    def _key(key):
++        return key.lower() if isinstance(key, str) else key
++
++    def __setitem__(self, key, value):
++        super(CaseInsensitiveHeaders, self).__setitem__(self._key(key), value)
++
++    def __getitem__(self, key):
++        return super(CaseInsensitiveHeaders, self).__getitem__(self._key(key))
++
++    def get(self, key, default=None):
++        return super(CaseInsensitiveHeaders, self).get(self._key(key), default)
++
++    def __contains__(self, key):
++        return super(CaseInsensitiveHeaders, self).__contains__(self._key(key))
++
++
++def _normalize_headers(headers):
++    if headers is None:
++        return CaseInsensitiveHeaders()
++
++    if isinstance(headers, dict):
++        result = CaseInsensitiveHeaders()
++        for key, value in headers.items():
++            result[key] = value
++        return result
++
++    result = CaseInsensitiveHeaders()
++    get_all = getattr(headers, 'getAllRawHeaders', None)
++    if get_all:
++        for key, values in get_all():
++            if not values:
++                continue
++            name = key.decode('latin1') if isinstance(key, bytes) else str(key)
++            value = values[0]
++            if isinstance(value, bytes):
++                value = value.decode('latin1')
++            result[name] = value
++        return result
++
++    result = CaseInsensitiveHeaders()
++    for key, value in dict(headers).items():
++        result[key] = value
++    return result
++
++
++class ResponseAdapter(object):
++    def __init__(self, code, headers, body):
++        self.status_code = code
++        self.headers = _normalize_headers(headers)
++        self.reason = http_responses.get(code, '')
++        self.content = body
++        self.text = body.decode('utf-8', 'replace') if isinstance(body, bytes) else body
++
++    def json(self):
++        return json.loads(self.text)
++
++
++def _run_loop():
++    global _loop, _loop_error
++    try:
++        loop = asyncio.new_event_loop()
++        asyncio.set_event_loop(loop)
++        asyncioreactor.install(loop)
++        _loop = loop
++        loop.call_soon(_loop_ready.set)
++        loop.run_forever()
++    except Exception as exc:
++        _loop_error = exc
++        _loop_ready.set()
++
++
++def _ensure_loop():
++    global _loop_thread
++    if _loop is None and not _loop_ready.is_set():
++        with _loop_lock:
++            if _loop is None and not _loop_ready.is_set():
++                _loop_thread = threading.Thread(target=_run_loop, name='segment-treq-loop', daemon=True)
++                _loop_thread.start()
++    _loop_ready.wait()
++    if _loop_error:
++        raise _loop_error
++
++
++def _build_agent(proxies=None):
++    from twisted.internet import reactor
++
++    if not proxies:
++        return Agent(reactor)
++
++    proxy = proxies
++    if isinstance(proxy, dict):
++        proxy = proxy.get('https') or proxy.get('http')
++        if proxy is None:
++            proxy = next(iter(proxies.values()), None)
++
++    if not proxy:
++        return Agent(reactor)
++
++    if not isinstance(proxy, str):
++        proxy = str(proxy)
++
++    if '://' not in proxy:
++        proxy = 'http://' + proxy
++
++    return ProxyAgent(proxy.encode('ascii'), reactor=reactor)
++
++
++async def _request(method, url, data=None, headers=None, timeout=None, proxies=None):
++    import treq
++
++    agent = _build_agent(proxies)
++    payload = data.encode('utf-8') if isinstance(data, str) else data
++    response = await treq.request(
++        method,
++        url,
++        agent=agent,
++        data=payload,
++        headers=headers or {},
++        timeout=timeout,
++    )
++    body = await treq.content(response)
++    return ResponseAdapter(response.code, response.headers, body)
++
++
++def request(method, url, data=None, headers=None, timeout=None, proxies=None):
++    _ensure_loop()
++    future = asyncio.run_coroutine_threadsafe(
++        _request(method, url, data=data, headers=headers, timeout=timeout, proxies=proxies),
++        _loop,
++    )
++    return future.result()
++
++
++def normalize_response(response):
++    if response is None:
++        return response
++
++    instance_dict = getattr(response, '__dict__', {})
++
++    if 'status_code' not in instance_dict and hasattr(response, 'code'):
++        try:
++            response.status_code = response.code
++        except Exception:
++            pass
++
++    headers = getattr(response, 'headers', None)
++    if headers is not None:
++        try:
++            response.headers = _normalize_headers(headers)
++        except Exception:
++            pass
++
++    if 'reason' not in instance_dict:
++        phrase = getattr(response, 'phrase', None)
++        if phrase is not None:
++            try:
++                response.reason = phrase.decode('latin1') if isinstance(phrase, bytes) else phrase
++            except Exception:
++                pass
++        else:
++            try:
++                response.reason = http_responses.get(getattr(response, 'status_code', 0), '')
++            except Exception:
++                pass
++
++    if 'text' not in instance_dict:
++        content = getattr(response, 'content', None)
++        if isinstance(content, bytes):
++            try:
++                response.text = content.decode('utf-8', 'replace')
++            except Exception:
++                pass
++        elif content is not None:
++            try:
++                response.text = content
++            except Exception:
++                pass
++
++    if 'json' not in type(response).__dict__ and 'text' in getattr(response, '__dict__', {}):
++        def _json():
++            return json.loads(response.text)
++
++        try:
++            response.json = _json
++        except Exception:
++            pass
++
++    return response
++
++
++class Session(object):
++    def post(self, url, data=None, headers=None, timeout=None, proxies=None, **kwargs):
++        return request('POST', url, data=data, headers=headers, timeout=timeout, proxies=proxies)
++
++
++class sessions(object):
++    Session = Session

@@ -1,0 +1,381 @@
+--- a/qtrade/questrade.py
++++ b/qtrade/questrade.py
+@@ -3,8 +3,9 @@
+ import logging
+ from typing import Any, Dict, List, Optional, Union
+ 
+-import requests
++import treq
+ import yaml
++from twisted.internet import defer
+ 
+ from .utility import TokenDict, get_access_token_yaml, validate_access_token
+ 
+@@ -38,7 +39,7 @@
+     ):
+         self.access_token: TokenDict
+         self.headers = None
+-        self.session = requests.Session()
++        self.session = treq
+ 
+         self.access_code = access_code
+         self.token_yaml = token_yaml
+@@ -50,15 +51,16 @@
+                 + " "
+                 + self.access_token["access_token"]
+             }
+-            # add headers to session
+-            self.session.headers.update(self.headers)
++            self._access_token_ready = defer.succeed(self.access_token)
+         else:
+-            self._get_access_token(save_yaml=save_yaml)
++            self._access_token_ready = defer.ensureDeferred(
++                self._get_access_token(save_yaml=save_yaml)
++            )
+ 
+         self.account_id = None
+         self.positions = None
+ 
+-    def _send_message(
++    async def _send_message(
+         self,
+         method: str,
+         endpoint: str,
+@@ -86,14 +88,24 @@
+         dict/list:
+             JSON response
+         """
++        await self._access_token_ready
+         if self.access_token is not None:
+             url = self.access_token["api_server"] + "/v1/" + endpoint
+         else:
+             log.error("Access token not set...")
+             raise Exception("Access token not set...")
+-        resp = self.session.request(method, url, params=params, data=data, json=json, timeout=30)
+-        resp.raise_for_status()
+-        return resp.json()
++        resp = await self.session.request(
++            method,
++            url,
++            headers=self.headers,
++            params=params,
++            data=data,
++            json=json,
++            timeout=30,
++        )
++        if resp.code >= 400:
++            raise Exception("HTTP error: {} {}".format(resp.code, resp.phrase))
++        return await resp.json()
+ 
+     def save_token_to_yaml(self, yaml_path: str = "access_token.yml"):
+         """Save the token payload as a yaml-file.
+@@ -108,7 +120,7 @@
+             log.debug("Saving access token to yaml file...")
+             yaml.dump(self.access_token, yaml_file)
+ 
+-    def _get_access_token(
++    async def _get_access_token(
+         self, save_yaml: bool = False, yaml_path: str = "access_token.yml"
+     ) -> TokenDict:
+         """Get access token.
+@@ -131,9 +143,10 @@
+         """
+         url = TOKEN_URL + str(self.access_code)
+         log.info("Getting access token...")
+-        data = requests.get(url)
+-        data.raise_for_status()
+-        response = data.json()
++        data = await treq.get(url)
++        if data.code >= 400:
++            raise Exception("HTTP error: {} {}".format(data.code, data.phrase))
++        response = await data.json()
+ 
+         # validate response
+         validate_access_token(**response)
+@@ -152,8 +165,6 @@
+             + self.access_token["access_token"]
+         }
+ 
+-        self.session.headers.update(self.headers)
+-
+         # save access token
+         if save_yaml:
+             log.info("Saving yaml file to {}...".format(yaml_path))  # pylint: disable=W1202
+@@ -161,7 +172,7 @@
+ 
+         return self.access_token
+ 
+-    def refresh_access_token(
++    async def refresh_access_token(
+         self, from_yaml: bool = False, yaml_path: str = "access_token.yml"
+     ) -> TokenDict:
+         """Refresh access token.
+@@ -184,6 +195,7 @@
+         dict
+             Dict with the access token data.
+         """
++        await self._access_token_ready
+         if from_yaml:
+             old_access_token = get_access_token_yaml(yaml_path)
+         else:
+@@ -191,9 +203,10 @@
+ 
+         url = TOKEN_URL + str(old_access_token["refresh_token"])
+         log.info("Refreshing access token...")
+-        data = requests.get(url)
+-        data.raise_for_status()
+-        response = data.json()
++        data = await treq.get(url)
++        if data.code >= 400:
++            raise Exception("HTTP error: {} {}".format(data.code, data.phrase))
++        response = await data.json()
+ 
+         # validate response
+         validate_access_token(**response)
+@@ -202,6 +215,8 @@
+ 
+         # clean the api_server entry of the escape characters
+         self.access_token["api_server"] = self.access_token["api_server"].replace("\\", "")
++        if self.access_token["api_server"][-1] == "/":
++            self.access_token["api_server"][-1] == "/"
+         if self.access_token["api_server"][-1] == "/":
+             self.access_token["api_server"] = self.access_token["api_server"][:-1]
+ 
+@@ -212,16 +227,13 @@
+             + self.access_token["access_token"]
+         }
+ 
+-        # update headers
+-        self.session.headers.update(self.headers)
+-
+         # save access token
+         if from_yaml:
+             self.save_token_to_yaml(yaml_path=yaml_path)
+ 
+         return self.access_token
+ 
+-    def get_account_id(self) -> List[int]:
++    async def get_account_id(self) -> List[int]:
+         """Get account ID.
+ 
+         This method gets the accounts ID connected to the token.
+@@ -232,7 +244,7 @@
+             List of account IDs.
+         """
+         log.info("Getting account ID...")
+-        response: Dict[str, List[Dict[str, int]]] = self._send_message("get", "accounts")
++        response: Dict[str, List[Dict[str, int]]] = await self._send_message("get", "accounts")
+ 
+         account_id = []
+         try:
+@@ -246,7 +258,7 @@
+ 
+         return account_id
+ 
+-    def get_account_positions(self, account_id: int) -> List[Dict]:
++    async def get_account_positions(self, account_id: int) -> List[Dict]:
+         """Get account positions.
+ 
+         This method will get the positions for the account ID connected to the token.
+@@ -283,7 +295,7 @@
+ 
+         """
+         log.info("Getting account positions...")
+-        response = self._send_message("get", "accounts/" + str(account_id) + "/positions")
++        response = await self._send_message("get", "accounts/" + str(account_id) + "/positions")
+         try:
+             positions = response["positions"]
+         except Exception:
+@@ -294,7 +306,7 @@
+ 
+         return positions
+ 
+-    def get_account_balances(self, account_id: int) -> Dict:
++    async def get_account_balances(self, account_id: int) -> Dict:
+         """Get account balances.
+ 
+         This method will get the account balance for a given account ID.
+@@ -310,14 +322,14 @@
+             Dictionary holding balance information
+         """
+         log.info("Getting account activities...")
+-        response = self._send_message("get", "accounts/" + str(account_id) + "/balances")
++        response = await self._send_message("get", "accounts/" + str(account_id) + "/balances")
+         try:
+             return response
+         except Exception:
+             print(response)
+             raise Exception
+ 
+-    def get_account_activities(self, account_id: int, start_date: str, end_date: str) -> List[Dict]:
++    async def get_account_activities(self, account_id: int, start_date: str, end_date: str) -> List[Dict]:
+         """Get account activities.
+ 
+         This method will get the account activities for a given account ID in a given time
+@@ -365,7 +377,7 @@
+         }
+ 
+         log.info("Getting account activities...")
+-        response = self._send_message(
++        response = await self._send_message(
+             "get", "accounts/" + str(account_id) + "/activities", params=payload
+         )
+ 
+@@ -377,7 +389,7 @@
+ 
+         return activities
+ 
+-    def get_account_executions(self, account_id: int, start_date: str, end_date: str) -> List[Dict]:
++    async def get_account_executions(self, account_id: int, start_date: str, end_date: str) -> List[Dict]:
+         """Get account executions.
+ 
+         This method will get the account executionss for a given account ID in a given time
+@@ -432,7 +444,7 @@
+         }
+ 
+         log.info("Getting account executions...")
+-        response = self._send_message(
++        response = await self._send_message(
+             "get", "accounts/" + str(account_id) + "/executions", params=payload
+         )
+ 
+@@ -444,7 +456,7 @@
+ 
+         return executions
+ 
+-    def ticker_information(self, tickers: Union[str, List[str]]) -> Union[Dict, List[Dict]]:
++    async def ticker_information(self, tickers: Union[str, List[str]]) -> Union[Dict, List[Dict]]:
+         """Get ticker information.
+ 
+         This function gets information such as a quote for a single ticker or a list of tickers.
+@@ -465,7 +477,7 @@
+         payload = {"names": ",".join(tickers)}
+ 
+         log.info("Getting ticker data...")
+-        response = self._send_message("get", "symbols", params=payload)
++        response = await self._send_message("get", "symbols", params=payload)
+         try:
+             symbols = response["symbols"]
+         except Exception:
+@@ -477,7 +489,7 @@
+ 
+         return symbols
+ 
+-    def get_quote(self, tickers: List[str]) -> Union[Dict, List[Dict]]:
++    async def get_quote(self, tickers: List[str]) -> Union[Dict, List[Dict]]:
+         """Get quote.
+ 
+         This function gets information such as a quote for a single ticker or a list of tickers.
+@@ -496,7 +508,7 @@
+             tickers = [tickers]
+ 
+         # translate tickers to IDs
+-        info = self.ticker_information(tickers)
++        info = await self.ticker_information(tickers)
+         if len(tickers) == 1 and isinstance(info, dict):
+             ids = [info["symbolId"]]
+         else:
+@@ -505,7 +517,7 @@
+         payload = {"ids": ",".join(map(str, ids))}
+ 
+         log.info("Getting quote...")
+-        response = self._send_message("get", "markets/quotes", params=payload)
++        response = await self._send_message("get", "markets/quotes", params=payload)
+         try:
+             quotes = response["quotes"]
+         except Exception:
+@@ -517,7 +529,7 @@
+ 
+         return quotes
+ 
+-    def get_historical_data(
++    async def get_historical_data(
+         self, ticker: str, start_date: str, end_date: str, interval: str
+     ) -> List:
+         """Get historical ticker data.
+@@ -541,7 +553,7 @@
+             list of historical data for each interval. The list is ordered by date.
+         """
+         # translate tickers to IDs
+-        info = self.ticker_information(ticker)
++        info = await self.ticker_information(ticker)
+         if isinstance(info, dict):
+             ids = info["symbolId"]
+         else:
+@@ -562,7 +574,7 @@
+             "Getting historical data for {0} from {1} to {2}".format(ticker, start_date, end_date)
+         )
+ 
+-        response = self._send_message("get", "markets/candles/" + str(ids), params=payload)
++        response = await self._send_message("get", "markets/candles/" + str(ids), params=payload)
+         try:
+             quotes = response["candles"]
+         except Exception:
+@@ -571,7 +583,7 @@
+ 
+         return quotes
+ 
+-    def submit_order(self, acct_id: int, order_dict: Dict[str, Union[int, bool, str]]) -> Dict:
++    async def submit_order(self, acct_id: int, order_dict: Dict[str, Union[int, bool, str]]) -> Dict:
+         """Submit order.
+ 
+         This method submits an order to Questrade. Note that currently only partner apps can submit
+@@ -604,17 +616,19 @@
+         dict
+             Dictionary with the API response to the order submission.
+         """
++        await self._access_token_ready
+         uri = self.access_token["api_server"] + "/v1/accounts/" + str(acct_id) + "/orders"
+         log.info("Posting order...")
+-        data = self.session.post(uri, json=order_dict)
+-        data.raise_for_status()
+-        response = self._send_message(
++        data = await self.session.post(uri, headers=self.headers, json=order_dict)
++        if data.code >= 400:
++            raise Exception("HTTP error: {} {}".format(data.code, data.phrase))
++        response = await self._send_message(
+             "post", "accounts/" + str(acct_id) + "/orders", json=order_dict
+         )
+ 
+         return response
+ 
+-    def get_option_chain(self, ticker: str) -> Dict:
++    async def get_option_chain(self, ticker: str) -> Dict:
+         """Retrieve an option chain for a particular underlying symbol.
+ 
+         https://www.questrade.com/api/documentation/rest-operations/market-calls/symbols-id-options
+@@ -665,15 +679,15 @@
+             Dictionary of option chain information for a particular symbol.
+         """
+         log.info(f"Getting option chain for ticker {ticker} ...")
+-        info = self.ticker_information([ticker])
++        info = await self.ticker_information([ticker])
+         if not isinstance(info, dict):
+             log.error(f"Something went wrong retrieving the symbol ID for ticker {ticker}...")
+             raise Exception(f"Something went wrong retrieving the symbol ID for ticker {ticker}...")
+         symbol_id = info["symbolId"]
+-        response = self._send_message("get", "symbols/" + str(symbol_id) + "/options")
++        response = await self._send_message("get", "symbols/" + str(symbol_id) + "/options")
+         return response
+ 
+-    def get_option_quotes(self, filters: List[Dict], option_ids: List[int]) -> Dict:
++    async def get_option_quotes(self, filters: List[Dict], option_ids: List[int]) -> Dict:
+         """Retrieve a single Level 1 market quote and Greek data for one or more option symbols.
+ 
+         www.questrade.com/api/documentation/rest-operations/market-calls/markets-quotes-options
+@@ -750,13 +764,9 @@
+             payload["filters"] = filters
+         if option_ids is not None:
+             payload["optionIds"] = option_ids
+-        response = self._send_message("post", "markets/quotes/options", json=payload)
++        response = await self._send_message("post", "markets/quotes/options", json=payload)
+         return response
+-
+-    def __del__(self):
+-        """Close session when class instance is deleted."""
+-        self.session.close()
+ 
+     @staticmethod
+     def _valid_intervals():
+-        return set(["OneDay", "OneWeek", "OneMonth", "OneYear"])
++        return set(["OneDay", "OneWeek", "OneMonth", "OneYear"])

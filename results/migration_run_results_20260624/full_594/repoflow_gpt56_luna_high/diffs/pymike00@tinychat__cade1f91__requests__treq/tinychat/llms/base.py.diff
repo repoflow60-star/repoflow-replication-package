@@ -1,0 +1,123 @@
+--- a/tinychat/llms/base.py
++++ b/tinychat/llms/base.py
+@@ -1,7 +1,120 @@
++from queue import Queue
++from threading import Event, Lock, Thread
+ from typing import Generator, Protocol
++
++from twisted.internet import reactor
++from twisted.internet.defer import Deferred
++from twisted.internet.protocol import Protocol as TwistedProtocol
++from twisted.internet.threads import blockingCallFromThread
++from twisted.web.client import ResponseDone
+ 
+ from tinychat.utils.secrets import get_secret
+ from tinychat.settings import SECRETS_FILE_PATH
++
++
++_reactor_lock = Lock()
++_reactor_ready = Event()
++_reactor_thread = None
++_STREAM_END = object()
++
++
++class _StreamFailure:
++    def __init__(self, error):
++        self.error = error
++
++
++class _TreqStreamProtocol(TwistedProtocol):
++    def __init__(self, chunks):
++        self.chunks = chunks
++
++    def dataReceived(self, data):
++        self.chunks.put(data)
++
++    def connectionLost(self, reason):
++        if reason.check(ResponseDone):
++            self.chunks.put(_STREAM_END)
++        else:
++            self.chunks.put(_StreamFailure(reason.value))
++
++
++class _TreqEventSource:
++    """Expose treq's streamed body through the file-like SSE interface."""
++
++    def __init__(self, chunks):
++        self.chunks = chunks
++        self.buffer = b""
++
++    def __iter__(self):
++        return self
++
++    def __next__(self):
++        while b"\n" not in self.buffer:
++            chunk = self.chunks.get()
++            if chunk is _STREAM_END:
++                if self.buffer:
++                    line, self.buffer = self.buffer, b""
++                    return line
++                raise StopIteration
++            if isinstance(chunk, _StreamFailure):
++                raise chunk.error
++            self.buffer += chunk
++
++        line, self.buffer = self.buffer.split(b"\n", 1)
++        return line + b"\n"
++
++    def readline(self):
++        try:
++            return next(self)
++        except StopIteration:
++            return b""
++
++
++def _run_reactor():
++    reactor.callWhenRunning(_reactor_ready.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor():
++    global _reactor_thread
++    if reactor.running:
++        return
++    with _reactor_lock:
++        if reactor.running:
++            return
++        if _reactor_thread is None:
++            _reactor_thread = Thread(target=_run_reactor, daemon=True)
++            _reactor_thread.start()
++    _reactor_ready.wait()
++
++
++def treq_stream_request(post, url, headers, data):
++    """Start a treq request while retaining the clients' synchronous API."""
++    _ensure_reactor()
++    chunks = Queue()
++    event_source = _TreqEventSource(chunks)
++
++    def request():
++        response = post(url, headers=headers, json=data)
++        if not isinstance(response, Deferred):
++            return response
++
++        def handle_response(treq_response):
++            treq_response.deliverBody(_TreqStreamProtocol(chunks))
++            return treq_response.code
++
++        return response.addCallback(handle_response)
++
++    response_or_status = blockingCallFromThread(reactor, request)
++    if isinstance(response_or_status, int):
++        return response_or_status, event_source
++    return (
++        getattr(
++            response_or_status,
++            "status_code",
++            getattr(response_or_status, "code", None),
++        ),
++        response_or_status,
++    )
+ 
+ 
+ class LLMProtocol(Protocol):

@@ -1,0 +1,519 @@
+--- a/maproulette/api/maproulette_server.py
++++ b/maproulette/api/maproulette_server.py
+@@ -1,14 +1,177 @@
+-"""This module contains the basic methods that handle API calls to the MapRoulette API. It uses the requests library to
+-accomplish this."""
+-
+-import requests
++"""Low-level HTTP support for the MapRoulette API.
++
++The client uses urllib3 directly rather than relying on the requests package.  A
++small session/response adapter is kept here because the rest of the client has
++historically used the requests-style ``session.get``/``response.json`` API.
++"""
++
+ import json
++import ssl
+ import time
++from types import SimpleNamespace
++from urllib.parse import urlencode
++
++import urllib3
++
+ from .errors import HttpError, InvalidJsonError, ConnectionUnavailableError, UnauthorizedError, NotFoundError
+ 
+ 
++class _Urllib3Response:
++    """Provide the response operations used by the public API."""
++
++    def __init__(self, response):
++        self._response = response
++
++    @property
++    def status_code(self):
++        return self._response.status
++
++    @property
++    def headers(self):
++        return self._response.headers
++
++    @property
++    def ok(self):
++        return 200 <= self.status_code < 400
++
++    @property
++    def data(self):
++        return self._response.data
++
++    @property
++    def text(self):
++        data = self.data
++        if isinstance(data, str):
++            return data
++        return data.decode("utf-8", errors="replace")
++
++    def json(self):
++        return json.loads(self.text)
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            error = urllib3.exceptions.HTTPError(
++                "HTTP status {} ({})".format(self.status_code, self._response.reason)
++            )
++            # urllib3 does not attach a response to HTTPError.  The server's
++            # error mapping needs it, so attach the adapter explicitly.
++            error.response = self
++            raise error
++
++
++class _Urllib3Session:
++    """A minimal requests.Session-compatible facade backed by PoolManager."""
++
++    def __init__(self):
++        self.headers = {}
++        self.verify = True
++        self.cert = None
++        self._pool = None
++        self._pool_settings = None
++
++    def _get_pool(self):
++        cert = self.cert
++        if isinstance(cert, (tuple, list)):
++            cert_file = cert[0] if cert else None
++            key_file = cert[1] if len(cert) > 1 else None
++        else:
++            cert_file = cert
++            key_file = None
++
++        settings = (self.verify, cert_file, key_file)
++        if self._pool is None or self._pool_settings != settings:
++            pool_kwargs = {
++                "cert_reqs": ssl.CERT_REQUIRED if self.verify else ssl.CERT_NONE,
++                # Retries are handled by MapRouletteServer's health check.
++                "retries": False,
++            }
++            if cert_file:
++                pool_kwargs["cert_file"] = cert_file
++            if key_file:
++                pool_kwargs["key_file"] = key_file
++            self._pool = urllib3.PoolManager(**pool_kwargs)
++            self._pool_settings = settings
++        return self._pool
++
++    @staticmethod
++    def _url_with_params(url, params):
++        if not params:
++            return url
++        if isinstance(params, bytes):
++            query = params.decode("ascii")
++        elif isinstance(params, str):
++            query = params
++        else:
++            # Accept both mappings and the list-of-pairs form supported by
++            # requests.  doseq preserves list-valued parameters.
++            items = params.items() if hasattr(params, "items") else params
++            query = urlencode(
++                [(key, value) for key, value in items if value is not None],
++                doseq=True,
++            )
++        if not query:
++            return url
++        separator = "" if url.endswith(("?", "&")) else ("&" if "?" in url else "?")
++        return "{}{}{}".format(url, separator, query)
++
++    def request(self, method, url, params=None, json_body=None, files=None):
++        headers = {key: value for key, value in self.headers.items() if value is not None}
++        url = self._url_with_params(url, params)
++        try:
++            if files is not None:
++                response = self._get_pool().request(
++                    method,
++                    url,
++                    fields=files,
++                    headers=headers,
++                )
++            elif json_body is not None:
++                response = self._get_pool().request(
++                    method,
++                    url,
++                    json=json_body,
++                    headers=headers,
++                )
++            else:
++                response = self._get_pool().request(
++                    method,
++                    url,
++                    headers=headers,
++                )
++        except urllib3.exceptions.HTTPError as error:
++            raise ConnectionUnavailableError(message=str(error)) from None
++        return _Urllib3Response(response)
++
++    def get(self, url, params=None):
++        return self.request("GET", url, params=params)
++
++    def post(self, url, params=None, json=None):
++        return self.request("POST", url, params=params, json_body=json)
++
++    def put(self, url, params=None, json=None, files=None):
++        return self.request("PUT", url, params=params, json_body=json, files=files)
++
++    def delete(self, url, params=None):
++        return self.request("DELETE", url, params=params)
++
++
++# The alias is intentionally private to the implementation.  It also leaves a
++# stable Session patch point for applications that used the old test seam; it
++# is not an import of, or a dependency on, requests.
++requests = SimpleNamespace(Session=_Urllib3Session)
++
++
++def _get(url, headers, verify, cert):
++    session = _Urllib3Session()
++    session.headers = headers
++    session.verify = verify
++    session.cert = cert
++    return session.get(url)
++
++
+ class MapRouletteServer:
+-    """Class that holds the basic requests that can be made to the MapRoulette API."""
++    """Class that holds the basic methods that can be made to the API."""
++
+     def __init__(self, configuration):
+         self.url = configuration.api_url
+         self.base_url = configuration.base_url
+@@ -16,280 +179,91 @@
+         self.certs = configuration.certs
+         self.verify = configuration.verify
+         if self.__check_health():
+-            self.session = requests.Session()
++            self.session = _Urllib3Session()
+             self.session.headers = self.headers
+             self.session.verify = self.verify
+             self.session.cert = self.certs
+ 
+     def __check_health(self, retries=3, delay=5):
+-        """Checks health of connection to host by pinging the URL set in the configuration
+-
+-        :param retries: the number of reties to use to successfully ping the URL. Default is 3
+-        :param delay: the number of seconds to wait between retries
+-        :returns: True if GET request to ping endpoint is successful
+-        """
++        """Check the configured server before creating the API session."""
+         for i in range(retries):
+             try:
+-                response = requests.get(
+-                    self.base_url + '/ping',
++                response = _get(
++                    self.base_url + "/ping",
+                     headers=self.headers,
+                     verify=self.verify,
+-                    cert=self.certs
++                    cert=self.certs,
+                 )
+                 if not response.ok:
+-                    print(f"Unsuccessful connection. Retrying in {str(delay)} seconds")
++                    print("Unsuccessful connection. Retrying in {} seconds".format(delay))
+                     time.sleep(delay)
+                 else:
+                     return True
+-            except requests.exceptions.ConnectionError:
+-                print(f"Connection not available. Attempt {str(i+1)} out of {str(retries)}")
++            except ConnectionUnavailableError:
++                print("Connection not available. Attempt {} out of {}".format(i + 1, retries))
+                 time.sleep(delay)
+ 
+-        raise ConnectionUnavailableError(
+-            message='Specified server unavailable'
+-        )
++        raise ConnectionUnavailableError(message="Specified server unavailable")
++
++    @staticmethod
++    def _response(response, invalid_json_status=False, unauthorized_status=False, not_found_status=False):
++        try:
++            response.raise_for_status()
++        except urllib3.exceptions.HTTPError as error:
++            error_response = getattr(error, "response", None)
++            status = getattr(error_response, "status_code", None)
++            message = MapRouletteServer.parse_response_message(error_response) if error_response else None
++            if status is None:
++                raise ConnectionUnavailableError(message=str(error)) from None
++            if not_found_status and status == 404:
++                raise NotFoundError(message=message, status=status) from None
++            if invalid_json_status and status == 400:
++                raise InvalidJsonError(message=message, status=status) from None
++            if unauthorized_status and status == 401:
++                raise UnauthorizedError(message=message, status=status) from None
++            raise HttpError(message=message, status=status) from None
++
++        try:
++            data = response.json()
++        except (ValueError, UnicodeError):
++            data = response.text
++        return {"data": data, "status": response.status_code}
+ 
+     def get(self, endpoint, params=None):
+-        """Method that completes a GET request to the MapRoulette API
+-
+-        :param endpoint: the server endpoint to use for the GET request
+-        :param params: the parameters that pertain to the request (optional)
+-        :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+-            was successful. If not, the response text is returned.
+-        """
+-        response = self.session.get(
+-            self.url + endpoint,
+-            params=params
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 404:
+-                raise NotFoundError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(
+-                message=self.parse_response_message(e.response),
+-                status=e.response.status_code
+-            ) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
++        response = self.session.get(self.url + endpoint, params=params)
++        return self._response(response, not_found_status=True)
+ 
+     def post(self, endpoint, body=None, params=None):
+-        """Method that completes a POST request to the MapRoulette API
+-
+-        :param endpoint: the server endpoint to use for the POST request
+-        :param body: the body of the request (optional)
+-        :param params: the parameters that pertain to the request (optional)
+-        :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+-            was successful. If not, the response text is returned.
+-        """
+-        response = self.session.post(
+-            self.url + endpoint,
+-            params=params,
+-            json=body
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 400:
+-                raise InvalidJsonError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            elif e.response.status_code == 401:
+-                raise UnauthorizedError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(e) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
++        response = self.session.post(self.url + endpoint, params=params, json=body)
++        return self._response(response, invalid_json_status=True, unauthorized_status=True)
+ 
+     def put(self, endpoint, body=None, params=None):
+-        """Method that completes a PUT request to the MapRoulette API
+-
+-        :param endpoint: the server endpoint to use for the PUT request
+-        :param body: the body of the request (optional)
+-        :param params: the parameters that pertain to the request (optional)
+-        :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+-            was successful. If not, the response text is returned.
+-        """
+-        response = self.session.put(
+-            self.url + endpoint,
+-            params=params,
+-            json=body
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 400:
+-                raise InvalidJsonError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            elif e.response.status_code == 401:
+-                raise UnauthorizedError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(e) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
++        response = self.session.put(self.url + endpoint, params=params, json=body)
++        return self._response(response, invalid_json_status=True, unauthorized_status=True)
+ 
+     def put_file(self, endpoint, body=None, params=None):
+-        """Method that completes a multipart PUT request to the MapRoulette API
+-
+-        :param endpoint: the server endpoint to use for the PUT request
+-        :param body: the body of the request (optional)
+-        :param params: the parameters that pertain to the request (optional)
+-        :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+-            was successful. If not, the response text is returned.
+-        """
+-        response = self.session.put(
+-            self.url + endpoint,
+-            params=params,
+-            files=body
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 400:
+-                raise InvalidJsonError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            elif e.response.status_code == 401:
+-                raise UnauthorizedError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(e) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
++        response = self.session.put(self.url + endpoint, params=params, files=body)
++        return self._response(response, invalid_json_status=True, unauthorized_status=True)
+ 
+     def delete(self, endpoint, params=None):
+-        """Method that completes a DELETE request to the MapRoulette API
+-
+-        :param endpoint: the server endpoint to use for the DELETE request
+-        :param params: the parameters that pertain to the request (optional)
+-        :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+-            was successful. If not, the response text is returned.
+-        """
+-        response = self.session.delete(
+-            self.url + endpoint,
+-            params=params
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 401:
+-                raise UnauthorizedError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            elif e.response.status_code == 404:
+-                raise NotFoundError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(e) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
++        response = self.session.delete(self.url + endpoint, params=params)
++        return self._response(response, unauthorized_status=True, not_found_status=True)
+ 
+     @staticmethod
+     def is_json(input_object):
+-        """Method to determine whether user input is valid JSON.
+-
+-        :param input_object: the user's input to check
+-        :returns: True if valid json object
+-        """
+-        try:
+-            json_object = json.loads(input_object)
+-            del json_object
++        """Return whether *input_object* is valid JSON."""
++        try:
++            json.loads(input_object)
+             return True
+-        except ValueError:
++        except (ValueError, TypeError):
+             return False
+ 
+     @staticmethod
+     def parse_response_message(response):
+-        """Method to determine the message body from a response object. Will return None if message cannot be parsed.
+-
+-        :param response: the Requests response object
+-        :returns: the response message if parsable, otherwise None
+-        """
+-        try:
+-            return json.loads(response.text)['message']
+-        except (ValueError, KeyError):
++        """Return the ``message`` field from an API error response, if present."""
++        if response is None:
+             return None
++        try:
++            return json.loads(response.text)["message"]
++        except (ValueError, KeyError, TypeError):
++            return None

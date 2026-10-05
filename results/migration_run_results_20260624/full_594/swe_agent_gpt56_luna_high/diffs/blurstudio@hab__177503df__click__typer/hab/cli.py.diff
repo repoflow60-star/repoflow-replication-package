@@ -1,0 +1,892 @@
+--- a/hab/cli.py
++++ b/hab/cli.py
+@@ -2,17 +2,26 @@
+ import re
+ import sys
+ import traceback
++from enum import Enum
+ from datetime import datetime
++from typing import List, Optional
+ from pathlib import Path
+ 
+-import click
+-from click.shell_completion import CompletionItem
++import typer
++from typer import core as typer_core
++from typer import _click as typer_click
++from typer._click.shell_completion import CompletionItem
+ from colorama import Fore
+ 
+ from . import Resolver, Site, __version__, utils
+ from .parsers.unfrozen_config import UnfrozenConfig
+ 
+ logger = logging.getLogger(__name__)
++
++
++# Typer exposes the Click-compatible exception through its own compatibility layer.
++# Keeping this alias local avoids making Click a direct dependency of hab.
++UsageError = typer_click.exceptions.UsageError
+ 
+ 
+ # No one wants to actually type `--help`
+@@ -34,7 +43,7 @@
+     ]
+ 
+ 
+-class UriArgument(click.Argument):
++class UriArgument(typer_core.TyperArgument):
+     """Accepts a URI string, frozen string or path to frozen json file.
+ 
+     - If a frozen string or json file path is passed returns the unfrozen data
+@@ -70,15 +79,18 @@
+ 
+     def __init__(self, *args, prompt=True, **kwargs):
+         self.prompt = prompt
+-        # Override shell_complete with our implementation by default
++        # Typer's parameter classes take declarations as a keyword argument.
++        # Accept positional declarations too, for compatibility with the old
++        # Click-based public helper.
++        kwargs.setdefault("param_decls", list(args))
+         kwargs.setdefault("shell_complete", self.complete_uri)
+-        super().__init__(*args, **kwargs)
++        super().__init__(**kwargs)
+ 
+     def __uri_prompt(self, uri=None):
+-        """Wrapper function of click.prompt.
++        """Wrapper function of typer.prompt.
+         Used to get a URI entry from the user"""
+         if uri:
+-            response = click.prompt(
++            response = typer.prompt(
+                 "Please enter a new URI...\n"
+                 "Or press ENTER to reuse the expired URI:"
+                 f" [{Fore.LIGHTBLUE_EX}{uri}{Fore.RESET}]",
+@@ -88,7 +100,7 @@
+                 err=True,
+             )
+         else:
+-            response = click.prompt(
++            response = typer.prompt(
+                 "No URI exists.\nPlease Enter a URI", type=str, err=True
+             )
+         return response
+@@ -107,7 +119,7 @@
+         uri to user prefs if enabled by the cli.
+         """
+         if value is None:
+-            result = click.UsageError("Missing argument 'URI'")
++            result = UsageError("Missing argument 'URI'")
+             if self.required:
+                 raise result
+             return result
+@@ -126,7 +138,7 @@
+                 value = self.__uri_prompt()
+                 # Save a new .hab_user_prefs.json
+                 ctx.obj.resolver.user_prefs().uri = value
+-                click.echo("Saved hab user prefs", err=True)
++                typer.echo("Saved hab user prefs", err=True)
+                 return value
+             # Check if the saved .hab_user_prefs.json has an expire timestamp
+             elif uri_check.timedout:
+@@ -140,14 +152,14 @@
+                 if value:
+                     # Saving an updated .hab_user_prefs.json
+                     ctx.obj.resolver.user_prefs().uri = value
+-                    click.echo("Saving hab user prefs", err=True)
++                    typer.echo("Saving hab user prefs", err=True)
+                     return value
+                 else:
+                     if self.required:
+-                        raise click.UsageError("A URI is required for Hab use.")
++                        raise UsageError("A URI is required for Hab use.")
+             # user_pref.json is found and its saved uri will be used
+             else:
+-                click.echo(
++                typer.echo(
+                     f"Using {Fore.LIGHTBLUE_EX}{uri_check.uri}{Fore.RESET} "
+                     "from hab user prefs",
+                     err=True,
+@@ -162,11 +174,10 @@
+         # If its not a string, convert to a Path object, if the path exists,
+         # return the extracted dictionary assuming it was a json file.
+         try:
+-            cpath = click.Path(path_type=Path, file_okay=True, resolve_path=True)
+-            data = cpath.convert(value, None, ctx=ctx)
++            data = Path(value).expanduser().resolve()
+             if data.exists():
+                 return utils.json.load(data.open())
+-        except ValueError:
++        except (OSError, ValueError):
+             self.fail(f"{value!r} is not a valid frozen file path.", ctx)
+ 
+         # Use standard click type casting on value.
+@@ -183,7 +194,7 @@
+         return value
+ 
+ 
+-class UriHelpClass(click.Command):
++class UriHelpClass(typer_core.TyperCommand):
+     """Adds info about user prefs to the help text of commands that take a uri."""
+ 
+     # Note: the leading whitespace is important to ensure the help text formats
+@@ -277,7 +288,7 @@
+         elif uri is None:
+             # If a uri wasn't provided by the user raise the exception click
+             # would have raised if uri didn't have `required=False`.
+-            raise click.UsageError("Missing argument 'URI'.")
++            raise UsageError("Missing argument 'URI'.")
+         else:
+             # Otherwise just process the uri like normal
+             cfg = self.resolver.resolve(uri)
+@@ -333,7 +344,7 @@
+             key (str or click.Option): The name of the SharedSettings property to modify.
+             value (str): The value to store on key.
+         """
+-        if isinstance(key, click.Option):
++        if not isinstance(key, str):
+             key = key.name
+ 
+         # Create the instance if it wasn't already created
+@@ -376,10 +387,10 @@
+     @site_paths.setter
+     def site_paths(self, value):
+         # Ensure the paths are converted to Path objects.
+-        self._site_paths = [Path(p) for p in value]
+-
+-
+-class SiteCommandLoader(click.Group):
++        self._site_paths = [Path(p) for p in (value or [])]
++
++
++class SiteCommandLoader(typer_core.TyperGroup):
+     """Allows extending the hab cli by modifying the site config. You can add
+     additional `click.Command` objects to the hab cli.
+ 
+@@ -407,11 +418,25 @@
+         # And populate the cache
+         for ep in site.entry_points_for_group("hab.cli"):
+             func = ep.load()
++            # A Typer decorator returns the original function, unlike the old
++            # Click decorators which returned a command object.  Materialize
++            # that function as a Typer command before adding it to this group.
++            if isinstance(func, typer.Typer):
++                func = typer.main.get_command(func)
++            elif not hasattr(func, "name"):
++                plugin = typer.Typer(add_completion=False)
++                plugin.command()(func)
++                func = typer.main.get_command(plugin)
+             self._ep_cache.append((ep, func))
+ 
+         return self._ep_cache
+ 
+     def list_commands(self, ctx):
++        # Typer discovers commands before the root callback is invoked while
++        # rendering help.  Ensure there is still a settings object for plugin
++        # discovery in that case.
++        if ctx.obj is None:
++            ctx.obj = SharedSettings()
+         ret = super().list_commands(ctx)
+         # Add any site defined entry_point commands
+         for _, cmd in self._cli_entry_points(ctx.obj.resolver.site):
+@@ -434,124 +459,215 @@
+ _verbose_errors = False
+ 
+ 
+-# Establish CLI command group
+-@click.group(cls=SiteCommandLoader, context_settings=CONTEXT_SETTINGS)
+-@click.version_option(__version__, prog_name="hab")
+-@click.option(
+-    "--site",
+-    "site_paths",
+-    callback=SharedSettings.set_ctx_instance,
+-    # Note: Eager enables processing of site when generating help so it can
+-    # include commands defined by plugins.
+-    is_eager=True,
+-    multiple=True,
+-    # TODO: Implement a custom type that handles pathsep and respects env vars
+-    type=click.Path(file_okay=True, resolve_path=True),
+-    help="One or more site json files to load settings from. Uses the env var "
+-    "`HAB_PATHS` if not passed. The values in each file are merged into a single "
+-    "dict with the right most value of any given configuration option being used.",
++def _setting_callback(ctx: typer.Context, param: typer_click.Parameter, value):
++    """Apply a root option to the shared settings object as it is parsed."""
++    return SharedSettings.set_ctx_instance(ctx, param, value)
++
++
++def _version_callback(value):
++    if value:
++        typer.echo(f"hab, version {__version__}")
++        raise typer.Exit()
++
++
++# Typer's application object replaces Click's group/decorator machinery.  The
++# custom group and command classes above are still used because Hab supports
++# commands supplied by site entry points and adds user-preference information
++# to the help of URI commands.
++app = typer.Typer(
++    cls=SiteCommandLoader,
++    context_settings=CONTEXT_SETTINGS,
++    add_completion=False,
++    pretty_exceptions_enable=False,
+ )
+-@click.option(
+-    "-v",
+-    "--verbose",
+-    "verbosity",
+-    callback=SharedSettings.set_ctx_instance,
+-    count=True,
+-    # Note: Using eager makes it so logging is configured as early as possible
+-    # based on this argument.
+-    is_eager=True,
+-    help="Increase the verbosity of the output. Can be used up to 3 times. "
+-    "This also enables showing a full traceback if an exception is raised.",
+-)
+-@click.option(
+-    "--logging-config",
+-    callback=SharedSettings.set_ctx_instance,
+-    # Note: Using eager makes it so logging is configured as early as possible
+-    # based on this argument.
+-    is_eager=True,
+-    type=click.Path(file_okay=True, resolve_path=True),
+-    help="Path to json file defining a logging configuration based on "
+-    "logging.config.dictConfig. If not specified uses .hab_logging_prefs.json "
+-    "next to user prefs file if it exists.",
+-)
+-@click.option(
+-    "--script-dir",
+-    callback=SharedSettings.set_ctx_instance,
+-    type=click.Path(file_okay=False, resolve_path=False),
+-    help="This directory will contain the shell specific script files to enable "
+-    "this environment configuration.",
+-)
+-@click.option(
+-    "--script-ext",
+-    callback=SharedSettings.set_ctx_instance,
+-    help="The shell specific scripts created in script-dir will have this "
+-    "format and extension.",
+-)
+-@click.option(
+-    "--cache/--no-cache",
+-    "cached",
+-    callback=SharedSettings.set_ctx_instance,
+-    default=True,
+-    help="Allow per-site caching of configs and distros.",
+-)
+-@click.option(
+-    "--pre/--no-pre",
+-    "prereleases",
+-    callback=SharedSettings.set_ctx_instance,
+-    default=None,
+-    help="Include pre-releases when finding the latest distro version.",
+-)
+-@click.option(
+-    "-r",
+-    "--requirement",
+-    "forced_requirements",
+-    callback=SharedSettings.set_ctx_instance,
+-    multiple=True,
+-    help="Forces this distro requirement ignoring normally resolved requirements. Using "
+-    "this may lead to configuring your environment incorrectly, use with caution.",
+-)
+-@click.option(
+-    "--dump-scripts/--no-dump-scripts",
+-    callback=SharedSettings.set_ctx_instance,
+-    default=False,
+-    help=(
+-        "Print the generated scripts hab uses for this command instead of "
+-        "running them. This does not work for dump."
+-    ),
+-)
+-@click.option(
+-    "--prefs/--no-prefs",
+-    "enable_user_prefs",
+-    callback=SharedSettings.set_ctx_instance,
+-    default=None,
+-    help="If you don't pass a URI, allow looking it up from user prefs.",
+-)
+-@click.option(
+-    "--save-prefs/--no-save-prefs",
+-    "enable_user_prefs_save",
+-    callback=SharedSettings.set_ctx_instance,
+-    default=None,
+-    help="Update the uri stored in prefs if the uri is provided.",
+-)
+-@click.pass_context
+-def _cli(ctx, **kargs):
+-    # Note: Using the `set_ctx_instance` callback on the options prevents
+-    # the need to process anything inside of this function.
+-    pass
+-
+-
+-# set uri command
+-@_cli.command()
+-@click.argument("uri", required=False)
+-@click.pass_obj
+-def set_uri(settings, uri):
++
++
++@app.callback()
++def _cli(
++    ctx: typer.Context,
++    site_paths: List[Path] = typer.Option(  # noqa: B008
++        None,
++        "--site",
++        callback=_setting_callback,
++        is_eager=True,
++        resolve_path=True,
++        help="One or more site json files to load settings from. Uses the env var "
++        "`HAB_PATHS` if not passed. The values in each file are merged into a single "
++        "dict with the right most value of any given configuration option being used.",
++    ),
++    verbosity: int = typer.Option(  # noqa: B008
++        0,
++        "-v",
++        "--verbose",
++        callback=_setting_callback,
++        count=True,
++        is_eager=True,
++        help="Increase the verbosity of the output. Can be used up to 3 times. "
++        "This also enables showing a full traceback if an exception is raised.",
++    ),
++    logging_config: Optional[Path] = typer.Option(  # noqa: B008
++        None,
++        "--logging-config",
++        callback=_setting_callback,
++        is_eager=True,
++        resolve_path=True,
++        help="Path to json file defining a logging configuration based on "
++        "logging.config.dictConfig. If not specified uses .hab_logging_prefs.json "
++        "next to user prefs file if it exists.",
++    ),
++    script_dir: Optional[Path] = typer.Option(  # noqa: B008
++        None,
++        "--script-dir",
++        callback=_setting_callback,
++        file_okay=False,
++        resolve_path=False,
++        help="This directory will contain the shell specific script files to enable "
++        "this environment configuration.",
++    ),
++    script_ext: Optional[str] = typer.Option(  # noqa: B008
++        None,
++        "--script-ext",
++        callback=_setting_callback,
++        help="The shell specific scripts created in script-dir will have this "
++        "format and extension.",
++    ),
++    cached: bool = typer.Option(  # noqa: B008
++        True,
++        "--cache/--no-cache",
++        callback=_setting_callback,
++        help="Allow per-site caching of configs and distros.",
++    ),
++    prereleases: Optional[bool] = typer.Option(  # noqa: B008
++        None,
++        "--pre/--no-pre",
++        callback=_setting_callback,
++        help="Include pre-releases when finding the latest distro version.",
++    ),
++    forced_requirements: List[str] = typer.Option(  # noqa: B008
++        None,
++        "-r",
++        "--requirement",
++        callback=_setting_callback,
++        help="Forces this distro requirement ignoring normally resolved requirements. Using "
++        "this may lead to configuring your environment incorrectly, use with caution.",
++    ),
++    dump_scripts: bool = typer.Option(  # noqa: B008
++        False,
++        "--dump-scripts/--no-dump-scripts",
++        callback=_setting_callback,
++        help=(
++            "Print the generated scripts hab uses for this command instead of "
++            "running them. This does not work for dump."
++        ),
++    ),
++    enable_user_prefs: Optional[bool] = typer.Option(  # noqa: B008
++        None,
++        "--prefs/--no-prefs",
++        callback=_setting_callback,
++        help="If you don't pass a URI, allow looking it up from user prefs.",
++    ),
++    enable_user_prefs_save: Optional[bool] = typer.Option(  # noqa: B008
++        None,
++        "--save-prefs/--no-save-prefs",
++        callback=_setting_callback,
++        help="Update the uri stored in prefs if the uri is provided.",
++    ),
++    version: bool = typer.Option(  # noqa: B008
++        False,
++        "--version",
++        callback=_version_callback,
++        is_eager=True,
++        help="Show the version and exit.",
++    ),
++):
++    # The callbacks above create this object before command discovery.  The
++    # fallback is useful when Typer is invoked programmatically with no options.
++    if ctx.obj is None:
++        ctx.obj = SharedSettings()
++
++
++def _uri_callback(value, ctx: typer.Context, param: typer_click.Parameter):
++    prompt = True
++    """Typer callback implementing Hab's URI conversion and preference rules."""
++    settings = ctx.obj
++    required = getattr(param, "required", False)
++    if value is None:
++        result = UsageError("Missing argument 'URI'")
++        if required:
++            raise result
++        return result
++
++    if value == "-":
++        uri_check = settings.resolver.user_prefs().uri_check()
++        if not prompt:
++            return uri_check
++        if uri_check.uri is None:
++            value = typer.prompt(
++                "No URI exists.\nPlease Enter a URI", type=str, err=True
++            )
++            settings.resolver.user_prefs().uri = value
++            typer.echo("Saved hab user prefs", err=True)
++            return value
++        if uri_check.timedout:
++            logger.info(
++                f"{Fore.RED}Invalid 'URI' preference: {Fore.RESET}"
++                f"The saved URI {Fore.LIGHTBLUE_EX}{uri_check.uri}{Fore.RESET} "
++                "has expired."
++            )
++            value = typer.prompt(
++                "Please enter a new URI...\n"
++                "Or press ENTER to reuse the expired URI:"
++                f" [{Fore.LIGHTBLUE_EX}{uri_check.uri}{Fore.RESET}]",
++                default=uri_check.uri,
++                show_default=False,
++                type=str,
++                err=True,
++            )
++            if value:
++                settings.resolver.user_prefs().uri = value
++                typer.echo("Saving hab user prefs", err=True)
++                return value
++            if required:
++                raise UsageError("A URI is required for Hab use.")
++        else:
++            typer.echo(
++                f"Using {Fore.LIGHTBLUE_EX}{uri_check.uri}{Fore.RESET} "
++                "from hab user prefs",
++                err=True,
++            )
++            return uri_check.uri
++
++    if re.match(r"^v\d+:", value):
++        return utils.decode_freeze(value)
++
++    try:
++        cpath = Path(value).expanduser().resolve()
++        if cpath.exists():
++            return utils.json.load(cpath.open())
++    except (OSError, ValueError):
++        raise typer.BadParameter(
++            f"{value!r} is not a valid frozen file path."
++        ) from None
++
++    if settings.enable_user_prefs_save:
++        settings.resolver.user_prefs().uri = value
++    settings.uri = value
++    return value
++
++
++@app.command()
++def set_uri(
++    ctx: typer.Context,
++    uri: Optional[str] = typer.Argument(None),  # noqa: B008
++):
+     """Allows for saving a local URI default by passing
+     a URI argument.  If no argument is passed uri-set
+     will prompt you to enter and argument."""
++    settings = ctx.obj
+     settings.log_context(uri)
+     current_uri = settings.resolver.user_prefs().uri
+     if uri is None:
+-        uri = click.prompt(
++        uri = typer.prompt(
+             "Please enter a URI value"
+             f"[{Fore.LIGHTBLUE_EX}{current_uri}{Fore.RESET}]",
+             default=current_uri,
+@@ -559,141 +675,119 @@
+             type=str,
+             err=True,
+         )
+-    click.echo(f"\nSetting default URI to: {Fore.LIGHTBLUE_EX}{uri}{Fore.RESET}\n")
++    typer.echo(f"\nSetting default URI to: {Fore.LIGHTBLUE_EX}{uri}{Fore.RESET}\n")
+     settings.resolver.user_prefs().uri = uri
+ 
+ 
+-# env command
+-@_cli.command(cls=UriHelpClass)
+-@click.argument("uri", cls=UriArgument)
+-@click.option(
+-    "-l",
+-    "--launch",
+-    default=None,
+-    help="Run this alias after activating. This leaves the new shell active.",
+-    # TODO: This requires resolving the uri argument before this option. Click
+-    # doesn't support that by default. Figure out how to get this working.
+-    # shell_complete=complete_alias,
+-)
+-@click.pass_obj
+-def env(settings, uri, launch):
++@app.command(cls=UriHelpClass)
++def env(
++    ctx: typer.Context,
++    uri: str = typer.Argument(..., callback=_uri_callback),  # noqa: B008
++    launch: Optional[str] = typer.Option(  # noqa: B008
++        None,
++        "-l",
++        "--launch",
++        help="Run this alias after activating. This leaves the new shell active.",
++    ),
++):
+     """Configures and launches a new shell with the resolved setup."""
+-    settings.write_script(uri, create_launch=True, launch=launch)
+-
+-
+-# dump command
+-@_cli.command(cls=UriHelpClass)
+-# For specific report_types uri is not required. This is manually checked in
+-# the code below where it raises `uri_error`.
+-@click.argument("uri", required=False, cls=UriArgument)
+-@click.pass_obj
+-@click.option(
+-    "--env/--no-env",
+-    default=True,
+-    help="Show the environment variable as a flattened structure.",
+-)
+-@click.option(
+-    "--env-config/--no-env-config",
+-    "--envc/--no-envc",
+-    default=False,
+-    help="Show the environment variable as a flattened structure.",
+-)
+-@click.option(
+-    "-t",
+-    "--type",
+-    "report_type",
+-    type=click.Choice(
+-        ["nice", "site", "s", "uris", "u", "versions", "v", "forest", "f", "all-uris"]
+-    ),
+-    default="nice",
+-    help="Type of report.",
+-)
+-@click.option(
+-    "--flat/--no-flat",
+-    default=True,
+-    help="Flatten the resolved object",
+-)
+-@click.option(
+-    "-v",
+-    "--verbose",
+-    "verbosity",
+-    count=True,
+-    help="Show increasingly detailed output. Can be used up to 3 times.",
+-)
+-@click.option(
+-    "-f",
+-    "--format",
+-    "format_type",
+-    type=click.Choice(["nice", "freeze", "json", "versions"]),
+-    default="nice",
+-    help="Choose how the output is formatted.",
+-)
+-def dump(settings, uri, env, env_config, report_type, flat, verbosity, format_type):
++    ctx.obj.write_script(uri, create_launch=True, launch=launch)
++
++
++class ReportType(str, Enum):
++    nice = "nice"
++    site = "site"
++    short_site = "s"
++    uris = "uris"
++    short_uris = "u"
++    versions = "versions"
++    short_versions = "v"
++    forest = "forest"
++    short_forest = "f"
++    all_uris = "all-uris"
++
++
++class FormatType(str, Enum):
++    nice = "nice"
++    freeze = "freeze"
++    json = "json"
++    versions = "versions"
++
++
++@app.command(cls=UriHelpClass)
++def dump(
++    ctx: typer.Context,
++    uri: Optional[str] = typer.Argument(None, callback=_uri_callback),  # noqa: B008
++    env: bool = typer.Option(  # noqa: B008
++        True,
++        "--env/--no-env",
++        help="Show the environment variable as a flattened structure.",
++    ),
++    env_config: bool = typer.Option(  # noqa: B008
++        False,
++        "--env-config/--no-env-config",
++        "--envc/--no-envc",
++        help="Show the environment variable as a flattened structure.",
++    ),
++    report_type: ReportType = typer.Option(  # noqa: B008
++        ReportType.nice, "-t", "--type", help="Type of report."
++    ),
++    flat: bool = typer.Option(  # noqa: B008
++        True, "--flat/--no-flat", help="Flatten the resolved object"
++    ),
++    verbosity: int = typer.Option(  # noqa: B008
++        0,
++        "-v",
++        "--verbose",
++        count=True,
++        help="Show increasingly detailed output. Can be used up to 3 times.",
++    ),
++    format_type: FormatType = typer.Option(  # noqa: B008
++        FormatType.nice, "-f", "--format", help="Choose how the output is formatted."
++    ),
++):
+     """Resolves and prints the requested setup."""
+-
+-    # Convert uri argument to handle if a uri was not provided/loaded
+-    uri_error = None
+-    if isinstance(uri, click.UsageError):
+-        uri_error = uri
++    settings = ctx.obj
++    uri_error = uri if isinstance(uri, UsageError) else None
++    if uri_error:
+         uri = None
+-
+     settings.log_context(uri)
+-    # Convert report_tupe short names to long names for ease of processing
+     report_map = {"u": "uris", "v": "versions", "f": "forest", "s": "site"}
+-    report_type = report_map.get(report_type, report_type)
+-
++    report_type = report_map.get(report_type.value, report_type.value)
++    format_type = format_type.value
+     resolver = settings.resolver
+ 
+     if report_type in ("uris", "versions", "forest"):
+         from .parsers.format_parser import FormatParser
+ 
+         formatter = FormatParser(verbosity, color=True)
+-        # Allow the user to disable truncation of versions with verbosity flag
+         truncate = None if verbosity > 1 else 3
+-
+         if report_type in ("uris", "forest"):
+-            click.echo(f'{Fore.YELLOW}{" URIs ".center(50, "-")}{Fore.RESET}')
+-            # Filter out any URI's hidden by the requested verbosity level
++            typer.echo(f'{Fore.YELLOW}{" URIs ".center(50, "-")}{Fore.RESET}')
+             with utils.verbosity_filter(resolver, verbosity):
+                 for line in resolver.dump_forest(
+                     resolver.configs, fmt=formatter.format
+                 ):
+-                    click.echo(line)
++                    typer.echo(line)
+         if report_type in ("versions", "forest"):
+-            click.echo(f'{Fore.YELLOW}{" Versions ".center(50, "-")}{Fore.RESET}')
+-
++            typer.echo(f'{Fore.YELLOW}{" Versions ".center(50, "-")}{Fore.RESET}')
+             for line in resolver.dump_forest(
+-                resolver.distros,
+-                attr="name",
+-                fmt=formatter.format,
+-                truncate=truncate,
++                resolver.distros, attr="name", fmt=formatter.format, truncate=truncate
+             ):
+-                click.echo(line)
++                typer.echo(line)
+     elif report_type == "all-uris":
+-        # Combines all non-placeholder URI's into a single json document and display.
+-        # This can be used to compare changes to configs when editing them in bulk.
+-        ret = resolver.freeze_configs()
+-        ret = utils.dumps_json(ret, indent=2)
+-        click.echo(ret)
++        typer.echo(utils.dumps_json(resolver.freeze_configs(), indent=2))
+     elif report_type == "site":
+-        click.echo(resolver.site.dump(verbosity=verbosity))
++        typer.echo(resolver.site.dump(verbosity=verbosity))
+     else:
+         if isinstance(uri, dict):
+-            # Load frozen json data instead of processing the URI
+             ret = UnfrozenConfig(uri, resolver)
+         elif uri_error:
+-            # If the user didn't choose a report type that doesn't require a uri
+-            # and a uri wasn't specified, raise a UsageError  similar to the one
+-            # click normally raises. UriArgument likely has augmented the
+-            # exception to make it easier to debug the issue.
+             raise uri_error
+         elif flat:
+             ret = resolver.resolve(uri)
+         else:
+             ret = resolver.closest_config(uri)
+-
+-        # This is a seperate set of if/elif/else statements than from above.
+-        # I became confused while reading so decided to add this reminder.
+         if format_type == "freeze":
+             ret = utils.encode_freeze(ret.freeze(), site=resolver.site)
+         elif format_type == "json":
+@@ -704,86 +798,75 @@
+             ret = ret.dump(
+                 environment=env, environment_config=env_config, verbosity=verbosity
+             )
+-
+-        click.echo(ret)
+-
+-
+-# activate command
+-@_cli.command(cls=UriHelpClass)
+-@click.argument("uri", cls=UriArgument)
+-@click.option(
+-    "-l",
+-    "--launch",
+-    default=None,
+-    help="Run this alias after activating. This leaves the new shell activated.",
+-    # TODO: This requires resolving the uri argument before this option. Click
+-    # doesn't support that by default. Figure out how to get this working.
+-    # shell_complete=complete_alias,
+-)
+-@click.pass_obj
+-def activate(settings, uri, launch):
++        typer.echo(ret)
++
++
++@app.command(cls=UriHelpClass)
++def activate(
++    ctx: typer.Context,
++    uri: str = typer.Argument(..., callback=_uri_callback),  # noqa: B008
++    launch: Optional[str] = typer.Option(  # noqa: B008
++        None,
++        "-l",
++        "--launch",
++        help="Run this alias after activating. This leaves the new shell activated.",
++    ),
++):
+     """Resolves the setup and updates in the current shell.
+ 
+     In powershell and bash you must use the source dot: ". hab activate ..."
+     WARNING: Not supported in Command Prompt currently.
+     """
++    settings = ctx.obj
+     if settings.script_ext in (".bat", ".cmd"):
+-        # The hab shell scripts clean up their temp script files before exiting.
+-        # Due to batch not having a `function` feature we have to create the
+-        # aliases as extra script files to support complex aliases. We can't use
+-        # doskey if we want to support complex aliases. Another reason to avoid
+-        # doskey, is that it leaks assignments to the parent command prompt when
+-        # using it for env/launch so exiting doesn't get rid of aliases in those
+-        # modes. The env/launch commands continue to run till the user exits, but
+-        # activate exits immediately so the temp alias batch files get deleted
+-        # before they can be used by the user/script breaking this command.
+-        click.echo(
++        typer.echo(
+             f"{Fore.RED}Not Supported:{Fore.RESET} Using hab activate in the "
+             "Command Prompt is not currently supported."
+         )
+-        sys.exit(1)
+-
++        raise typer.Exit(1)
+     settings.write_script(uri, launch=launch)
+ 
+ 
+-# launch command
+-@_cli.command(
+-    context_settings=dict(
+-        ignore_unknown_options=True,
+-    ),
++@app.command(
++    context_settings={"ignore_unknown_options": True},
+     cls=UriHelpClass,
+ )
+-@click.argument("uri", cls=UriArgument)
+-@click.argument("alias", shell_complete=complete_alias)
+-# Pass all remaining arguments to the requested alias
+-@click.argument("args", nargs=-1, type=click.UNPROCESSED)
+-@click.pass_obj
+-def launch(settings, uri, alias, args):
++def launch(
++    ctx: typer.Context,
++    uri: str = typer.Argument(..., callback=_uri_callback),  # noqa: B008
++    alias: str = typer.Argument(..., shell_complete=complete_alias),  # noqa: B008
++    args: List[str] = typer.Argument(None),  # noqa: B008
++):
+     """Configure and launch an alias without modifying the current shell. The
+     first argument is a URI, The second argument is the ALIAS to launch. Any
+     additional arguments are passed as launch arguments to the alias. Note, if
+-    using bash on windows you may need to pass file paths correctly for bash as
+-    any quotes used may not make it to the alias launch arguments. (ie: '/c/Program\\ Files').
++    using bash on windows you may need to pass file paths correctly as bash
++    may not preserve quotes in launch arguments.
+     """
+-    settings.write_script(uri, create_launch=True, launch=alias, exit=True, args=args)
+-
+-
+-# Cache command
+-@_cli.command()
+-@click.argument("path", type=click.Path(file_okay=True, resolve_path=True))
+-@click.pass_obj
+-def cache(settings, path):
++    ctx.obj.write_script(uri, create_launch=True, launch=alias, exit=True, args=args)
++
++
++@app.command()
++def cache(
++    ctx: typer.Context,
++    path: Path = typer.Argument(..., resolve_path=True),  # noqa: B008
++):
+     """Create/update the cache for a given site file. The path argument is the
+-    site config file. To allow for cross-platform support you should make sure
+-    you are loading the same site configuration that will be used by this cache
+-    or at least a site configuration that defines the same `platform_path_maps`.
++    site config file. To allow for cross-platform support you should make sure you
++    are loading the same site configuration that will be used by this cache.
+     """
+-    path = Path(path)
+-    click.echo(f"Caching: {path}")
++    settings = ctx.obj
++    typer.echo(f"Caching: {path}")
+     s = datetime.now()
+     out = settings.resolver.site.cache.save_cache(settings.resolver, path)
+     e = datetime.now()
+-    click.echo(f"Cache took: {e - s}, cache file: {out}")
++    typer.echo(f"Cache took: {e - s}, cache file: {out}")
++
++
++# Build the Click-compatible command through Typer.  This preserves the public
++# callable `_cli` used by integrations while Click itself remains an internal
++# implementation detail of Typer.
++_cli_command = typer.main.get_command(app)
+ 
+ 
+ def cli(*args, **kwargs):
+@@ -792,17 +875,12 @@
+     the entire stack trace.
+     """
+     try:
+-        return _cli(*args, **kwargs)
++        return _cli_command(*args, **kwargs)
+     except Exception:
+-        click.echo(f"{Fore.RED}Hab encountered an error:{Fore.RESET}")
++        typer.echo(f"{Fore.RED}Hab encountered an error:{Fore.RESET}")
+         if _verbose_errors or sys.excepthook != sys.__excepthook__:
+-            # If a plugin has replaced sys.excepthook it likely want's to handle
+-            # how the traceback is handled.
+-            # Ensure the full traceback is shown when in verbose mode.
+             raise
+-
+-        # Otherwise print the traceback message without the stack trace.
+-        click.echo(traceback.format_exc(limit=0))
++        typer.echo(traceback.format_exc(limit=0))
+         return 1
+ 
+ 

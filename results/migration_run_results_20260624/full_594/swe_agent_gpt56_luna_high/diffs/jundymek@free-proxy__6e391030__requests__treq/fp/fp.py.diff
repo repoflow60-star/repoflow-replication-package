@@ -1,0 +1,158 @@
+--- a/fp/fp.py
++++ b/fp/fp.py
+@@ -1,11 +1,76 @@
+ #!/usr/bin/env python3
+ 
+ import random
++import threading
++from urllib.parse import urlsplit
+ 
+ import lxml.html as lh
+-import requests
++import treq
++from twisted.internet import reactor
++from twisted.internet.endpoints import HostnameEndpoint
++from twisted.python.failure import Failure
++from twisted.web.client import ProxyAgent
+ 
+ from fp.errors import FreeProxyException
++
++
++# treq is asynchronous, while FreeProxy's public API has historically been
++# synchronous.  Keep the public API compatible by running one reactor in a
++# daemon thread and waiting for each Deferred to finish.  Keeping the reactor
++# alive is important: Twisted reactors cannot be started again after they have
++# been stopped.
++_reactor_lock = threading.Lock()
++_reactor_thread = None
++
++
++def _wait_for_deferred(operation):
++    """Run a treq operation and return its Deferred's result synchronously."""
++    global _reactor_thread
++    result = []
++    finished = threading.Event()
++
++    def complete(value):
++        result.append(value)
++        finished.set()
++        return value
++
++    def start_operation():
++        try:
++            value = operation() if callable(operation) else operation
++            if hasattr(value, 'addBoth'):
++                value.addBoth(complete)
++            else:
++                complete(value)
++        except BaseException as error:
++            complete(error)
++
++    # Calls made after the first request have to be submitted to the reactor
++    # thread.  Calling connectTCP from a different thread can corrupt Twisted's
++    # event loop (and, in particular, its file descriptor registrations).
++    if reactor.running:
++        if threading.current_thread() is _reactor_thread:
++            raise RuntimeError('FreeProxy synchronous methods cannot run in the reactor thread')
++        reactor.callFromThread(start_operation)
++    else:
++        start_operation()
++
++    if not finished.is_set() and not reactor.running:
++        with _reactor_lock:
++            if not reactor.running and _reactor_thread is None:
++                _reactor_thread = threading.Thread(
++                    target=lambda: reactor.run(installSignalHandlers=False),
++                    name='free-proxy-treq-reactor',
++                    daemon=True,
++                )
++                _reactor_thread.start()
++
++    finished.wait()
++    value = result[0]
++    if isinstance(value, Failure):
++        value.raiseException()
++    if isinstance(value, BaseException):
++        raise value
++    return value
+ 
+ 
+ class FreeProxy:
+@@ -29,12 +94,13 @@
+         self.url = url
+ 
+     def get_proxy_list(self, repeat):
++        website = self.__website(repeat)
+         try:
+-            page = requests.get(self.__website(repeat))
+-            doc = lh.fromstring(page.content)
+-        except requests.exceptions.RequestException as e:
+-            raise FreeProxyException(
+-                f'Request to {self.__website(repeat)} failed') from e
++            response = _wait_for_deferred(lambda: treq.get(website))
++            content = _wait_for_deferred(lambda: treq.content(response))
++            doc = lh.fromstring(content)
++        except Exception as e:
++            raise FreeProxyException(f'Request to {website} failed') from e
+         try:
+             tr_elements = doc.xpath('//*[@id="list"]//tr')
+             return [f'{tr_elements[i][0].text_content()}:{tr_elements[i][1].text_content()}'
+@@ -78,7 +144,9 @@
+                 working_proxy = self.__check_if_proxy_is_working(proxies)
+                 if working_proxy:
+                     return working_proxy
+-            except requests.exceptions.RequestException:
++            except Exception:
++                # Treq reports connection, DNS and timeout failures through
++                # Deferreds, which _wait_for_deferred re-raises here.
+                 continue
+         if not working_proxy and not repeat:
+             if self.country_id is not None:
+@@ -88,9 +156,42 @@
+             'There are no working proxies at this time.')
+ 
+     def __check_if_proxy_is_working(self, proxies):
+-        url = f'{self.schema}://{self.url}'
+-        ip = proxies[self.schema].split(':')[1][2:]
+-        with requests.get(url, proxies=proxies, timeout=self.timeout, stream=True) as r:
+-            if r.raw.connection.sock and r.raw.connection.sock.getpeername()[0] == ip:
+-                return proxies[self.schema]
++        url = self.url if '://' in self.url else f'{self.schema}://{self.url}'
++        proxy_url = proxies[self.schema]
++        parsed_proxy = urlsplit(proxy_url)
++        if not parsed_proxy.hostname or parsed_proxy.port is None:
++            raise ValueError(f'Invalid proxy URL: {proxy_url}')
++
++        # ProxyAgent supplies the proxy connection for treq.  It connects to
++        # the proxy and sends the target URL
++        # through that connection; treq then supplies the response handling.
++        endpoint = HostnameEndpoint(
++            reactor,
++            parsed_proxy.hostname,
++            parsed_proxy.port,
++            timeout=self.timeout,
++        )
++        agent = ProxyAgent(endpoint, reactor=reactor)
++        response = _wait_for_deferred(
++            lambda: treq.get(
++                url,
++                agent=agent,
++                timeout=self.timeout,
++                unbuffered=True,
++            )
++        )
++        # Consume the response before returning.  This releases the response
++        # body before returning, as the previous synchronous client did.
++        _wait_for_deferred(lambda: treq.content(response))
++
++        # ProxyAgent already guarantees that the request was made through the
++        # proxy.  Where Twisted exposes the peer, retain the old additional
++        # check; some response implementations do not expose their transport,
++        # in which case a successful proxied response is sufficient.
++        original = getattr(response, 'original', response)
++        transport = getattr(original, 'transport', None)
++        peer = transport.getPeer() if transport is not None else None
++        peer_host = getattr(peer, 'host', None)
++        if peer_host is None or peer_host == parsed_proxy.hostname:
++            return proxy_url
+         return

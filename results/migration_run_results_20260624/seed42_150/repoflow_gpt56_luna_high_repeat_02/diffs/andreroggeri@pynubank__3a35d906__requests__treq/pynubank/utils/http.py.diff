@@ -1,0 +1,135 @@
+--- a/pynubank/utils/http.py
++++ b/pynubank/utils/http.py
+@@ -1,7 +1,60 @@
+-from requests import Response
+-from requests_pkcs12 import get, post
++import threading
++from typing import Any
++
++import OpenSSL
++import treq
++from cryptography.hazmat.primitives.serialization.pkcs12 import load_key_and_certificates
++from twisted.internet import reactor, ssl
++from twisted.web.client import Agent
++from treq import get, post
+ 
+ from pynubank import NuRequestException
++
++
++_reactor_thread = None
++_reactor_ready = threading.Event()
++_reactor_lock = threading.Lock()
++
++
++def _run_reactor():
++    reactor.callWhenRunning(_reactor_ready.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _wait_for_deferred(value):
++    if not hasattr(value, 'addCallbacks'):
++        return value
++
++    global _reactor_thread
++    with _reactor_lock:
++        if not reactor.running:
++            if _reactor_thread is None:
++                _reactor_thread = threading.Thread(target=_run_reactor, daemon=True)
++                _reactor_thread.start()
++            _reactor_ready.wait()
++        elif threading.current_thread() is _reactor_thread:
++            raise RuntimeError('Synchronous HTTP calls cannot run on the Twisted reactor thread')
++
++    result = []
++    completed = threading.Event()
++
++    def succeeded(response):
++        result.append((True, response))
++        completed.set()
++        return response
++
++    def failed(failure):
++        result.append((False, failure))
++        completed.set()
++        return None
++
++    value.addCallbacks(succeeded, failed)
++    completed.wait()
++
++    success, response = result[0]
++    if not success:
++        response.raiseException()
++    return response
+ 
+ 
+ class HttpClient:
+@@ -28,22 +81,60 @@
+ 
+     @property
+     def _cert_args(self):
+-        return {'pkcs12_data': self._cert, 'pkcs12_password': ''} if self._cert else {}
++        if not self._cert:
++            return {}
+ 
+-    def _handle_response(self, response: Response) -> dict:
+-        if response.status_code != 200:
++        private_key, certificate, _ = load_key_and_certificates(self._cert, None)
++        context_factory = ssl.CertificateOptions(
++            privateKey=OpenSSL.crypto.PKey.from_cryptography_key(private_key),
++            certificate=OpenSSL.crypto.X509.from_cryptography(certificate),
++        )
++        return {'agent': Agent(reactor, contextFactory=context_factory)}
++
++    @staticmethod
++    def response_status_code(response: Any) -> int:
++        return response.status_code if hasattr(response, 'status_code') else response.code
++
++    @staticmethod
++    def response_headers(response: Any):
++        headers = response.headers
++        if not hasattr(headers, 'getRawHeaders'):
++            return headers
++
++        class HeaderMap(dict):
++            def get(self, name, default=None):
++                values = headers.getRawHeaders(name)
++                if not values:
++                    return default
++                value = values[0]
++                return value.decode() if isinstance(value, bytes) else value
++
++        return HeaderMap()
++
++    @staticmethod
++    def response_json(response: Any) -> dict:
++        if hasattr(response, 'json'):
++            return response.json()
++        return _wait_for_deferred(treq.json_content(response))
++
++    def _handle_response(self, response: Any) -> dict:
++        if self.response_status_code(response) != 200:
+             raise NuRequestException(response)
+ 
+-        return response.json()
++        return self.response_json(response)
+ 
+-    def raw_get(self, url: str) -> Response:
+-        return get(url, headers=self._headers, **self._cert_args)
++    def raw_get(self, url: str):
++        headers = {name: [value] for name, value in self._headers.items()}
++        response = get(url, headers=headers, **self._cert_args)
++        return _wait_for_deferred(response)
+ 
+-    def raw_post(self, url: str, json: dict) -> Response:
+-        return post(url, json=json, headers=self._headers, **self._cert_args)
++    def raw_post(self, url: str, json: dict):
++        headers = {name: [value] for name, value in self._headers.items()}
++        response = post(url, json_content=json, headers=headers, **self._cert_args)
++        return _wait_for_deferred(response)
+ 
+     def get(self, url: str) -> dict:
+         return self._handle_response(self.raw_get(url))
+ 
+     def post(self, url: str, json: dict) -> dict:
+-        return self._handle_response(post(url, json=json, headers=self._headers, **self._cert_args))
++        return self._handle_response(self.raw_post(url, json))

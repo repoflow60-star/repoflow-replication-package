@@ -1,0 +1,168 @@
+--- a/whatsapp_api_client_python/API.py
++++ b/whatsapp_api_client_python/API.py
+@@ -1,9 +1,11 @@
+ import json
+ import logging
++import threading
+ from typing import Any, NoReturn, Optional
+ 
+-from requests import Response, Session
+-from requests.adapters import HTTPAdapter, Retry
++import treq
++from twisted.internet import defer, reactor
++from twisted.internet.threads import blockingCallFromThread
+ 
+ from .response import Response as GreenAPIResponse
+ from .tools import (
+@@ -18,6 +20,125 @@
+     serviceMethods,
+     webhooks
+ )
++
++
++class _TreqResponse:
++    """Small synchronous response view used by the existing API surface.
++
++    treq returns a Deferred and exposes the response body through another
++    Deferred.  The public methods in this package are intentionally
++    synchronous, so the adapter below resolves both Deferreds before
++    returning a response with the attributes the rest of this package uses.
++    """
++
++    def __init__(self, status_code: int, body: bytes):
++        self.status_code = status_code
++        self.text = body.decode("utf-8", errors="replace")
++
++
++_reactor_lock = threading.Lock()
++_reactor_started = threading.Event()
++_reactor_thread: Optional[threading.Thread] = None
++
++
++def _run_reactor() -> None:
++    reactor.callWhenRunning(_reactor_started.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor() -> None:
++    """Start the Twisted reactor used by the synchronous compatibility layer."""
++
++    global _reactor_thread
++
++    if reactor.running:
++        return
++
++    with _reactor_lock:
++        if not reactor.running and _reactor_thread is None:
++            _reactor_thread = threading.Thread(
++                target=_run_reactor,
++                name="whatsapp-api-treq-reactor",
++                daemon=True,
++            )
++            _reactor_thread.start()
++
++    _reactor_started.wait()
++
++
++def _request_with_treq(**arguments: Any) -> _TreqResponse:
++    """Execute a treq request and wait for its complete response body."""
++
++    def request() -> defer.Deferred:
++        deferred = defer.maybeDeferred(treq.request, **arguments)
++
++        def read_body(response: Any) -> defer.Deferred:
++            body = defer.maybeDeferred(treq.content, response)
++            return body.addCallback(
++                lambda content: _TreqResponse(response.code, content)
++            )
++
++        return deferred.addCallback(read_body)
++
++    _ensure_reactor()
++    return blockingCallFromThread(reactor, request)
++
++
++def _treq_file_value(value: Any) -> Any:
++    """Accept the legacy file tuple used by existing tool methods.
++
++    The previous HTTP client used ``(filename, file_object, content_type)``
++    while treq uses
++    ``(filename, content_type, file_object)``.  Supporting both forms keeps
++    the tool methods compatible while sending the request through treq.
++    """
++
++    if (
++        isinstance(value, tuple)
++        and len(value) == 3
++        and hasattr(value[1], "read")
++        and not hasattr(value[2], "read")
++    ):
++        return value[0], value[2], value[1]
++    return value
++
++
++class Session:
++    """Compatibility session backed by treq."""
++
++    def __init__(self) -> None:
++        self.headers = {}
++
++    def mount(self, *_arguments: Any, **_keywords: Any) -> None:
++        # Kept for callers that used the old session.  Connection
++        # pooling is managed by treq's global HTTP connection pool.
++        return None
++
++    def request(self, method: str, url: str, **arguments: Any) -> _TreqResponse:
++        headers = dict(self.headers)
++        headers.update(arguments.pop("headers", {}) or {})
++        headers = {key: value for key, value in headers.items() if value is not None}
++
++        if arguments.get("json") is None:
++            # The previous client treated json=None as no body; treq uses None as an
++            # explicit JSON null value, so omit it to preserve that behavior.
++            arguments.pop("json", None)
++
++        files = arguments.get("files")
++        if files:
++            if hasattr(files, "items"):
++                arguments["files"] = {
++                    key: _treq_file_value(value)
++                    for key, value in files.items()
++                }
++            else:
++                arguments["files"] = [
++                    (key, _treq_file_value(value)) for key, value in files
++                ]
++
++        arguments["headers"] = headers
++        arguments["reactor"] = reactor
++        return _request_with_treq(method=method, url=url, **arguments)
+ 
+ 
+ class GreenApi:
+@@ -116,7 +237,7 @@
+ 
+         return GreenAPIResponse(response.status_code, response.text)
+ 
+-    def __handle_response(self, response: Response) -> Optional[NoReturn]:
++    def __handle_response(self, response: _TreqResponse) -> Optional[NoReturn]:
+         status_code = response.status_code
+         if status_code != 200 or self.debug_mode:
+             try:
+@@ -161,16 +282,6 @@
+     def __prepare_session(self) -> None:
+         self.session.headers["Connection"] = "close"
+ 
+-        retry = Retry(
+-            total=3,
+-            backoff_factor=1.0,
+-            allowed_methods=None,
+-            status_forcelist=[429]
+-        )
+-
+-        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+-
+ 
+ class GreenAPI(GreenApi):
+     pass

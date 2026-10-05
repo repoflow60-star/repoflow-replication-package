@@ -1,0 +1,228 @@
+--- a/filestack/utils.py
++++ b/filestack/utils.py
+@@ -1,9 +1,11 @@
++import io
++import json
++import random
++import string
+ import time
+-import string
+-import random
+-from functools import partial
+-import requests as original_requests
+-from requests.exceptions import HTTPError
++from urllib.parse import urlencode
++
++import pycurl
+ 
+ from filestack import config
+ from filestack.exceptions import FilestackHTTPError
+@@ -13,34 +15,185 @@
+     return ''.join(random.choice(string.ascii_letters + string.digits) for i in range(length))
+ 
+ 
+-class RequestsWrapper:
+-    """
+-    This class wraps selected methods from requests package and adds
+-    default headers if no headers were specified.
+-    """
+-    def __getattr__(self, name):
+-        if name in ('get', 'post', 'put', 'delete'):
+-            return partial(self.handle_request, name)
+-        return original_requests.__getattribute__(name)
+-
+-    def handle_request(self, name, *args, **kwargs):
+-        if 'headers' not in kwargs:
+-            kwargs['headers'] = config.HEADERS
+-            kwargs['headers']['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
+-            kwargs['headers']['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
+-
+-        requests_method = getattr(original_requests, name)
+-        response = requests_method(*args, **kwargs)
+-
++class ResponseHeaders(dict):
++    """Dictionary with case-insensitive HTTP header lookup."""
++
++    def __getitem__(self, key):
++        for header, value in self.items():
++            if header.lower() == key.lower():
++                return value
++        raise KeyError(key)
++
++    def get(self, key, default=None):
+         try:
++            return self[key]
++        except KeyError:
++            return default
++
++    def __contains__(self, key):
++        return any(header.lower() == key.lower() for header in self)
++
++
++class HTTPResult:
++    """Response-shaped result returned by the pycurl client."""
++
++    def __init__(self, content, status_code, headers):
++        self.content = content
++        self.status_code = status_code
++        self.headers = ResponseHeaders(headers)
++
++    @property
++    def ok(self):
++        return self.status_code < 400
++
++    @property
++    def text(self):
++        return self.content.decode('utf-8', errors='replace')
++
++    def json(self):
++        return json.loads(self.text)
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise FilestackHTTPError(self.text)
++
++    def iter_content(self, chunk_size=1):
++        for start in range(0, len(self.content), chunk_size):
++            yield self.content[start:start + chunk_size]
++
++
++_UNSET = object()
++
++
++class PycurlClient:
++    """Synchronous HTTP client backed by pycurl."""
++
++    def get(self, url, **kwargs):
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, **kwargs):
++        return self.request('POST', url, **kwargs)
++
++    def put(self, url, **kwargs):
++        return self.request('PUT', url, **kwargs)
++
++    def delete(self, url, **kwargs):
++        return self.request('DELETE', url, **kwargs)
++
++    def post_with_retries(self, url, retries=7, **kwargs):
++        response = None
++        for attempt in range(retries + 1):
++            response = self.request('POST', url, _raise_for_status=False, **kwargs)
++            if response.status_code != 202 or attempt == retries:
++                return response
++            time.sleep(0.2 * (2 ** attempt))
++        return response
++
++    def request(self, method, url, headers=_UNSET, params=None, json_body=None,
++                data=None, files=None, _raise_for_status=True, **kwargs):
++        json_body = kwargs.pop('json', json_body)
++        if params:
++            query = urlencode(params, doseq=True)
++            url = '{}{}{}'.format(url, '&' if '?' in url else '?', query)
++
++        if headers is _UNSET:
++            request_headers = dict(config.HEADERS)
++            request_headers.update({
++                'Filestack-Trace-Id': '{}-{}'.format(int(time.time()), unique_id()),
++                'Filestack-Trace-Span': 'pythonsdk-{}'.format(unique_id())
++            })
++        else:
++            request_headers = dict(headers or {})
++
++        body = None
++        if json_body is not None:
++            body = json.dumps(json_body).encode('utf-8')
++            if not any(key.lower() == 'content-type' for key in request_headers):
++                request_headers['Content-Type'] = 'application/json'
++        elif data is not None and not files:
++            if isinstance(data, bytes):
++                body = data
++            elif isinstance(data, str):
++                body = data.encode('utf-8')
++            elif hasattr(data, 'read'):
++                body = data.read()
++            else:
++                body = urlencode(data, doseq=True).encode('utf-8')
++                if not any(key.lower() == 'content-type' for key in request_headers):
++                    request_headers['Content-Type'] = 'application/x-www-form-urlencoded'
++
++        response_body = io.BytesIO()
++        response_headers = {}
++
++        def capture_header(line):
++            decoded = line.decode('iso-8859-1').strip() if isinstance(line, bytes) else line.strip()
++            if decoded.startswith('HTTP/'):
++                response_headers.clear()
++            elif ':' in decoded:
++                key, value = decoded.split(':', 1)
++                response_headers[key.strip()] = value.strip()
++            return len(line)
++
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.WRITEDATA, response_body)
++            curl.setopt(pycurl.HEADERFUNCTION, capture_header)
++            curl.setopt(pycurl.FOLLOWLOCATION, 1)
++            curl.setopt(pycurl.NOSIGNAL, 1)
++            curl.setopt(pycurl.HTTPHEADER, [
++                '{}: {}'.format(key, value) for key, value in request_headers.items()
++            ])
++
++            if files:
++                post_data = []
++                if isinstance(data, dict):
++                    post_data.extend((key, str(value)) for key, value in data.items())
++                for field, file_info in files.items():
++                    filename, file_obj, content_type = file_info
++                    post_data.append((field, (
++                        pycurl.FORM_BUFFER, filename,
++                        pycurl.FORM_BUFFERPTR, file_obj.read(),
++                        pycurl.FORM_CONTENTTYPE, content_type
++                    )))
++                curl.setopt(pycurl.HTTPPOST, post_data)
++            elif body is not None:
++                curl.setopt(pycurl.POSTFIELDS, body)
++
++            if method == 'GET':
++                curl.setopt(pycurl.HTTPGET, 1)
++            elif method == 'POST':
++                curl.setopt(pycurl.POST, 1)
++            else:
++                curl.setopt(pycurl.CUSTOMREQUEST, method)
++
++            if 'timeout' in kwargs and kwargs['timeout'] is not None:
++                timeout = kwargs['timeout']
++                if isinstance(timeout, tuple):
++                    curl.setopt(pycurl.CONNECTTIMEOUT_MS, int(timeout[0] * 1000))
++                    timeout = timeout[1]
++                curl.setopt(pycurl.TIMEOUT_MS, int(timeout * 1000))
++            if kwargs.get('allow_redirects') is False:
++                curl.setopt(pycurl.FOLLOWLOCATION, 0)
++            if kwargs.get('verify') is False:
++                curl.setopt(pycurl.SSL_VERIFYPEER, 0)
++                curl.setopt(pycurl.SSL_VERIFYHOST, 0)
++
++            curl.perform()
++            response = HTTPResult(
++                response_body.getvalue(),
++                curl.getinfo(pycurl.RESPONSE_CODE),
++                response_headers
++            )
++        finally:
++            curl.close()
++
++        if _raise_for_status:
+             response.raise_for_status()
+-        except HTTPError as e:
+-            raise FilestackHTTPError(response.text) from e
+-
+         return response
+ 
+ 
+-requests = RequestsWrapper()
++http = PycurlClient()
+ 
+ 
+ def return_transform_task(transformation, params):

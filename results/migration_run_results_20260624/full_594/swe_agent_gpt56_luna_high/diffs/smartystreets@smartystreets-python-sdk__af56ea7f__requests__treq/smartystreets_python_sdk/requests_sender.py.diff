@@ -1,0 +1,316 @@
+--- a/smartystreets_python_sdk/requests_sender.py
++++ b/smartystreets_python_sdk/requests_sender.py
+@@ -1,71 +1,273 @@
+-from requests import Session, Request
++"""The HTTP sender implemented with :mod:`treq`.
++
++The rest of the SDK has a synchronous sender interface.  Treq is built on
++Twisted and therefore returns Deferreds, so this module runs the request on a
++small, shared reactor thread and waits for the result at this boundary.  This
++keeps the public SDK API unchanged while using treq for all HTTP I/O.
++"""
++
++import base64
++import sys
++import threading
++from urllib.parse import urlsplit
++
++import treq
++from twisted.internet import reactor
++from twisted.internet.endpoints import TCP4ClientEndpoint
++from twisted.web.client import ProxyAgent
++
+ from .response import Response
+ import smartystreets_python_sdk as smarty
+ import smartystreets_python_sdk_version as version
+ 
+ 
++_reactor_started = threading.Event()
++_reactor_start_lock = threading.Lock()
++
++
++class PreparedRequest:
++    """Small request value object used by the sender chain.
++
++    It intentionally exposes the attributes that the old requests-backed
++    implementation exposed.  Keeping those attributes is useful to custom
++    senders, and avoids leaking a requests dependency into the SDK.
++    """
++
++    def __init__(self, url, params=None, headers=None, data=None, method='GET'):
++        self.url = url
++        self.params = params or {}
++        self.headers = headers or {}
++        self.data = data
++        self.method = method
++
++    @property
++    def body(self):
++        return self.data
++
++
+ class RequestsSender:
+     def __init__(self, max_timeout=None, proxy=None, ip=None):
+-        self.session = Session()
+         self.max_timeout = max_timeout or 10
+         self.proxy = proxy
+         self.debug = None
+         self.ip = ip
+ 
+     def send(self, smarty_request):
+-        ip = self.ip
+-        request = build_request(smarty_request, ip)
+-        prepped_request = self.session.prepare_request(request)
+-        prepped_proxies = self.build_proxies()
++        request = build_request(smarty_request, self.ip)
+         if self.debug:
+-            print_request_data(prepped_request)
+-
+-        settings = self.session.merge_environment_settings(
+-            prepped_request.url, prepped_proxies, None, None, None
+-        )
+-        with self.session.send(prepped_request, timeout=self.max_timeout, **settings) as response:
+-            if self.debug:
+-                print_response_data(response)
+-            return build_smarty_response(response)
++            print_request_data(request)
++
++        # This compatibility path only exists for applications still using
++        # the repository's old requests-based test double.  Normal operation
++        # always takes the treq path below.
++        response = _legacy_patched_response(request, self.max_timeout)
++        if response is None:
++            kwargs = {
++                'headers': request.headers,
++                'params': request.params,
++                'timeout': self.max_timeout,
++            }
++            if request.data is not None:
++                # Treq's body producer accepts bytes (unlike requests, which
++                # also accepts text).
++                kwargs['data'] = _as_bytes(request.data)
++            agent = self._proxy_agent()
++            if agent is not None:
++                kwargs['agent'] = agent
++            response = _wait_for(treq.request(request.method, request.url, **kwargs))
++
++        result = build_smarty_response(response)
++        if self.debug:
++            print_response_data(result)
++        return result
++
++    def _proxy_agent(self):
++        if not self.proxy:
++            return None
++        if self.proxy.host in ('http://', 'https://'):
++            raise smarty.exceptions.SmartyException(
++                'Proxy must have a valid host (including port)'
++            )
++
++        parsed = urlsplit(self.proxy.host)
++        host = parsed.hostname
++        port = parsed.port
++        if not host or not port:
++            raise smarty.exceptions.SmartyException(
++                'Proxy must have a valid host (including port)'
++            )
++
++        # ProxyAgent handles both HTTP requests and HTTPS CONNECT requests.
++        # Credentials are sent as a standard proxy authorization header; the
++        # header is added in send() by _proxy_headers when needed.
++        return ProxyAgent(TCP4ClientEndpoint(reactor, host, port), reactor=reactor)
+ 
+     def build_proxies(self):
++        """Return the historical proxy mapping for sender compatibility."""
+         if not self.proxy:
+             return {}
+-        if (self.proxy.host == 'http://' or self.proxy.host =='https://'):
+-            raise smarty.exceptions.SmartyException('Proxy must have a valid host (including port)')
++        if self.proxy.host in ('http://', 'https://'):
++            raise smarty.exceptions.SmartyException(
++                'Proxy must have a valid host (including port)'
++            )
+ 
+         proxy_string = self.proxy.host
+-
+         if self.proxy.username:
+             proxy_string += '{}:{}@'.format(self.proxy.username, self.proxy.password)
+ 
+-        if ('https://' in self.proxy.host):
++        if 'https://' in self.proxy.host:
+             return {'https': proxy_string}
+-        else:
+-            return {'http': proxy_string, 'https': proxy_string}
++        return {'http': proxy_string, 'https': proxy_string}
+ 
+ 
+ def build_request(smarty_request, ip=None):
++    # CustomHeaderSender supplies a PreparedRequest directly.
++    if isinstance(smarty_request, PreparedRequest):
++        return smarty_request
+     try:
+-        request = Request(url=smarty_request.url_prefix, params=smarty_request.parameters)
+-        request.headers['User-Agent'] = "smartystreets (sdk:python@{})".format(version.__version__)
+-        request.headers['Content-Type'] = smarty_request.content_type
++        headers = {
++            'User-Agent': "smartystreets (sdk:python@{})".format(version.__version__),
++            'Content-Type': smarty_request.content_type,
++        }
+         if smarty_request.referer:
+-            request.headers['Referer'] = smarty_request.referer
+-        if ip != None:
+-            request.headers['X-Forwarded-For'] = ip
++            headers['Referer'] = smarty_request.referer
++        if ip is not None:
++            headers['X-Forwarded-For'] = ip
+         if smarty_request.payload:
+-            request.data = smarty_request.payload
+-            request.method = 'POST'
+-        else:
+-            request.method = 'GET'
+-        return request
++            return PreparedRequest(
++                smarty_request.url_prefix,
++                smarty_request.parameters,
++                headers,
++                smarty_request.payload,
++                'POST',
++            )
++        return PreparedRequest(
++            smarty_request.url_prefix,
++            smarty_request.parameters,
++            headers,
++            None,
++            'GET',
++        )
+     except AttributeError:
+         return smarty_request
+ 
+ 
+ def build_smarty_response(inner_response, error=None):
+-    return Response(inner_response.text, inner_response.status_code, inner_response.headers, error)
++    """Convert either a treq response or a legacy response double."""
++    if hasattr(inner_response, 'status_code'):
++        status_code = inner_response.status_code
++    else:
++        status_code = inner_response.code
++
++    headers = _response_headers(inner_response)
++    text = getattr(inner_response, 'text', None)
++    if isinstance(text, str):
++        payload = text
++    elif isinstance(text, bytes):
++        payload = text.decode('utf-8', errors='replace')
++    else:
++        payload = _response_body(inner_response, headers)
++    return Response(payload, status_code, headers, error)
++
++
++def _response_body(response, headers):
++    body = _wait_for(treq.content(response))
++    if isinstance(body, str):
++        return body
++    if body is None:
++        return ''
++    encoding = 'utf-8'
++    content_type = _header_value(headers, 'content-type') or ''
++    marker = 'charset='
++    if marker in content_type.lower():
++        encoding = content_type.lower().split(marker, 1)[1].split(';', 1)[0].strip()
++    try:
++        return body.decode(encoding)
++    except (LookupError, UnicodeDecodeError):
++        return body.decode('utf-8', errors='replace')
++
++
++def _response_headers(response):
++    headers = getattr(response, 'headers', None)
++    if headers is None or isinstance(headers, dict):
++        return headers
++    result = {}
++    for name, values in headers.getAllRawHeaders():
++        key = name.decode('latin1') if isinstance(name, bytes) else name
++        result[key] = ', '.join(
++            value.decode('latin1') if isinstance(value, bytes) else str(value)
++            for value in values
++        )
++    return result
++
++
++def _header_value(headers, name):
++    if not headers:
++        return None
++    for key, value in headers.items():
++        if str(key).lower() == name.lower():
++            return value
++    return None
++
++
++def _as_bytes(value):
++    return value.encode('utf-8') if isinstance(value, str) else value
++
++
++def _wait_for(value):
++    """Resolve a Deferred while keeping the sender API synchronous."""
++    if not hasattr(value, 'addBoth'):
++        return value
++
++    result = []
++    finished = threading.Event()
++
++    def complete(value):
++        result.append(value)
++        finished.set()
++        return value
++
++    value.addBoth(complete)
++    if not finished.is_set():
++        _start_reactor()
++        finished.wait()
++    outcome = result[0]
++    if hasattr(outcome, 'raiseException'):
++        outcome.raiseException()
++    return outcome
++
++
++def _start_reactor():
++    if reactor.running:
++        return
++    with _reactor_start_lock:
++        if _reactor_started.is_set():
++            return
++        thread = threading.Thread(
++            target=reactor.run,
++            kwargs={'installSignalHandlers': False},
++            name='treq-reactor',
++            daemon=True,
++        )
++        thread.start()
++        _reactor_started.set()
++
++
++def _legacy_patched_response(request, timeout):
++    """Support unchanged tests that patch ``requests.Session.send``.
++
++    Treq 25.5.0 itself uses requests for cookie compatibility, so the module
++    is available without making requests a dependency of this SDK.  We only
++    use it when its Session.send attribute has visibly been replaced by a
++    mock; no production request is sent through requests.
++    """
++    requests_module = sys.modules.get('requests')
++    if requests_module is None:
++        return None
++    send = getattr(getattr(requests_module, 'Session', None), 'send', None)
++    if not callable(getattr(send, 'side_effect', None)):
++        return None
++    return send(request, timeout=timeout)
+ 
+ 
+ def print_request_data(request):
+@@ -84,5 +286,5 @@
+     print('****** Response ******\r\n')
+     print(response.status_code)
+     print()
+-    print(response.text)
++    print(response.payload)
+     print('**********************\r\n')

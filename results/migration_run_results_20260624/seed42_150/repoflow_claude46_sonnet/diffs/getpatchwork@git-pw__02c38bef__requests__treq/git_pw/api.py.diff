@@ -1,0 +1,330 @@
+--- a/git_pw/api.py
++++ b/git_pw/api.py
+@@ -3,6 +3,8 @@
+ """
+ 
+ from functools import update_wrapper
++import base64
++import json
+ import logging
+ import os.path
+ import re
+@@ -11,7 +13,10 @@
+ import typing as ty
+ 
+ import click
+-import requests
++import treq
++from twisted.internet import defer
++from twisted.internet.selectreactor import SelectReactor
++from twisted.web.error import Error as WebError
+ 
+ import git_pw
+ from git_pw import config
+@@ -22,30 +27,111 @@
+ Filters = ty.List[ty.Tuple[str, str]]
+ 
+ 
+-class HTTPTokenAuth(requests.auth.AuthBase):
+-    """Attaches HTTP Token Authentication to the given Request object."""
+-
+-    def __init__(self, token: str):
+-        self.token = token
+-
+-    def __call__(
++class HTTPError(Exception):
++    """Raised when an HTTP request returns an error status code."""
++
++    def __init__(self, response: ty.Any, message: str = '') -> None:
++        self.response = response
++        self.message = message
++        super().__init__(message)
++
++
++class RequestException(Exception):
++    """Base exception for HTTP request failures."""
++
++    def __init__(self, message: str = '', response: ty.Any = None) -> None:
++        self.response = response
++        super().__init__(message)
++
++
++class _Response:
++    """Adapter wrapping a treq/Twisted response to mimic requests.Response."""
++
++    def __init__(
+         self,
+-        r: requests.PreparedRequest,
+-    ) -> requests.PreparedRequest:
+-        r.headers['Authorization'] = self._token_auth_str(self.token)
+-        return r
+-
+-    @staticmethod
+-    def _token_auth_str(token: str) -> str:
+-        """Return a Token auth string."""
+-        return 'Token {}'.format(token.strip())
+-
+-
+-def _get_auth(optional: bool = False) -> ty.Optional[requests.auth.AuthBase]:
++        twisted_response: ty.Any,
++        body: bytes,
++    ) -> None:
++        self._response = twisted_response
++        self._body = body
++        self.status_code: int = twisted_response.code
++        self.headers: ty.Any = _Headers(twisted_response.headers)
++
++    def raise_for_status(self) -> None:
++        if self.status_code >= 400:
++            raise RequestException(
++                'HTTP Error {}'.format(self.status_code),
++                response=self,
++            )
++
++    def json(self) -> ty.Any:
++        return json.loads(self._body.decode('utf-8'))
++
++    @property
++    def content(self) -> bytes:
++        return self._body
++
++    def iter_content(self, chunk_size: int = 1) -> ty.Iterator[bytes]:
++        data = self._body
++        for i in range(0, len(data), chunk_size):
++            yield data[i:i + chunk_size]
++
++
++class _Headers:
++    """Adapter for Twisted Headers to mimic requests' case-insensitive dict."""
++
++    def __init__(self, twisted_headers: ty.Any) -> None:
++        self._headers = twisted_headers
++
++    def get(self, name: str, default: ty.Optional[str] = None) -> ty.Optional[str]:
++        values = self._headers.getRawHeaders(name.encode('utf-8') if isinstance(name, str) else name)
++        if values:
++            v = values[0]
++            return v.decode('utf-8') if isinstance(v, bytes) else v
++        return default
++
++
++def _run_sync(coro: ty.Any) -> ty.Any:
++    """Run a coroutine synchronously using a fresh Twisted reactor."""
++    result: ty.List[ty.Any] = []
++    failure: ty.List[BaseException] = []
++
++    rx = SelectReactor()
++
++    async def _runner() -> None:
++        try:
++            result.append(await coro)
++        except Exception as exc:
++            failure.append(exc)
++        finally:
++            rx.stop()
++
++    rx.callLater(0, defer.ensureDeferred, _runner())
++    rx.run()
++
++    if failure:
++        raise failure[0]
++    return result[0]
++
++
++def _auth_headers(auth: ty.Optional[ty.Tuple[str, str]]) -> ty.Dict[str, str]:
++    """Convert (username, password) tuple to Authorization header dict."""
++    if auth is None:
++        return {}
++    username, password = auth
++    credentials = base64.b64encode(
++        '{}:{}'.format(username, password).encode('utf-8')
++    ).decode('utf-8')
++    return {'Authorization': 'Basic {}'.format(credentials)}
++
++
++def _get_auth(
++    optional: bool = False,
++) -> ty.Optional[ty.Tuple[str, str]]:
+     if CONF.token:
+-        return HTTPTokenAuth(CONF.token)
++        return ('__token__', CONF.token)
+     elif CONF.username and CONF.password:
+-        return requests.auth.HTTPBasicAuth(CONF.username, CONF.password)
++        return (CONF.username, CONF.password)
+     elif not optional:
+         LOG.error('Authentication information missing')
+         LOG.error(
+@@ -54,6 +140,25 @@
+         )
+         sys.exit(1)
+     return None
++
++
++def _build_headers(
++    auth: ty.Optional[ty.Tuple[str, str]] = None,
++) -> ty.Dict[str, str]:
++    """Build combined headers dict including auth and user-agent."""
++    headers: ty.Dict[str, str] = {
++        'User-Agent': 'git-pw ({})'.format(git_pw.__version__),
++    }
++    if auth is not None:
++        username, password = auth
++        if username == '__token__':
++            headers['Authorization'] = 'Token {}'.format(password.strip())
++        else:
++            credentials = base64.b64encode(
++                '{}:{}'.format(username, password).encode('utf-8')
++            ).decode('utf-8')
++            headers['Authorization'] = 'Basic {}'.format(credentials)
++    return headers
+ 
+ 
+ def _get_headers() -> ty.Dict[str, str]:
+@@ -107,7 +212,7 @@
+ 
+ def _handle_error(
+     operation: str,
+-    exc: requests.exceptions.RequestException,
++    exc: RequestException,
+ ) -> None:
+     if exc.response is not None and exc.response.content:
+         # server errors should always be reported
+@@ -116,7 +221,7 @@
+                 'Server error. Please report this issue to '
+                 'https://github.com/getpatchwork/patchwork'
+             )
+-            raise
++            raise exc
+ 
+         # we make the assumption that all responses will be JSON encoded
+         if exc.response.status_code == 404:
+@@ -131,32 +236,46 @@
+         LOG.error("Use the '--debug' flag for more information")
+ 
+     if CONF.debug:
+-        raise
++        raise exc
+     else:
+         sys.exit(1)
++
++
++async def _fetch_response(
++    method: str,
++    url: str,
++    headers: ty.Dict[str, str],
++    params: ty.Optional[ty.Any] = None,
++    data: ty.Optional[ty.Any] = None,
++) -> '_Response':
++    """Perform an HTTP request using treq and return a _Response."""
++    kwargs: ty.Dict[str, ty.Any] = {'headers': headers}
++    if params is not None:
++        kwargs['params'] = params
++    if data is not None:
++        kwargs['data'] = data
++
++    method_func = getattr(treq, method)
++    twisted_resp = await method_func(url, **kwargs)
++    body = await treq.content(twisted_resp)
++    return _Response(twisted_resp, body)
+ 
+ 
+ def _get(
+     url: str,
+     params: ty.Optional[Filters] = None,
+     stream: bool = False,
+-) -> requests.Response:
++) -> '_Response':
+     """Make GET request and handle errors."""
+     LOG.debug('GET %s', url)
+ 
++    auth = _get_auth(optional=True)
++    headers = _build_headers(auth)
++
+     try:
+-        # TODO(stephenfin): We only use a subset of the types possible for
+-        # 'params' (namely a list of tuples) but it doesn't seem possible to
+-        # indicate this
+-        rsp = requests.get(
+-            url,
+-            auth=_get_auth(optional=True),
+-            headers=_get_headers(),
+-            stream=stream,
+-            params=params,
+-        )  # type: ignore
++        rsp = _run_sync(_fetch_response('get', url, headers, params=params))
+         rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++    except RequestException as exc:
+         _handle_error('fetch', exc)
+ 
+     LOG.debug('Got response')
+@@ -167,16 +286,17 @@
+ def _post(
+     url: str,
+     data: ty.List[ty.Tuple[str, ty.Any]],
+-) -> requests.Response:
++) -> '_Response':
+     """Make POST request and handle errors."""
+     LOG.debug('POST %s, data=%r', url, data)
+ 
++    auth = _get_auth()
++    headers = _build_headers(auth)
++
+     try:
+-        rsp = requests.post(
+-            url, auth=_get_auth(), headers=_get_headers(), data=data
+-        )
++        rsp = _run_sync(_fetch_response('post', url, headers, data=data))
+         rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++    except RequestException as exc:
+         _handle_error('create', exc)
+ 
+     LOG.debug('Got response')
+@@ -187,19 +307,17 @@
+ def _patch(
+     url: str,
+     data: ty.List[ty.Tuple[str, ty.Any]],
+-) -> requests.Response:
++) -> '_Response':
+     """Make PATCH request and handle errors."""
+     LOG.debug('PATCH %s, data=%r', url, data)
+ 
++    auth = _get_auth()
++    headers = _build_headers(auth)
++
+     try:
+-        rsp = requests.patch(
+-            url,
+-            auth=_get_auth(),
+-            headers=_get_headers(),
+-            data=data,
+-        )
++        rsp = _run_sync(_fetch_response('patch', url, headers, data=data))
+         rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++    except RequestException as exc:
+         _handle_error('update', exc)
+ 
+     LOG.debug('Got response')
+@@ -207,14 +325,17 @@
+     return rsp
+ 
+ 
+-def _delete(url: str) -> requests.Response:
++def _delete(url: str) -> '_Response':
+     """Make DELETE request and handle errors."""
+     LOG.debug('DELETE %s', url)
+ 
++    auth = _get_auth()
++    headers = _build_headers(auth)
++
+     try:
+-        rsp = requests.delete(url, auth=_get_auth(), headers=_get_headers())
++        rsp = _run_sync(_fetch_response('delete', url, headers))
+         rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++    except RequestException as exc:
+         _handle_error('delete', exc)
+ 
+     LOG.debug('Got response')

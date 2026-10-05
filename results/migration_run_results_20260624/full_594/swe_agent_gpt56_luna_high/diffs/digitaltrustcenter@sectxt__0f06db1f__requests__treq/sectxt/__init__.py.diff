@@ -1,0 +1,177 @@
+--- a/sectxt/__init__.py
++++ b/sectxt/__init__.py
+@@ -2,10 +2,11 @@
+ # SPDX-License-Identifier: EUPL-1.2
+ #
+ import codecs
+-
++from dataclasses import dataclass
+ import langcodes
+ import re
+ import sys
++import threading
+ from email.message import Message
+ import validators
+ from collections import defaultdict
+@@ -15,6 +16,9 @@
+ from pgpy_dtc import PGPMessage
+ from pgpy_dtc.errors import PGPError
+ from dateutil.relativedelta import relativedelta
++from twisted.internet import reactor
++from twisted.internet.threads import blockingCallFromThread
++import treq
+ 
+ if sys.version_info < (3, 8):
+     from typing_extensions import TypedDict
+@@ -22,11 +26,112 @@
+     from typing import TypedDict
+ 
+ import dateutil.parser
+-import requests
+ 
+ __version__ = "0.9.6"
+ 
+-s = requests.Session()
++
++@dataclass
++class _HTTPResponse:
++    """The small part of an HTTP response needed by the parser."""
++
++    status_code: int
++    headers: dict
++    content: bytes
++    url: str
++    history: List["_HTTPResponse"]
++
++
++_reactor_thread: Optional[threading.Thread] = None
++_reactor_lock = threading.Lock()
++_reactor_started = threading.Event()
++
++
++def _run_reactor() -> None:
++    reactor.callWhenRunning(_reactor_started.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor() -> None:
++    """Start a reactor thread for the synchronous public API.
++
++    ``treq`` is Deferred-based, while ``SecurityTXT`` has historically been a
++    synchronous API.  Keeping the reactor in a daemon thread lets callers keep
++    using that API without replacing treq with a blocking HTTP client.
++    """
++    global _reactor_thread
++    if reactor.running:
++        if _reactor_thread is not None and threading.current_thread() is _reactor_thread:
++            raise RuntimeError("SecurityTXT cannot be used from its reactor thread")
++        return
++    with _reactor_lock:
++        if not reactor.running:
++            _reactor_started.clear()
++            _reactor_thread = threading.Thread(
++                target=_run_reactor,
++                name="sectxt-treq-reactor",
++                daemon=True,
++            )
++            _reactor_thread.start()
++    if not _reactor_started.wait(timeout=5):
++        raise RuntimeError("Unable to start the Twisted reactor")
++
++
++def _response_url(response) -> str:
++    url = response.request.absoluteURI
++    if isinstance(url, bytes):
++        return url.decode("ascii")
++    return str(url)
++
++
++def _response_headers(response) -> dict:
++    headers = {}
++    for name, values in response.headers.getAllRawHeaders():
++        if isinstance(name, bytes):
++            name = name.decode("ascii")
++        decoded_values = [
++            value.decode("latin1") if isinstance(value, bytes) else str(value)
++            for value in values
++        ]
++        headers[name.lower()] = ", ".join(decoded_values)
++    return headers
++
++
++def _treq_get(url: str, headers: dict, timeout: int) -> _HTTPResponse:
++    """Perform a treq GET and expose a requests-like result internally."""
++    _ensure_reactor()
++
++    def request():
++        deferred = treq.get(url, headers=headers, timeout=timeout, reactor=reactor)
++
++        def read_body(response):
++            return treq.content(response).addCallback(
++                lambda content: (response, content)
++            )
++
++        return deferred.addCallback(read_body)
++
++    response, content = blockingCallFromThread(reactor, request)
++    history = [
++        _HTTPResponse(
++            status_code=item.code,
++            headers=_response_headers(item),
++            content=b"",
++            url=_response_url(item),
++            history=[],
++        )
++        for item in response.history()
++    ]
++    return _HTTPResponse(
++        status_code=response.code,
++        headers=_response_headers(response),
++        content=content,
++        url=_response_url(response),
++        history=history,
++    )
++
++
++def _get_response(url: str, headers: dict, timeout: int) -> _HTTPResponse:
++    return _treq_get(url, headers, timeout)
+ 
+ 
+ class ErrorDict(TypedDict):
+@@ -557,31 +662,16 @@
+                 for path in [".well-known/security.txt", "security.txt"]:
+                     url = urlunsplit((scheme, self._loc, path, None, None))
+                     try:
+-                        resp = requests.get(
++                        resp = _get_response(
+                             url,
+                             headers={
+                                 'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+                                               'Gecko/20100101 Firefox/12.0'},
+-                            timeout=5
++                            timeout=5,
+                         )
+-                    except requests.exceptions.SSLError:
+-                        if not any(d["code"] == "invalid_cert" for d in self._errors):
+-                            self._add_error(
+-                                "invalid_cert",
+-                                "security.txt must be served with a valid TLS certificate.",
+-                            )
+-                        try:
+-                            resp = requests.get(
+-                                url,
+-                                headers={
+-                                    'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                                  'Gecko/20100101 Firefox/12.0'},
+-                                timeout=5,
+-                                verify=False
+-                            )
+-                        except:
+-                            continue
+-                    except:
++                    except Exception:
++                        # Network and TLS failures are treated as a failed
++                        # candidate; the next candidate is tried below.
+                         continue
+                     if resp.status_code == 200:
+                         if resp.history:

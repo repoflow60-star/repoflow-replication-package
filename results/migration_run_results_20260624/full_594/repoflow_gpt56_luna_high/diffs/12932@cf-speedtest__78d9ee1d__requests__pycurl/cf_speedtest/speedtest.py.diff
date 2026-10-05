@@ -1,0 +1,151 @@
+--- a/cf_speedtest/speedtest.py
++++ b/cf_speedtest/speedtest.py
+@@ -2,18 +2,136 @@
+ from __future__ import annotations
+ 
+ import argparse
++import io
+ import math
+ import statistics
+ import time
+ from timeit import default_timer as timer
+ 
+-import requests
+-import urllib3
++import pycurl
+ 
+ import cf_speedtest.locations as locations
+ import cf_speedtest.options as options
+ 
+-REQ_SESSION = requests.Session()
++
++class _CaseInsensitiveHeaders(dict):
++    def __getitem__(self, key):
++        try:
++            return super().__getitem__(key)
++        except KeyError:
++            key_lower = key.lower()
++            for name, value in self.items():
++                if name.lower() == key_lower:
++                    return value
++            raise
++
++    def get(self, key, default=None):
++        try:
++            return self[key]
++        except KeyError:
++            return default
++
++
++class _PycurlResponse:
++    def __init__(self, content: bytes, headers: dict, status_code: int):
++        self.content = content
++        self.headers = _CaseInsensitiveHeaders(headers)
++        self.status_code = status_code
++
++    @property
++    def text(self) -> str:
++        return self.content.decode('utf-8', errors='replace')
++
++    def raise_for_status(self) -> None:
++        if self.status_code >= 400:
++            raise pycurl.error(
++                self.status_code,
++                f'The requested URL returned error: {self.status_code}',
++            )
++
++
++class _PycurlSession:
++    @staticmethod
++    def _proxy_options(curl, url: str, proxies: dict | None) -> None:
++        if not proxies:
++            return
++
++        proxy_key = 'https' if url.startswith('https://') else 'http'
++        proxy = proxies.get(proxy_key)
++        if not proxy:
++            return
++
++        curl.setopt(pycurl.PROXY, proxy)
++        proxy_lower = proxy.lower()
++        if proxy_lower.startswith('socks5h://'):
++            curl.setopt(pycurl.PROXYTYPE, pycurl.PROXYTYPE_SOCKS5_HOSTNAME)
++        elif proxy_lower.startswith('socks5://'):
++            curl.setopt(pycurl.PROXYTYPE, pycurl.PROXYTYPE_SOCKS5)
++        elif proxy_lower.startswith('socks4a://'):
++            curl.setopt(pycurl.PROXYTYPE, pycurl.PROXYTYPE_SOCKS4A)
++        elif proxy_lower.startswith('socks4://'):
++            curl.setopt(pycurl.PROXYTYPE, pycurl.PROXYTYPE_SOCKS4)
++
++    def request(
++        self,
++        method: str,
++        url: str,
++        data: bytes | bytearray | None = None,
++        headers: dict | None = None,
++        verify: bool = True,
++        proxies: dict | None = None,
++    ) -> _PycurlResponse:
++        body = io.BytesIO()
++        response_headers = {}
++
++        def capture_header(line: bytes) -> int:
++            header = line.decode('iso-8859-1').strip()
++            if header.startswith('HTTP/'):
++                response_headers.clear()
++            elif ':' in header:
++                name, value = header.split(':', 1)
++                response_headers[name] = value.strip()
++            return len(line)
++
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.WRITEFUNCTION, body.write)
++            curl.setopt(pycurl.HEADERFUNCTION, capture_header)
++            curl.setopt(pycurl.FOLLOWLOCATION, 1)
++            curl.setopt(pycurl.SSL_VERIFYPEER, int(verify))
++            curl.setopt(pycurl.SSL_VERIFYHOST, 2 if verify else 0)
++            curl.setopt(
++                pycurl.USERAGENT,
++                'Mozilla/5.0 (compatible; cf-speedtest/0.1.9)',
++            )
++            self._proxy_options(curl, url, proxies)
++
++            if headers:
++                curl.setopt(
++                    pycurl.HTTPHEADER,
++                    [f'{name}: {value}' for name, value in headers.items()],
++                )
++
++            if method == 'POST':
++                curl.setopt(pycurl.POST, 1)
++                curl.setopt(pycurl.POSTFIELDS, bytes(data or b''))
++
++            curl.perform()
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        finally:
++            curl.close()
++
++        return _PycurlResponse(body.getvalue(), response_headers, status_code)
++
++    def get(self, url: str, **kwargs) -> _PycurlResponse:
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url: str, **kwargs) -> _PycurlResponse:
++        return self.request('POST', url, **kwargs)
++
++
++REQ_SESSION = _PycurlSession()
+ 
+ CGI_ENDPOINT = 'https://speed.cloudflare.com/cdn-cgi/trace'
+ DOWNLOAD_ENDPOINT = 'https://speed.cloudflare.com/__down?measId=0&bytes={}'
+@@ -290,8 +408,6 @@
+ 
+ def main(argv=None) -> int:
+     global PROXY_DICT, VERIFY_SSL, OUTPUT_FILE
+-    # disable annoying warning when using verify=False in requests.get("x", verify=False)
+-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+ 
+     parser = argparse.ArgumentParser()
+     parser_with_args = options.add_run_options(parser)

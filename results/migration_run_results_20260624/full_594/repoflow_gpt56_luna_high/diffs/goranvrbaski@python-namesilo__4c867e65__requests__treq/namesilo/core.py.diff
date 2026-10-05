@@ -1,0 +1,95 @@
+--- a/namesilo/core.py
++++ b/namesilo/core.py
+@@ -1,6 +1,11 @@
+ import os
+-import requests
++from threading import Event, Lock, Thread
++
++import treq
+ import xmltodict
++from twisted.internet import reactor
++from twisted.internet.defer import Deferred
++from twisted.internet.threads import blockingCallFromThread
+ 
+ from typing import List, Tuple
+ 
+@@ -8,6 +13,52 @@
+ from namesilo.exceptions import exception_codes
+ 
+ __author__ = 'goran.vrbaski'
++
++
++# Keep the module-level client name available while using treq underneath.
++requests = treq
++
++_reactor_started = Event()
++_reactor_lock = Lock()
++_reactor_thread = None
++
++
++def _run_reactor():
++    reactor.callWhenRunning(_reactor_started.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor():
++    global _reactor_thread
++
++    if reactor.running:
++        return
++
++    with _reactor_lock:
++        if reactor.running:
++            return
++        if _reactor_thread is None:
++            _reactor_thread = Thread(
++                target=_run_reactor,
++                name='namesilo-treq-reactor',
++                daemon=True
++            )
++            _reactor_thread.start()
++
++    _reactor_started.wait()
++
++
++def _fetch_content(url):
++    response = treq.get(url)
++    if not isinstance(response, Deferred):
++        return response, response.content
++
++    def _read_content(response):
++        return treq.content(response).addCallback(
++            lambda content: (response, content)
++        )
++
++    return response.addCallback(_read_content)
+ 
+ 
+ class ContactModel:
+@@ -105,14 +156,21 @@
+             raise exception_codes[error_code[0]](error_code[1])
+ 
+     def _get_content_xml(self, url: str) -> dict:
+-        api_request = requests.get(os.path.join(self._base_url, url))
+-        if api_request.status_code != 200:
++        _ensure_reactor()
++        api_request, content = blockingCallFromThread(
++            reactor,
++            _fetch_content,
++            os.path.join(self._base_url, url)
++        )
++        status_code = getattr(api_request, 'status_code', None)
++        if status_code is None:
++            status_code = api_request.code
++        if status_code != 200:
+             raise Exception(
+-                f"API responded with status code: {api_request.status_code}"
++                f"API responded with status code: {status_code}"
+             )
+ 
+-        content = xmltodict.parse(api_request.content.decode())
+-        return content
++        return xmltodict.parse(content.decode())
+ 
+     def check_domain(self, domain_name: str) -> bool:
+         """

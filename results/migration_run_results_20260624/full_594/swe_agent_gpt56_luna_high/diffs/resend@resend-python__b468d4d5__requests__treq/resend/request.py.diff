@@ -1,0 +1,183 @@
+--- a/resend/request.py
++++ b/resend/request.py
+@@ -1,6 +1,11 @@
++import json
++import threading
+ from typing import Any, Dict, Generic, List, Union, cast
+ 
+-import requests
++import treq
++from twisted.internet import reactor
++from twisted.internet.defer import Deferred
++from twisted.python.failure import Failure
+ from typing_extensions import Literal, TypeVar
+ 
+ import resend
+@@ -10,6 +15,116 @@
+ RequestVerb = Literal["get", "post", "put", "patch", "delete"]
+ 
+ T = TypeVar("T")
++
++
++class _Response:
++    """Small synchronous response facade for treq's asynchronous response."""
++
++    def __init__(self, response: Any, body: bytes) -> None:
++        self.status_code = response.code
++        self.headers = self._headers(response.headers)
++        self.text = self._text(body, self.headers.get("content-type", ""))
++
++    @staticmethod
++    def _headers(headers: Any) -> Dict[str, str]:
++        result: Dict[str, str] = {}
++        for name, values in headers.getAllRawHeaders():
++            if isinstance(name, bytes):
++                name = name.decode("latin-1")
++            decoded_values = [
++                value.decode("latin-1") if isinstance(value, bytes) else str(value)
++                for value in values
++            ]
++            result[str(name).lower()] = ", ".join(decoded_values)
++        return result
++
++    @staticmethod
++    def _text(body: bytes, content_type: str) -> str:
++        encoding = "utf-8"
++        for part in content_type.split(";")[1:]:
++            key, separator, value = part.strip().partition("=")
++            if separator and key.lower() == "charset":
++                encoding = value.strip().strip('"')
++                break
++        return body.decode(encoding, errors="replace")
++
++    def json(self) -> Any:
++        return json.loads(self.text)
++
++
++_reactor_lock = threading.Lock()
++_reactor_started = threading.Event()
++_reactor_thread: Union[threading.Thread, None] = None
++
++
++def _start_reactor() -> None:
++    reactor.callWhenRunning(_reactor_started.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor() -> None:
++    global _reactor_thread
++    with _reactor_lock:
++        if _reactor_thread is not None and _reactor_thread.is_alive():
++            return
++        _reactor_started.clear()
++        _reactor_thread = threading.Thread(
++            target=_start_reactor, name="treq-reactor", daemon=True
++        )
++        _reactor_thread.start()
++    if not _reactor_started.wait(timeout=5):
++        raise RuntimeError("Unable to start the Twisted reactor")
++
++
++def _request_with_treq(
++    method: str,
++    url: str,
++    params: Union[Dict[Any, Any], List[Dict[Any, Any]]],
++    headers: Dict[Any, Any],
++) -> Any:
++    """Run one treq request synchronously for the SDK's synchronous API."""
++    _ensure_reactor()
++    completed = threading.Event()
++    result: Dict[str, Any] = {}
++
++    def fail(failure: Any) -> None:
++        if isinstance(failure, Failure):
++            result["error"] = failure.value
++        else:
++            result["error"] = failure
++        completed.set()
++
++    def done(response: Any, body: Any) -> None:
++        try:
++            result["response"] = _Response(response, body)
++        except Exception as error:
++            result["error"] = error
++        completed.set()
++
++    def got_response(response: Any) -> Any:
++        body_deferred = treq.content(response)
++        body_deferred.addCallbacks(lambda body: done(response, body), fail)
++        return response
++
++    def issue_request() -> None:
++        try:
++            deferred = treq.request(method, url, json=params, headers=headers)
++            # treq always returns a Deferred.  Keeping a direct return value
++            # usable also makes the transport easy to replace in applications.
++            if isinstance(deferred, Deferred):
++                deferred.addCallbacks(got_response, fail)
++            else:
++                result["response"] = deferred
++                completed.set()
++        except Exception as error:
++            result["error"] = error
++            completed.set()
++
++    reactor.callFromThread(issue_request)
++    completed.wait()
++    if "error" in result:
++        raise result["error"]
++    return result["response"]
+ 
+ 
+ # This class wraps the HTTP request creation logic
+@@ -33,7 +148,7 @@
+             Union[T, None]: A generic type of the Request class or None
+ 
+         Raises:
+-            requests.HTTPError: If the request fails
++            Exception: If the request fails
+         """
+         resp = self.make_request(url=f"{resend.api_url}{self.path}")
+ 
+@@ -43,7 +158,7 @@
+ 
+         # this is a safety net, if we get here it means the Resend API is having issues
+         # and most likely the gateway is returning htmls
+-        if "application/json" not in resp.headers["content-type"]:
++        if "application/json" not in resp.headers.get("content-type", ""):
+             raise_for_code_and_type(
+                 code=500,
+                 message="Failed to parse Resend API response. Please try again.",
+@@ -89,24 +204,11 @@
+             "User-Agent": f"resend-python:{get_version()}",
+         }
+ 
+-    def make_request(self, url: str) -> requests.Response:
+-        """make_request is a helper function that makes the actual
+-        HTTP request to the Resend API.
+-
+-        Args:
+-            url (str): The URL to make the request to
+-
+-        Returns:
+-            requests.Response: The response object from the request
+-
+-        Raises:
+-            requests.HTTPError: If the request fails
+-        """
+-        headers = self.__get_headers()
+-        params = self.params
+-        verb = self.verb
+-
+-        try:
+-            return requests.request(verb, url, json=params, headers=headers)
+-        except requests.HTTPError as e:
+-            raise e
++    def make_request(self, url: str) -> Any:
++        """Make the HTTP request through treq.
++
++        treq is Deferred-based while this SDK exposes a synchronous API. The
++        adapter runs the Deferred on a dedicated reactor thread and returns a
++        response with the attributes used by ``perform``.
++        """
++        return _request_with_treq(self.verb, url, self.params, self.__get_headers())

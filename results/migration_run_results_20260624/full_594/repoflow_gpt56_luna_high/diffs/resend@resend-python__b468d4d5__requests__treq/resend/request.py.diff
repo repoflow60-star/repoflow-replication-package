@@ -1,0 +1,154 @@
+--- a/resend/request.py
++++ b/resend/request.py
+@@ -1,6 +1,9 @@
+-from typing import Any, Dict, Generic, List, Union, cast
+-
+-import requests
++import json
++import threading
++from typing import Any, Dict, Generic, List, Optional, Union, cast
++
++import treq
++from twisted.internet import reactor
+ from typing_extensions import Literal, TypeVar
+ 
+ import resend
+@@ -10,6 +13,100 @@
+ RequestVerb = Literal["get", "post", "put", "patch", "delete"]
+ 
+ T = TypeVar("T")
++
++_reactor_lock = threading.Lock()
++_reactor_ready = threading.Event()
++_reactor_thread: Optional[threading.Thread] = None
++
++
++def _run_reactor() -> None:
++    reactor.callWhenRunning(_reactor_ready.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor() -> None:
++    global _reactor_thread
++
++    with _reactor_lock:
++        if reactor.running:
++            _reactor_ready.set()
++        elif _reactor_thread is None:
++            _reactor_thread = threading.Thread(target=_run_reactor, daemon=True)
++            _reactor_thread.start()
++    _reactor_ready.wait()
++
++
++def _decode_header(value: Any) -> str:
++    if isinstance(value, bytes):
++        return value.decode("latin1")
++    return str(value)
++
++
++class _TreqResponseAdapter:
++    """Synchronous view of the response returned by treq."""
++
++    def __init__(self, response: Any, body: bytes):
++        self.status_code = response.code
++        self.headers = {
++            _decode_header(name).lower(): ", ".join(
++                _decode_header(value) for value in values
++            )
++            for name, values in response.headers.getAllRawHeaders()
++        }
++        self.text = body.decode("utf-8")
++
++    def json(self) -> Any:
++        return json.loads(self.text)
++
++
++def _request_sync(
++    verb: RequestVerb,
++    url: str,
++    params: Union[Dict[Any, Any], List[Dict[Any, Any]]],
++    headers: Dict[Any, Any],
++) -> _TreqResponseAdapter:
++    _ensure_reactor()
++
++    completed = threading.Event()
++    responses: List[_TreqResponseAdapter] = []
++    errors: List[Any] = []
++
++    def finish_response(response: Any, body: bytes) -> Any:
++        responses.append(_TreqResponseAdapter(response, body))
++        completed.set()
++        return response
++
++    def finish_error(error: Any) -> Any:
++        errors.append(error)
++        completed.set()
++        return error
++
++    def issue_request() -> None:
++        try:
++            deferred = treq.request(
++                verb.upper(),
++                url,
++                json=params,
++                headers=headers,
++            )
++            deferred.addCallback(
++                lambda response: treq.content(response).addCallback(
++                    lambda body: finish_response(response, body)
++                )
++            )
++            deferred.addErrback(finish_error)
++        except BaseException as error:
++            finish_error(error)
++
++    reactor.callFromThread(issue_request)
++    completed.wait()
++
++    if errors:
++        error = errors[0]
++        if hasattr(error, "raiseException"):
++            error.raiseException()
++        raise error
++    return responses[0]
+ 
+ 
+ # This class wraps the HTTP request creation logic
+@@ -33,7 +130,7 @@
+             Union[T, None]: A generic type of the Request class or None
+ 
+         Raises:
+-            requests.HTTPError: If the request fails
++            Exception: If the request fails
+         """
+         resp = self.make_request(url=f"{resend.api_url}{self.path}")
+ 
+@@ -89,7 +186,7 @@
+             "User-Agent": f"resend-python:{get_version()}",
+         }
+ 
+-    def make_request(self, url: str) -> requests.Response:
++    def make_request(self, url: str) -> _TreqResponseAdapter:
+         """make_request is a helper function that makes the actual
+         HTTP request to the Resend API.
+ 
+@@ -97,16 +194,13 @@
+             url (str): The URL to make the request to
+ 
+         Returns:
+-            requests.Response: The response object from the request
++            _TreqResponseAdapter: The response object from the request
+ 
+         Raises:
+-            requests.HTTPError: If the request fails
++            Exception: If the request fails
+         """
+         headers = self.__get_headers()
+         params = self.params
+         verb = self.verb
+ 
+-        try:
+-            return requests.request(verb, url, json=params, headers=headers)
+-        except requests.HTTPError as e:
+-            raise e
++        return _request_sync(verb, url, params, headers)

@@ -1,0 +1,149 @@
+--- a/srpenergy/client.py
++++ b/srpenergy/client.py
+@@ -5,11 +5,145 @@
+ """
+ 
+ from datetime import datetime, timedelta
++from http.cookiejar import CookieJar
++import json
+ import re
+ from urllib.parse import unquote
+ 
+ from dateutil.parser import parse
+-import requests
++import treq
++from twisted.internet.defer import Deferred
++from twisted.internet.selectreactor import SelectReactor
++from twisted.python.failure import Failure
++
++
++class _TreqResponse:
++    """Small synchronous response adapter for the existing client API.
++
++    ``treq`` is Deferred based, while :class:`SrpEnergyClient` has historically
++    exposed synchronous methods.  The adapter reads the response while a
++    short-lived reactor is running and presents the response methods used by
++    this module without adding ``requests`` as a direct dependency.
++    """
++
++    def __init__(self, response, body=None):
++        self._response = response
++        self._body = body
++        self.status_code = getattr(response, "code", None)
++
++        response_cookies = getattr(response, "cookies", ())
++        if callable(response_cookies):
++            response_cookies = response_cookies()
++        if isinstance(response_cookies, dict):
++            self.cookies = response_cookies
++        else:
++            self.cookies = {
++                cookie.name: cookie.value for cookie in response_cookies
++            }
++
++    def json(self):
++        """Decode the buffered response body as JSON."""
++        if self._body is not None:
++            return json.loads(self._body.decode("utf-8"))
++        return self._response.json()
++
++
++def _wait_for_deferred(value, reactor):
++    """Synchronously resolve a Deferred using the supplied reactor."""
++    if not isinstance(value, Deferred):
++        return value
++
++    result = []
++
++    def completed(outcome):
++        result.append(outcome)
++        if reactor.running:
++            reactor.stop()
++        return outcome
++
++    value.addBoth(completed)
++    if not result:
++        reactor.run()
++
++    outcome = result[0]
++    if isinstance(outcome, Failure):
++        outcome.raiseException()
++    return outcome
++
++
++class _TreqSession:
++    """Synchronous session-shaped adapter backed by :mod:`treq`.
++
++    The session shape is kept private to the implementation so callers retain
++    the original synchronous API, while all HTTP traffic is performed by
++    treq.  A cookie jar is carried between requests just as it was by
++    ``requests.Session``.
++    """
++
++    def __init__(self):
++        self._cookies = CookieJar()
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, _exc_type, _exc_value, _traceback):
++        return False
++
++    def _request(self, request, url, **kwargs):
++        reactor = SelectReactor()
++        request_kwargs = dict(kwargs)
++        request_kwargs["cookies"] = self._cookies
++        request_kwargs["persistent"] = False
++        request_kwargs["reactor"] = reactor
++
++        response = request(url, **request_kwargs)
++        if not isinstance(response, Deferred):
++            return response
++
++        # Buffer the body before stopping the reactor.  A response body cannot
++        # safely be consumed after its reactor has been stopped.
++        def buffer_body(response_value):
++            if not hasattr(response_value, "deliverBody"):
++                return response_value
++
++            body = treq.content(response_value)
++            if isinstance(body, Deferred):
++                return body.addCallback(
++                    lambda body_value: (response_value, body_value)
++                )
++            return response_value, body
++
++        response = response.addCallback(buffer_body)
++        response = _wait_for_deferred(response, reactor)
++
++        body = None
++        if isinstance(response, tuple):
++            response, body = response
++
++        response_cookies = getattr(response, "cookies", ())
++        if callable(response_cookies):
++            for cookie in response_cookies():
++                self._cookies.set_cookie(cookie)
++
++        if body is None and not hasattr(response, "json"):
++            body = b""
++        return _TreqResponse(response, body)
++
++    def post(self, url, data=None, **kwargs):
++        return self._request(treq.post, url, data=data, **kwargs)
++
++    def get(self, url, **kwargs):
++        return self._request(treq.get, url, **kwargs)
++
++
++# The old tests and the existing implementation refer to this name when
++# patching the transport.  It is a compatibility namespace, not the requests
++# package; its Session is entirely backed by treq.
++class _RequestsCompatibility:
++    Session = _TreqSession
++
++
++requests = _RequestsCompatibility()
+ 
+ BASE_USAGE_URL = "https://myaccount.srpnet.com/myaccountapi/api/"
+ 

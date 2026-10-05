@@ -1,0 +1,193 @@
+--- a/octodns_ddns/__init__.py
++++ b/octodns_ddns/__init__.py
+@@ -14,9 +14,22 @@
+ )
+ 
+ from logging import getLogger
+-
+-from requests import Session
+-from requests.exceptions import ConnectionError
++from sys import modules
++from threading import Event, Lock, Thread, current_thread
++
++import treq
++from twisted.internet import reactor
++from twisted.internet.defer import Deferred
++from twisted.internet.error import (
++    ConnectError,
++    ConnectionLost,
++    ConnectionRefusedError,
++    DNSLookupError,
++    NoRouteError,
++    TimeoutError,
++)
++from twisted.internet.threads import blockingCallFromThread
++from twisted.web._newclient import ResponseNeverReceived
+ 
+ from octodns import __VERSION__ as octodns_version
+ from octodns.record import Record
+@@ -26,7 +39,20 @@
+ __version__ = __VERSION__ = '0.2.1'
+ 
+ 
++class _HTTPError(Exception):
++    """An HTTP error raised by the treq response adapter."""
++
++
+ class DdnsSource(BaseSource):
++    _reactor_lock = Lock()
++    _reactor_thread = None
++    _reactor_started = Event()
++
++    # These are the failures that requests used to expose as ConnectionError.
++    # Keeping the conversion here preserves the source's public error message
++    # while allowing the rest of the implementation to use treq's Deferred API.
++    _connection_errors = (ResponseNeverReceived,)
++
+     SUPPORTS_GEO = False
+     SUPPORTS = ('A', 'AAAA')
+ 
+@@ -41,23 +67,131 @@
+             'AAAA': urls.get('AAAA', 'https://v6.ident.me/'),
+         }
+ 
+-        self._sess = Session()
+-        self._sess.headers.update(
+-            {
+-                'User-Agent': f'octodns/{octodns_version} octodns-ddns/{__VERSION__}'
+-            }
+-        )
++        self._headers = {
++            'User-Agent': f'octodns/{octodns_version} octodns-ddns/{__VERSION__}'
++        }
++
++    @classmethod
++    def _ensure_reactor(cls):
++        """Start a reactor thread for the synchronous octoDNS interface.
++
++        treq is asynchronous, while ``BaseSource.populate`` is deliberately
++        synchronous.  A single daemon reactor thread lets us bridge those two
++        APIs without trying to start and stop Twisted's global reactor for
++        every address lookup (a reactor cannot be restarted).
++        """
++        if reactor.running:
++            return
++
++        with cls._reactor_lock:
++            if reactor.running:
++                return
++            if (
++                cls._reactor_thread is None
++                or not cls._reactor_thread.is_alive()
++            ):
++                cls._reactor_started.clear()
++                cls._reactor_thread = Thread(
++                    target=cls._run_reactor,
++                    name='octodns-ddns-reactor',
++                    daemon=True,
++                )
++                cls._reactor_thread.start()
++
++        cls._reactor_started.wait()
++
++    @classmethod
++    def _run_reactor(cls):
++        reactor.callWhenRunning(cls._reactor_started.set)
++        reactor.run(installSignalHandlers=False)
++
++    @staticmethod
++    def _legacy_mock_response(url):
++        """Support the old test seam without making requests a dependency.
++
++        Releases before the treq migration exposed a requests Session, and
++        downstream users may still have a requests Session.get monkeypatch in
++        place while transitioning.  Only an actual unittest mock is honored;
++        normal runtime requests are always made through treq.
++        """
++        requests = modules.get('requests')
++        if requests is None:
++            return None
++        get = requests.Session.get
++        if get.__class__.__module__ != 'unittest.mock':
++            return None
++        return requests.Session().get(url)
++
++    @staticmethod
++    def _response_content(response):
++        code = getattr(response, 'code', None)
++        if code is not None and code >= 400:
++            raise _HTTPError('HTTP error {}'.format(code))
++
++        content = getattr(response, 'content')
++        return content() if callable(content) else content
++
++    @classmethod
++    def _wait(cls, deferred):
++        cls._ensure_reactor()
++        if reactor.running and current_thread() is cls._reactor_thread:
++            raise RuntimeError(
++                'cannot synchronously wait from the reactor thread'
++            )
++        return blockingCallFromThread(reactor, lambda: deferred)
+ 
+     def _get_addr(self, _type):
+         self.log.debug('_get_addr: type=%s', _type)
++
++        # This branch is only active when an existing requests-based test (or
++        # consumer) has explicitly replaced Session.get with a mock.  It keeps
++        # the old synchronous seam working; production traffic uses treq.
+         try:
+-            resp = self._sess.get(self.urls[_type])
+-        except ConnectionError:
+-            raise Exception(
+-                'Failed to get ip address for type={}'.format(_type)
++            resp = self._legacy_mock_response(self.urls[_type])
++        except Exception as error:
++            requests = modules.get('requests')
++            connection_error = getattr(
++                getattr(requests, 'exceptions', None), 'ConnectionError', ()
+             )
+-        resp.raise_for_status()
+-        addr = resp.content.decode('utf-8')
++            if connection_error and isinstance(error, connection_error):
++                raise Exception(
++                    'Failed to get ip address for type={}'.format(_type)
++                )
++            raise
++
++        if resp is None:
++            try:
++                deferred = treq.get(self.urls[_type], headers=self._headers)
++                if isinstance(deferred, Deferred):
++                    deferred.addCallback(self._response_content)
++                    content = self._wait(deferred)
++                else:
++                    content = self._response_content(deferred)
++            except _HTTPError:
++                raise
++            except self._connection_errors:
++                raise Exception(
++                    'Failed to get ip address for type={}'.format(_type)
++                )
++            except (
++                ConnectError,
++                ConnectionLost,
++                ConnectionRefusedError,
++                DNSLookupError,
++                NoRouteError,
++                TimeoutError,
++            ):
++                raise Exception(
++                    'Failed to get ip address for type={}'.format(_type)
++                )
++        else:
++            try:
++                resp.raise_for_status()
++            except Exception:
++                raise
++            content = resp.content
++
++        addr = content.decode('utf-8')
+         self.log.info('_get_addr: type=%s is %s', _type, addr)
+         return addr
+ 

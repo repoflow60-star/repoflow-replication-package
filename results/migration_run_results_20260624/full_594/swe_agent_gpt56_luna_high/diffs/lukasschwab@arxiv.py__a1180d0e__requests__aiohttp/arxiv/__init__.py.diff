@@ -1,0 +1,119 @@
+--- a/arxiv/__init__.py
++++ b/arxiv/__init__.py
+@@ -1,6 +1,7 @@
+ """.. include:: ../README.md"""
+ from __future__ import annotations
+ 
++import asyncio
+ import logging
+ import time
+ import itertools
+@@ -8,7 +9,8 @@
+ import os
+ import math
+ import re
+-import requests
++import threading
++import aiohttp
+ import warnings
+ 
+ from urllib.parse import urlencode
+@@ -525,7 +527,9 @@
+     """
+ 
+     _last_request_dt: datetime
+-    _session: requests.Session
++    # HTTP requests are made through aiohttp in `_request`.  A session is
++    # created and closed within each request because this class exposes a
++    # synchronous API while aiohttp is asynchronous.
+ 
+     def __init__(self, page_size: int = 100, delay_seconds: float = 3.0, num_retries: int = 3):
+         """
+@@ -540,7 +544,6 @@
+         self.delay_seconds = delay_seconds
+         self.num_retries = num_retries
+         self._last_request_dt = None
+-        self._session = requests.Session()
+ 
+     def __str__(self) -> str:
+         # TODO: develop a more informative string representation.
+@@ -627,13 +630,60 @@
+         except (
+             HTTPError,
+             UnexpectedEmptyPageError,
+-            requests.exceptions.ConnectionError,
++            aiohttp.ClientError,
+         ) as err:
+             if _try_index < self.num_retries:
+                 logger.debug("Got error (try %d): %s", _try_index, err)
+                 return self._parse_feed(url, first_page=first_page, _try_index=_try_index + 1)
+             logger.debug("Giving up (try %d): %s", _try_index, err)
+             raise err
++
++    async def _request(self, url: str) -> tuple[int, bytes]:
++        """Fetch ``url`` with aiohttp and return its status and body.
++
++        ``Client`` intentionally retains its historical synchronous API.  The
++        session therefore belongs to this coroutine and is always closed before
++        the coroutine returns, avoiding sessions tied to an event loop that has
++        already been shut down by the synchronous adapter.
++        """
++        async with aiohttp.ClientSession() as session:
++            async with session.get(
++                url, headers={"user-agent": "arxiv.py/2.1.3"}
++            ) as response:
++                return response.status, await response.read()
++
++    @staticmethod
++    def _run_async(coroutine):
++        """Run an aiohttp coroutine from the client's synchronous API.
++
++        ``asyncio.run`` is sufficient for normal synchronous callers.  If a
++        caller invokes the synchronous client while another event loop is
++        running (for example, from a notebook), execute the request on a
++        dedicated thread instead of raising ``RuntimeError``.
++        """
++        try:
++            loop = asyncio.get_running_loop()
++        except RuntimeError:
++            return asyncio.run(coroutine)
++
++        if not loop.is_running():
++            return asyncio.run(coroutine)
++
++        result = []
++        error = []
++
++        def run_in_thread():
++            try:
++                result.append(asyncio.run(coroutine))
++            except BaseException as exception:  # propagate the original error
++                error.append(exception)
++
++        thread = threading.Thread(target=run_in_thread)
++        thread.start()
++        thread.join()
++        if error:
++            raise error[0]
++        return result[0]
+ 
+     def __try_parse_feed(
+         self,
+@@ -657,12 +707,12 @@
+ 
+         logger.info("Requesting page (first: %r, try: %d): %s", first_page, try_index, url)
+ 
+-        resp = self._session.get(url, headers={"user-agent": "arxiv.py/2.1.3"})
++        status, content = self._run_async(self._request(url))
+         self._last_request_dt = datetime.now()
+-        if resp.status_code != requests.codes.OK:
+-            raise HTTPError(url, try_index, resp.status_code)
+-
+-        feed = feedparser.parse(resp.content)
++        if status != 200:
++            raise HTTPError(url, try_index, status)
++
++        feed = feedparser.parse(content)
+         if len(feed.entries) == 0 and not first_page:
+             raise UnexpectedEmptyPageError(url, try_index, feed)
+ 

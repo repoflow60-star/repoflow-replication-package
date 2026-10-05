@@ -1,0 +1,244 @@
+--- a/github_nonpublic_api/api.py
++++ b/github_nonpublic_api/api.py
+@@ -14,18 +14,138 @@
+ 
+ """An API to do things that aren't in the official public GitHub REST API."""
+ 
+-import os.path
+ import functools
+ from enum import Enum
++from http.cookiejar import CookieJar
++import os.path
+ import re
++import threading
++from typing import Optional
+ from urllib.parse import urljoin
+ 
+ import html5lib
+ import pyotp
+-import requests
++import treq
+ from absl import logging
+ from configobj import ConfigObj
+-from typing import Optional
++from twisted.internet import reactor
++from twisted.python.failure import Failure
++from twisted.web.client import Agent, CookieAgent, RedirectAgent
++
++
++_reactor_lock = threading.Lock()
++_reactor_ready = threading.Event()
++_reactor_thread = None
++
++
++def _start_reactor():
++    reactor.callWhenRunning(_reactor_ready.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor():
++    global _reactor_thread
++
++    if reactor.running:
++        return
++    with _reactor_lock:
++        if not reactor.running and _reactor_thread is None:
++            _reactor_ready.clear()
++            _reactor_thread = threading.Thread(
++                target=_start_reactor, name="github-nonpublic-treq-reactor", daemon=True
++            )
++            _reactor_thread.start()
++    _reactor_ready.wait()
++
++
++def _wait_for_deferred(operation):
++    """Run a treq operation without changing this module's synchronous API."""
++    _ensure_reactor()
++    completed = threading.Event()
++    result = []
++
++    def _run_operation():
++        try:
++            deferred = operation()
++        except BaseException as error:
++            result.append(error)
++            completed.set()
++            return
++
++        def _complete(value):
++            result.append(value)
++            completed.set()
++            return value
++
++        deferred.addBoth(_complete)
++
++    reactor.callFromThread(_run_operation)
++    completed.wait()
++    value = result[0]
++    if isinstance(value, Failure):
++        value.raiseException()
++    if isinstance(value, BaseException):
++        raise value
++    return value
++
++
++def _response_url(response, fallback):
++    request = getattr(response, "request", None)
++    url = getattr(request, "absoluteURI", None)
++    if isinstance(url, bytes):
++        url = url.decode("ascii")
++    return url or fallback
++
++
++class _ResponseInfo:
++    def __init__(self, url):
++        self.url = url
++
++
++class TreqResponse:
++    """Synchronous response view over a response returned by treq."""
++
++    def __init__(self, response, url):
++        self._response = response
++        self.status_code = response.code
++        self.url = _response_url(response, url)
++        self.history = []
++        previous = getattr(response, "previousResponse", None)
++        while previous is not None:
++            self.history.append(_ResponseInfo(_response_url(previous, url)))
++            previous = getattr(previous, "previousResponse", None)
++        self.headers = response.headers
++        self.content = _wait_for_deferred(lambda: treq.content(response))
++        self.text = self.content.decode("utf-8", errors="replace")
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise RuntimeError("HTTP request failed with status %s" % self.status_code)
++
++
++class TreqSession:
++    """Synchronous session backed by treq with persistent cookies and redirects."""
++
++    def __init__(self):
++        self.cookies = CookieJar()
++        self._agent = None
++
++    def _get_agent(self):
++        if self._agent is None:
++            self._agent = RedirectAgent(CookieAgent(Agent(reactor), self.cookies))
++        return self._agent
++
++    def _request(self, method, url, data=None):
++        response = _wait_for_deferred(
++            lambda: treq.request(method, url, agent=self._get_agent(), data=data)
++        )
++        return TreqResponse(response, url)
++
++    def get(self, url):
++        return self._request("GET", url)
++
++    def post(self, url, data=None):
++        return self._request("POST", url, data=data)
+ 
+ 
+ def _get_and_submit_form(
+@@ -85,10 +205,10 @@
+     username: str,
+     password: str,
+     tfa_callback,
+-    session: Optional[requests.Session] = None,
+-) -> requests.Session:
+-    """Create a requests.Session object with logged in GitHub cookies for the user."""
+-    session = session or requests.Session()
++    session: Optional[TreqSession] = None,
++) -> TreqSession:
++    """Create a treq session with logged in GitHub cookies for the user."""
++    session = session or TreqSession()
+ 
+     # Clear cookies before re-authentication
+     session.cookies.clear()
+@@ -150,7 +270,7 @@
+         username: str,
+         password: str,
+         tfa_callback=None,
+-        session: Optional[requests.Session] = None,
++        session: Optional[TreqSession] = None,
+     ):
+         self._session = session or create_login_session(
+             username=username,
+@@ -159,7 +279,7 @@
+             session=session,
+         )
+ 
+-    def request_usage(self, enterprise_name: str, days: int = 30) -> requests.Response:
++    def request_usage(self, enterprise_name: str, days: int = 30) -> TreqResponse:
+         """Requests a GitHub usage report.
+ 
+         Github will send an email link when the report is available.
+@@ -183,7 +303,7 @@
+         contact_email: str,
+         org_usage: OrganizationUsage,
+         business_name: Optional[str] = None,
+-    ) -> requests.Response:
++    ) -> TreqResponse:
+         """Create the specified GitHub organization.
+ 
+         Right now, only creates free tier organizations.
+@@ -207,7 +327,7 @@
+ 
+     def install_application_in_organization(
+         self, app_name: str, org_id: int
+-    ) -> requests.Response:
++    ) -> TreqResponse:
+         """Installs the specified app on the given organization."""
+         url = _INSTALL_APP_URL.format(app_name=app_name, org_id=org_id)
+ 
+@@ -223,7 +343,7 @@
+ 
+     def toggle_app_suspended(
+         self, org_name: str, app_install_id: int
+-    ) -> requests.Response:
++    ) -> TreqResponse:
+         """Set this applicaiton install to be suspended or not."""
+         url = _APP_SUSPEND_URL.format(org_name=org_name, app_install_id=app_install_id)
+ 
+@@ -235,14 +355,14 @@
+ 
+     def download_usage_report(
+         self, enterprise_name: str, report_id: int
+-    ) -> requests.Response:
++    ) -> TreqResponse:
+         """Download a usage report based on an id recieved in an email"""
+         url = _USAGE_REPORT_URL.format(
+             enterprise_name=enterprise_name, report_id=report_id
+         )
+         return _get_url_with_session(session=self._session, url=url)
+ 
+-    def request_dormant_users_report(self, enterprise_name: str) -> requests.Response:
++    def request_dormant_users_report(self, enterprise_name: str) -> TreqResponse:
+         """Requests a GitHub dormant users report.
+ 
+         Github will send an email link when the report is available.
+@@ -256,7 +376,7 @@
+             form_matcher=lambda form: form.attrib.get("action") == action,
+         )
+ 
+-    def download_dormant_users_report(self, enterprise_name: str) -> requests.Response:
++    def download_dormant_users_report(self, enterprise_name: str) -> TreqResponse:
+         """Download a usage report based on an id received in an email"""
+         url = _REQUEST_DORMANTUSERS_URL.format(enterprise_name=enterprise_name)
+         page = _get_url_with_session(session=self._session, url=url)
+@@ -272,7 +392,7 @@
+         self,
+         org_name: str,
+         app_install_id: str,
+-    ) -> requests.Response:
++    ) -> TreqResponse:
+         """Approve a request for updated permissions for a GitHub app installation in an org"""
+ 
+         return _get_and_submit_form(
+@@ -324,4 +444,4 @@
+         username=config["username"],
+         password=config["password"],
+         tfa_callback=lambda: pyotp.TOTP(config["otp_seed"]).now(),
+-    )+    )

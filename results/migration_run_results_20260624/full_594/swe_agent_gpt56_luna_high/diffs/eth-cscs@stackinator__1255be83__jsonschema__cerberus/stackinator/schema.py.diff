@@ -1,0 +1,195 @@
+--- a/stackinator/schema.py
++++ b/stackinator/schema.py
+@@ -1,37 +1,146 @@
+ import json
+ import pathlib
++import re
+ 
+-import jsonschema
++from cerberus import Validator as CerberusValidator
+ import yaml
+ 
+ prefix = pathlib.Path(__file__).parent.resolve()
+ 
+-# create a validator that will insert optional fields with their default values
+-# if they have not been provided.
++
++# Keep the exception compatible with clients of the pre-Cerberus API when
++# jsonschema happens to be installed (it is not a runtime dependency anymore).
++try:  # pragma: no cover - the fallback is used in minimal installations
++    from jsonschema.exceptions import ValidationError as _LegacyValidationError
++except ImportError:  # pragma: no cover
++    _LegacyValidationError = Exception
+ 
+ 
+-def extend_with_default(validator_class):
+-    validate_properties = validator_class.VALIDATORS["properties"]
++class ValidationError(_LegacyValidationError):
++    """Raised when a recipe document does not conform to its schema."""
+ 
+-    def set_defaults(validator, properties, instance, schema):
+-        # if instance is none, it's not possible to set any default for any sub-property
+-        if instance is not None:
+-            for property, subschema in properties.items():
+-                if "default" in subschema:
+-                    instance.setdefault(property, subschema["default"])
+ 
+-        for error in validate_properties(
+-            validator,
+-            properties,
+-            instance,
+-            schema,
+-        ):
+-            yield error
++class _StackValidator(CerberusValidator):
++    """Cerberus validator with the behaviour used by stackinator.
+ 
+-    return jsonschema.validators.extend(
+-        validator_class,
+-        {"properties": set_defaults},
+-    )
++    Cerberus keeps validation and normalization separate.  The old validator
++    normalized documents as part of ``validate`` (in particular, it inserted
++    defaults), so do that here as well.  The exception also preserves the
++    fail-fast behaviour of the old jsonschema based implementation: callers do
++    not have to remember to inspect a boolean return value.
++    """
++
++    def __init__(self, *args, dynamic_root=False, **kwargs):
++        self.dynamic_root = dynamic_root
++        super().__init__(*args, **kwargs)
++
++    def _run_document(self, document):
++        """Validate an already-normalized document."""
++        return super().validate(document, normalize=False)
++
++    def _check_nested_key_patterns(self, environment):
++        """Check the patternProperties represented by Cerberus dynamic dicts."""
++        errors = {}
++        views = environment.get("views") if isinstance(environment, dict) else None
++        if isinstance(views, dict):
++            for name, view in views.items():
++                if not re.match(r"\w+", str(name)):
++                    errors.setdefault("views", {})[name] = ["invalid view name"]
++                if isinstance(view, dict):
++                    projections = view.get("projections")
++                    if isinstance(projections, dict):
++                        for projection in projections:
++                            if not re.match(r"(?:all|\w[\w-]*)", str(projection)):
++                                errors.setdefault("projections", {})[projection] = ["invalid projection name"]
++                    uenv = view.get("uenv")
++                    prefix_paths = uenv.get("prefix_paths") if isinstance(uenv, dict) else None
++                    if isinstance(prefix_paths, dict):
++                        for path_name in prefix_paths:
++                            if not re.match(r"\w+", str(path_name)):
++                                errors.setdefault("prefix_paths", {})[path_name] = ["invalid prefix path name"]
++        return errors
++
++    def _handle_dynamic_root(self, document):
++        """Normalize and validate each user-named environment."""
++        errors = {}
++        for name, value in document.items():
++            if not re.fullmatch(r"\w[\w-]*", str(name)):
++                errors[name] = ["environment name does not match \\w[\\w-]*"]
++                continue
++
++            child = _StackValidator(self.schema, allow_unknown=False)
++            normalized = child.normalized(value, always_return_document=True)
++            if isinstance(value, dict) and isinstance(normalized, dict):
++                value.clear()
++                value.update(normalized)
++                # Cerberus does not normalize defaults inside an ``anyof``
++                # branch.  ``mpi.gpu`` has a default in that branch, so apply
++                # it explicitly to retain the recipe format's semantics.
++                if isinstance(value.get("mpi"), dict):
++                    value["mpi"].setdefault("gpu", None)
++            nested_errors = self._check_nested_key_patterns(value)
++            if not child._run_document(value):
++                nested_errors.update(child.errors)
++            if nested_errors:
++                errors[name] = nested_errors
++        return errors
++
++    def validate(self, document, *args, **kwargs):
++        if self.dynamic_root and isinstance(document, dict):
++            dynamic_errors = self._handle_dynamic_root(document)
++            if dynamic_errors:
++                raise ValidationError(_error_message(dynamic_errors))
++            return True
++
++        normalized = self.normalized(document, always_return_document=True)
++        if isinstance(document, dict) and isinstance(normalized, dict):
++            document.clear()
++            document.update(normalized)
++
++        # Normalization has already happened above.  Passing normalize=False
++        # avoids running it a second time and keeps the caller's object intact.
++        kwargs["normalize"] = False
++        valid = super().validate(document, *args, **kwargs)
++        if not valid:
++            raise ValidationError(_error_message(self.errors))
++        return valid
++
++
++def _error_message(errors):
++    """Return a useful, compact error while retaining the old API contract."""
++    unknown = []
++
++    def collect(value):
++        if isinstance(value, dict):
++            for key, child in value.items():
++                if child == ["unknown field"]:
++                    unknown.append(key)
++                else:
++                    collect(child)
++        elif isinstance(value, list):
++            for child in value:
++                collect(child)
++
++    collect(errors)
++    if unknown:
++        names = ", ".join(repr(name) for name in unknown)
++        return "Additional properties are not allowed (%s was unexpected)" % names
++    return "Schema validation failed: %s" % errors
++
++
++def validator(schema):
++    """Create a stackinator validator for a Cerberus schema."""
++    # ``allow_unknown`` is normally false.  Environments are the one schema
++    # whose top-level keys are user-selected names; each such value must match
++    # the environment schema.
++    allow_unknown = False
++    dynamic_root = schema is globals().get("environments_schema")
++    if dynamic_root:
++        # Cerberus' ``allow_unknown`` can validate unknown values, but this
++        # schema is itself the value schema and therefore needs a small
++        # per-environment normalization pass (above).
++        allow_unknown = True
++    return _StackValidator(schema, allow_unknown=allow_unknown, dynamic_root=dynamic_root)
+ 
+ 
+ def py2yaml(data, indent):
+@@ -41,14 +150,17 @@
+     return res
+ 
+ 
+-validator = extend_with_default(jsonschema.Draft7Validator)
++def _load_schema(name):
++    with (prefix / "schema" / name).open() as schema_file:
++        return json.load(schema_file)
+ 
+-# load recipe yaml schema
+-config_schema = json.load(open(prefix / "schema/config.json"))
++
++# load recipe yaml schemas
++config_schema = _load_schema("config.json")
+ config_validator = validator(config_schema)
+-compilers_schema = json.load(open(prefix / "schema/compilers.json"))
++compilers_schema = _load_schema("compilers.json")
+ compilers_validator = validator(compilers_schema)
+-environments_schema = json.load(open(prefix / "schema/environments.json"))
++environments_schema = _load_schema("environments.json")
+ environments_validator = validator(environments_schema)
+-cache_schema = json.load(open(prefix / "schema/cache.json"))
++cache_schema = _load_schema("cache.json")
+ cache_validator = validator(cache_schema)

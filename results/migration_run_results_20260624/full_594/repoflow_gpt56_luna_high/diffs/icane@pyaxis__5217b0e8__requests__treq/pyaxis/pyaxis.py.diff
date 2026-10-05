@@ -1,0 +1,122 @@
+--- a/pyaxis/pyaxis.py
++++ b/pyaxis/pyaxis.py
+@@ -22,12 +22,16 @@
+ 
+ import logging
+ import re
++from threading import Event, Lock, Thread
+ 
+ from numpy import nan
+ 
+ from pandas import Series
+ 
+-import requests
++import treq
++from twisted.internet import reactor
++from twisted.internet.defer import inlineCallbacks
++from twisted.internet.threads import blockingCallFromThread
+ 
+ from pyaxis.metadata_processing import metadata_extract, metadata_split_to_dict, multilingual_parse
+ 
+@@ -36,6 +40,64 @@
+ 
+ logging.basicConfig(level=logging.INFO)
+ logger = logging.getLogger(__name__)
++
++
++class HTTPError(Exception):
++    """Raised when a URL returns an unsuccessful HTTP status."""
++
++    def __init__(self, response):
++        self.response = response
++        self.status_code = response.code
++        phrase = response.phrase
++        if isinstance(phrase, bytes):
++            phrase = phrase.decode('ascii', errors='replace')
++        self.reason = phrase
++        super().__init__('{} {}'.format(self.status_code, self.reason))
++
++
++class ConnectionError(OSError):
++    """Raised when a URL cannot be reached."""
++
++
++_reactor_lock = Lock()
++_reactor_ready = Event()
++_reactor_thread = None
++
++
++def _run_reactor():
++    """Run Twisted's reactor on a background thread for sync callers."""
++    reactor.callWhenRunning(_reactor_ready.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor():
++    """Start the reactor once without changing the public sync API."""
++    global _reactor_thread
++
++    if reactor.running:
++        return
++
++    with _reactor_lock:
++        if not reactor.running and _reactor_thread is None:
++            _reactor_thread = Thread(target=_run_reactor, daemon=True)
++            _reactor_thread.start()
++
++    _reactor_ready.wait()
++
++
++@inlineCallbacks
++def _read_url(uri, encoding, timeout):
++    """Fetch and decode a URL using treq's Deferred-based API."""
++    try:
++        response = yield treq.get(uri, timeout=timeout)
++        content = yield treq.content(response)
++    except Exception as error:
++        raise ConnectionError(str(error)) from error
++
++    if response.code >= 400:
++        raise HTTPError(response)
++
++    return content.decode(encoding, errors='replace')
+ 
+ 
+ def uri_type(uri):
+@@ -83,25 +145,14 @@
+ 
+     if uri_type(uri) == 'URL':
+         try:
+-            response = requests.get(uri, stream=True, timeout=timeout)
+-            response.raise_for_status()
+-            response.encoding = encoding
+-            raw_pcaxis = response.text
+-            response.close()
+-        except requests.exceptions.ConnectTimeout as connect_timeout:
+-            logger.error('ConnectionTimeout = %s', str(connect_timeout))
+-            raise
+-        except requests.exceptions.ConnectionError as connection_error:
++            _ensure_reactor()
++            raw_pcaxis = blockingCallFromThread(
++                reactor, _read_url, uri, encoding, timeout)
++        except ConnectionError as connection_error:
+             logger.error('ConnectionError = %s', str(connection_error))
+             raise
+-        except requests.exceptions.HTTPError as http_error:
+-            logger.error('HTTPError = %s',
+-                         str(http_error.response.status_code) + ' ' +
+-                         http_error.response.reason)
+-            raise
+-        except requests.exceptions.InvalidURL as url_error:
+-            logger.error('URLError = ' + url_error.response.status_code + ' ' +
+-                         url_error.response.reason)
++        except HTTPError as http_error:
++            logger.error('HTTPError = %s', str(http_error))
+             raise
+         except Exception:
+             import traceback
+@@ -176,4 +227,4 @@
+         'DATA': df,
+         'TRANSLATION' : translation_dict
+     }
+-    return parsed_pc_axis+    return parsed_pc_axis

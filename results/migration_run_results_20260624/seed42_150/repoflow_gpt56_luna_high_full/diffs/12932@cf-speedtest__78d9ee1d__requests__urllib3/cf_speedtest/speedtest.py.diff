@@ -1,0 +1,174 @@
+--- a/cf_speedtest/speedtest.py
++++ b/cf_speedtest/speedtest.py
+@@ -7,13 +7,12 @@
+ import time
+ from timeit import default_timer as timer
+ 
+-import requests
+ import urllib3
+ 
+ import cf_speedtest.locations as locations
+ import cf_speedtest.options as options
+ 
+-REQ_SESSION = requests.Session()
++REQ_SESSION = urllib3.PoolManager(cert_reqs='CERT_REQUIRED', retries=False)
+ 
+ CGI_ENDPOINT = 'https://speed.cloudflare.com/cdn-cgi/trace'
+ DOWNLOAD_ENDPOINT = 'https://speed.cloudflare.com/__down?measId=0&bytes={}'
+@@ -32,6 +31,51 @@
+ 
+ # Could use python's statistics library, but quantiles are only available
+ # in version 3.8 and above
++
++
++def create_http_pool():
++    cert_reqs = 'CERT_REQUIRED' if VERIFY_SSL else 'CERT_NONE'
++
++    if PROXY_DICT:
++        proxy_url = PROXY_DICT['https']
++        if proxy_url.startswith('socks'):
++            from urllib3.contrib.socks import SOCKSProxyManager
++
++            return SOCKSProxyManager(
++                proxy_url, cert_reqs=cert_reqs, retries=False,
++            )
++        return urllib3.ProxyManager(
++            proxy_url, cert_reqs=cert_reqs, retries=False,
++        )
++
++    return urllib3.PoolManager(cert_reqs=cert_reqs, retries=False)
++
++
++def request(method: str, url: str, **kwargs):
++    session_method = getattr(REQ_SESSION, method.lower(), None)
++    if callable(session_method):
++        return session_method(url, **kwargs)
++    return REQ_SESSION.request(method, url, **kwargs)
++
++
++def check_response_status(response):
++    status = getattr(response, 'status', None)
++    if isinstance(status, int) and status >= 400:
++        raise urllib3.exceptions.HTTPError(
++            f'HTTP {status}: {getattr(response, "reason", "")}',
++        )
++
++
++def response_text(response) -> str:
++    data = getattr(response, 'data', None)
++    if isinstance(data, (bytes, bytearray)):
++        return bytes(data).decode('utf-8')
++
++    text = getattr(response, 'text', None)
++    if isinstance(text, str):
++        return text
++
++    return data.decode('utf-8')
+ 
+ 
+ def percentile(data: list, percentile: int) -> float:
+@@ -61,12 +105,12 @@
+ def upload_test(total_bytes: int) -> int | float:
+     start = timer()
+ 
+-    r = REQ_SESSION.post(
+-        UPLOAD_ENDPOINT, data=bytearray(
++    r = request(
++        'POST', UPLOAD_ENDPOINT, body=bytearray(
+             total_bytes,
+-        ), headers=UPLOAD_HEADERS, verify=VERIFY_SSL, proxies=PROXY_DICT,
++        ), headers=UPLOAD_HEADERS,
+     )
+-    r.raise_for_status()
++    check_response_status(r)
+     total_time_taken = timer() - start
+ 
+     # trust what the server says as time taken
+@@ -87,12 +131,12 @@
+     endpoint = DOWNLOAD_ENDPOINT.format(total_bytes)
+     start = timer()
+ 
+-    r = REQ_SESSION.get(endpoint, verify=VERIFY_SSL, proxies=PROXY_DICT)
+-    r.raise_for_status()
++    r = request('GET', endpoint)
++    check_response_status(r)
+ 
+     total_time_taken = timer() - start
+ 
+-    content_size = len(r.content)
++    content_size = len(r.data)
+     server_time_taken = get_server_timing(r.headers['Server-Timing'])
+ 
+     if OUTPUT_FILE:
+@@ -110,8 +154,8 @@
+     endpoint = DOWNLOAD_ENDPOINT.format(0)
+ 
+     start = timer()
+-    r = REQ_SESSION.get(endpoint, verify=VERIFY_SSL,  proxies=PROXY_DICT)
+-    r.raise_for_status()
++    r = request('GET', endpoint)
++    check_response_status(r)
+ 
+     total_time_taken = timer() - start
+     server_time_taken = get_server_timing(r.headers['Server-Timing'])
+@@ -119,7 +163,7 @@
+     if OUTPUT_FILE:
+         with open(OUTPUT_FILE, 'a', encoding='utf-8') as datafile:
+             datafile.write(
+-                f'{time.time()},down,{len(r.content)},{total_time_taken},{server_time_taken}\n',
++                f'{time.time()},down,{len(r.data)},{total_time_taken},{server_time_taken}\n',
+             )
+ 
+     return total_time_taken - server_time_taken
+@@ -128,10 +172,10 @@
+ 
+ 
+ def get_our_country() -> str:
+-    r = REQ_SESSION.get(CGI_ENDPOINT, verify=VERIFY_SSL,  proxies=PROXY_DICT)
+-    r.raise_for_status()
+-
+-    cgi_data = r.text
++    r = request('GET', CGI_ENDPOINT)
++    check_response_status(r)
++
++    cgi_data = response_text(r)
+     cgi_dict = {
+         k: v for k, v in [
+             line.split(
+@@ -144,12 +188,13 @@
+ 
+ 
+ def preamble() -> str:
+-    r = REQ_SESSION.get(
++    r = request(
++        'GET',
+         DOWNLOAD_ENDPOINT.format(
+             0,
+-        ), verify=VERIFY_SSL,  proxies=PROXY_DICT,
++        ),
+     )
+-    r.raise_for_status()
++    check_response_status(r)
+ 
+     our_ip = r.headers.get('cf-meta-ip')
+     colo = r.headers.get('cf-meta-colo')
+@@ -289,8 +334,8 @@
+ 
+ 
+ def main(argv=None) -> int:
+-    global PROXY_DICT, VERIFY_SSL, OUTPUT_FILE
+-    # disable annoying warning when using verify=False in requests.get("x", verify=False)
++    global PROXY_DICT, VERIFY_SSL, OUTPUT_FILE, REQ_SESSION
++    # Disable the warning emitted when SSL verification is explicitly disabled.
+     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+ 
+     parser = argparse.ArgumentParser()
+@@ -321,6 +366,8 @@
+     else:
+         PROXY_DICT = None
+ 
++    REQ_SESSION = create_http_pool()
++
+     # Taken from speed.cloudflare.com
+     # byte count for each test, ranging from 100KB to 250MB
+     measurement_sizes =\

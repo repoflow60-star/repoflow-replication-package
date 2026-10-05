@@ -1,0 +1,186 @@
+--- a/cronitor/monitor.py
++++ b/cronitor/monitor.py
+@@ -3,29 +3,18 @@
+ import logging
+ import json
+ import os
+-import requests
++import treq
++from twisted.internet.defer import inlineCallbacks, returnValue
+ from yaml.loader import SafeLoader
+ 
+ 
+ import cronitor
+-from urllib3.util.retry import Retry
+-from requests.adapters import HTTPAdapter
+ 
+ logger = logging.getLogger(__name__)
+ 
+-# https://stackoverflow.com/questions/49121365/implementing-retry-for-requests-in-python
++# treq does not provide requests-style sessions or HTTPAdapter mounts.
+ def retry_session(retries, session=None, backoff_factor=0.3):
+-    session = session or requests.Session()
+-    retry = Retry(
+-        total=retries,
+-        read=retries,
+-        connect=retries,
+-        backoff_factor=backoff_factor,
+-    )
+-    adapter = HTTPAdapter(max_retries=retry)
+-    session.mount('http://', adapter)
+-    session.mount('https://', adapter)
+-    return session
++    return session or treq
+ 
+ JSON = 'json'
+ YAML = 'yaml'
+@@ -38,19 +27,22 @@
+     _req = retry_session(retries=3)
+ 
+     @classmethod
++    @inlineCallbacks
+     def as_yaml(cls, api_key=None, api_version=None):
+         timeout = cronitor.timeout or 10
+         api_key = api_key or cronitor.api_key
+-        resp = cls._req.get('%s.yaml' % cls._monitor_api_url(),
++        resp = yield cls._req.get('%s.yaml' % cls._monitor_api_url(),
+                         auth=(api_key, ''),
+                         headers=dict(cls._headers, **{'Content-Type': 'application/yaml', 'Cronitor-Version': api_version}),
+                         timeout=timeout)
+-        if resp.status_code == 200:
+-            return resp.text
+-        else:
+-            raise cronitor.APIError("Unexpected error %s" % resp.text)
+-
+-    @classmethod
++        response_text = yield treq.text_content(resp)
++        if resp.code == 200:
++            returnValue(response_text)
++        else:
++            raise cronitor.APIError("Unexpected error %s" % response_text)
++
++    @classmethod
++    @inlineCallbacks
+     def put(cls, monitors=None, **kwargs):
+         api_key = cronitor.api_key
+         api_version = cronitor.api_version
+@@ -73,10 +65,10 @@
+         _monitors = monitors or [kwargs]
+         nested_format = True if type(monitors) == dict else False
+ 
+-        data = cls._put(_monitors, api_key, rollback, request_format, api_version)
++        data = yield cls._put(_monitors, api_key, rollback, request_format, api_version)
+ 
+         if nested_format:
+-            return data
++            returnValue(data)
+ 
+         _monitors = []
+         for md in data:
+@@ -84,9 +76,10 @@
+             m.data = md
+             _monitors.append(m)
+ 
+-        return _monitors if len(_monitors) > 1 else _monitors[0]
+-
+-    @classmethod
++        returnValue(_monitors if len(_monitors) > 1 else _monitors[0])
++
++    @classmethod
++    @inlineCallbacks
+     def _put(cls, monitors, api_key, rollback, request_format, api_version):
+         timeout = cronitor.timeout or 10
+         payload = _prepare_payload(monitors, rollback, request_format)
+@@ -99,21 +92,25 @@
+             data = json.dumps(payload)
+             url = cls._monitor_api_url()
+ 
+-        resp = cls._req.put(url,
++        resp = yield cls._req.put(url,
+                         auth=(api_key, ''),
+                         data=data,
+                         headers=dict(cls._headers, **{'Content-Type': content_type, 'Cronitor-Version': api_version}),
+                         timeout=timeout)
+ 
+-        if resp.status_code == 200:
++        if resp.code == 200:
+             if request_format == YAML:
+-                return yaml.load(resp.text, Loader=SafeLoader)
++                response_text = yield treq.text_content(resp)
++                returnValue(yaml.load(response_text, Loader=SafeLoader))
+             else:
+-                return resp.json().get('monitors', [])
+-        elif resp.status_code == 400:
+-            raise cronitor.APIValidationError(resp.text)
+-        else:
+-            raise cronitor.APIError("Unexpected error %s" % resp.text)
++                response_data = yield treq.json_content(resp)
++                returnValue(response_data.get('monitors', []))
++        elif resp.code == 400:
++            response_text = yield treq.text_content(resp)
++            raise cronitor.APIValidationError(response_text)
++        else:
++            response_text = yield treq.text_content(resp)
++            raise cronitor.APIError("Unexpected error %s" % response_text)
+ 
+     def __init__(self, key, api_key=None, api_version=None, env=None):
+         self.key = key
+@@ -123,27 +120,29 @@
+         self._data = None
+ 
+     @property
++    @inlineCallbacks
+     def data(self):
+         if self._data and type(self._data) is not Struct:
+             self._data = Struct(**self._data)
+         elif not self._data:
+-            self._data = Struct(**self._fetch())
+-        return self._data
++            self._data = Struct(**(yield self._fetch()))
++        returnValue(self._data)
+ 
+     @data.setter
+     def data(self, data):
+         self._data = Struct(**data)
+ 
++    @inlineCallbacks
+     def delete(self):
+-        resp = requests.delete(
++        resp = yield treq.delete(
+                     self._monitor_api_url(self.key),
+                     auth=(self.api_key, ''),
+                     headers=self._headers,
+                     timeout=10)
+ 
+-        if resp.status_code == 204:
+-            return True
+-        elif resp.status_code == 404:
++        if resp.code == 204:
++            returnValue(True)
++        elif resp.code == 404:
+             raise cronitor.MonitorNotFound("Monitor '%s' not found" % self.key)
+         else:
+             raise cronitor.APIError("An unexpected error occured when deleting '%s'" % self.key)
+@@ -168,18 +167,19 @@
+     def unpause(self):
+         return self.pause(0)
+ 
++    @inlineCallbacks
+     def _fetch(self):
+         if not self.api_key:
+             raise cronitor.AuthenticationError('No api_key detected. Set cronitor.api_key or initialize Monitor with kwarg.')
+ 
+-        resp = requests.get(self._monitor_api_url(self.key),
++        resp = yield treq.get(self._monitor_api_url(self.key),
+                             timeout=10,
+                             auth=(self.api_key, ''),
+                             headers=dict(self._headers, **{'Content-Type': 'application/json', 'Cronitor-Version': self.api_verion}))
+ 
+-        if resp.status_code == 404:
++        if resp.code == 404:
+             raise cronitor.MonitorNotFound("Monitor '%s' not found" % self.key)
+-        return resp.json()
++        returnValue((yield treq.json_content(resp)))
+ 
+     def _clean_params(self, params):
+         metrics = None

@@ -1,0 +1,1031 @@
+--- a/pdpyras.py
++++ b/pdpyras.py
+@@ -3,6 +3,7 @@
+ # See LICENSE for details.
+ 
+ # Standard libraries
++import json
+ import logging
+ import sys
+ import time
+@@ -13,14 +14,104 @@
+ from warnings import warn
+ 
+ # Upstream components on which this client is based:
+-from requests import Response, Session
+-from requests import __version__ as REQUESTS_VERSION
++from urllib3 import PoolManager
++from urllib3 import __version__ as REQUESTS_VERSION
+ 
+ # HTTP client exceptions:
+ from urllib3.exceptions import HTTPError, PoolError
+-from requests.exceptions import RequestException
+ 
+ __version__ = '5.4.0'
++
++
++class _Request:
++    def __init__(self, method, url):
++        self.method = method
++        self.url = url
++
++
++class Response:
++    """
++    Compatibility response object backed by an urllib3 HTTPResponse.
++    """
++
++    def __init__(self, response, method, url, elapsed):
++        self._response = response
++        self.status_code = response.status
++        self.headers = response.headers
++        self.request = _Request(method, url)
++        self.elapsed = elapsed
++
++    @property
++    def ok(self):
++        return self.status_code < 400
++
++    @property
++    def data(self):
++        return self._response.data
++
++    @property
++    def text(self):
++        return self.data.decode('utf-8', errors='replace')
++
++    def json(self):
++        return json.loads(self.text)
++
++
++class Session:
++    """
++    Minimal session interface backed by urllib3.PoolManager.
++    """
++
++    def __init__(self):
++        self.headers = {}
++        self._pool = PoolManager()
++
++    def request(self, method, url, **kwargs):
++        headers = kwargs.pop('headers', None)
++        params = kwargs.pop('params', None)
++        json_body = kwargs.pop('json', None)
++        data = kwargs.pop('data', None)
++        timeout = kwargs.pop('timeout', None)
++        stream = kwargs.pop('stream', False)
++
++        body = None
++        fields = params
++
++        if json_body is not None:
++            body = json.dumps(json_body)
++            fields = None
++        elif data is not None:
++            if isinstance(data, (dict, list, tuple)):
++                fields = data
++            else:
++                body = data
++                fields = None
++
++        started = datetime.now()
++        response = self._pool.request(
++            method,
++            url,
++            body=body,
++            fields=fields,
++            headers=headers,
++            preload_content=not stream,
++            timeout=timeout,
++        )
++        elapsed = datetime.now() - started
++        return Response(response, method, url, elapsed)
++
++    def get(self, url, **kwargs):
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, **kwargs):
++        return self.request('POST', url, **kwargs)
++
++    def put(self, url, **kwargs):
++        return self.request('PUT', url, **kwargs)
++
++    def delete(self, url, **kwargs):
++        return self.request('DELETE', url, **kwargs)
++
+ 
+ #######################
+ ### CLIENT DEFAULTS ###
+@@ -374,12 +465,12 @@
+ can also be None to denote that either the request or response is unwrapped.
+ 
+ An endpoint, under the design logic of this client, is said to have entity
+-wrapping if the body (request or response) has only one property containing
+-the content requested or transmitted, apart from properties used for
+-pagination. If there are any secondary content-bearing properties (other than
+-those used for pagination), entity wrapping should be disabled to avoid
+-discarding those properties from responses or preventing the use of those
+-properties in request bodies.
++wrapping if the body (request or response) has only one property containing the
++content requested or transmitted, apart from properties used for pagination. If
++there are any secondary content-bearing properties (other than those used for
++pagination), entity wrapping should be disabled to avoid discarding those
++properties from responses or preventing the use of those properties in request
++bodies.
+ 
+ :meta hide-value:
+ """
+@@ -408,34 +499,26 @@
+         The canonical REST API v2 path corresponding to a URL.
+     """
+     full_url = normalize_url(base_url, url)
+-    # Starting with / after hostname before the query string:
+     url_path = full_url.replace(base_url.rstrip('/'), '').split('?')[0]
+-    # Root node (blank) counts so we include it:
+     n_nodes = url_path.count('/')
+-    # First winnow the list down to paths with the same number of nodes:
+     patterns = list(filter(
+         lambda p: p.count('/') == n_nodes,
+         CANONICAL_PATHS
+     ))
+-    # Match against each node, skipping index zero because the root node always
+-    # matches, and using the adjusted index "j":
+     for i, node in enumerate(url_path.split('/')[1:]):
+         j = i+1
+         patterns = list(filter(
+             lambda p: p.split('/')[j] == node or is_path_param(p.split('/')[j]),
+             patterns
+         ))
+-        # Don't break early if len(patterns) == 1, but require an exact match...
+ 
+     if len(patterns) == 0:
+         raise URLError(f"URL {url} does not match any canonical API path " \
+             'supported by this client.')
+     elif len(patterns) > 1:
+-        # If there's multiple matches but one matches exactly, return that.
+         if url_path in patterns:
+             return url_path
+ 
+-        # ...otherwise this is ambiguous.
+         raise Exception(f"Ambiguous URL {url} matches more than one " \
+             "canonical path pattern: "+', '.join(patterns)+'; this is likely ' \
+             'a bug.')
+@@ -468,24 +551,12 @@
+ def is_path_param(path_node: str) -> bool:
+     """
+     Whether a part of a canonical path represents a variable parameter
+-
+-    :param path_node: The node (value between slashes) in the path
+-    :returns:
+-        True if the node is an arbitrary variable, False if it is a fixed value
+     """
+     return path_node.startswith('{') and path_node.endswith('}')
+ 
+ def normalize_url(base_url: str, url: str) -> str:
+     """
+     Normalize a URL to a complete API URL.
+-
+-    The ``url`` argument may be a path relative to the base URL or a full URL.
+-
+-    :param url: The URL to normalize
+-    :param baseurl:
+-        The base API URL, excluding any trailing slash, i.e.
+-        "https://api.pagerduty.com"
+-    :returns: The full API endpoint URL
+     """
+     if url.startswith(base_url):
+         return url
+@@ -502,16 +573,7 @@
+ 
+ def entity_wrappers(method: str, path: str) -> tuple:
+     """
+-    Obtains entity wrapping information for a given endpoint (path and method)
+-
+-    :param method: The HTTP method
+-    :param path: A canonical API path i.e. as returned by ``canonical_path``
+-    :returns:
+-        A 2-tuple. The first element is the wrapper name that should be used for
+-        the request body, and the second is the wrapper name to be used for the
+-        response body. For either elements, if ``None`` is returned, that
+-        signals to disable wrapping and pass the user-supplied request body or
+-        API response body object unmodified.
++    Obtains entity wrapping information for a given endpoint.
+     """
+     m = method.upper()
+     endpoint = "%s %s"%(m, path)
+@@ -521,29 +583,18 @@
+     ))
+ 
+     if len(match) == 1:
+-        # Look up entity wrapping info from the global dictionary and validate:
+         wrapper = ENTITY_WRAPPER_CONFIG[match[0]]
+         invalid_config_error = 'Invalid entity wrapping configuration for ' \
+                     f"{endpoint}: {wrapper}; this is most likely a bug."
+         if wrapper is not None and type(wrapper) not in (tuple, str):
+             raise Exception(invalid_config_error)
+         elif wrapper is None or type(wrapper) is str:
+-            # Both request and response have the same wrapping at this endpoint.
+             return (wrapper, wrapper)
+         elif type(wrapper) is tuple and len(wrapper) == 2:
+-            # Endpoint uses different wrapping for request and response bodies.
+-            #
+-            # Both elements must be either str or None. The first element is the
+-            # request body wrapper and the second is the response body wrapper.
+-            # If a value is None, that indicates that the request or response
+-            # value should be encoded and decoded as-is without modifications.
+             if False in [w is None or type(w) is str for w in wrapper]:
+                 raise Exception(invalid_config_error)
+             return wrapper
+     elif len(match) == 0:
+-        # Nothing in entity wrapper config matches. In this case it is assumed
+-        # that the endpoint follows classic API patterns and the wrapper name
+-        # can be inferred from the URL and request method:
+         wrapper = infer_entity_wrapper(method, path)
+         return (wrapper, wrapper)
+     else:
+@@ -554,46 +605,23 @@
+ def infer_entity_wrapper(method: str, path: str) -> str:
+     """
+     Infer the entity wrapper name from the endpoint using orthodox patterns.
+-
+-    This is based on patterns that are broadly applicable but not universal in
+-    the v2 REST API, where the wrapper name is predictable from the path and
+-    method. This is the default logic applied to determine the wrapper name
+-    based on the path if there is no explicit entity wrapping defined for the
+-    given path in :attr:`ENTITY_WRAPPER_CONFIG`.
+-
+-    :param method: The HTTP method
+-    :param path: A canonical API path i.e. as returned by ``canonical_path``
+     """
+     m = method.upper()
+     path_nodes = path.split('/')
+     if is_path_param(path_nodes[-1]):
+-        # Singular if it's an individual resource's URL for read/update/delete
+-        # (named similarly to the second to last node, as the last is its ID and
+-        # the second to last denotes the API resource collection it is part of):
+         return singular_name(path_nodes[-2])
+     elif m == 'POST':
+-        # Singular if creating a new resource by POSTing to the index containing
+-        # similar resources (named simiarly to the last path node):
+         return singular_name(path_nodes[-1])
+     else:
+-        # Plural if listing via GET to the index endpoint, or doing a multi-put:
+         return path_nodes[-1]
+ 
+ def unwrap(response: Response, wrapper) -> Union[dict, list]:
+     """
+     Unwraps a wrapped entity.
+-
+-    :param response: The response object
+-    :param wrapper: The entity wrapper
+-    :type wrapper: str or None
+-    :returns:
+-        The value associated with the wrapper key in the JSON-decoded body of
+-        the response, which is expected to be a dictionary (map).
+     """
+     body = try_decoding(response)
+     endpoint = "%s %s"%(response.request.method.upper(), response.request.url)
+     if wrapper is not None:
+-        # There is a wrapped entity to unpack:
+         bod_type = type(body)
+         error_msg = f"Expected response body from {endpoint} after JSON-" \
+             f"decoding to be a dictionary with a key \"{wrapper}\", but "
+@@ -612,7 +640,6 @@
+                 response
+             )
+     else:
+-        # Wrapping is disabled for responses:
+         return body
+ 
+ ###########################
+@@ -622,9 +649,6 @@
+ def auto_json(method):
+     """
+     Makes methods return the full response body object after decoding from JSON.
+-
+-    Intended for use on functions that take a URL positional argument followed
+-    by keyword arguments and return a `requests.Response`_ object.
+     """
+     doc = method.__doc__
+     def call(self, url, **kw):
+@@ -644,19 +668,12 @@
+ 
+ def resource_url(method):
+     """
+-    API call decorator that allows passing a resource dict as the path/URL
+-
+-    Most resources returned by the API will contain a ``self`` attribute that is
+-    the URL of the resource itself.
+-
+-    Using this decorator allows the implementer to pass either a URL/path or
+-    such a resource dictionary as the ``path`` argument, thus eliminating the
+-    need to re-construct the resource URL or hold it in a temporary variable.
++    API call decorator that allows passing a resource dict as the path/URL.
+     """
+     doc = method.__doc__
+     def call(self, resource, **kw):
+         url = resource
+-        if type(resource) is dict and 'self' in resource: # passing an object
++        if type(resource) is dict and 'self' in resource:
+             url = resource['self']
+         elif type(resource) is not str:
+             name = method.__name__
+@@ -696,20 +713,15 @@
+     http_method = method.__name__.lstrip('r')
+     doc = method.__doc__
+     def call(self, url, **kw):
+-        pass_kw = deepcopy(kw) # Make a copy for modification
++        pass_kw = deepcopy(kw)
+         path = canonical_path(self.url, url)
+         endpoint = "%s %s"%(http_method.upper(), path)
+         req_w, res_w = entity_wrappers(http_method, path)
+-        # Validate the abbreviated (or full) request payload, and automatically
+-        # wrap the request entity for the implementer if necessary:
+         if req_w is not None and http_method in ('post', 'put') \
+                 and 'json' in pass_kw and req_w not in pass_kw['json']:
+             pass_kw['json'] = {req_w: pass_kw['json']}
+ 
+-        # Make the request:
+         r = successful_response(method(self, url, **pass_kw))
+-
+-        # Unpack the response:
+         return unwrap(r, res_w)
+     call.__doc__ = doc
+     return call
+@@ -722,9 +734,6 @@
+ def deprecated_kwarg(deprecated_name: str, details=None):
+     """
+     Raises a warning if a deprecated keyword argument is used.
+-
+-    :param deprecated_name: The name of the deprecated function
+-    :param details: An optional message to append to the deprecation message
+     """
+     details_msg = ''
+     if details is not None:
+@@ -734,13 +743,6 @@
+ def http_error_message(r: Response, context=None) -> str:
+     """
+     Formats a message describing a HTTP error.
+-
+-    :param r:
+-        The response object.
+-    :param context:
+-        A description of when the error was received, or None to not include it
+-    :returns:
+-        The message to include in the HTTP error
+     """
+     received_http_response = bool(r.status_code)
+     endpoint = "%s %s"%(r.request.method.upper(), r.request.url)
+@@ -764,62 +766,33 @@
+ 
+ def last_4(secret: str) -> str:
+     """
+-    Truncate a sensitive value to its last 4 characters
+-
+-    :param secret: text to truncate
+-    :returns:
+-        The truncated text
++    Truncate a sensitive value to its last 4 characters.
+     """
+     return '*'+str(secret)[-4:]
+ 
+ def plural_name(obj_type: str) -> str:
+     """
+-    Pluralizes a name, i.e. the API name from the ``type`` property
+-
+-    :param obj_type:
+-        The object type, i.e. ``user`` or ``user_reference``
+-    :returns:
+-        The name of the resource, i.e. the last part of the URL for the
+-        resource's index URL
++    Pluralizes a name.
+     """
+     if obj_type.endswith('_reference'):
+-        # Strip down to basic type if it's a reference
+         obj_type = obj_type[:obj_type.index('_reference')]
+     if obj_type.endswith('y'):
+-        # Because English
+         return obj_type[:-1]+'ies'
+     else:
+         return obj_type+'s'
+ 
+ def singular_name(r_name: str) -> str:
+     """
+-    Singularizes a name, i.e. for the entity wrapper in a POST request
+-
+-    :para r_name:
+-        The "resource" name, i.e. "escalation_policies", a plural noun that
+-        forms the part of the canonical path identifying what kind of resource
+-        lives in the collection there, for an API that follows classic wrapped
+-        entity naming patterns.
+-    :returns:
+-        The singularized name
++    Singularizes a name.
+     """
+     if r_name.endswith('ies'):
+-        # Because English
+         return r_name[:-3]+'y'
+     else:
+         return r_name.rstrip('s')
+ 
+ def successful_response(r: Response, context=None) -> Response:
+-    """Validates the response as successful.
+-
+-    Returns the response if it was successful; otherwise, raises an exception.
+-
+-    :param r:
+-        Response object corresponding to the response received.
+-    :param context:
+-        A description of when the HTTP request is happening, for error reporting
+-    :returns:
+-        The response object, if it was successful
++    """
++    Validates the response as successful.
+     """
+     if r.ok and bool(r.status_code):
+         return r
+@@ -831,9 +804,8 @@
+         raise PDClientError(http_error_message(r, context=context))
+ 
+ def truncate_text(text: str) -> str:
+-    """Truncates a string longer than :attr:`TEXT_LEN_LIMIT`
+-
+-    :param text: The string to truncate if longer than the limit.
++    """
++    Truncates a string longer than TEXT_LEN_LIMIT.
+     """
+     if len(text) > TEXT_LEN_LIMIT:
+         return text[:TEXT_LEN_LIMIT-1]+'...'
+@@ -842,13 +814,7 @@
+ 
+ def try_decoding(r: Response) -> Union[dict, list, str]:
+     """
+-    JSON-decode a response body
+-
+-    Returns the decoded body if successful; raises :class:`PDServerError`
+-    otherwise.
+-
+-    :param r:
+-        The response object
++    JSON-decode a response body.
+     """
+     try:
+         return r.json()
+@@ -864,6 +830,7 @@
+ 
+ class PDSession(Session):
+     """
++    Base class for making HTTP requests to PagerDuty APIs.
+     Base class for making HTTP requests to PagerDuty APIs
+ 
+     This is an opinionated wrapper of `requests.Session`_, with a few additional
+@@ -890,38 +857,14 @@
+     """
+ 
+     log = None
+-    """
+-    A ``logging.Logger`` object for logging messages. By default it is
+-    configured without any handlers and so no messages will be emitted. See
+-    `logger objects
+-    <https://docs.python.org/3/library/logging.html#logger-objects>`_
+-    """
+ 
+     max_http_attempts = 10
+-    """
+-    The number of times that the client will retry after error statuses, for any
+-    that are defined greater than zero in :attr:`retry`.
+-    """
+ 
+     max_network_attempts = 3
+-    """
+-    The number of times that connecting to the API will be attempted before
+-    treating the failure as non-transient; a :class:`PDClientError` exception
+-    will be raised if this happens.
+-    """
+ 
+     parent = None
+-    """The ``super`` object (`requests.Session`_)"""
+ 
+     permitted_methods = ()
+-    """
+-    A tuple of the methods permitted by the API which the client implements.
+-
+-    For instance:
+-
+-    * The REST API accepts GET, POST, PUT and DELETE.
+-    * The Events API and Change Events APIs only accept POST.
+-    """
+ 
+     retry = {}
+     """
+@@ -942,26 +885,10 @@
+     """
+ 
+     sleep_timer = 1.5
+-    """
+-    Default initial cooldown time factor for rate limiting and network errors.
+-
+-    Each time that the request makes a followup request, there will be a delay
+-    in seconds equal to this number times :attr:`sleep_timer_base` to the power
+-    of how many attempts have already been made so far, unless
+-    :attr:`stagger_cooldown` is nonzero.
+-    """
+ 
+     sleep_timer_base = 2
+-    """
+-    After each retry, the time to sleep before reattempting the API connection
+-    and request will increase by a factor of this amount.
+-    """
+ 
+     timeout = TIMEOUT
+-    """
+-    This is the value sent to `Requests`_ as the ``timeout`` parameter that
+-    determines the TCP read timeout.
+-    """
+ 
+     url = ""
+ 
+@@ -974,20 +901,10 @@
+         self.retry = {}
+ 
+     def after_set_api_key(self):
+-        """
+-        Setter hook for setting or updating the API key.
+-
+-        Child classes should implement this to perform additional steps.
+-        """
+         pass
+ 
+     @property
+     def api_key(self) -> str:
+-        """
+-        API Key property getter.
+-
+-        Returns the _api_key attribute's value.
+-        """
+         return self._api_key
+ 
+     @api_key.setter
+@@ -1000,9 +917,6 @@
+ 
+     @property
+     def auth_header(self) -> dict:
+-        """
+-        Generates the header with the API credential used for authentication.
+-        """
+         raise NotImplementedError
+ 
+     def cooldown_factor(self) -> float:
+@@ -1031,16 +945,9 @@
+         return updated_params
+ 
+     def normalize_url(self, url) -> str:
+-        """Compose the URL whether it is a path or an already-complete URL"""
+         return normalize_url(self.url, url)
+ 
+     def postprocess(self, response):
+-        """
+-        Perform supplemental actions immediately after receiving a response.
+-
+-        This method is called once per request not including retries, and can be
+-        extended in child classes.
+-        """
+         pass
+ 
+     def prepare_headers(self, method, user_headers={}) -> dict:
+@@ -1087,7 +994,6 @@
+             self.log.setLevel(logging.NOTSET)
+             self.log.removeHandler(self._debugHandler)
+             delattr(self, '_debugHandler')
+-        # else: no-op; only happens if debug is set to the same value twice
+ 
+     def request(self, method, url, **kwargs) -> Response:
+         """
+@@ -1118,7 +1024,6 @@
+         full_url = self.normalize_url(url)
+         endpoint = "%s %s"%(method.upper(), full_url)
+ 
+-        # Add in any headers specified in keyword arguments:
+         headers = kwargs.get('headers', {})
+         req_kw.update({
+             'headers': self.prepare_headers(method, user_headers=headers),
+@@ -1126,16 +1031,14 @@
+             'timeout': self.timeout
+         })
+ 
+-        # Special changes to user-supplied parameters, for convenience
+         if 'params' in kwargs and kwargs['params']:
+             req_kw['params'] = self.normalize_params(kwargs['params'])
+ 
+-        # Make the request (and repeat w/cooldown if the rate limit is reached):
+         while True:
+             try:
+                 response = self.parent.request(method, full_url, **req_kw)
+                 self.postprocess(response)
+-            except (HTTPError, PoolError, RequestException) as e:
++            except (HTTPError, PoolError) as e:
+                 network_attempts += 1
+                 if network_attempts > self.max_network_attempts:
+                     error_msg = f"{endpoint}: Non-transient network " \
+@@ -1152,9 +1055,7 @@
+             status = response.status_code
+             retry_logic = self.retry.get(status, 0)
+             if not response.ok and retry_logic != 0:
+-                # Take special action as defined by the retry logic
+                 if retry_logic != -1:
+-                    # Retry a specific number of times (-1 implies infinite)
+                     if http_attempts.get(status, 0)>=retry_logic or \
+                             sum(http_attempts.values())>self.max_http_attempts:
+                         lower_limit = retry_logic
+@@ -1179,14 +1080,11 @@
+                 time.sleep(sleep_timer)
+                 continue
+             elif status == 401:
+-                # Stop. Authentication failed. We shouldn't try doing any more,
+-                # because we'll run into the same problem later anyway.
+                 raise PDHTTPError(
+                     "Received 401 Unauthorized response from the API. The key "
+                     "(...%s) may be invalid or deactivated."%self.trunc_key,
+                     response)
+             else:
+-                # All went according to plan.
+                 return response
+ 
+     @property
+@@ -1232,18 +1130,18 @@
+ 
+     @property
+     def trunc_key(self) -> str:
+-        """Truncated key for secure display/identification purposes."""
+         return last_4(self.api_key)
+ 
+     @property
+     def user_agent(self) -> str:
+-        return 'pdpyras/%s python-requests/%s Python/%d.%d'%(
++        return 'pdpyras/%s python-urllib3/%s Python/%d.%d'%(
+             __version__,
+             REQUESTS_VERSION,
+             sys.version_info.major,
+             sys.version_info.minor
+         )
+ 
++
+ class EventsAPISession(PDSession):
+ 
+     """
+@@ -1263,35 +1161,19 @@
+ 
+     def __init__(self, api_key: str, debug=False):
+         super(EventsAPISession, self).__init__(api_key, debug)
+-        # See: https://developer.pagerduty.com/docs/3d063fd4814a6-events-api-v2-overview#response-codes--retry-logic
+-        self.retry[500] = 2 # internal server error
+-        self.retry[502] = 4 # bad gateway
+-        self.retry[503] = 6 # service unavailable
+-        self.retry[504] = 6 # gateway timeout
++        self.retry[500] = 2
++        self.retry[502] = 4
++        self.retry[503] = 6
++        self.retry[504] = 6
+ 
+     @property
+     def auth_header(self) -> dict:
+         return {}
+ 
+     def acknowledge(self, dedup_key) -> str:
+-        """
+-        Acknowledge an alert via Events API.
+-
+-        :param dedup_key:
+-            The deduplication key of the alert to set to the acknowledged state.
+-        :returns:
+-            The deduplication key
+-        """
+         return self.send_event('acknowledge', dedup_key=dedup_key)
+ 
+     def prepare_headers(self, method, user_headers={}) -> dict:
+-        """
+-        Add user agent and content type headers for Events API requests.
+-
+-        :param user_headers: User-supplied headers that will override defaults
+-        :returns:
+-            The final list of headers to use in the request
+-        """
+         headers = {}
+         headers.update(self.headers)
+         headers.update({
+@@ -1302,12 +1184,6 @@
+         return headers
+ 
+     def resolve(self, dedup_key) -> str:
+-        """
+-        Resolve an alert via Events API.
+-
+-        :param dedup_key:
+-            The deduplication key of the alert to resolve.
+-        """
+         return self.send_event('resolve', dedup_key=dedup_key)
+ 
+     def send_event(self, action, dedup_key=None, **properties) -> str:
+@@ -1356,11 +1232,6 @@
+         return response_body['dedup_key']
+ 
+     def post(self, *args, **kw) -> Response:
+-        """
+-        Override of ``requests.Session.post``
+-
+-        Adds the ``routing_key`` parameter to the body before sending.
+-        """
+         if 'json' in kw and hasattr(kw['json'], 'update'):
+             kw['json'].update({'routing_key': self.api_key})
+         return super(EventsAPISession, self).post(*args, **kw)
+@@ -1442,10 +1313,9 @@
+ 
+     def __init__(self, api_key: str, debug=False):
+         super(ChangeEventsAPISession, self).__init__(api_key, debug)
+-        # See: https://developer.pagerduty.com/docs/ZG9jOjExMDI5NTgw-events-api-v2-overview#response-codes--retry-logic
+-        self.retry[500] = 2 # internal server error, 3 requests total
+-        self.retry[502] = 4 # bad gateway, 5 requests total
+-        self.retry[503] = 6 # service unavailable, 7 requests total
++        self.retry[500] = 2
++        self.retry[502] = 4
++        self.retry[503] = 6
+ 
+     @property
+     def auth_header(self) -> dict:
+@@ -1456,13 +1326,6 @@
+         return datetime.utcnow().isoformat()+'Z'
+ 
+     def prepare_headers(self, method, user_headers={}) -> dict:
+-        """
+-        Add user agent and content type headers for Change Events API requests.
+-
+-        :param user_headers: User-supplied headers that will override defaults
+-        :returns:
+-            The final list of headers to use in the request
+-        """
+         headers = deepcopy(self.headers)
+         headers.update({
+             'Content-Type': 'application/json',
+@@ -1564,24 +1427,16 @@
+     """
+ 
+     api_call_counts = None
+-    """A dict object recording the number of API calls per endpoint"""
+ 
+     api_time = None
+-    """A dict object recording the total time of API calls to each endpoint"""
+ 
+     default_from = None
+-    """The default value to use as the ``From`` request header"""
+ 
+     default_page_size = 100
+-    """
+-    This will be the default number of results requested in each page when
+-    iterating/querying an index (the ``limit`` parameter).
+-    """
+ 
+     permitted_methods = ('GET', 'POST', 'PUT', 'DELETE')
+ 
+     url = 'https://api.pagerduty.com'
+-    """Base URL of the REST API"""
+ 
+     def __init__(self, api_key: str, default_from=None,
+             auth_type='token', debug=False):
+@@ -1626,11 +1481,6 @@
+ 
+     @property
+     def auth_type(self) -> str:
+-        """
+-        Defines the method of API authentication.
+-
+-        By default this is "token"; if "oauth2", the API key will be used.
+-        """
+         return self._auth_type
+ 
+     @auth_type.setter
+@@ -1773,17 +1623,11 @@
+         path = canonical_path(self.url, url)
+         endpoint = f"GET {path}"
+ 
+-        # Short-circuit to cursor-based pagination if appropriate:
+         if path in CURSOR_BASED_PAGINATION_PATHS:
+             return self.iter_cursor(url, params=params)
+ 
+         nodes = path.split('/')
+         if is_path_param(nodes[-1]):
+-            # NOTE: If this happens for a newer API, the path might need to be
+-            # added to the EXPAND_PATHS dictionary in
+-            # scripts/get_path_list/get_path_list.py, after which
+-            # CANONICAL_PATHS will then need to be updated accordingly based on
+-            # the new output of the script.
+             raise URLError(f"Path {path} (URL={url}) is formatted like an " \
+                 "individual resource versus a resource collection. It is " \
+                 "therefore assumed to not support pagination.")
+@@ -1792,7 +1636,6 @@
+         if wrapper is None:
+             raise URLError(f"Pagination is not supported for {endpoint}.")
+ 
+-        # Parameters to send:
+         data = {}
+         if page_size is None:
+             data['limit'] = self.default_page_size
+@@ -1801,7 +1644,6 @@
+         if total:
+             data['total'] = 1
+         if isinstance(params, (dict, list)):
+-            # Override defaults with values given:
+             data.update(dict(params))
+ 
+         more = True
+@@ -1810,7 +1652,6 @@
+             offset = int(params.get('offset', 0))
+         n = 0
+         while more:
+-            # Check the offset and limit:
+             data['offset'] = offset
+             highest_record_index = int(data['offset']) + int(data['limit'])
+             if highest_record_index > ITERATION_LIMIT:
+@@ -1823,7 +1664,6 @@
+                 )
+                 return
+ 
+-            # Make the request and validate/unpack the response:
+             r = successful_response(
+                 self.get(url, params=data.copy()),
+                 context='classic pagination'
+@@ -1861,10 +1701,8 @@
+             if 'total' in body:
+                 total_count = body['total']
+ 
+-            # Perform per-page actions on the response data
+             for result in results:
+                 n += 1
+-                # Call a callable object for each item, i.e. to print progress:
+                 if hasattr(item_hook, '__call__'):
+                     item_hook(result, n, total_count)
+                 yield result
+@@ -1886,7 +1724,6 @@
+         _, wrapper = entity_wrappers('GET', path)
+         user_params = {}
+         if isinstance(params, (dict, list)):
+-            # Override defaults with values given:
+             user_params.update(dict(params))
+ 
+         more = True
+@@ -1894,7 +1731,6 @@
+         total = 0
+ 
+         while more:
+-            # Update parameters and request a new page:
+             if next_cursor:
+                 user_params.update({'cursor': next_cursor})
+             r = successful_response(
+@@ -1902,7 +1738,6 @@
+                 context='cursor-based pagination',
+             )
+ 
+-            # Unpack and yield results
+             body = try_decoding(r)
+             results = unwrap(r, wrapper)
+             for result in results:
+@@ -1910,44 +1745,25 @@
+                 if hasattr(item_hook, '__call__'):
+                     item_hook(result, total, '?')
+                 yield result
+-            # Advance to the next page
+             next_cursor = body.get('next_cursor', None)
+             more = bool(next_cursor)
+ 
+     @resource_url
+     @auto_json
+     def jget(self, url, **kw) -> Union[dict, list]:
+-        """
+-        Performs a GET request, returning the JSON-decoded body as a dictionary
+-        """
+         return self.get(url, **kw)
+ 
+     @resource_url
+     @auto_json
+     def jpost(self, url, **kw) -> Union[dict, list]:
+-        """
+-        Performs a POST request, returning the JSON-decoded body as a dictionary
+-        """
+         return self.post(url, **kw)
+ 
+     @resource_url
+     @auto_json
+     def jput(self, url, **kw) -> Union[dict, list]:
+-        """
+-        Performs a PUT request, returning the JSON-decoded body as a dictionary
+-        """
+         return self.put(url, **kw)
+ 
+     def list_all(self, url, **kw) -> list:
+-        """
+-        Returns a list of all objects from a given index endpoint.
+-
+-        All keyword arguments passed to this function are also passed directly
+-        to :attr:`iter_all`; see the documentation on that method for details.
+-
+-        :param url:
+-            The index endpoint URL to use.
+-        """
+         return list(self.iter_all(url, **kw))
+ 
+     def persist(self, resource, attr, values, update=False):
+@@ -2017,16 +1833,12 @@
+         try:
+             endpoint = "%s %s"%(method, canonical_path(self.url, url))
+         except URLError:
+-            # This is necessary so that profiling can also support using the
+-            # basic get / post / put / delete methods with APIs that are not yet
+-            # explicitly supported by inclusion in CANONICAL_PATHS.
+             endpoint = "%s %s"%(method, url)
+         self.api_call_counts.setdefault(endpoint, 0)
+         self.api_time.setdefault(endpoint, 0.0)
+         self.api_call_counts[endpoint] += 1
+         self.api_time[endpoint] += request_time
+ 
+-        # Request ID / timestamp logging
+         self.log.debug("Request completed: #method=%s|#url=%s|#status=%d|"
+             "#x_request_id=%s|#date=%s|#wall_time_s=%g", method, url, status,
+             request_id, request_date, request_time)
+@@ -2123,11 +1935,6 @@
+ 
+     @property
+     def subdomain(self) -> str:
+-        """
+-        Subdomain of the PagerDuty account of the API access token.
+-
+-        :type: str or None
+-        """
+         if not hasattr(self, '_subdomain') or self._subdomain is None:
+             try:
+                 url = self.rget('users', params={'limit':1})[0]['html_url']
+@@ -2140,45 +1947,36 @@
+ 
+     @property
+     def total_call_count(self) -> int:
+-        """The total number of API calls made by this instance."""
+         return sum(self.api_call_counts.values())
+ 
+     @property
+     def total_call_time(self) -> float:
+-        """The total time spent making API calls."""
+         return sum(self.api_time.values())
+ 
+     @property
+     def trunc_token(self) -> str:
+-        """Truncated token for secure display/identification purposes."""
+         return last_4(self.api_key)
+ 
++
+ class URLError(Exception):
+     """
+     Exception class for unsupported URLs or malformed input.
+     """
+     pass
+ 
++
+ class PDClientError(Exception):
+     """
+     General API errors base class.
+-
+-    Note, the name of this class does not imply it solely includes errors
+-    experienced by the client or HTTP status 4xx responses, but descendants can
+-    include issues with the API backend.
+     """
+ 
+     response = None
+-    """
+-    The HTTP response object, if a response was successfully received.
+-
+-    In the case of network errors, this property will be None.
+-    """
+ 
+     def __init__(self, message, response=None):
+         self.msg = message
+         self.response = response
+         super(PDClientError, self).__init__(message)
++
+ 
+ class PDHTTPError(PDClientError):
+     """
+@@ -2217,13 +2015,9 @@
+     def __init__(self, message, response: Response):
+         super(PDHTTPError, self).__init__(message, response=response)
+ 
++
+ class PDServerError(PDHTTPError):
+     """
+-    Error class representing failed expectations made of the server
+-
+-    This is raised in cases where the response schema differs from the expected
+-    schema because of an API bug, or because it's an early access endpoint and
+-    changes before GA, or in cases of HTTP status 5xx where a successful
+-    response is required.
+-    """
+-    pass
++    Error class representing failed expectations made of the server.
++    """
++    pass

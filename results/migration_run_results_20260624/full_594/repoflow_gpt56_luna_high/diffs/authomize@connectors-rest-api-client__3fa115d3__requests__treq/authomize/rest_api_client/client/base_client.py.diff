@@ -1,0 +1,174 @@
+--- a/authomize/rest_api_client/client/base_client.py
++++ b/authomize/rest_api_client/client/base_client.py
+@@ -1,9 +1,36 @@
++from threading import Event, Lock, Thread
+ from typing import Optional
+ 
+-import requests
+-from requests import Response
++import treq
++from treq.client import HTTPClient
++from twisted.internet import reactor
++from twisted.internet.defer import Deferred
++from twisted.internet.threads import blockingCallFromThread
++from twisted.web.client import Agent
+ 
+ AUTHOMIZE_API_URL = 'https://api.authomize.com'
++
++_reactor_lock = Lock()
++_reactor_started = Event()
++_reactor_thread = None
++
++
++def _ensure_reactor_running():
++    global _reactor_thread
++    if reactor.running:
++        return
++    with _reactor_lock:
++        if reactor.running:
++            return
++        if _reactor_thread is None:
++            reactor.callWhenRunning(_reactor_started.set)
++            _reactor_thread = Thread(
++                target=reactor.run,
++                kwargs={'installSignalHandlers': False},
++                daemon=True,
++            )
++            _reactor_thread.start()
++    _reactor_started.wait()
+ 
+ 
+ class ClientError(Exception):
+@@ -15,67 +42,98 @@
+     def __init__(self, auth_token: str, base_url: str = AUTHOMIZE_API_URL):
+         self.auth_token = auth_token
+         self.base_url = base_url
+-        self.session = requests.Session()
+-        self.session.headers.update({'Authorization': self.authorization_header})
++        _ensure_reactor_running()
++        self.session = HTTPClient(Agent(reactor))
++        self.headers = {'Authorization': self.authorization_header}
+ 
+     @property
+     def authorization_header(self) -> str:
+         raise NotImplementedError()
+ 
+     @staticmethod
+-    def _handle_response(response: Response):
+-        if response.ok:
++    def _handle_response(response):
++        if response.code < 400:
+             return BaseClient._handle_ok_response(response)
+-        try:
+-            response_json = response.json()
++
++        deferred = treq.json_content(response)
++
++        def handle_error(response_json):
+             detail = response_json.get('detail')
+-            if 400 <= response.status_code < 500:
+-                response.reason = response.text
+-        except Exception:
+-            detail = None
+-        if detail:
+-            raise ClientError(str(detail))
+-        response.raise_for_status()
++            if detail:
++                raise ClientError(str(detail))
++            raise ClientError(f'HTTP {response.code}')
++
++        def handle_invalid_json(_failure):
++            raise ClientError(f'HTTP {response.code}')
++
++        return deferred.addCallbacks(handle_error, handle_invalid_json)
+ 
+     @staticmethod
+-    def _handle_ok_response(response: Response) -> dict:
+-        if content_type := response.headers.get('content-type'):
+-            if content_type.startswith('application/json'):
+-                return response.json()
++    def _handle_ok_response(response) -> Deferred:
++        content_types = response.headers.getRawHeaders('content-type') or []
++        if content_types and content_types[0].startswith('application/json'):
++            return treq.json_content(response)
+ 
+-        raise ClientError(
+-            message={
+-                'status_code': response.status_code,
+-                'url': response.url,
+-                'message': 'Unexpected response from API',
+-                'raw': response.content,
+-            },
++        deferred = treq.content(response)
++
++        def raise_unexpected(raw):
++            raise ClientError(
++                message={
++                    'status_code': response.code,
++                    'url': response.request.absoluteURI,
++                    'message': 'Unexpected response from API',
++                    'raw': raw,
++                },
++            )
++
++        return deferred.addCallback(raise_unexpected)
++
++    def _request(self, method, url, params=None, body=None, headers=None):
++        request_headers = dict(self.headers)
++        if headers:
++            request_headers.update(headers)
++        deferred = self.session.request(
++            method,
++            url,
++            headers=request_headers,
++            params=params,
++            data=body.encode('utf-8') if isinstance(body, str) else body,
++        )
++        return deferred.addCallback(self._handle_response)
++
++    def _sync_request(self, method, url, params=None, body=None, headers=None):
++        return blockingCallFromThread(
++            reactor,
++            self._request,
++            method,
++            url,
++            params,
++            body,
++            headers,
+         )
+ 
+     def http_get(self, url, params=None):
+         url = self.base_url + url
+-        response = self.session.get(url, params=params)
+-        return self._handle_response(response)
++        return self._sync_request('GET', url, params=params)
+ 
+     def http_post(self, url: str, body: Optional[str] = None):
+         url = self.base_url + url
+-        response = self.session.post(
++        return self._sync_request(
++            'POST',
+             url,
+             headers={'Content-Type': 'application/json'},
+-            data=body,
++            body=body,
+         )
+-        return self._handle_response(response)
+ 
+     def http_patch(self, url: str, body: Optional[str] = None):
+         url = self.base_url + url
+-        response = self.session.patch(
++        return self._sync_request(
++            'PATCH',
+             url,
+             headers={'Content-Type': 'application/json'},
+-            data=body,
++            body=body,
+         )
+-        return self._handle_response(response)
+ 
+     def http_delete(self, url: str, params=None):
+         url = self.base_url + url
+-        response = self.session.delete(url, params=params)
+-        return self._handle_response(response)
++        return self._sync_request('DELETE', url, params=params)

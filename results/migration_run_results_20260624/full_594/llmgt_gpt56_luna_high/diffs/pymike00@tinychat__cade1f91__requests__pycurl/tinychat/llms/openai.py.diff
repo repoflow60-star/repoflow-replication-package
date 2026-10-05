@@ -1,0 +1,180 @@
+--- a/tinychat/llms/openai.py
++++ b/tinychat/llms/openai.py
+@@ -1,11 +1,121 @@
+ import json
++import threading
+ from typing import Generator
+ 
+-import requests
++import pycurl
+ from sseclient import SSEClient
+ 
+ from tinychat.llms.base import BaseLLMClient
+ from tinychat.settings import OPENAI_API_KEY_NAME
++
++
++class _PycurlEventSource:
++    def __init__(self) -> None:
++        self._condition = threading.Condition()
++        self._data = bytearray()
++        self._closed = False
++        self._error = None
++        self._status_code = None
++
++    def write(self, data: bytes) -> int:
++        with self._condition:
++            self._data.extend(data)
++            self._condition.notify_all()
++        return len(data)
++
++    def header(self, data: bytes) -> int:
++        status_line = data.decode("iso-8859-1").strip()
++        if status_line.startswith("HTTP/"):
++            try:
++                status_code = int(status_line.split()[1])
++                if status_code < 300 or status_code >= 400:
++                    self.set_status(status_code)
++            except (IndexError, ValueError):
++                pass
++        return len(data)
++
++    def set_status(self, status_code: int) -> None:
++        with self._condition:
++            self._status_code = status_code
++            self._condition.notify_all()
++
++    def wait_for_status(self) -> int:
++        with self._condition:
++            while self._status_code is None and self._error is None:
++                self._condition.wait()
++            if self._error is not None:
++                raise self._error
++            return self._status_code
++
++    def set_error(self, error: Exception) -> None:
++        with self._condition:
++            self._error = error
++            self._closed = True
++            self._condition.notify_all()
++
++    def close(self) -> None:
++        with self._condition:
++            self._closed = True
++            self._condition.notify_all()
++
++    def readline(self) -> bytes:
++        with self._condition:
++            while True:
++                newline_index = self._data.find(b"\n")
++                if newline_index != -1:
++                    line = bytes(self._data[: newline_index + 1])
++                    del self._data[: newline_index + 1]
++                    return line
++
++                if self._closed:
++                    if self._data:
++                        line = bytes(self._data)
++                        self._data.clear()
++                        return line
++                    if self._error is not None:
++                        raise self._error
++                    return b""
++
++                self._condition.wait()
++
++    def read(self, size: int = -1) -> bytes:
++        with self._condition:
++            if size < 0:
++                while not self._closed:
++                    self._condition.wait()
++                data = bytes(self._data)
++                self._data.clear()
++                if not data and self._error is not None:
++                    raise self._error
++                return data
++
++            while not self._data and not self._closed:
++                self._condition.wait()
++
++            if self._data:
++                data = bytes(self._data[:size])
++                del self._data[:size]
++                return data
++
++            if self._error is not None:
++                raise self._error
++            return b""
++
++    def iter_lines(self):
++        while True:
++            line = self.readline()
++            if not line:
++                return
++            yield line
++
++    def __iter__(self):
++        return self
++
++    def __next__(self):
++        line = self.readline()
++        if not line:
++            raise StopIteration
++        return line
+ 
+ 
+ class OpenAIClient(BaseLLMClient):
+@@ -31,17 +141,39 @@
+             "temperature": self.temperature,
+             "stream": True,
+         }
+-        response = requests.post(
+-            self.OPENAI_COMPLETION_API_URL,
+-            headers=self.default_headers(),  # type: ignore
+-            json=data,
+-            stream=True,
+-        )
+-        if response.status_code != 200:
++        event_source = _PycurlEventSource()
++        headers = [
++            f"{key}: {value}" for key, value in self.default_headers().items()
++        ]
++        body = json.dumps(data).encode("utf-8")
++
++        def perform() -> None:
++            curl = pycurl.Curl()
++            try:
++                curl.setopt(pycurl.URL, self.OPENAI_COMPLETION_API_URL)
++                curl.setopt(pycurl.HTTPHEADER, headers)
++                curl.setopt(pycurl.POST, 1)
++                curl.setopt(pycurl.POSTFIELDS, body)
++                curl.setopt(pycurl.FOLLOWLOCATION, 1)
++                curl.setopt(pycurl.WRITEFUNCTION, event_source.write)
++                curl.setopt(pycurl.HEADERFUNCTION, event_source.header)
++                curl.perform()
++                event_source.set_status(curl.getinfo(pycurl.RESPONSE_CODE))
++            except Exception as error:
++                event_source.set_error(error)
++            finally:
++                curl.close()
++                event_source.close()
++
++        thread = threading.Thread(target=perform)
++        thread.start()
++
++        status_code = event_source.wait_for_status()
++        if status_code != 200:
+             raise ValueError(
+-                f"Server responded with an error. Status Code: {response.status_code}"
++                f"Server responded with an error. Status Code: {status_code}"
+             )
+-        return SSEClient(event_source=response)  # type: ignore
++        return SSEClient(event_source=event_source)  # type: ignore
+ 
+ 
+ class OpenAIHandler:
+@@ -88,4 +220,4 @@
+                     response_piece = json_load["content"]
+                     lm_response += response_piece
+                     yield response_piece
+-        self._messages.append({"role": "assistant", "content": lm_response})
++        self._messages.append({"role": "assistant", "content": lm_response})

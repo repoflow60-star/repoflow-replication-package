@@ -1,0 +1,220 @@
+--- a/sectxt/__init__.py
++++ b/sectxt/__init__.py
+@@ -22,11 +22,15 @@
+     from typing import TypedDict
+ 
+ import dateutil.parser
+-import requests
++import treq
++from twisted.internet.error import SSLError
++from twisted.internet.ssl import ClientContextFactory
++from twisted.internet.task import react
++from twisted.internet.defer import inlineCallbacks
++from twisted.web._newclient import ResponseNeverReceived
++from twisted.web.client import Agent, BrowserLikeRedirectAgent
+ 
+ __version__ = "0.9.6"
+-
+-s = requests.Session()
+ 
+ 
+ class ErrorDict(TypedDict):
+@@ -281,8 +285,8 @@
+                     "according to ISO 8601.",
+                 )
+                 # Stop to prevent errors when comparing the current datetime,
+-                # which is set with a timezone, and the parsed date, that
+-                # could potentially not have a timezone.
++                # which is set with a timezone, and the parsed date,
++                # that could potentially not have a timezone.
+                 return
+ 
+             now = datetime.now(timezone.utc)
+@@ -552,88 +556,115 @@
+             security_txt_file.close()
+             super()._process()
+         else:
+-            security_txt_found = False
+-            for scheme in ["https", "http"]:
+-                for path in [".well-known/security.txt", "security.txt"]:
+-                    url = urlunsplit((scheme, self._loc, path, None, None))
++            react(self._process_remote)
++
++    @inlineCallbacks
++    def _process_remote(self, reactor):
++        security_txt_found = False
++        for scheme in ["https", "http"]:
++            for path in [".well-known/security.txt", "security.txt"]:
++                url = urlunsplit((scheme, self._loc, path, None, None))
++                try:
++                    resp = yield treq.get(
++                        url,
++                        headers={
++                            'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
++                                          'Gecko/20100101 Firefox/12.0'},
++                        timeout=5,
++                        reactor=reactor
++                    )
++                    resp_content = yield treq.content(resp)
++                except (SSLError, ResponseNeverReceived):
++                    if not any(d["code"] == "invalid_cert" for d in self._errors):
++                        self._add_error(
++                            "invalid_cert",
++                            "security.txt must be served with a valid TLS certificate.",
++                        )
+                     try:
+-                        resp = requests.get(
++                        agent = BrowserLikeRedirectAgent(
++                            Agent(reactor, contextFactory=ClientContextFactory())
++                        )
++                        resp = yield treq.get(
+                             url,
+                             headers={
+                                 'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+                                               'Gecko/20100101 Firefox/12.0'},
+-                            timeout=5
++                            timeout=5,
++                            agent=agent
+                         )
+-                    except requests.exceptions.SSLError:
+-                        if not any(d["code"] == "invalid_cert" for d in self._errors):
+-                            self._add_error(
+-                                "invalid_cert",
+-                                "security.txt must be served with a valid TLS certificate.",
+-                            )
+-                        try:
+-                            resp = requests.get(
+-                                url,
+-                                headers={
+-                                    'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                                  'Gecko/20100101 Firefox/12.0'},
+-                                timeout=5,
+-                                verify=False
+-                            )
+-                        except:
+-                            continue
++                        resp_content = yield treq.content(resp)
+                     except:
+                         continue
+-                    if resp.status_code == 200:
+-                        if resp.history:
+-                            if not resp.url.endswith(path):
+-                                continue
+-                        self._path = path
+-                        self._url = url
+-                        if scheme != "https":
++                except:
++                    continue
++
++                response_url = resp.request.absoluteURI
++                if isinstance(response_url, bytes):
++                    response_url = response_url.decode("ascii")
++
++                response_history = []
++                previous_response = getattr(resp, "previousResponse", None)
++                while previous_response is not None:
++                    previous_url = previous_response.request.absoluteURI
++                    if isinstance(previous_url, bytes):
++                        previous_url = previous_url.decode("ascii")
++                    response_history.insert(0, previous_url)
++                    previous_response = getattr(previous_response, "previousResponse", None)
++
++                if resp.code == 200:
++                    if response_history:
++                        if not response_url.endswith(path):
++                            continue
++                    self._path = path
++                    self._url = url
++                    if scheme != "https":
++                        self._add_error(
++                            "invalid_uri_scheme",
++                            "Insecure URI scheme HTTP is not allowed. "
++                            "The security.txt file access MUST use "
++                            'the "https" scheme',
++                        )
++                    if path != CORRECT_PATH:
++                        self._add_error(
++                            "location",
++                            "security.txt was located on the top-level path "
++                            "(legacy place), but must be placed under "
++                            "the '/.well-known/' path.",
++                        )
++                    if not resp.headers.hasHeader("content-type"):
++                        self._add_error(
++                            "no_content_type", "HTTP Content-Type header must be sent."
++                        )
++                    else:
++                        m = Message()
++                        content_type = resp.headers.getRawHeaders("content-type")[0]
++                        if isinstance(content_type, bytes):
++                            content_type = content_type.decode("latin1")
++                        m['content-type'] = content_type
++                        params = dict(m.get_params())
++                        if "text/plain" not in params:
+                             self._add_error(
+-                                "invalid_uri_scheme",
+-                                "Insecure URI scheme HTTP is not allowed. "
+-                                "The security.txt file access MUST use "
+-                                'the "https" scheme',
++                                "invalid_media",
++                                "Media type in Content-Type header must be "
++                                "'text/plain'.",
+                             )
+-                        if path != CORRECT_PATH:
++                        charset = params.get("charset", "utf-8").lower()
++                        if charset != "utf-8" and charset != "csutf8":
++                            # According to RFC9116, charset default is utf-8
+                             self._add_error(
+-                                "location",
+-                                "security.txt was located on the top-level path "
+-                                "(legacy place), but must be placed under "
+-                                "the '/.well-known/' path.",
++                                "invalid_charset",
++                                "Charset parameter in Content-Type header must be "
++                                "'utf-8' if present.",
+                             )
+-                        if "content-type" not in resp.headers:
+-                            self._add_error(
+-                                "no_content_type", "HTTP Content-Type header must be sent."
+-                            )
+-                        else:
+-                            m = Message()
+-                            m['content-type'] = resp.headers["content-type"]
+-                            params = dict(m.get_params())
+-                            if "text/plain" not in params:
+-                                self._add_error(
+-                                    "invalid_media",
+-                                    "Media type in Content-Type header must be "
+-                                    "'text/plain'.",
+-                                )
+-                            charset = params.get("charset", "utf-8").lower()
+-                            if charset != "utf-8" and charset != "csutf8":
+-                                # According to RFC9116, charset default is utf-8
+-                                self._add_error(
+-                                    "invalid_charset",
+-                                    "Charset parameter in Content-Type header must be "
+-                                    "'utf-8' if present.",
+-                                )
+-                        self._content = resp.content
+-                        if resp.history:
+-                            self._urls = [resp.history[0].url, resp.url]
+-                        else:
+-                            self._urls = [url]
+-                        super()._process()
+-                        security_txt_found = True
+-                        break
+-                if security_txt_found:
++                    self._content = resp_content
++                    if response_history:
++                        self._urls = [response_history[0], response_url]
++                    else:
++                        self._urls = [url]
++                    super()._process()
++                    security_txt_found = True
+                     break
+-            if not security_txt_found:
+-                self._add_error("no_security_txt", "security.txt could not be located.")
++            if security_txt_found:
++                break
++        if not security_txt_found:
++            self._add_error("no_security_txt", "security.txt could not be located.")

@@ -1,0 +1,106 @@
+--- a/filestack/uploads/multipart.py
++++ b/filestack/uploads/multipart.py
+@@ -2,12 +2,12 @@
+ import hashlib
+ import mimetypes
+ import multiprocessing
++import asyncio
+ from base64 import b64encode
+ from functools import partial
+-from concurrent.futures import ThreadPoolExecutor
+ 
+ from filestack import config
+-from filestack.utils import requests
++import aiohttp
+ 
+ 
+ class Chunk:
+@@ -32,7 +32,7 @@
+         return data
+ 
+ 
+-def multipart_request(url, payload, params=None, security=None):
++async def multipart_request(url, payload, params=None, security=None, session=None):
+     for key in ('path', 'location', 'region', 'container', 'access'):
+         if key in params:
+             payload['store'][key] = params[key]
+@@ -43,7 +43,8 @@
+             'signature': security.signature
+         })
+ 
+-    return requests.post(url, json=payload).json()
++    async with session.post(url, json=payload) as response:
++        return await response.json()
+ 
+ 
+ def make_chunks(filepath=None, file_obj=None, filesize=None):
+@@ -61,7 +62,7 @@
+     return chunks
+ 
+ 
+-def upload_chunk(apikey, filename, storage, start_response, chunk):
++async def upload_chunk(apikey, filename, storage, start_response, chunk, session):
+     payload = {
+         'apikey': apikey,
+         'part': chunk.num,
+@@ -75,17 +76,17 @@
+         }
+     }
+ 
+-    fs_resp = requests.post(
++    async with session.post(
+         'https://{}/multipart/upload'.format(start_response['location_url']),
+         json=payload
+-    ).json()
++    ) as response:
++        fs_resp = await response.json()
+ 
+-    resp = requests.put(fs_resp['url'], headers=fs_resp['headers'], data=chunk.bytes)
+-
+-    return {'part_number': chunk.num, 'etag': resp.headers['ETag']}
++    async with session.put(fs_resp['url'], headers=fs_resp['headers'], data=chunk.bytes) as response:
++        return {'part_number': chunk.num, 'etag': response.headers['ETag']}
+ 
+ 
+-def multipart_upload(apikey, filepath, file_obj, storage, params=None, security=None):
++async def multipart_upload(apikey, filepath, file_obj, storage, params=None, security=None):
+     params = params or {}
+ 
+     upload_processes = multiprocessing.cpu_count()
+@@ -111,22 +112,22 @@
+     }
+ 
+     chunks = make_chunks(filepath, file_obj, filesize)
+-    start_response = multipart_request(config.MULTIPART_START_URL, payload, params, security)
+-    upload_func = partial(upload_chunk, apikey, filename, storage, start_response)
++    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=upload_processes)) as session:
++        start_response = await multipart_request(config.MULTIPART_START_URL, payload, params, security, session)
++        upload_func = partial(upload_chunk, apikey, filename, storage, start_response)
+ 
+-    with ThreadPoolExecutor(max_workers=upload_processes) as executor:
+-        uploaded_parts = list(executor.map(upload_func, chunks))
++        uploaded_parts = await asyncio.gather(*(upload_func(chunk, session) for chunk in chunks))
+ 
+-    location_url = start_response.pop('location_url')
+-    payload.update(start_response)
+-    payload['parts'] = uploaded_parts
++        location_url = start_response.pop('location_url')
++        payload.update(start_response)
++        payload['parts'] = uploaded_parts
+ 
+-    if 'workflows' in params:
+-        payload['store']['workflows'] = params.pop('workflows')
++        if 'workflows' in params:
++            payload['store']['workflows'] = params.pop('workflows')
+ 
+-    if 'upload_tags' in params:
+-        payload['upload_tags'] = params.pop('upload_tags')
++        if 'upload_tags' in params:
++            payload['upload_tags'] = params.pop('upload_tags')
+ 
+-    complete_url = 'https://{}/multipart/complete'.format(location_url)
+-    complete_response = multipart_request(complete_url, payload, params, security)
+-    return complete_response
++        complete_url = 'https://{}/multipart/complete'.format(location_url)
++        complete_response = await multipart_request(complete_url, payload, params, security, session)
++    return complete_response

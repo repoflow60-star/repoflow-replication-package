@@ -1,0 +1,152 @@
+--- a/tinychat/llms/anthropic.py
++++ b/tinychat/llms/anthropic.py
+@@ -1,11 +1,115 @@
+ import json
++import queue
++import threading
+ from typing import Generator
+ 
+-import requests
++import pycurl
+ from sseclient import SSEClient
+ 
+ from tinychat.llms.base import BaseLLMClient
+ from tinychat.settings import ANTHROPIC_API_KEY_NAME
++
++
++class _PycurlStream:
++    def __init__(self, url: str, headers: dict, data: dict) -> None:
++        self._queue = queue.Queue()
++        self._buffer = b""
++        self.status_code = None
++        self.error = None
++        self._status_ready = threading.Event()
++        self._curl = pycurl.Curl()
++
++        self._curl.setopt(pycurl.URL, url)
++        self._curl.setopt(
++            pycurl.HTTPHEADER,
++            [f"{key}: {value}" for key, value in headers.items()],
++        )
++        self._curl.setopt(pycurl.POST, 1)
++        self._curl.setopt(
++            pycurl.POSTFIELDS,
++            json.dumps(data).encode("utf-8"),
++        )
++        self._curl.setopt(pycurl.HEADERFUNCTION, self._header)
++        self._curl.setopt(pycurl.WRITEFUNCTION, self._write)
++
++        self._thread = threading.Thread(target=self._perform)
++        self._thread.daemon = True
++        self._thread.start()
++        self._status_ready.wait()
++
++    def _header(self, header):
++        if isinstance(header, bytes) and header.startswith(b"HTTP/"):
++            parts = header.split()
++            if len(parts) > 1:
++                try:
++                    status_code = int(parts[1])
++                except ValueError:
++                    status_code = None
++
++                if status_code is not None:
++                    if status_code != 100:
++                        self.status_code = status_code
++                        self._status_ready.set()
++                        if status_code != 200:
++                            return 0
++
++        return len(header)
++
++    def _write(self, chunk):
++        self._queue.put(chunk)
++        return len(chunk)
++
++    def _perform(self):
++        try:
++            self._curl.perform()
++        except pycurl.error as error:
++            self.error = error
++            self._queue.put(error)
++        finally:
++            if self.status_code is None:
++                self.status_code = self._curl.getinfo(pycurl.RESPONSE_CODE)
++            self._status_ready.set()
++            self._queue.put(None)
++            self._curl.close()
++
++    def wait(self):
++        self._thread.join()
++
++    def read(self, size: int = -1):
++        if size == 0:
++            return b""
++
++        if size < 0:
++            chunks = [self._buffer]
++            self._buffer = b""
++            while True:
++                chunk = self.read(1024)
++                if not chunk:
++                    break
++                chunks.append(chunk)
++            return b"".join(chunks)
++
++        while not self._buffer:
++            chunk = self._queue.get()
++            if chunk is None:
++                return b""
++            if isinstance(chunk, BaseException):
++                raise chunk
++            self._buffer = chunk
++
++        chunk = self._buffer[:size]
++        self._buffer = self._buffer[size:]
++        return chunk
++
++    def iter_content(self, chunk_size: int = 1024, decode_unicode: bool = False):
++        while True:
++            chunk = self.read(chunk_size)
++            if not chunk:
++                break
++            yield chunk
++
++    def __iter__(self):
++        return self.iter_content()
+ 
+ 
+ class AnthropicAIClient(BaseLLMClient):
+@@ -41,13 +145,15 @@
+             "stream": True,
+             "max_tokens": 2048,
+         }
+-        response = requests.post(
++        response = _PycurlStream(
+             self.ANTHROPIC_MESSAGES_API_URL,
+-            headers=self.anthropic_headers(),  # type: ignore
+-            json=data,
+-            stream=True,
++            self.anthropic_headers(),  # type: ignore
++            data,
+         )
+         if response.status_code != 200:
++            response.wait()
++            if response.error is not None and response.status_code == 0:
++                raise response.error
+             raise ValueError(
+                 f"Server responded with an error. Status Code: {response.status_code}"
+             )
+@@ -81,9 +187,9 @@
+         Yield stream responses from the client as they are received.
+ 
+         This method sends the user input to the client and then yields each piece
+-        of the language model's response as it is received in real-time. After the
+-        streaming is complete, it updates the message list with the user input and
+-        the full language model response.
++        of the language model's response as it is received in real-time. After
++        the streaming is complete, it updates the message list with the user
++        input and the full language model response.
+ 
+         :param user_input: The input string from the user to be sent to the model.
+         :return: A generator yielding the model's response in streamed parts.

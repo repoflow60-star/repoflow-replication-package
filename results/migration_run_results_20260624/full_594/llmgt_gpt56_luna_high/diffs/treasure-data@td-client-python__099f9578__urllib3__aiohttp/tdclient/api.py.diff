@@ -1,0 +1,368 @@
+--- a/tdclient/api.py
++++ b/tdclient/api.py
+@@ -1,5 +1,6 @@
+ #!/usr/bin/env python
+ 
++import asyncio
+ import contextlib
+ import csv
+ import email.utils
+@@ -17,9 +18,8 @@
+ import urllib.parse as urlparse
+ from array import array
+ 
++import aiohttp
+ import msgpack
+-import urllib3
+-import urllib3.util
+ 
+ from tdclient import errors, version
+ from tdclient.bulk_import_api import BulkImportAPI
+@@ -128,7 +128,8 @@
+         if "timeout" not in pool_options:
+             pool_options["timeout"] = 60
+ 
+-        self.http = self._init_http(
++        self.http = None
++        self._http_options = self._init_http(
+             http_proxy if http_proxy else os.getenv("HTTP_PROXY"), **pool_options
+         )
+         self._retry_post_requests = retry_post_requests
+@@ -144,13 +145,36 @@
+         return self._endpoint
+ 
+     def _init_http(self, http_proxy=None, **kwargs):
++        pool_options = dict(kwargs)
++        ca_certs = pool_options.pop("ca_certs", None)
++        cert_reqs = pool_options.pop("cert_reqs", None)
++        timeout = pool_options.pop("timeout", 60)
++
++        if ca_certs is not None:
++            ssl_context = ssl.create_default_context(cafile=ca_certs)
++        elif cert_reqs == ssl.CERT_NONE:
++            ssl_context = False
++        else:
++            ssl_context = None
++
++        if not isinstance(timeout, aiohttp.ClientTimeout):
++            timeout = aiohttp.ClientTimeout(total=timeout)
++
++        options = {
++            "timeout": timeout,
++            "ssl": ssl_context,
++        }
++
++        if "maxsize" in pool_options:
++            options["limit"] = pool_options["maxsize"]
++
+         if http_proxy is None:
+-            return urllib3.PoolManager(**kwargs)
++            return options
+         else:
+             if http_proxy.startswith("http://"):
+-                return self._init_http_proxy(http_proxy, **kwargs)
++                return self._init_http_proxy(http_proxy, **options)
+             else:
+-                return self._init_http_proxy("http://%s" % (http_proxy,), **kwargs)
++                return self._init_http_proxy("http://%s" % (http_proxy,), **options)
+ 
+     def _init_http_proxy(self, http_proxy, **kwargs):
+         pool_options = dict(kwargs)
+@@ -159,10 +183,24 @@
+         netloc = p.netloc
+         if "@" in netloc:
+             auth, netloc = netloc.split("@", 2)
+-            pool_options["proxy_headers"] = urllib3.make_headers(proxy_basic_auth=auth)
+-        return urllib3.ProxyManager("%s://%s" % (scheme, netloc), **pool_options)
+-
+-    def get(self, path, params=None, headers=None, **kwargs):
++            pool_options["proxy_auth"] = aiohttp.BasicAuth(*auth.split(":", 1))
++        pool_options["proxy"] = "%s://%s" % (scheme, netloc)
++        return pool_options
++
++    async def _get_http(self):
++        if self.http is None:
++            pool_options = dict(self._http_options)
++            ssl_context = pool_options.pop("ssl", None)
++            limit = pool_options.pop("limit", 0)
++            pool_options.pop("proxy", None)
++            pool_options.pop("proxy_auth", None)
++            connector = aiohttp.TCPConnector(ssl=ssl_context, limit=limit)
++            self.http = aiohttp.ClientSession(
++                connector=connector, **pool_options
++            )
++        return self.http
++
++    async def get(self, path, params=None, headers=None, **kwargs):
+         headers = {} if headers is None else dict(headers)
+         headers["accept-encoding"] = "deflate, gzip"
+         url, headers = self.build_request(path=path, headers=headers, **kwargs)
+@@ -183,7 +221,7 @@
+         response = None
+         while True:
+             try:
+-                response = self.send_request(
++                response = await self.send_request(
+                     "GET",
+                     url,
+                     fields=params,
+@@ -198,15 +236,14 @@
+                     log.warning(
+                         "Error %d: %s. Retrying after %d seconds... (cumulative: %d/%d)",
+                         response.status,
+-                        response.data,
++                        await response.read(),
+                         retry_delay,
+                         cumul_retry_delay,
+                         self._max_cumul_retry_delay,
+                     )
+             except (
+-                urllib3.exceptions.TimeoutStateError,
+-                urllib3.exceptions.TimeoutError,
+-                urllib3.exceptions.PoolError,
++                aiohttp.ClientError,
++                asyncio.TimeoutError,
+                 http.client.IncompleteRead,
+                 TimeoutError,
+                 socket.error,
+@@ -220,7 +257,7 @@
+                     cumul_retry_delay,
+                     self._max_cumul_retry_delay,
+                 )
+-                time.sleep(retry_delay)
++                await asyncio.sleep(retry_delay)
+                 cumul_retry_delay += retry_delay
+                 retry_delay *= 2
+             else:
+@@ -235,13 +272,13 @@
+ 
+         log.debug(
+             "REST GET response:\n  headers: %s\n  status: %d\n  body: <omitted>",
+-            repr(dict(response.getheaders())),
++            repr(dict(response.headers)),
+             response.status,
+         )
+ 
+         return contextlib.closing(response)
+ 
+-    def post(self, path, params=None, headers=None, **kwargs):
++    async def post(self, path, params=None, headers=None, **kwargs):
+         headers = {} if headers is None else dict(headers)
+         url, headers = self.build_request(path=path, headers=headers, **kwargs)
+ 
+@@ -271,7 +308,7 @@
+         response = None
+         while True:
+             try:
+-                response = self.send_request(
++                response = await self.send_request(
+                     "POST",
+                     url,
+                     fields=fields,
+@@ -292,15 +329,14 @@
+                     log.warning(
+                         "Error %d: %s. Retrying after %d seconds... (cumulative: %d/%d)",
+                         response.status,
+-                        response.data,
++                        await response.read(),
+                         retry_delay,
+                         cumul_retry_delay,
+                         self._max_cumul_retry_delay,
+                     )
+             except (
+-                urllib3.exceptions.TimeoutStateError,
+-                urllib3.exceptions.TimeoutError,
+-                urllib3.exceptions.PoolError,
++                aiohttp.ClientError,
++                asyncio.TimeoutError,
+                 socket.error,
+             ):
+                 if not self._retry_post_requests:
+@@ -313,7 +349,7 @@
+                     cumul_retry_delay,
+                     self._max_cumul_retry_delay,
+                 )
+-                time.sleep(retry_delay)
++                await asyncio.sleep(retry_delay)
+                 cumul_retry_delay += retry_delay
+                 retry_delay *= 2
+             else:
+@@ -328,13 +364,13 @@
+ 
+         log.debug(
+             "REST POST response:\n  headers: %s\n  status: %d\n  body: <omitted>",
+-            repr(dict(response.getheaders())),
++            repr(dict(response.headers)),
+             response.status,
+         )
+ 
+         return contextlib.closing(response)
+ 
+-    def put(self, path, bytes_or_stream, size, headers=None, **kwargs):
++    async def put(self, path, bytes_or_stream, size, headers=None, **kwargs):
+         headers = {} if headers is None else dict(headers)
+         headers["content-length"] = str(size)
+         if "content-type" not in headers:
+@@ -348,7 +384,7 @@
+         )
+ 
+         if hasattr(bytes_or_stream, "read"):
+-            # file-like must support `read` and `fileno` to work with `httplib`
++            # file-like must support `read` and `fileno` to work with aiohttp
+             fileno_supported = hasattr(bytes_or_stream, "fileno")
+             if fileno_supported:
+                 try:
+@@ -362,12 +398,12 @@
+                 stream = array("b", bytes_or_stream.read())
+ 
+         else:
+-            # send request body as an `array.array` since `httplib` requires the request body to be a unicode string
++            # send request body as an `array.array`
+             stream = array("b", bytes_or_stream)
+ 
+         response = None
+         try:
+-            response = self.send_request(
++            response = await self.send_request(
+                 "PUT",
+                 url,
+                 body=stream,
+@@ -378,24 +414,23 @@
+             if response.status < 500:
+                 pass
+             else:
+-                raise APIError("Error %d: %s", response.status, response.data)
++                raise APIError("Error %d: %s", response.status, await response.read())
+         except (
+-            urllib3.exceptions.TimeoutStateError,
+-            urllib3.exceptions.TimeoutError,
+-            urllib3.exceptions.PoolError,
++            aiohttp.ClientError,
++            asyncio.TimeoutError,
+             socket.error,
+         ):
+             raise APIError("Error: %s" % (repr(response)))
+ 
+         log.debug(
+             "REST PUT response:\n  headers: %s\n  status: %d\n  body: <omitted>",
+-            repr(dict(response.getheaders())),
++            repr(dict(response.headers)),
+             response.status,
+         )
+ 
+         return contextlib.closing(response)
+ 
+-    def delete(self, path, params=None, headers=None, **kwargs):
++    async def delete(self, path, params=None, headers=None, **kwargs):
+         headers = {} if headers is None else dict(headers)
+         url, headers = self.build_request(path=path, headers=headers, **kwargs)
+ 
+@@ -415,7 +450,7 @@
+         response = None
+         while True:
+             try:
+-                response = self.send_request(
++                response = await self.send_request(
+                     "DELETE",
+                     url,
+                     fields=params,
+@@ -430,15 +465,14 @@
+                     log.warning(
+                         "Error %d: %s. Retrying after %d seconds... (cumulative: %d/%d)",
+                         response.status,
+-                        response.data,
++                        await response.read(),
+                         retry_delay,
+                         cumul_retry_delay,
+                         self._max_cumul_retry_delay,
+                     )
+             except (
+-                urllib3.exceptions.TimeoutStateError,
+-                urllib3.exceptions.TimeoutError,
+-                urllib3.exceptions.PoolError,
++                aiohttp.ClientError,
++                asyncio.TimeoutError,
+                 socket.error,
+             ):
+                 pass
+@@ -450,7 +484,7 @@
+                     cumul_retry_delay,
+                     self._max_cumul_retry_delay,
+                 )
+-                time.sleep(retry_delay)
++                await asyncio.sleep(retry_delay)
+                 cumul_retry_delay += retry_delay
+                 retry_delay *= 2
+             else:
+@@ -465,7 +499,7 @@
+ 
+         log.debug(
+             "REST DELETE response:\n  headers: %s\n  status: %d\n  body: <omitted>",
+-            repr(dict(response.getheaders())),
++            repr(dict(response.headers)),
+             response.status,
+         )
+ 
+@@ -496,19 +530,30 @@
+         _headers.update({key.lower(): value for (key, value) in headers.items()})
+         return (url, _headers)
+ 
+-    def send_request(self, method, url, fields=None, body=None, headers=None, **kwargs):
++    async def send_request(self, method, url, fields=None, body=None, headers=None, **kwargs):
++        session = await self._get_http()
++        request_options = dict(kwargs)
++        request_options.pop("decode_content", None)
++        request_options.pop("preload_content", None)
++
++        if fields is not None:
++            request_options["params"] = fields
++        if headers is not None:
++            request_options["headers"] = headers
++
++        if "proxy" in self._http_options:
++            request_options["proxy"] = self._http_options["proxy"]
++        if "proxy_auth" in self._http_options:
++            request_options["proxy_auth"] = self._http_options["proxy_auth"]
++
+         if body is None:
+-            return self.http.request(
+-                method, url, fields=fields, headers=headers, **kwargs
+-            )
+-
+-        if urllib3.util.IS_PYOPENSSL and isinstance(body, bytearray):
+-            # workaround for https://github.com/pyca/pyopenssl/issues/621
+-            body = memoryview(body)
+-        if urllib3.util.IS_PYOPENSSL and isinstance(body, array):
+-            # workaround for https://github.com/pyca/pyopenssl/issues/621
++            return await session.request(method, url, **request_options)
++
++        if isinstance(body, array):
+             body = body.tobytes()
+-        return self.http.urlopen(method, url, body=body, headers=headers, **kwargs)
++
++        request_options["data"] = body
++        return await session.request(method, url, **request_options)
+ 
+     def raise_error(self, msg, res, body):
+         status_code = res.status
+@@ -538,10 +583,10 @@
+             )
+         return js
+ 
+-    def close(self):
+-        # urllib3 doesn't allow to close all connections immediately.
+-        # all connections in pool will be closed eventually during gc.
+-        self.http.clear()
++    async def close(self):
++        if self.http is not None:
++            await self.http.close()
++            self.http = None
+ 
+     def _prepare_file(self, file_like, fmt, **kwargs):
+         fp = tempfile.TemporaryFile()
+@@ -610,4 +655,4 @@
+         return read_csv_records(reader, dtypes, converters, **kwargs)
+ 
+     def _read_tsv_file(self, file_like, **kwargs):
+-        return self._read_csv_file(file_like, dialect=csv.excel_tab, **kwargs)
++        return self._read_csv_file(file_like, dialect=csv.excel_tab, **kwargs)

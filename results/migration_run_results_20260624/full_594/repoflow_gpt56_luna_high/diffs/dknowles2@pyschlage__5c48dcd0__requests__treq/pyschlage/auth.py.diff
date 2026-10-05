@@ -1,0 +1,220 @@
+--- a/pyschlage/auth.py
++++ b/pyschlage/auth.py
+@@ -2,13 +2,19 @@
+ 
+ from __future__ import annotations
+ 
++from dataclasses import dataclass, field
+ from functools import wraps
+-from typing import Callable
++import json
++import threading
++from typing import Any, Callable
+ 
+ from botocore.exceptions import ClientError
+ import pycognito
+ from pycognito import utils
+-import requests
++import treq
++from twisted.internet import reactor
++from twisted.internet.defer import Deferred
++from twisted.web.http_headers import Headers
+ 
+ from .exceptions import NotAuthorizedError, UnknownError
+ 
+@@ -28,13 +34,101 @@
+ USER_POOL_ID = USER_POOL_REGION + "_2zhrVs9d4"
+ 
+ 
++class _HTTPError(Exception):
++    """Raised when the remote service returns an unsuccessful status."""
++
++
++@dataclass
++class _AuthRequest:
++    """Request shape consumed by pycognito's requests auth handler."""
++
++    method: str | None = None
++    url: str | None = None
++    headers: dict[str, str] = field(default_factory=dict)
++    body: bytes | None = None
++
++
++class _SynchronousResponse:
++    """Synchronous response facade retained for the package's public API."""
++
++    def __init__(self, response: Any, body: bytes) -> None:
++        self.status_code = response.code
++        phrase = response.phrase
++        self.reason = phrase.decode("utf-8", errors="replace") if isinstance(
++            phrase, bytes
++        ) else str(phrase)
++        self._body = body
++
++    def raise_for_status(self) -> None:
++        if self.status_code >= 400:
++            raise _HTTPError(f"{self.status_code} {self.reason}".strip())
++
++    def json(self) -> Any:
++        return json.loads(self._body.decode("utf-8"))
++
++
++_reactor_started = threading.Event()
++_reactor_thread: threading.Thread | None = None
++_reactor_lock = threading.Lock()
++
++
++def _start_reactor() -> None:
++    global _reactor_thread
++    if reactor.running:
++        return
++    with _reactor_lock:
++        if reactor.running or _reactor_thread is not None:
++            return
++
++        def run_reactor() -> None:
++            reactor.callWhenRunning(_reactor_started.set)
++            reactor.run(installSignalHandlers=False)
++
++        _reactor_thread = threading.Thread(
++            target=run_reactor,
++            name="pyschlage-treq-reactor",
++            daemon=True,
++        )
++        _reactor_thread.start()
++    _reactor_started.wait()
++
++
++def _wait_for_deferred(value: Any) -> Any:
++    """Resolve a treq Deferred without changing the package's sync API."""
++    if not isinstance(value, Deferred):
++        return value
++    if reactor.running and threading.current_thread() is _reactor_thread:
++        raise RuntimeError("Cannot synchronously wait from the Twisted reactor")
++
++    _start_reactor()
++    completed = threading.Event()
++    result: list[Any] = []
++    failure: list[Any] = []
++
++    def callback(response: Any) -> Any:
++        result.append(response)
++        completed.set()
++        return response
++
++    def errback(error: Any) -> Any:
++        failure.append(error)
++        completed.set()
++        return error
++
++    reactor.callFromThread(value.addCallbacks, callback, errback)
++    completed.wait()
++    if failure:
++        failure[0].raiseException()
++    return result[0]
++
++
+ def _translate_auth_errors(
+     # pylint: disable=invalid-name
+-    fn: Callable[..., requests.Response],
++    fn: Callable[..., _SynchronousResponse],
+     # pylint: enable=invalid-name
+-) -> Callable[..., requests.Response]:
++) -> Callable[..., _SynchronousResponse]:
+     @wraps(fn)
+-    def wrapper(*args, **kwargs) -> requests.Response:
++    def wrapper(*args, **kwargs) -> _SynchronousResponse:
+         try:
+             return fn(*args, **kwargs)
+         except ClientError as ex:
+@@ -50,19 +144,19 @@
+ 
+ def _translate_http_errors(
+     # pylint: disable=invalid-name
+-    fn: Callable[..., requests.Response],
++    fn: Callable[..., _SynchronousResponse],
+     # pylint: enable=invalid-name
+-) -> Callable[..., requests.Response]:
++) -> Callable[..., _SynchronousResponse]:
+     @wraps(fn)
+-    def wrapper(*args, **kwargs) -> requests.Response:
++    def wrapper(*args, **kwargs) -> _SynchronousResponse:
+         resp = fn(*args, **kwargs)
+         try:
+             resp.raise_for_status()
+             return resp
+-        except requests.HTTPError as ex:
++        except _HTTPError as ex:
+             try:
+                 message = resp.json().get("message", resp.reason)
+-            except requests.JSONDecodeError:
++            except json.JSONDecodeError:
+                 message = resp.reason
+             raise UnknownError(message) from ex
+ 
+@@ -100,7 +194,7 @@
+         :raise pyschlage.exceptions.NotAuthorizedError: When authentication fails.
+         :raise pyschlage.exceptions.UnknownError: On other errors.
+         """
+-        self.auth(requests.Request())
++        self.auth(_AuthRequest())
+ 
+     @property
+     def user_id(self) -> str:
+@@ -117,15 +211,48 @@
+     @_translate_auth_errors
+     def request(
+         self, method: str, path: str, base_url: str = BASE_URL, **kwargs
+-    ) -> requests.Response:
++    ) -> _SynchronousResponse:
+         """Performs a request against the Schlage WiFi cloud service.
+ 
+         :meta private:
+         """
+-        kwargs["auth"] = self.auth
+-        if "headers" not in kwargs:
+-            kwargs["headers"] = {}
+-        kwargs["headers"]["X-Api-Key"] = API_KEY
+-        kwargs.setdefault("timeout", _DEFAULT_TIMEOUT)
+-        # pylint: disable=missing-timeout
+-        return requests.request(method, f"{base_url}/{path.lstrip('/')}", **kwargs)
++        url = f"{base_url}/{path.lstrip('/')}"
++        headers = dict(kwargs.pop("headers", {}))
++        headers["X-Api-Key"] = API_KEY
++        timeout = kwargs.pop("timeout", _DEFAULT_TIMEOUT)
++        params = kwargs.pop("params", None)
++
++        body = None
++        if "json" in kwargs:
++            body = json.dumps(kwargs.pop("json")).encode("utf-8")
++            headers.setdefault("Content-Type", "application/json")
++        elif "data" in kwargs:
++            body = kwargs.pop("data")
++
++        auth_request = _AuthRequest(
++            method=method.upper(), url=url, headers=headers, body=body
++        )
++        authenticated_request = self.auth(auth_request)
++        if authenticated_request is not None:
++            auth_request = authenticated_request
++
++        request_method = auth_request.method or method
++        request_url = auth_request.url or url
++        request_body = auth_request.body
++        treq_headers = Headers(
++            {
++                key.encode("utf-8"): [str(value).encode("utf-8")]
++                for key, value in (auth_request.headers or {}).items()
++            }
++        )
++        request_kwargs = {"headers": treq_headers, "timeout": timeout}
++        if params is not None:
++            request_kwargs["params"] = params
++        if request_body is not None:
++            request_kwargs["data"] = request_body
++
++        response = _wait_for_deferred(
++            treq.request(request_method, request_url, **request_kwargs)
++        )
++        response_body = _wait_for_deferred(treq.content(response))
++        return _SynchronousResponse(response, response_body)

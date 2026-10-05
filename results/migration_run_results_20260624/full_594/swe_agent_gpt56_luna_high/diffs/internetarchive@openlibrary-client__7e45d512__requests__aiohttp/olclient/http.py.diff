@@ -1,0 +1,177 @@
+--- a/olclient/http.py
++++ b/olclient/http.py
+@@ -0,0 +1,174 @@
++"""Synchronous compatibility helpers built on top of :mod:`aiohttp`.
++
++The public Open Library client is intentionally synchronous.  aiohttp is an
++asyncio HTTP client, so this module keeps the public API synchronous while
++making all network I/O go through aiohttp.  Responses are fully read before
++being returned; this is necessary because the short-lived aiohttp session can
++then be safely closed and the response remains usable by the rest of the
++client.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import threading
++from typing import Any, Mapping, Optional
++
++import aiohttp
++
++
++class Response:
++    """A small, synchronous response object used by the client.
++
++    Only the response operations used by openlibrary-client are exposed.  In
++    particular, ``json`` is deliberately synchronous to preserve the existing
++    OpenLibrary API.
++    """
++
++    def __init__(self, response: aiohttp.ClientResponse, body: bytes):
++        self.status = response.status
++        # ``status_code`` is useful to callers familiar with the former HTTP
++        # implementation, while aiohttp's native spelling is ``status``.
++        self.status_code = response.status
++        self.url = str(response.url)
++        self.headers = response.headers
++        self._body = body
++        self._request_info = response.request_info
++        self._history = response.history
++        self._reason = response.reason
++
++    @property
++    def ok(self) -> bool:
++        return self.status < 400
++
++    def json(self) -> Any:
++        """Decode the response body as JSON synchronously."""
++        encoding = self._encoding()
++        return json.loads(self._body.decode(encoding))
++
++    def text(self, encoding: Optional[str] = None) -> str:
++        return self._body.decode(encoding or self._encoding())
++
++    def _encoding(self) -> str:
++        content_type = self.headers.get('Content-Type', '')
++        if 'charset=' in content_type:
++            return content_type.split('charset=', 1)[1].split(';', 1)[0].strip()
++        return 'utf-8'
++
++    def raise_for_status(self) -> None:
++        if self.status >= 400:
++            raise aiohttp.ClientResponseError(
++                self._request_info,
++                self._history,
++                status=self.status,
++                message=self._reason or '',
++                headers=self.headers,
++            )
++
++
++class Session:
++    """A synchronous facade over :class:`aiohttp.ClientSession`.
++
++    A new aiohttp session is used for each request, but the cookie jar is
++    retained.  This avoids binding a ClientSession to an event loop while
++    retaining the cookie-based login behavior of the original client.
++    """
++
++    def __init__(self) -> None:
++        # aiohttp 3.14 creates CookieJar instances inside an event loop.  The
++        # loop is created lazily because OpenLibrary itself is synchronous.
++        self._cookies: Optional[aiohttp.CookieJar] = None
++
++    @property
++    def cookies(self) -> Optional[aiohttp.CookieJar]:
++        return self._cookies
++
++    @staticmethod
++    def _run(coro):
++        """Run an aiohttp coroutine from both synchronous and async callers."""
++        try:
++            asyncio.get_running_loop()
++        except RuntimeError:
++            return asyncio.run(coro)
++
++        # asyncio.run cannot be called while the caller's loop is running.
++        # Running this one blocking operation in a worker keeps the existing
++        # synchronous API usable from applications that otherwise use asyncio.
++        result = []
++        error = []
++
++        def run_in_thread() -> None:
++            try:
++                result.append(asyncio.run(coro))
++            except BaseException as exc:  # re-raise in the calling thread
++                error.append(exc)
++
++        thread = threading.Thread(target=run_in_thread)
++        thread.start()
++        thread.join()
++        if error:
++            raise error[0]
++        return result[0]
++
++    @staticmethod
++    def _form_data(files: Mapping[str, Any]) -> aiohttp.FormData:
++        form = aiohttp.FormData()
++        for name, value in files.items():
++            if isinstance(value, tuple):
++                if len(value) == 3:
++                    filename, content, content_type = value
++                elif len(value) == 2:
++                    filename, content = value
++                    content_type = None
++                else:
++                    raise ValueError('file values must contain two or three items')
++                form.add_field(
++                    name,
++                    content,
++                    filename=filename,
++                    content_type=content_type,
++                )
++            else:
++                form.add_field(name, value)
++        return form
++
++    async def _request(self, method: str, url: str, **kwargs: Any) -> Response:
++        if self._cookies is None:
++            self._cookies = aiohttp.CookieJar(unsafe=True)
++
++        files = kwargs.pop('files', None)
++        if files is not None:
++            kwargs['data'] = self._form_data(files)
++
++        async with aiohttp.ClientSession(cookie_jar=self._cookies) as client:
++            async with client.request(method, url, **kwargs) as response:
++                body = await response.read()
++                # ClientSession normally updates the jar when a response is
++                # released.  Do it explicitly because the response is read
++                # and the session is closed before the facade returns.
++                self._cookies.update_cookies(response.cookies, response.url)
++                return Response(response, body)
++
++    def request(self, method: str, url: str, **kwargs: Any) -> Response:
++        return self._run(self._request(method, url, **kwargs))
++
++    def get(self, url: str, **kwargs: Any) -> Response:
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url: str, **kwargs: Any) -> Response:
++        return self.request('POST', url, **kwargs)
++
++    def put(self, url: str, **kwargs: Any) -> Response:
++        return self.request('PUT', url, **kwargs)
++
++    def delete(self, url: str, **kwargs: Any) -> Response:
++        return self.request('DELETE', url, **kwargs)
++
++    def close(self) -> None:
++        """Provided for callers that previously owned a session object."""
++        if self._cookies is not None:
++            self._cookies.clear()
++
++
++__all__ = ['Response', 'Session']

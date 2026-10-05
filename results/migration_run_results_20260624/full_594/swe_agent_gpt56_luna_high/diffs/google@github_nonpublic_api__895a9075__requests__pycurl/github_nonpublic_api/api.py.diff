@@ -1,0 +1,256 @@
+--- a/github_nonpublic_api/api.py
++++ b/github_nonpublic_api/api.py
+@@ -14,18 +14,153 @@
+ 
+ """An API to do things that aren't in the official public GitHub REST API."""
+ 
++import functools
++import io
+ import os.path
+-import functools
++import re
+ from enum import Enum
+-import re
+-from urllib.parse import urljoin
++from typing import Optional
++from urllib.parse import urlencode, urljoin
+ 
+ import html5lib
++import pycurl
+ import pyotp
+-import requests
+ from absl import logging
+ from configobj import ConfigObj
+-from typing import Optional
++
++
++class PycurlHTTPError(Exception):
++    """Raised when a PycURL response has an HTTP error status."""
++
++    def __init__(self, response):
++        self.response = response
++        super().__init__(
++            "%s Server Error: %s for url: %s"
++            % (response.status_code, response.status_code, response.url)
++        )
++
++
++class PycurlResponse:
++    """The small response interface used by this module.
++
++    PycURL exposes libcurl's transfer API rather than a high-level response
++    object.  Keeping this adapter here gives the rest of the API response text,
++    response content, and status checking without another HTTP dependency.
++    """
++
++    def __init__(self, content, url, status_code, headers=None, history=None):
++        self.content = content
++        self.url = url
++        self.status_code = status_code
++        self.headers = headers or {}
++        self.history = history or []
++
++    @property
++    def encoding(self):
++        content_type = self.headers.get("content-type", "")
++        match = re.search(r"charset\s*=\s*[\"']?([^;\"'\s]+)", content_type, re.I)
++        return match.group(1) if match else None
++
++    @property
++    def text(self):
++        encoding = self.encoding or "utf-8"
++        try:
++            return self.content.decode(encoding)
++        except (LookupError, UnicodeDecodeError):
++            return self.content.decode(encoding, errors="replace")
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise PycurlHTTPError(self)
++
++
++class _PycurlCookies:
++    """Cookie-jar compatibility used by ``create_login_session``."""
++
++    def __init__(self, curl):
++        self._curl = curl
++
++    def clear(self):
++        # COOKIELIST=ALL removes every cookie in libcurl's in-memory jar.
++        self._curl.setopt(pycurl.COOKIELIST, "ALL")
++
++
++class PycurlSession:
++    """A session-like wrapper around one reusable PycURL handle."""
++
++    def __init__(self):
++        self._curl = pycurl.Curl()
++        # An empty cookie file enables libcurl's in-memory cookie engine.  The
++        # same handle is reused for every request, so login cookies persist.
++        self._curl.setopt(pycurl.COOKIEFILE, "")
++        self.cookies = _PycurlCookies(self._curl)
++
++    @staticmethod
++    def _encode_form(data):
++        if data is None:
++            return b""
++        if isinstance(data, bytes):
++            return data
++        if isinstance(data, str):
++            return data.encode("utf-8")
++        return urlencode(data, doseq=True).encode("utf-8")
++
++    @staticmethod
++    def _headers_from_bytes(header_lines):
++        # A redirect produces several header blocks.  The last block belongs
++        # to the response represented by the body, so discard earlier blocks.
++        current = {}
++        for raw_header in header_lines:
++            line = raw_header.decode("iso-8859-1").strip()
++            if line.startswith("HTTP/"):
++                current = {}
++            elif ":" in line:
++                name, value = line.split(":", 1)
++                current[name.lower()] = value.strip()
++        return current
++
++    def _request(self, url, data=None):
++        body = io.BytesIO()
++        header_lines = []
++
++        def receive_header(header):
++            header_lines.append(header)
++            return len(header)
++
++        self._curl.setopt(pycurl.URL, url)
++        self._curl.setopt(pycurl.WRITEDATA, body)
++        self._curl.setopt(pycurl.HEADERFUNCTION, receive_header)
++        self._curl.setopt(pycurl.FOLLOWLOCATION, True)
++        self._curl.setopt(pycurl.ACCEPT_ENCODING, "")
++
++        if data is None:
++            # HTTPGET also clears the POST mode left by a preceding login
++            # submission.  POSTFIELDS must be reset on a reused Curl handle.
++            self._curl.setopt(pycurl.POSTFIELDS, b"")
++            self._curl.setopt(pycurl.HTTPGET, True)
++        else:
++            self._curl.setopt(pycurl.HTTPGET, False)
++            self._curl.setopt(pycurl.POST, True)
++            self._curl.setopt(pycurl.POSTFIELDS, self._encode_form(data))
++
++        self._curl.perform()
++        status_code = self._curl.getinfo(pycurl.RESPONSE_CODE)
++        effective_url = self._curl.getinfo(pycurl.EFFECTIVE_URL) or url
++        return PycurlResponse(
++            content=body.getvalue(),
++            url=effective_url,
++            status_code=status_code,
++            headers=self._headers_from_bytes(header_lines),
++        )
++
++    def get(self, url):
++        return self._request(url)
++
++    def post(self, url, data=None):
++        return self._request(url, data=data)
++
++    def close(self):
++        self._curl.close()
+ 
+ 
+ def _get_and_submit_form(
+@@ -85,10 +220,10 @@
+     username: str,
+     password: str,
+     tfa_callback,
+-    session: Optional[requests.Session] = None,
+-) -> requests.Session:
+-    """Create a requests.Session object with logged in GitHub cookies for the user."""
+-    session = session or requests.Session()
++    session: Optional[PycurlSession] = None,
++) -> PycurlSession:
++    """Create a PycurlSession with logged in GitHub cookies for the user."""
++    session = session or PycurlSession()
+ 
+     # Clear cookies before re-authentication
+     session.cookies.clear()
+@@ -150,7 +285,7 @@
+         username: str,
+         password: str,
+         tfa_callback=None,
+-        session: Optional[requests.Session] = None,
++        session: Optional[PycurlSession] = None,
+     ):
+         self._session = session or create_login_session(
+             username=username,
+@@ -159,7 +294,7 @@
+             session=session,
+         )
+ 
+-    def request_usage(self, enterprise_name: str, days: int = 30) -> requests.Response:
++    def request_usage(self, enterprise_name: str, days: int = 30) -> PycurlResponse:
+         """Requests a GitHub usage report.
+ 
+         Github will send an email link when the report is available.
+@@ -183,7 +318,7 @@
+         contact_email: str,
+         org_usage: OrganizationUsage,
+         business_name: Optional[str] = None,
+-    ) -> requests.Response:
++    ) -> PycurlResponse:
+         """Create the specified GitHub organization.
+ 
+         Right now, only creates free tier organizations.
+@@ -207,7 +342,7 @@
+ 
+     def install_application_in_organization(
+         self, app_name: str, org_id: int
+-    ) -> requests.Response:
++    ) -> PycurlResponse:
+         """Installs the specified app on the given organization."""
+         url = _INSTALL_APP_URL.format(app_name=app_name, org_id=org_id)
+ 
+@@ -223,7 +358,7 @@
+ 
+     def toggle_app_suspended(
+         self, org_name: str, app_install_id: int
+-    ) -> requests.Response:
++    ) -> PycurlResponse:
+         """Set this applicaiton install to be suspended or not."""
+         url = _APP_SUSPEND_URL.format(org_name=org_name, app_install_id=app_install_id)
+ 
+@@ -235,14 +370,14 @@
+ 
+     def download_usage_report(
+         self, enterprise_name: str, report_id: int
+-    ) -> requests.Response:
++    ) -> PycurlResponse:
+         """Download a usage report based on an id recieved in an email"""
+         url = _USAGE_REPORT_URL.format(
+             enterprise_name=enterprise_name, report_id=report_id
+         )
+         return _get_url_with_session(session=self._session, url=url)
+ 
+-    def request_dormant_users_report(self, enterprise_name: str) -> requests.Response:
++    def request_dormant_users_report(self, enterprise_name: str) -> PycurlResponse:
+         """Requests a GitHub dormant users report.
+ 
+         Github will send an email link when the report is available.
+@@ -256,7 +391,7 @@
+             form_matcher=lambda form: form.attrib.get("action") == action,
+         )
+ 
+-    def download_dormant_users_report(self, enterprise_name: str) -> requests.Response:
++    def download_dormant_users_report(self, enterprise_name: str) -> PycurlResponse:
+         """Download a usage report based on an id received in an email"""
+         url = _REQUEST_DORMANTUSERS_URL.format(enterprise_name=enterprise_name)
+         page = _get_url_with_session(session=self._session, url=url)
+@@ -272,7 +407,7 @@
+         self,
+         org_name: str,
+         app_install_id: str,
+-    ) -> requests.Response:
++    ) -> PycurlResponse:
+         """Approve a request for updated permissions for a GitHub app installation in an org"""
+ 
+         return _get_and_submit_form(

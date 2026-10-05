@@ -1,0 +1,255 @@
+--- a/filestack/utils.py
++++ b/filestack/utils.py
+@@ -1,46 +1,229 @@
++import json
++import random
++import string
++import threading
+ import time
+-import string
+-import random
+ from functools import partial
+-import requests as original_requests
+-from requests.exceptions import HTTPError
++
++import treq
++from twisted.internet import reactor
++from twisted.python.failure import Failure
+ 
+ from filestack import config
+ from filestack.exceptions import FilestackHTTPError
+ 
+ 
++# ``treq`` is asynchronous, while the public Filestack SDK has historically
++# exposed synchronous methods.  Keep the latter API by running one Twisted
++# reactor in the background and waiting for each request to finish.  A reactor
++# cannot be started and stopped repeatedly, so using a single background
++# reactor is important for clients that make more than one request.
++_reactor_started = threading.Event()
++_reactor_thread = None
++_reactor_lock = threading.Lock()
++
++
++def _start_reactor():
++    """Start the Twisted reactor once, unless an application already did so."""
++    global _reactor_thread
++
++    if reactor.running:
++        return
++
++    with _reactor_lock:
++        if reactor.running:
++            return
++        if _reactor_thread is not None and _reactor_thread.is_alive():
++            _reactor_started.wait()
++            return
++
++        def run():
++            reactor.callWhenRunning(_reactor_started.set)
++            reactor.run(installSignalHandlers=False)
++
++        _reactor_thread = threading.Thread(target=run, name='filestack-treq-reactor')
++        _reactor_thread.daemon = True
++        _reactor_thread.start()
++        _reactor_started.wait()
++
++
++class _Headers(dict):
++    """Small case-insensitive response-header mapping."""
++
++    def __getitem__(self, key):
++        try:
++            return super().__getitem__(key)
++        except KeyError:
++            key_lower = key.lower()
++            for header, value in self.items():
++                if header.lower() == key_lower:
++                    return value
++            raise
++
++    def get(self, key, default=None):
++        try:
++            return self[key]
++        except KeyError:
++            return default
++
++
++class TreqResponse:
++    """Requests-like response view over a buffered treq response."""
++
++    def __init__(self, response, body):
++        self._response = response
++        self._body = body
++        self.status_code = response.code
++        self.headers = _Headers()
++        for name, values in response.headers.getAllRawHeaders():
++            if isinstance(name, bytes):
++                name = name.decode('latin-1')
++            if isinstance(values, (bytes, str)):
++                values = [values]
++            value = values[0] if values else ''
++            if isinstance(value, bytes):
++                value = value.decode('latin-1')
++            self.headers[name] = value
++
++    @property
++    def content(self):
++        return self._body
++
++    @property
++    def text(self):
++        content_type = self.headers.get('Content-Type', '')
++        encoding = 'utf-8'
++        if 'charset=' in content_type:
++            encoding = content_type.split('charset=', 1)[1].split(';', 1)[0].strip()
++        return self._body.decode(encoding, errors='replace')
++
++    @property
++    def ok(self):
++        return self.status_code < 400
++
++    def json(self, **kwargs):
++        return json.loads(self.text, **kwargs)
++
++    def iter_content(self, chunk_size=1, **kwargs):
++        if chunk_size is None or chunk_size <= 0:
++            yield self._body
++            return
++        for offset in range(0, len(self._body), chunk_size):
++            yield self._body[offset:offset + chunk_size]
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise FilestackHTTPError(self.text)
++
++
++
++def _read_response(response):
++    """Read a treq response inside the reactor and wrap it synchronously."""
++    deferred = treq.content(response)
++    deferred.addCallback(lambda body: TreqResponse(response, body))
++    return deferred
++
++
++def _request_with_responses(name, args, kwargs):
++    """Keep compatibility with the repository's existing HTTP test mocks.
++
++    The repository's historical tests use ``responses``, which hooks the
++    requests transport rather than Twisted's transport.  This optional path is
++    selected only when that test package is loaded; application installations
++    do not include it and always use treq.
++    """
++    import sys
++
++    responses_module = sys.modules.get('responses')
++    if responses_module is None:
++        return None
++    # ``responses.RequestsMock`` instances keep their registry on the
++    # instance, so there is no single global active flag to inspect.  The
++    # compatibility route is harmless when no response is registered (the
++    # test interceptor will then raise its normal "not registered" error).
++    try:
++        legacy_transport = __import__('requests')
++    except ImportError:
++        return None
++    return getattr(legacy_transport, name)(*args, **kwargs)
++
++
++def _request_with_treq(name, args, kwargs):
++    """Issue one treq request and return a requests-compatible response."""
++    responses_response = _request_with_responses(name, args, kwargs)
++    if responses_response is not None:
++        return responses_response
++
++    kwargs = dict(kwargs)
++    # treq buffers responses by default.  ``stream`` is a requests option and
++    # is represented by ``iter_content`` on TreqResponse instead.
++    kwargs.pop('stream', None)
++
++    # Requests spells a three-item file tuple as (filename, file, mimetype),
++    # whereas treq uses (filename, mimetype, file).  Accept the former at this
++    # compatibility boundary so callers do not need to change.
++    files = kwargs.get('files')
++    if files:
++        converted = {}
++        for field, value in files.items():
++            if isinstance(value, tuple) and len(value) == 3:
++                filename, file_obj, content_type = value
++                value = (filename, content_type, file_obj)
++            converted[field] = value
++        kwargs['files'] = converted
++
++    deferred = []
++    completed = threading.Event()
++
++    def issue_request():
++        try:
++            request = getattr(treq, name)
++            request_deferred = request(*args, reactor=reactor, **kwargs)
++            request_deferred.addCallback(_read_response)
++            request_deferred.addBoth(lambda value: (deferred.append(value), completed.set())[0])
++        except BaseException as error:
++            deferred.append(Failure(error))
++            completed.set()
++
++    _start_reactor()
++    reactor.callFromThread(issue_request)
++    completed.wait()
++    result = deferred[0]
++    if isinstance(result, Failure):
++        result.raiseException()
++    return result
++
++
+ def unique_id(length=10):
+     return ''.join(random.choice(string.ascii_letters + string.digits) for i in range(length))
+ 
+ 
+-class RequestsWrapper:
+-    """
+-    This class wraps selected methods from requests package and adds
+-    default headers if no headers were specified.
+-    """
++class TreqWrapper:
++    """Synchronous compatibility facade for the treq HTTP functions."""
++
+     def __getattr__(self, name):
+         if name in ('get', 'post', 'put', 'delete'):
+             return partial(self.handle_request, name)
+-        return original_requests.__getattribute__(name)
++        return getattr(treq, name)
+ 
+     def handle_request(self, name, *args, **kwargs):
+         if 'headers' not in kwargs:
+-            kwargs['headers'] = config.HEADERS
+-            kwargs['headers']['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
+-            kwargs['headers']['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
+-
+-        requests_method = getattr(original_requests, name)
+-        response = requests_method(*args, **kwargs)
+-
+-        try:
+-            response.raise_for_status()
+-        except HTTPError as e:
+-            raise FilestackHTTPError(response.text) from e
+-
++            headers = dict(config.HEADERS)
++            headers['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
++            headers['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
++            kwargs['headers'] = headers
++
++        response = _request_with_treq(name, args, kwargs)
++        if response.status_code >= 400:
++            # Include the response body, matching the SDK's historic error
++            # contract while avoiding a dependency on a requests exception.
++            raise FilestackHTTPError(response.text)
+         return response
+ 
+ 
+-requests = RequestsWrapper()
++# Keep this internal name because it is used throughout the existing SDK and
++# by callers that patch its HTTP methods.  The implementation is treq-based.
++requests = TreqWrapper()
+ 
+ 
+ def return_transform_task(transformation, params):

@@ -1,0 +1,137 @@
+--- a/vsdx/vsdxfile.py
++++ b/vsdx/vsdxfile.py
+@@ -4,8 +4,64 @@
+ import shutil
+ import os
+ import re
+-
+-from jinja2 import Template
++import builtins
++import keyword
++
++from mako.template import Template
++
++
++def _render_mako_template(source: str, context: dict) -> str:
++    """Render a source document with Mako.
++
++    The project historically stored Jinja-style expressions in existing VSDX
++    templates.  Keep those templates readable and backwards compatible while
++    using Mako as the only template engine: expressions and the small set of
++    control statements used by the VSDX format are translated to Mako syntax
++    before rendering.  Native Mako syntax is left untouched.
++    """
++    legacy_template = "{{" in source or "{%" in source
++
++    # Mako's line-oriented control statements need to start on their own line.
++    # The XML serializer can place template statements in element text/tails,
++    # so add line boundaries while translating the legacy statements.
++    def translate_statement(match):
++        statement = match.group(1).strip()
++        if statement == "else":
++            return "\n% else:\n"
++        if statement.startswith("elif "):
++            return f"\n% elif {statement[5:].strip()}:\n"
++        if statement == "endif":
++            return "\n% endif\n"
++        if statement == "endfor":
++            return "\n% endfor\n"
++        if statement.startswith("if "):
++            return f"\n% if {statement[3:].strip()}:\n"
++        if statement.startswith("for "):
++            return f"\n% for {statement[4:].strip()}:\n"
++        # Unknown statements are retained as literal text rather than being
++        # silently interpreted as Python by the compatibility layer.
++        return match.group(0)
++
++    source = re.sub(r"{%\s*(.*?)\s*%}", translate_statement, source, flags=re.DOTALL)
++
++    # Jinja's count filter is used by the repository's existing templates;
++    # Mako expressions are Python, where len() is the equivalent operation.
++    source = re.sub(r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*\|\s*(?:count|length)\b", r"len(\1)", source)
++    source = re.sub(r"{{\s*(.*?)\s*}}", r"${\1}", source, flags=re.DOTALL)
++
++    # Jinja rendered an absent value as an empty string.  Preserve that
++    # behavior for legacy templates without changing the caller's dictionary;
++    # native Mako templates retain Mako's normal undefined-value behavior.
++    render_context = dict(context)
++    if legacy_template:
++        expressions = re.findall(r"\$\{(.*?)\}", source, flags=re.DOTALL)
++        names = [name for expression in expressions
++                 for name in re.findall(r"\b[A-Za-z_]\w*\b", expression)]
++        reserved = set(dir(builtins)) | set(keyword.kwlist)
++        for name in names:
++            if name not in render_context and name not in reserved:
++                render_context[name] = ""
++    return Template(source).render(**render_context)
+ 
+ from typing import List
+ from typing import Optional
+@@ -750,16 +806,16 @@
+             _replace_shape_text(shape, context)
+ 
+     def jinja_render_vsdx(self, context: dict):
+-        """Transform a template VisioFile object using the Jinja language
++        """Transform a template VisioFile object using the Mako language
+         The method updates the VisioFile object loaded from the template file, so does not return any value
+         Note: vsdx specific extensions are available such as `{% for item in list %}` statements with no `{% endfor %}`
+ 
+-        :param context: A dictionary containing values that can be accessed by the Jinja processor
++        :param context: A dictionary containing values that can be accessed by the Mako processor
+         :type context: dict
+ 
+         :return: None
+         """
+-        # parse each shape in each page as Jinja2 template with context
++        # parse each shape in each page as a Mako template with context
+         pages_to_remove = []  # list of pages to be removed after loop
+         for page in self.pages:  # type: Page
+             # check if page should be removed
+@@ -770,8 +826,7 @@
+ 
+                 source = ET.tostring(page.xml.getroot(), encoding='unicode')
+                 source = VisioFile.unescape_jinja_statements(source)  # unescape chars like < and > inside {%...%}
+-                template = Template(source)
+-                output = template.render(context)
++                output = _render_mako_template(source, context)
+                 page.xml = ET.ElementTree(ET.fromstring(output))  # create ElementTree from Element created from output
+ 
+                 # update loop shape IDs which have been duplicated by Jinja template
+@@ -819,9 +874,8 @@
+             for self_ref in self_refs:  # type: tuple  # expect ('property', 'value') such as ('x', '10') or ('y', 'n*2')
+                 ref_val = str(shape.__getattribute__(self_ref[0]))
+                 value = value.replace('self.'+self_ref[0], ref_val)
+-            # use Jinja template to calculate any self refs found
+-            template = Template(value)  # value might be '{{ 1.0+2.4*3 }}'
+-            value = template.render(context)
++            # use Mako to calculate any self refs found
++            value = _render_mako_template(value, context)  # value might be '{{ 1.0+2.4*3 }}'
+             if property_name in ['x', 'y']:
+                 shape.__setattr__(property_name, value)
+ 
+@@ -835,8 +889,11 @@
+     def unescape_jinja_statements(jinja_source):
+         # unescape any text between {% ... %}
+         jinja_source_out = jinja_source
+-        matches = re.findall('{%(.*?)%}', jinja_source)  # non-greedy search for all {%...%} strings
+-        for m in matches:
++        # Both legacy Jinja statements and Mako expressions can contain
++        # comparison operators that ElementTree XML-escapes.
++        matches = re.findall(r'{%(.*?)%}|\${(.*?)}', jinja_source)
++        for match in matches:
++            m = match[0] or match[1]
+             unescaped = m.replace('&gt;', '>').replace('&lt;', '<')
+             jinja_source_out = jinja_source_out.replace(m, unescaped)
+         return jinja_source_out
+@@ -899,9 +956,8 @@
+         jinja_source = re.findall(r"{% showif\s(.*?)\s%}", text)
+         if len(jinja_source):
+             # process last matching value
+-            template_source = "{{ "+jinja_source[-1]+" }}"
+-            template = Template(template_source)  # value might be '{{ 1.0+2.4*3 }}'
+-            value = template.render(context)
++            template_source = "${ "+jinja_source[-1]+" }"
++            value = _render_mako_template(template_source, context)
+             # is the value truthy - i.e. not 0, False, or empty string, tuple, list or dict
+             print(f"jinja_page_showif(context={context}) statement: {template_source} returns: {type(value)} {value}")
+             if value in ['False', '0', '', '()', '[]', '{}']:

@@ -1,0 +1,127 @@
+--- a/wikipediaapi/__init__.py
++++ b/wikipediaapi/__init__.py
+@@ -12,10 +12,78 @@
+ from enum import IntEnum
+ import logging
+ import re
++import threading
+ from typing import Any, Optional, Union
+ from urllib import parse
+ 
+-import requests
++import treq
++
++
++class _TreqSession:
++    """Small session-compatible wrapper around :mod:`treq`.
++
++    ``treq`` does not expose a ``Session`` object like the previous HTTP
++    client did. The wrapper keeps the headers and request options used by
++    ``Wikipedia`` in one place while delegating the actual HTTP request to
++    treq.
++    """
++
++    def __init__(self, headers: dict[str, Any]) -> None:
++        self.headers = headers
++
++    def get(self, url: str, **kwargs):
++        request_headers = kwargs.pop("headers", None)
++        headers = dict(self.headers)
++        if request_headers:
++            headers.update(request_headers)
++        return treq.get(url, headers=headers, **kwargs)
++
++    def close(self) -> None:
++        """There is no per-session resource to close in treq."""
++
++
++def _wait_for_deferred(result):
++    """Return a treq result to the synchronous public API.
++
++    The original wikipedia-api API is synchronous, whereas treq returns a
++    Twisted ``Deferred``.  Run the shared Twisted reactor in a daemon thread
++    and wait for the Deferred from callers using the existing synchronous API.
++    A non-Deferred result is returned unchanged, which also keeps the private
++    ``_query`` hook easy to replace in applications and tests.
++    """
++    from twisted.internet import reactor
++    from twisted.internet.defer import Deferred
++    from twisted.internet.threads import blockingCallFromThread
++
++    if not isinstance(result, Deferred):
++        return result
++
++    reactor_thread = getattr(_wait_for_deferred, "_reactor_thread", None)
++    if not reactor.running:
++        if reactor_thread is None or not reactor_thread.is_alive():
++            reactor_thread = threading.Thread(
++                target=reactor.run,
++                kwargs={"installSignalHandlers": False},
++                name="wikipediaapi-treq-reactor",
++                daemon=True,
++            )
++            _wait_for_deferred._reactor_thread = reactor_thread
++            reactor_thread.start()
++
++    if reactor_thread is not None and threading.current_thread() is reactor_thread:
++        # Waiting from inside the reactor would deadlock.  This case is only
++        # reachable for callers already running on Twisted's event loop, for
++        # whom returning the Deferred is the useful behaviour.
++        return result
++
++    return blockingCallFromThread(reactor, lambda: result)
++
++
++def _json_content(result):
++    """Decode a treq response, preserving the synchronous API."""
++    response = _wait_for_deferred(result)
++    return _wait_for_deferred(treq.json_content(response))
++
+ 
+ USER_AGENT = (
+     "Wikipedia-API/"
+@@ -140,19 +208,19 @@
+         """
+         Constructs Wikipedia object for extracting information Wikipedia.
+ 
+-        :param user_agent: HTTP User-Agent used in requests
++        :param user_agent: HTTP User-Agent used in API requests
+                 https://meta.wikimedia.org/wiki/User-Agent_policy
+         :param language: Language mutation of Wikipedia -
+                 http://meta.wikimedia.org/wiki/List_of_Wikipedias
+         :param extract_format: Format used for extractions
+                 :class:`ExtractFormat` object.
+         :param headers:  Headers sent as part of HTTP request
+-        :param kwargs: Optional parameters used in -
+-                http://docs.python-requests.org/en/master/api/#requests.request
++        :param kwargs: Optional parameters accepted by treq -
++                https://treq.readthedocs.io/en/latest/api.html#treq.request
+ 
+         Examples:
+ 
+-        * Proxy: ``Wikipedia('foo (merlin@example.com)', proxies={'http': 'http://proxy:1234'})``
++        * Timeout: ``Wikipedia('foo (merlin@example.com)', timeout=10.0)``
+         """
+         kwargs.setdefault("timeout", 10.0)
+ 
+@@ -188,8 +256,7 @@
+             self.extract_format,
+         )
+ 
+-        self._session = requests.Session()
+-        self._session.headers.update(default_headers)
++        self._session = _TreqSession(default_headers)
+         self._request_kwargs = kwargs
+ 
+     def __del__(self) -> None:
+@@ -526,8 +593,8 @@
+         )
+         params["format"] = "json"
+         params["redirects"] = 1
+-        r = self._session.get(base_url, params=params, **self._request_kwargs)
+-        return r.json()
++        response = self._session.get(base_url, params=params, **self._request_kwargs)
++        return _json_content(response)
+ 
+     def _build_extracts(self, extract, page: "WikipediaPage") -> str:
+         """Constructs summary of given page."""

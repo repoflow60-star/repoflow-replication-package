@@ -1,0 +1,134 @@
+--- a/ingen/utils/app_http/aiohttp_retry.py
++++ b/ingen/utils/app_http/aiohttp_retry.py
+@@ -2,10 +2,11 @@
+ #  All Rights Reserved.
+ 
+ import asyncio
++import inspect
+ import logging
+ from collections import namedtuple
+ 
+-from aiohttp import ClientSession
++from httpx import AsyncClient
+ 
+ from ingen.utils.app_http.success_criterias import status_criteria, DEFAULT_STATUS_CRITERIA_OPTIONS
+ 
+@@ -15,7 +16,7 @@
+ 
+ 
+ async def http_retry_request(
+-        session: ClientSession,
++        session: AsyncClient,
+         method,
+         url,
+         retries=2,
+@@ -27,7 +28,7 @@
+     """
+     Asynchronously retries the HTTP call until the given success_criteria (a callable) is succeeded or
+     number of retries reaches to zero
+-    :param session: aiohttp ClientSession
++    :param session: httpx.AsyncClient
+     :param method: HTTP Methods
+     :param url: Request URL
+     :param retries: How many times to retry
+@@ -48,7 +49,9 @@
+     if _method not in ["get", "post", "put", "patch", "delete"]:
+         raise ValueError("Unsupported HTTP method passed for retry")
+ 
+-    attempt = retries + 1
++    # There is always one request, with ``retries`` additional attempts.  A
++    # negative value is treated like zero rather than making the loop endless.
++    attempt = max(1, retries + 1)
+     should_retry = None
+ 
+     while attempt != 0:
+@@ -57,27 +60,72 @@
+         if should_retry:
+             wait_time = wait_time + interval_increment
+             await asyncio.sleep(wait_time)
+-        async with getattr(session, _method)(url, **kwargs) as response:
+-            logger.info(f"awaiting {_method.upper()} {url}")
+ 
+-            try:
+-                status = response.status
+-                headers = response.headers
++        request_kwargs = dict(kwargs)
++        # AsyncClient.get() and AsyncClient.delete() do not accept ``data``.
++        # Keep the existing request model for methods that support a body,
++        # while omitting its default None value for bodyless methods.
++        if _method in ("get", "delete"):
++            if request_kwargs.get('data') is None:
++                request_kwargs.pop('data', None)
++                request = getattr(session, _method)(url, **request_kwargs)
++            else:
++                # The convenience methods for GET and DELETE reject a body
++                # argument in httpx; request() supports the existing data
++                # field when a caller explicitly supplies one.
++                request = session.request(_method, url, **request_kwargs)
++        else:
++            request = getattr(session, _method)(url, **request_kwargs)
+ 
+-                if headers.get('Content-Type') and 'application/json' in headers.get('Content-Type', ''):
+-                    data = await response.json()
+-                else:
+-                    data = await response.text()
+-            except Exception as e:
+-                raise ConnectionError(f"Error occurred while getting response from url {url}: {e}")
++        # Some session adapters return an async context manager, while httpx
++        # returns an awaitable Response. Supporting both keeps this helper
++        # usable with simple test doubles without affecting the httpx path.
++        if hasattr(request, '__enter__'):
++            # A few older synchronous test doubles expose the context manager
++            # protocol in addition to their async methods.
++            with request as response:
++                return_response = await _make_http_response(response, url)
++        elif hasattr(request, '__aenter__'):
++            async with request as response:
++                return_response = await _make_http_response(response, url)
++        else:
++            response = await request
++            return_response = await _make_http_response(response, url)
+ 
+-            http_response = HTTPResponse(status, headers, data)
+-            logger.info(f"Response for {url}: {http_response}")
++        http_response = return_response
++        logger.info(f"Response for {url}: {http_response}")
+ 
+-            if success_criteria(http_response, criteria_options):
+-                return http_response
++        if success_criteria(http_response, criteria_options):
++            return http_response
+ 
+-            should_retry = True
+-            logger.info(f"Retrying in {wait_time} seconds")
++        should_retry = True
++        logger.info(f"Retrying in {wait_time} seconds")
+ 
+     logger.error(f"Could not get a successful response for url: {url} after {retries} retries.")
++
++
++async def _make_http_response(response, url):
++    """Convert an httpx response into the public ``HTTPResponse`` value."""
++    logger.info(f"awaiting response for {url}")
++
++    try:
++        status = getattr(response, 'status_code', None)
++        # ``status_code`` is the httpx attribute.  The fallback is useful for
++        # response adapters that expose the older ``status`` spelling.
++        if not isinstance(status, int):
++            status = response.status
++        headers = response.headers
++
++        if headers.get('Content-Type') and 'application/json' in headers.get('Content-Type', ''):
++            data = response.json()
++        else:
++            data = response.text
++
++        # httpx exposes json() and text as synchronous properties.  Awaiting
++        # an awaitable here also supports legacy async response adapters.
++        if inspect.isawaitable(data):
++            data = await data
++    except Exception as e:
++        raise ConnectionError(f"Error occurred while getting response from url {url}: {e}")
++
++    return HTTPResponse(status, headers, data)

@@ -1,0 +1,131 @@
+--- a/pynubank/utils/http.py
++++ b/pynubank/utils/http.py
+@@ -1,7 +1,116 @@
+-from requests import Response
+-from requests_pkcs12 import get, post
++"""Small HTTP client backed by libcurl through :mod:`pycurl`.
+ 
+-from pynubank import NuRequestException
++The project only needs a small subset of the response object provided by the
++old HTTP client. Keeping that subset here also gives callers of ``raw_get`` and
++``raw_post`` a stable response object without adding another HTTP dependency.
++"""
++
++from io import BytesIO
++import json as json_module
++from typing import Dict, Optional
++
++import pycurl
++
++from pynubank.exception import NuRequestException
++
++
++class Response:
++    """The response data exposed by :class:`HttpClient`."""
++
++    def __init__(self, content: bytes = b'', status_code: int = 0, url: str = '',
++                 headers: Optional[Dict[str, str]] = None):
++        self.content = content
++        self.status_code = status_code
++        self.url = url
++        self.headers = {} if headers is None else headers
++
++    def json(self):
++        return json_module.loads(self.content.decode('utf-8'))
++
++
++def _response_headers(raw_headers: bytes) -> Dict[str, str]:
++    """Return headers from curl's final response block."""
++    headers = {}
++    for raw_line in raw_headers.splitlines():
++        line = raw_line.decode('latin-1').strip()
++        if not line:
++            continue
++        # A redirect or an interim response starts another header block.
++        if line.startswith('HTTP/'):
++            headers = {}
++            continue
++        if ':' in line:
++            name, value = line.split(':', 1)
++            headers[name.strip()] = value.strip()
++    return headers
++
++
++def _request(method: str, url: str, body: Optional[dict] = None,
++             headers: Optional[Dict[str, str]] = None, cert_data: bytes = None,
++             cert_password: str = '') -> Response:
++    response_body = BytesIO()
++    response_headers = BytesIO()
++    curl = pycurl.Curl()
++    temporary_cert = None
++
++    try:
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.HTTPHEADER,
++                    [f'{name}: {value}' for name, value in (headers or {}).items()])
++        curl.setopt(pycurl.WRITEDATA, response_body)
++        curl.setopt(pycurl.HEADERFUNCTION, response_headers.write)
++        curl.setopt(pycurl.FOLLOWLOCATION, True)
++
++        if method == 'POST':
++            curl.setopt(pycurl.POST, True)
++            curl.setopt(pycurl.POSTFIELDS,
++                        json_module.dumps(body if body is not None else {}).encode('utf-8'))
++        else:
++            curl.setopt(pycurl.HTTPGET, True)
++
++        if cert_data:
++            # pycurl 7.46.0 exposes CURLOPT_SSLCERT_BLOB, allowing the
++            # existing API to continue accepting PKCS#12 bytes directly.
++            if hasattr(pycurl, 'SSLCERT_BLOB'):
++                curl.setopt(pycurl.SSLCERTTYPE, 'P12')
++                curl.setopt(pycurl.SSLCERT_BLOB, cert_data)
++                curl.setopt(pycurl.SSLCERTPASSWD, cert_password)
++            else:  # pragma: no cover - only for older pycurl builds
++                import os
++                import tempfile
++
++                temporary_cert = tempfile.NamedTemporaryFile(delete=False)
++                temporary_cert.write(cert_data)
++                temporary_cert.close()
++                curl.setopt(pycurl.SSLCERT, temporary_cert.name)
++                curl.setopt(pycurl.SSLCERTTYPE, 'P12')
++                curl.setopt(pycurl.SSLCERTPASSWD, cert_password)
++
++        curl.perform()
++        status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        effective_url = url
++        if hasattr(pycurl, 'EFFECTIVE_URL'):
++            effective_url = curl.getinfo(pycurl.EFFECTIVE_URL) or url
++
++        return Response(response_body.getvalue(), status_code, effective_url,
++                        _response_headers(response_headers.getvalue()))
++    finally:
++        curl.close()
++        if temporary_cert is not None:
++            import os
++            os.unlink(temporary_cert.name)
++
++
++def get(url: str, headers: Optional[Dict[str, str]] = None,
++        cert_data: bytes = None, pkcs12_password: str = '') -> Response:
++    return _request('GET', url, headers=headers, cert_data=cert_data,
++                    cert_password=pkcs12_password)
++
++
++def post(url: str, json: dict, headers: Optional[Dict[str, str]] = None,
++         cert_data: bytes = None, pkcs12_password: str = '') -> Response:
++    return _request('POST', url, body=json, headers=headers, cert_data=cert_data,
++                    cert_password=pkcs12_password)
+ 
+ 
+ class HttpClient:
+@@ -28,7 +137,7 @@
+ 
+     @property
+     def _cert_args(self):
+-        return {'pkcs12_data': self._cert, 'pkcs12_password': ''} if self._cert else {}
++        return {'cert_data': self._cert, 'pkcs12_password': ''} if self._cert else {}
+ 
+     def _handle_response(self, response: Response) -> dict:
+         if response.status_code != 200:

@@ -1,0 +1,170 @@
+--- a/olclient/openlibrary.py
++++ b/olclient/openlibrary.py
+@@ -2,6 +2,7 @@
+ 
+ 
+ import json
++from concurrent.futures import Future
+ from typing import List, Dict, Optional, Any
+ 
+ import jsonschema
+@@ -13,6 +14,7 @@
+ 
+ import backoff
+ import requests
++from requests_futures.sessions import FuturesSession
+ from requests import Response
+ 
+ from olclient import common
+@@ -21,6 +23,19 @@
+ from olclient.utils import merge_unique_lists
+ 
+ logger = logging.getLogger('openlibrary')
++
++
++class _FuturesSession(FuturesSession):
++    """A FuturesSession retaining requests' positional call behavior."""
++
++    # requests-futures passes ``json=None`` and makes ``data`` a keyword when
++    # delegating these methods.  Keep the requests call shape for compatibility
++    # with callers that patch requests.Session methods.
++    def post(self, url, *args, **kwargs):
++        return super(FuturesSession, self).post(url, *args, **kwargs)
++
++    def put(self, url, *args, **kwargs):
++        return super(FuturesSession, self).put(url, *args, **kwargs)
+ 
+ 
+ class OpenLibrary:
+@@ -62,11 +77,22 @@
+     WORKS_PAGINATION_OFFSET = 0
+ 
+     def __init__(self, credentials=None, base_url='https://openlibrary.org'):
+-        self.session = requests.Session()
++        self.session = _FuturesSession()
+         self.base_url = base_url
+         credentials = credentials or Config().get_config().get('s3', None)
+         if credentials:
+             self.login(credentials)
++
++    def _request(self, method, *args, **kwargs):
++        """Run a requests-futures call and return its completed response.
++
++        OpenLibrary's public methods have historically returned ``Response``
++        objects.  ``FuturesSession`` returns ``Future`` objects instead, so
++        wait here at the boundary to preserve that API (and allow errors to be
++        handled by the existing backoff decorators).
++        """
++        response = getattr(self.session, method)(*args, **kwargs)
++        return response.result() if isinstance(response, Future) else response
+ 
+     def login(self, credentials):
+         """Login to Open Library with given credentials, ensures the requests
+@@ -86,7 +112,7 @@
+         @backoff.on_exception(on_giveup=err, **self.BACKOFF_KWARGS)
+         def _login(url, headers, data):
+             """Makes best effort to perform request w/ exponential backoff"""
+-            return self.session.post(url, data=data, headers=headers)
++            return self._request('post', url, data=data, headers=headers)
+ 
+         _ = _login(url, headers, data)
+ 
+@@ -117,7 +143,7 @@
+         """
+         data = json.dumps({'type': {'key': '/type/delete'}, '_comment': comment})
+         url = self._generate_url_from_olid(olid)
+-        return self.session.put(url, data=data)
++        return self._request('put', url, data=data)
+ 
+     def save_many(self, docs, comment) -> Response:
+         """
+@@ -131,7 +157,7 @@
+             '42-comment': comment,
+         }
+         doc_json = [doc.json() for doc in docs]
+-        return self.session.post(
++        return self._request('post',
+             f'{self.base_url}/api/save_many', json.dumps(doc_json), headers=headers
+         )
+ 
+@@ -146,7 +172,7 @@
+     @backoff.on_exception(on_giveup=err, **BACKOFF_KWARGS)  # type: ignore
+     def get_ol_response(self, path):
+         """Makes best effort to perform request w/ exponential backoff"""
+-        response = self.session.get(self.base_url + path)
++        response = self._request('get', self.base_url + path)
+         response.raise_for_status()
+         return response
+ 
+@@ -258,7 +284,7 @@
+             def add_bookcover(self, cover_url):
+                 """Adds a cover image to this edition"""
+                 url = f'{self.OL.base_url}/books/{self.olid}/-/add-cover'
+-                r = self.OL.session.post(
++                r = self.OL._request('post',
+                     url, files={'file': '', 'url': cover_url, 'upload': 'submit'}
+                 )
+                 return r
+@@ -274,7 +300,7 @@
+                     "url": (None, "https://"),
+                     "upload": (None, "Submit")
+                 }
+-                return self.OL.session.post(
++                return self.OL._request('post',
+                     f'{self.OL.base_url}/books/{self.olid}/-/add-cover',
+                     files=form_data_body
+                 )
+@@ -284,7 +310,7 @@
+                 body = self.json()
+                 body['_comment'] = comment
+                 url = self.OL.base_url + f'/books/{self.olid}.json'
+-                return self.OL.session.put(url, json.dumps(body))
++                return self.OL._request('put', url, json.dumps(body))
+ 
+             @classmethod
+             def create(cls, book, work_olid, debug=False):
+@@ -517,7 +543,7 @@
+                 body = self.json()
+                 body['_comment'] = comment
+                 url = self.OL.base_url + f'/authors/{self.olid}.json'
+-                return self.OL.session.put(url, json.dumps(body))
++                return self.OL._request('put', url, json.dumps(body))
+ 
+             def works(self, limit=OL.WORKS_LIMIT, offset=OL.WORKS_PAGINATION_OFFSET):
+                 """Returns a list of OpenLibrary Works associated with an OpenLibrary Author.
+@@ -627,7 +653,7 @@
+                     @backoff.on_exception(on_giveup=err, **cls.OL.BACKOFF_KWARGS)
+                     def _get_matching_authors_by_name(url):
+                         """Makes best effort to perform request w/ exponential backoff"""
+-                        return cls.OL.session.get(url)
++                        return cls.OL._request('get', url)
+ 
+                     response = _get_matching_authors_by_name(url)
+                     author_matches = response.json()
+@@ -691,7 +717,7 @@
+                 body = self.json()
+                 body['_comment'] = comment
+                 url = self.OL._generate_url_from_olid(self.olid)
+-                return self.OL.session.put(url, json.dumps(body))
++                return self.OL._request('put', url, json.dumps(body))
+ 
+         return Delete
+ 
+@@ -738,7 +764,7 @@
+                 body = self.json()
+                 body['_comment'] = comment
+                 url = self.OL._generate_url_from_olid(self.olid)
+-                return self.OL.session.put(url, json.dumps(body))
++                return self.OL._request('put', url, json.dumps(body))
+ 
+         return Redirect
+ 
+@@ -848,7 +874,7 @@
+         @backoff.on_exception(on_giveup=err, **self.BACKOFF_KWARGS)
+         def _create_book_post(url, data=data):
+             """Makes best effort to perform request w/ exponential backoff"""
+-            return self.session.post(url, data=data)
++            return self._request('post', url, data=data)
+ 
+         response = _create_book_post(url, data=data)
+         _olid = self._extract_olid_from_url(response.url, url_type="books")

@@ -1,0 +1,179 @@
+--- a/pynubank/utils/http.py
++++ b/pynubank/utils/http.py
+@@ -1,7 +1,154 @@
+-from requests import Response
+-from requests_pkcs12 import get, post
++import json as json_module
++import threading
++from io import BytesIO
++
++import treq
++from cryptography.hazmat.primitives import serialization
++from cryptography.hazmat.primitives.serialization import pkcs12
++from twisted.internet import defer, reactor
++from twisted.internet.ssl import CertificateOptions, platformTrust
++from twisted.internet.threads import blockingCallFromThread
++from twisted.web.client import Agent, FileBodyProducer
++from twisted.web.http_headers import Headers
+ 
+ from pynubank import NuRequestException
++
++
++_reactor_lock = threading.Lock()
++_reactor_ready = threading.Event()
++_reactor_thread = None
++
++
++class _HeaderMap(dict):
++    def get(self, name, default=None):
++        return super().get(name.lower(), default)
++
++
++class _TreqResponse:
++    def __init__(self, response, url: str, content: bytes):
++        self.status_code = response.code
++        self.url = url
++        self.headers = _HeaderMap()
++        for name, values in response.headers.getAllRawHeaders():
++            if isinstance(name, bytes):
++                name = name.decode('latin1')
++            value = values[0]
++            if isinstance(value, bytes):
++                value = value.decode('latin1')
++            self.headers[name.lower()] = value
++        self._content = content
++
++    def json(self):
++        return json_module.loads(self._content.decode('utf-8'))
++
++
++class _CertificateContextFactory:
++    def __init__(self, cert_data: bytes, password=''):
++        password_bytes = password.encode() if isinstance(password, str) else password
++        try:
++            private_key, certificate, _ = pkcs12.load_key_and_certificates(cert_data, password_bytes)
++        except ValueError:
++            if password_bytes not in (None, b''):
++                raise
++            private_key, certificate, _ = pkcs12.load_key_and_certificates(cert_data, None)
++
++        if private_key is None or certificate is None:
++            raise ValueError('The PKCS#12 data does not contain a certificate and private key')
++
++        self._options = CertificateOptions(
++            privateKey=private_key.private_bytes(
++                serialization.Encoding.PEM,
++                serialization.PrivateFormat.TraditionalOpenSSL,
++                serialization.NoEncryption(),
++            ),
++            certificate=certificate.public_bytes(serialization.Encoding.PEM),
++            trustRoot=platformTrust(),
++        )
++
++    def getContext(self, hostname, port):
++        return self._options.getContext()
++
++
++def _start_reactor():
++    reactor.callWhenRunning(_reactor_ready.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor():
++    global _reactor_thread
++
++    with _reactor_lock:
++        if _reactor_thread is None:
++            _reactor_thread = threading.Thread(target=_start_reactor, daemon=True)
++            _reactor_thread.start()
++
++    if not _reactor_ready.wait(timeout=10):
++        raise RuntimeError('Unable to start the treq reactor')
++
++
++@defer.inlineCallbacks
++def _perform_request(method: bytes, url: str, headers: dict, body: bytes, cert_data: bytes, cert_password: str):
++    treq_headers = Headers({
++        name.encode('ascii'): [value.encode('utf-8')]
++        for name, value in headers.items()
++    })
++    agent = Agent(
++        reactor,
++        contextFactory=_CertificateContextFactory(cert_data, cert_password),
++    ) if cert_data else Agent(reactor)
++    producer = FileBodyProducer(BytesIO(body)) if body is not None else None
++
++    response = yield agent.request(
++        method,
++        url.encode('utf-8'),
++        headers=treq_headers,
++        bodyProducer=producer,
++    )
++    content = yield treq.content(response)
++    return _TreqResponse(response, url, content)
++
++
++def _request(
++    method: bytes,
++    url: str,
++    headers: dict,
++    body: bytes = None,
++    cert_data: bytes = None,
++    cert_password: str = '',
++):
++    _ensure_reactor()
++    return blockingCallFromThread(
++        reactor,
++        _perform_request,
++        method,
++        url,
++        headers,
++        body,
++        cert_data,
++        cert_password,
++    )
++
++
++def get(url: str, headers=None, pkcs12_data=None, pkcs12_password='', **kwargs):
++    return _request(
++        b'GET',
++        url,
++        headers or {},
++        cert_data=pkcs12_data,
++        cert_password=pkcs12_password,
++    )
++
++
++def post(url: str, json=None, headers=None, pkcs12_data=None, pkcs12_password='', **kwargs):
++    body = None if json is None else json_module.dumps(json).encode('utf-8')
++    return _request(
++        b'POST',
++        url,
++        headers or {},
++        body=body,
++        cert_data=pkcs12_data,
++        cert_password=pkcs12_password,
++    )
+ 
+ 
+ class HttpClient:
+@@ -30,16 +177,16 @@
+     def _cert_args(self):
+         return {'pkcs12_data': self._cert, 'pkcs12_password': ''} if self._cert else {}
+ 
+-    def _handle_response(self, response: Response) -> dict:
++    def _handle_response(self, response) -> dict:
+         if response.status_code != 200:
+             raise NuRequestException(response)
+ 
+         return response.json()
+ 
+-    def raw_get(self, url: str) -> Response:
++    def raw_get(self, url: str):
+         return get(url, headers=self._headers, **self._cert_args)
+ 
+-    def raw_post(self, url: str, json: dict) -> Response:
++    def raw_post(self, url: str, json: dict):
+         return post(url, json=json, headers=self._headers, **self._cert_args)
+ 
+     def get(self, url: str) -> dict:

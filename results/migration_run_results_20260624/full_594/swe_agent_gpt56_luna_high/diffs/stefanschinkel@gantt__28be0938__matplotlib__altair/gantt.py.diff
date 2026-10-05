@@ -1,0 +1,298 @@
+--- a/gantt.py
++++ b/gantt.py
+@@ -4,26 +4,32 @@
+ Gantt.py is a simple class to render Gantt charts, as commonly used in
+ """
+ 
+-import os
+ import json
+-import platform
+-from operator import sub
+-
++
++import altair as alt
+ import numpy as np
+-import matplotlib.pyplot as plt
+-from matplotlib import rc
+-
+-# TeX support: on Linux assume TeX in /usr/bin, on OSX check for texlive
+-if (platform.system() == "Darwin") and "tex" in os.getenv("PATH"):
+-    LATEX = True
+-elif (platform.system() == "Linux") and os.path.isfile("/usr/bin/latex"):
+-    LATEX = True
+-else:
+-    LATEX = False
+-
+-# setup pyplot w/ tex support
+-if LATEX:
+-    rc("text", usetex=True)
++
++
++class _ChartAxis:
++    """Small compatibility view for the old ``g.ax`` attribute.
++
++    The previous renderer exposed its axes as ``g.ax``.  Altair has no axes
++    object, so the chart is exposed as ``g.chart`` instead.  Keeping this forwarding
++    object means code which only used ``g.ax.get_title()`` continues to work
++    while the actual renderer is entirely Altair based.
++    """
++
++    def __init__(self, chart):
++        self.chart = chart
++
++    def get_title(self):
++        title = self.chart.to_dict().get("title", "")
++        if isinstance(title, dict):
++            return title.get("text", "")
++        return title
++
++    def __getattr__(self, name):
++        return getattr(self.chart, name)
+ 
+ 
+ class Package:
+@@ -124,8 +130,7 @@
+             self.xticks = ""
+ 
+     def _procData(self):
+-        """Process data to have all values needed for plotting"""
+-        # parameters for bars
++        """Process data to have all values needed for plotting."""
+         self.nPackages = len(self.labels)
+         self.start = [None] * self.nPackages
+         self.end = [None] * self.nPackages
+@@ -135,111 +140,143 @@
+             self.start[idx] = pkg.start
+             self.end[idx] = pkg.end
+ 
+-        self.durations = map(sub, self.end, self.start)
++        # Keep these as concrete values.  A one-shot ``map`` is inconvenient
++        # when the data is used by more than one Altair layer.
++        self.durations = [end - start for start, end in zip(self.start, self.end)]
+         self.yPos = np.arange(self.nPackages, 0, -1)
++        self.chart = None
++        self.fig = None
++        self.ax = None
++        self.barlist = []
++        self._milestones_added = False
++
++    def _scale(self):
++        """Return the common x scale used by bars and milestones."""
++        # A non-zero domain also makes an empty or all-zero input renderable.
++        maximum = max(self.end, default=0)
++        return alt.Scale(domain=[0, max(1, maximum)])
++
++    def _records(self):
++        """Build the inline records consumed by Altair.
++
++        Altair 6 does not accept a bare list as ``Chart.data``.  The records
++        are therefore passed through ``alt.Data(values=...)`` in ``render``.
++        """
++        records = []
++        for pkg in self.packages:
++            # A private key lets bars without a legend keep their own color,
++            # while the explicit legend values below hide those private keys.
++            legend_key = pkg.legend or "__color__{}".format(pkg.color)
++            records.append(
++                {
++                    "label": pkg.label,
++                    "start": pkg.start,
++                    "end": pkg.end,
++                    "color": pkg.color,
++                    "legend_key": legend_key,
++                }
++            )
++        return records
++
++    def _bar_chart(self):
++        records = self._records()
++        legend_labels = []
++        domains = []
++        ranges = []
++        for record in records:
++            key = record["legend_key"]
++            if key not in domains:
++                domains.append(key)
++                ranges.append(record["color"])
++            if not key.startswith("__color__") and key not in legend_labels:
++                legend_labels.append(key)
++
++        legend = None
++        if legend_labels:
++            legend = alt.Legend(values=legend_labels, columns=3, title=None)
++
++        axis = alt.Axis(title=self.xlabel or None)
++        if self.xticks:
++            axis = alt.Axis(title=self.xlabel or None, values=self.xticks)
++
++        return alt.Chart(alt.Data(values=records)).mark_bar().encode(
++            x=alt.X("start:Q", scale=self._scale(), axis=axis),
++            x2=alt.X2("end:Q"),
++            y=alt.Y(
++                "label:N",
++                sort=list(reversed(self.labels)),
++                axis=alt.Axis(title=None),
++            ),
++            color=alt.Color(
++                "legend_key:N",
++                scale=alt.Scale(domain=domains, range=ranges),
++                legend=legend,
++            ),
++        )
+ 
+     def format(self):
+-        """Format various aspect of the plot, such as labels,ticks, BBox
+-        :todo: Refactor to use a settings object
+-        """
+-        # format axis
+-        plt.tick_params(
+-            axis="both",  # format x and y
+-            which="both",  # major and minor ticks affected
+-            bottom="on",  # bottom edge ticks are on
+-            top="off",  # top, left and right edge ticks are off
+-            left="off",
+-            right="off",
+-        )
+-
+-        # tighten axis but give a little room from bar height
+-        plt.xlim(0, max(self.end))
+-        plt.ylim(0.5, self.nPackages + 0.5)
+-
+-        # add title and package names
+-        plt.yticks(self.yPos, self.labels)
+-        plt.title(self.title)
+-
+-        if self.xlabel:
+-            plt.xlabel(self.xlabel)
+-
+-        if self.xticks:
+-            plt.xticks(self.xticks, map(str, self.xticks))
++        """Apply chart title and axis formatting using Altair properties."""
++        if self.chart is not None:
++            self.chart = self.chart.properties(title=self.title)
++            if self.ax is not None:
++                self.ax.chart = self.chart
+ 
+     def add_milestones(self):
+-        """Add milestones to GANTT chart.
+-        The milestones are simple yellow diamonds
+-        """
+-
+-        if not self.milestones:
++        """Add yellow diamond milestone markers to the Altair chart."""
++        if self.chart is None or not self.milestones or self._milestones_added:
+             return
+ 
+-        x = []
+-        y = []
+-        for key in self.milestones.keys():
+-            for value in self.milestones[key]:
+-                y += [self.yPos[self.labels.index(key)]]
+-                x += [value]
+-
+-        plt.scatter(
+-            x, y, s=120, marker="D", color="yellow", edgecolor="black", zorder=3
+-        )
++        records = []
++        for label, values in self.milestones.items():
++            records.extend({"label": label, "value": value} for value in values)
++
++        if records:
++            milestones = alt.Chart(alt.Data(values=records)).mark_point(
++                shape="diamond", size=120, filled=True, color="yellow", stroke="black"
++            ).encode(
++                x=alt.X("value:Q", scale=self._scale()),
++                y=alt.Y("label:N", sort=list(reversed(self.labels))),
++            )
++            self.chart = alt.layer(self.chart, milestones).properties(title=self.title)
++            self._milestones_added = True
++            if self.ax is not None:
++                self.ax.chart = self.chart
+ 
+     def add_legend(self):
+-        """Add a legend to the plot iff there are legend entries in
+-        the package definitions
+-        """
+-
+-        cnt = 0
+-        for pkg in self.packages:
+-            if pkg.legend:
+-                cnt += 1
+-                idx = self.labels.index(pkg.label)
+-                self.barlist[idx].set_label(pkg.legend)
+-
+-        if cnt > 0:
+-            self.legend = self.ax.legend(shadow=False, ncol=3, fontsize="medium")
++        """Keep explicit package legends in the bar chart.
++
++        Altair creates the legend as part of the color encoding, so unlike
++        Matplotlib there is no separate legend object to attach to an axis.
++        ``self.legend`` is retained as a useful list for callers that used to
++        check whether package legends were present.
++        """
++        self.legend = [pkg.legend for pkg in self.packages if pkg.legend]
+ 
+     def render(self):
+-        """Prepare data for plotting"""
+-
+-        # init figure
+-        self.fig, self.ax = plt.subplots()
+-        self.ax.yaxis.grid(False)
+-        self.ax.xaxis.grid(True)
+-
+-        # assemble colors
+-        colors = []
+-        for pkg in self.packages:
+-            colors.append(pkg.color)
+-
+-        self.barlist = plt.barh(
+-            self.yPos,
+-            list(self.durations),
+-            left=self.start,
+-            align="center",
+-            height=0.5,
+-            alpha=1,
+-            color=colors,
+-        )
+-
+-        # format plot
++        """Prepare and return an Altair chart."""
++        self.chart = self._bar_chart()
++        self._milestones_added = False
++        self.fig = self.chart
++        self.ax = _ChartAxis(self.chart)
++        self.barlist = []
++
+         self.format()
+         self.add_milestones()
+         self.add_legend()
+-
+-    @staticmethod
+-    def show():
+-        """Show the plot"""
+-        plt.show()
+-
+-    @staticmethod
+-    def save(saveFile="img/GANTT.png"):
+-        """Save the plot to a file. It defaults to `img/GANTT.png`.
+-
+-        :arg str saveFile: file to save to
+-        """
+-        plt.savefig(saveFile, bbox_inches="tight")
++        return self.chart
++
++    def _require_chart(self):
++        if self.chart is None:
++            raise RuntimeError("render() must be called before displaying or saving")
++        return self.chart
++
++    def show(self):
++        """Show the Altair chart in the default viewer."""
++        self._require_chart().show()
++
++    def save(self, saveFile="img/GANTT.png"):
++        """Save the chart to a file (PNG by default)."""
++        self._require_chart().save(saveFile)
+ 
+ 
+ if __name__ == "__main__":

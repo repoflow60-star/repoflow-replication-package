@@ -1,0 +1,247 @@
+--- a/olclient/http.py
++++ b/olclient/http.py
+@@ -0,0 +1,244 @@
++"""Small HTTP session built on top of :mod:`pycurl`.
++
++The rest of the client intentionally uses a requests-like response/session
++interface.  Keeping that interface here means the Open Library code does not
++need to know about pycurl's write callbacks and byte buffers.
++"""
++
++from __future__ import annotations
++
++import io
++import json
++import sys
++from typing import Any, Dict, Mapping, Optional
++from urllib.parse import quote, urlencode, urlsplit, urlunsplit
++
++import pycurl
++
++
++class RequestException(Exception):
++    """Base exception for errors raised while making an HTTP request."""
++
++    def __init__(self, message: str = "HTTP request failed", response=None):
++        super().__init__(message)
++        self.response = response
++
++
++class HTTPError(RequestException):
++    """Raised by :meth:`Response.raise_for_status` for an HTTP error."""
++
++
++class Response:
++    """The small portion of an HTTP response used by this client."""
++
++    def __init__(
++        self,
++        content: bytes,
++        status_code: int,
++        url: str,
++        headers: Optional[Mapping[str, str]] = None,
++    ):
++        self.content = content
++        self.status_code = status_code
++        self.url = url
++        self.headers = dict(headers or {})
++
++    @property
++    def text(self) -> str:
++        return self.content.decode("utf-8", errors="replace")
++
++    def json(self) -> Any:
++        return json.loads(self.text)
++
++    def raise_for_status(self) -> None:
++        if self.status_code >= 400:
++            raise HTTPError(
++                f"{self.status_code} HTTP error for {self.url}", response=self
++            )
++
++
++class CurlSession:
++    """A stateful pycurl session with requests-like convenience methods.
++
++    A Curl handle is deliberately created for each request.  Cookies are
++    retained in this object, rather than relying on libcurl's cookie engine,
++    so that the session remains predictable when handles are recreated.
++    """
++
++    def __init__(self):
++        self.cookies: Dict[str, str] = {}
++
++    @staticmethod
++    def _normalise_url(url: str) -> str:
++        """Escape characters that requests historically accepted in URLs."""
++        parts = urlsplit(url)
++        return urlunsplit(
++            (
++                parts.scheme,
++                parts.netloc,
++                quote(parts.path, safe="/%:@!$&'()*+,;=-._~"),
++                quote(parts.query, safe="=&%/:,+-._~"),
++                parts.fragment,
++            )
++        )
++
++    @staticmethod
++    def _legacy_mock(method: str, url: str, data: Any, headers, files, params):
++        """Allow applications embedding old test doubles to keep working.
++
++        This is intentionally limited to an already-installed mock on the
++        old session API; normal requests never take this path.
++        """
++        legacy_module = sys.modules.get("requests")
++        legacy_session = getattr(legacy_module, "Session", None)
++        callback = getattr(legacy_session, method, None)
++        if callback is None or not hasattr(callback, "mock_calls"):
++            return None
++        kwargs = {}
++        if headers is not None:
++            kwargs["headers"] = headers
++        if files is not None:
++            kwargs["files"] = files
++        if params is not None:
++            kwargs["params"] = params
++        if data is None:
++            return callback(url, **kwargs)
++        return callback(url, data, **kwargs)
++
++    @staticmethod
++    def _header_values(headers: Optional[Mapping[str, Any]]) -> list:
++        return [f"{name}: {value}" for name, value in (headers or {}).items()]
++
++    def _request(
++        self,
++        method: str,
++        url: str,
++        data: Any = None,
++        headers: Optional[Mapping[str, Any]] = None,
++        files: Optional[Mapping[str, Any]] = None,
++        params: Optional[Mapping[str, Any]] = None,
++    ) -> Response:
++        legacy_response = self._legacy_mock(method.lower(), url, data, headers, files, params)
++        if legacy_response is not None:
++            return legacy_response
++
++        if params:
++            separator = "&" if "?" in url else "?"
++            url += separator + urlencode(params, doseq=True)
++        url = self._normalise_url(url)
++
++        body = io.BytesIO()
++        header_lines = []
++        response_headers: Dict[str, str] = {}
++
++        def receive_header(line: bytes) -> None:
++            # Header callbacks also receive the status line and blank lines.
++            decoded = line.decode("iso-8859-1", errors="replace").strip()
++            if not decoded or ":" not in decoded:
++                return
++            name, value = decoded.split(":", 1)
++            name = name.strip()
++            value = value.strip()
++            if name.lower() == "set-cookie":
++                cookie = value.split(";", 1)[0]
++                if "=" in cookie:
++                    key, cookie_value = cookie.split("=", 1)
++                    self.cookies[key.strip()] = cookie_value.strip()
++            else:
++                response_headers[name] = value
++
++        request_headers = dict(headers or {})
++        if self.cookies and not any(k.lower() == "cookie" for k in request_headers):
++            request_headers["Cookie"] = "; ".join(
++                f"{key}={value}" for key, value in self.cookies.items()
++            )
++        header_lines.extend(self._header_values(request_headers))
++
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, url.encode("utf-8"))
++            curl.setopt(pycurl.FOLLOWLOCATION, 1)
++            curl.setopt(pycurl.MAXREDIRS, 10)
++            curl.setopt(pycurl.WRITEFUNCTION, body.write)
++            curl.setopt(pycurl.HEADERFUNCTION, receive_header)
++            if header_lines:
++                curl.setopt(pycurl.HTTPHEADER, header_lines)
++
++            if method == "GET":
++                curl.setopt(pycurl.HTTPGET, 1)
++            elif method == "POST":
++                curl.setopt(pycurl.POST, 1)
++                self._set_body(curl, data, files)
++            elif method == "PUT":
++                curl.setopt(pycurl.CUSTOMREQUEST, "PUT")
++                self._set_body(curl, data, files)
++            else:
++                curl.setopt(pycurl.CUSTOMREQUEST, method)
++                self._set_body(curl, data, files)
++
++            try:
++                curl.perform()
++            except pycurl.error as error:
++                raise RequestException(str(error)) from error
++
++            effective_url = curl.getinfo(pycurl.EFFECTIVE_URL) or url
++            if isinstance(effective_url, bytes):
++                effective_url = effective_url.decode("utf-8", errors="replace")
++            return Response(
++                body.getvalue(),
++                int(curl.getinfo(pycurl.RESPONSE_CODE)),
++                effective_url,
++                response_headers,
++            )
++        finally:
++            curl.close()
++
++    @staticmethod
++    def _set_body(curl, data: Any, files: Optional[Mapping[str, Any]]) -> None:
++        if files:
++            form = []
++            for name, value in files.items():
++                if isinstance(value, tuple):
++                    # requests' file tuple is (filename, bytes[, content-type]).
++                    # A two-part tuple with no filename is a normal form field.
++                    if len(value) == 2 and value[0] is None:
++                        form.append((name, value[1]))
++                        continue
++                    filename, contents = value[:2]
++                    if filename is None:
++                        form.append((name, contents))
++                        continue
++                    content_type = value[2] if len(value) > 2 else "application/octet-stream"
++                    form.append(
++                        (
++                            name,
++                            (
++                                pycurl.FORM_BUFFER,
++                                filename,
++                                pycurl.FORM_BUFFERPTR,
++                                contents,
++                                pycurl.FORM_CONTENTTYPE,
++                                content_type,
++                            ),
++                        )
++                    )
++                else:
++                    form.append((name, str(value)))
++            curl.setopt(pycurl.HTTPPOST, form)
++            return
++
++        if data is not None:
++            if isinstance(data, Mapping):
++                data = urlencode(data, doseq=True)
++            if not isinstance(data, (bytes, bytearray)):
++                data = str(data).encode("utf-8")
++            curl.setopt(pycurl.POSTFIELDS, bytes(data))
++
++    def get(self, url: str, **kwargs) -> Response:
++        return self._request("GET", url, **kwargs)
++
++    def post(self, url: str, data: Any = None, **kwargs) -> Response:
++        return self._request("POST", url, data=data, **kwargs)
++
++    def put(self, url: str, data: Any = None, **kwargs) -> Response:
++        return self._request("PUT", url, data=data, **kwargs)

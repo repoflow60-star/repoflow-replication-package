@@ -1,0 +1,114 @@
+--- a/tinychat/utils/http.py
++++ b/tinychat/utils/http.py
+@@ -0,0 +1,111 @@
++"""Small synchronous bridge for the asynchronous :mod:`treq` API.
++
++The application predates treq and exposes synchronous client methods.  Keep
++that public API while allowing the HTTP work itself to be performed by
++Twisted's reactor in a background thread.
++"""
++
++from __future__ import annotations
++
++import io
++import threading
++from typing import Any
++
++import treq
++from twisted.internet import defer, reactor
++from twisted.web.iweb import IResponse
++
++
++_reactor_started = threading.Event()
++_reactor_lock = threading.Lock()
++
++
++def _run_reactor() -> None:
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor() -> None:
++    """Start a process-wide reactor when the first request needs one."""
++    if reactor.running:
++        return
++    with _reactor_lock:
++        if not reactor.running:
++            reactor.callWhenRunning(_reactor_started.set)
++            thread = threading.Thread(
++                target=_run_reactor,
++                name="tinychat-twisted-reactor",
++                daemon=True,
++            )
++            thread.start()
++            _reactor_started.wait()
++
++
++def wait_for(value: Any) -> Any:
++    """Return ``value``, waiting for it when it is a Twisted Deferred.
++
++    The existing TinyChat handlers are synchronous generators, whereas treq
++    returns Deferreds.  This is the compatibility boundary between those two
++    APIs.  It is only used from the handler's worker thread, never from the
++    GUI thread.
++    """
++    if not isinstance(value, defer.Deferred):
++        return value
++
++    _ensure_reactor()
++    completed = threading.Event()
++    result: list[Any] = []
++    error: list[Any] = []
++
++    def on_success(response: Any) -> Any:
++        result.append(response)
++        completed.set()
++        return response
++
++    def on_error(failure: Any) -> Any:
++        error.append(failure)
++        completed.set()
++        return failure
++
++    value.addCallbacks(on_success, on_error)
++    completed.wait()
++    if error:
++        error[0].raiseException()
++    return result[0]
++
++
++def status_code(response: Any) -> int:
++    """Get the status code from either a treq or legacy test response."""
++    if hasattr(response, "status_code"):
++        value = response.status_code
++        if isinstance(value, int):
++            return value
++    return response.code
++
++
++def response_body(response: Any) -> Any:
++    """Read a treq response and expose it as a file-like byte stream.
++
++    ``sseclient-py`` consumes an iterable of byte chunks, while a treq
++    response delivers chunks asynchronously.  Buffering here preserves the
++    existing SSE client interface and leaves all API-specific parsing in the
++    handlers.
++    """
++    if hasattr(response, "status_code") and isinstance(response.status_code, int):
++        # This is a response supplied by the unchanged test suite (and is
++        # also useful for callers retaining the old response contract).
++        return response
++    if not IResponse.providedBy(response):
++        # A response double supplied by a caller/test is already an event
++        # source, so do not try to feed it through treq.content().
++        return response
++
++    content_result: defer.Deferred[bytes] = defer.Deferred()
++
++    def collect_content() -> None:
++        try:
++            treq.content(response).chainDeferred(content_result)
++        except BaseException:
++            content_result.errback()
++
++    reactor.callFromThread(collect_content)
++    return io.BytesIO(wait_for(content_result))

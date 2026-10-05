@@ -1,0 +1,324 @@
+--- a/bigcommerce/connection.py
++++ b/bigcommerce/connection.py
+@@ -13,10 +13,101 @@
+     from urllib.parse import urlencode
+ 
+ import logging
+-import requests
++import treq
+ import jwt
+ 
+ from json import dumps, loads
++from twisted.internet.defer import Deferred
++
++
++def _is_deferred(value):
++    """Return whether *value* is a Twisted Deferred.
++
++    Keeping this check explicit is important: the existing public API and its
++    tests also accept ordinary response objects (and MagicMock instances).
++    """
++    return isinstance(value, Deferred)
++
++
++class _TreqSession(object):
++    """Small session-state transport backed by treq.
++
++    The rest of this module historically kept authentication and default
++    headers on a stateful HTTP session.  treq deliberately has no Session
++    object, so this adapter keeps that bit of state while delegating every
++    network operation to treq.  It also lets callers that replace
++    ``_session.request`` continue to do so.
++    """
++
++    def __init__(self):
++        self.auth = None
++        self.headers = {}
++
++    def request(self, method, url, data=None, timeout=None, headers=None):
++        request_headers = dict(self.headers)
++        if headers:
++            request_headers.update(headers)
++
++        # _run_method serializes mappings to JSON to retain the old wire
++        # format.  treq's body producer accepts bytes, not text.
++        if isinstance(data, str):
++            data = data.encode("utf-8")
++
++        response = treq.request(method, url, data=data,
++                                timeout=timeout, headers=request_headers,
++                                auth=self.auth)
++        if _is_deferred(response):
++            return response.addCallback(_TreqResponse)
++        return _TreqResponse(response)
++
++
++class _TreqResponse(object):
++    """Expose the response attributes used by this package.
++
++    treq responses expose ``code`` and asynchronous ``content()``/``json()``
++    methods, whereas the old implementation consumed synchronous responses.
++    Body data is populated by ``_handle_response`` before an error is raised.
++    """
++
++    def __init__(self, response):
++        self._response = response
++        self._content = None
++
++    @property
++    def status_code(self):
++        return self._response.code
++
++    @property
++    def reason(self):
++        phrase = self._response.phrase
++        return phrase.decode("utf-8", "replace") if isinstance(phrase, bytes) else phrase
++
++    @property
++    def headers(self):
++        result = {}
++        for key, values in self._response.headers.getAllRawHeaders():
++            if isinstance(key, bytes):
++                key = key.decode("ascii", "replace")
++            if isinstance(values, (list, tuple)):
++                value = values[-1] if values else ""
++            else:
++                value = values
++            if isinstance(value, bytes):
++                value = value.decode("utf-8", "replace")
++            result[key] = value
++        return result
++
++    @property
++    def content(self):
++        return self._content
++
++    def content_deferred(self):
++        return self._response.content()
++
++    def json_deferred(self):
++        return self._response.json()
++
++
+ from math import ceil
+ from time import sleep
+ 
+@@ -39,7 +130,7 @@
+         log.info("API Host: %s/%s" % (self.host, self.api_path))
+ 
+         # set up the session
+-        self._session = requests.Session()
++        self._session = _TreqSession()
+         self._session.auth = auth
+         self._session.headers = {"Accept": "application/json"}
+ 
+@@ -137,7 +228,13 @@
+         data should be a dictionary.
+         """
+         response = self._run_method('PUT', url, data=data)
+-        log.debug("OUTPUT: %s" % response.content)
++        if _is_deferred(response):
++            def log_response(res):
++                log.debug("OUTPUT: %s" % res.content)
++                return res
++            response.addCallback(log_response)
++        else:
++            log.debug("OUTPUT: %s" % response.content)
+         return self._handle_response(url, response)
+ 
+     def post(self, url, data, headers={}):
+@@ -149,28 +246,71 @@
+         return self._handle_response(url, response)
+ 
+     def _handle_response(self, url, res, suppress_empty=True):
+-        """
+-        Returns parsed JSON or raises an exception appropriately.
+-        """
++        """Return decoded JSON or raise the package's HTTP exceptions.
++
++        A treq response is asynchronous.  The callback path below consumes
++        its body before parsing it or constructing an exception.  The
++        synchronous path is retained for response doubles and keeps the
++        established API useful to applications embedding a custom transport.
++        """
++        if _is_deferred(res):
++            return res.addCallback(lambda response: self._handle_response(
++                url, response, suppress_empty=suppress_empty))
++
+         self._last_response = res
+-        result = {}
+-        if res.status_code in (200, 201, 202):
++        status_code = res.status_code
++
++        if status_code in (200, 201, 202):
++            if isinstance(res, _TreqResponse):
++                body = res.content_deferred()
++
++                def decode(body):
++                    res._content = body
++                    try:
++                        return loads(body)
++                    except Exception as error:
++                        raise ValueError(
++                            "%s (_handle_response failed to decode JSON: %s)" %
++                            (error, body)
++                        )
++
++                return body.addCallback(decode)
+             try:
+-                result = res.json()
+-            except Exception as e:  # json might be invalid, or store might be down
+-                e.message += " (_handle_response failed to decode JSON: " + str(res.content) + ")"
+-                raise  # TODO better exception
+-        elif res.status_code == 204 and not suppress_empty:
+-            raise EmptyResponseWarning("%d %s @ %s: %s" % (res.status_code, res.reason, url, res.content), res)
+-        elif res.status_code >= 500:
+-            raise ServerException("%d %s @ %s: %s" % (res.status_code, res.reason, url, res.content), res)
+-        elif res.status_code == 429:
+-            raise RateLimitingException("%d %s @ %s: %s" % (res.status_code, res.reason, url, res.content), res)
+-        elif res.status_code >= 400:
+-            raise ClientRequestException("%d %s @ %s: %s" % (res.status_code, res.reason, url, res.content), res)
+-        elif res.status_code >= 300:
+-            raise RedirectionException("%d %s @ %s: %s" % (res.status_code, res.reason, url, res.content), res)
+-        return result
++                return res.json()
++            except Exception as error:  # json might be invalid, or store down
++                raise ValueError(
++                    "%s (_handle_response failed to decode JSON: %s)" %
++                    (error, res.content)
++                )
++
++        if status_code == 204 and not suppress_empty:
++            return self._raise_http_error(EmptyResponseWarning, url, res)
++        if status_code >= 500:
++            return self._raise_http_error(ServerException, url, res)
++        if status_code == 429:
++            return self._raise_http_error(RateLimitingException, url, res)
++        if status_code >= 400:
++            return self._raise_http_error(ClientRequestException, url, res)
++        if status_code >= 300:
++            return self._raise_http_error(RedirectionException, url, res)
++        return {}
++
++    def _raise_http_error(self, exception_class, url, res):
++        """Raise *exception_class*, reading a treq body when necessary."""
++        if isinstance(res, _TreqResponse):
++            def raise_with_body(body):
++                res._content = body
++                raise exception_class(
++                    "%d %s @ %s: %s" %
++                    (res.status_code, res.reason, url, body), res
++                )
++
++            return res.content_deferred().addCallback(raise_with_body)
++
++        raise exception_class(
++            "%d %s @ %s: %s" %
++            (res.status_code, res.reason, url, res.content), res
++        )
+ 
+     def __repr__(self):
+         return "%s %s%s" % (self.__class__.__name__, self.host, self.api_path)
+@@ -196,7 +336,7 @@
+         self.timeout = 7.0  # can attach to session?
+         self.rate_limiting_management = rate_limiting_management
+ 
+-        self._session = requests.Session()
++        self._session = _TreqSession()
+         self._session.headers = {"Accept": "application/json",
+                                  "Accept-Encoding": "gzip"}
+         if access_token and store_hash:
+@@ -247,7 +387,7 @@
+                     token_url='https://login.bigcommerce.com/oauth2/token'):
+         """
+         Fetches a token from given token_url, using given parameters, and sets up session headers for
+-        future requests.
++        future API calls.
+         redirect_uri should be the same as your callback URL.
+         code, context, and scope should be passed as parameters to your callback URL on app installation.
+ 
+@@ -261,31 +401,55 @@
+                                     'grant_type': 'authorization_code',
+                                     'redirect_uri': redirect_uri},
+                         headers={'Content-Type': 'application/x-www-form-urlencoded'})
+-        self._session.headers.update(self._oauth_headers(self.client_id, res['access_token']))
+-        return res
++        def save_token(response):
++            self._session.headers.update(
++                self._oauth_headers(self.client_id, response['access_token'])
++            )
++            return response
++
++        if _is_deferred(res):
++            return res.addCallback(save_token)
++        return save_token(res)
+ 
+     def _handle_response(self, url, res, suppress_empty=True):
+         """
+-        Adds rate limiting information on to the response object
++        Adds rate limiting information on to the response object.
+         """
+         result = Connection._handle_response(self, url, res, suppress_empty)
+-        if 'X-Rate-Limit-Time-Reset-Ms' in res.headers:
+-            self.rate_limit = dict(ms_until_reset=int(res.headers['X-Rate-Limit-Time-Reset-Ms']),
+-                                   window_size_ms=int(res.headers['X-Rate-Limit-Time-Window-Ms']),
+-                                   requests_remaining=int(res.headers['X-Rate-Limit-Requests-Left']),
+-                                   requests_quota=int(res.headers['X-Rate-Limit-Requests-Quota']))
+-            if self.rate_limiting_management:
+-                if self.rate_limiting_management['min_requests_remaining'] >= self.rate_limit['requests_remaining']:
+-                    if self.rate_limiting_management['wait']:
+-                        sleep(ceil(float(self.rate_limit['ms_until_reset']) / 1000))
+-                    if self.rate_limiting_management.get('callback_function'):
+-                        callback = self.rate_limiting_management['callback_function']
+-                        args_dict = self.rate_limiting_management.get('callback_args')
+-                        if args_dict:
+-                            callback(args_dict)
+-                        else:
+-                            callback()
+-
++
++        def apply_rate_limit(response_result):
++            update_rate_limit(self._last_response)
++            return response_result
++
++        def update_rate_limit(response):
++            headers = response.headers
++            if 'X-Rate-Limit-Time-Reset-Ms' in headers:
++                self.rate_limit = dict(
++                    ms_until_reset=int(headers['X-Rate-Limit-Time-Reset-Ms']),
++                    window_size_ms=int(headers['X-Rate-Limit-Time-Window-Ms']),
++                    requests_remaining=int(headers['X-Rate-Limit-Requests-Left']),
++                    requests_quota=int(headers['X-Rate-Limit-Requests-Quota'])
++                )
++                if self.rate_limiting_management:
++                    if (self.rate_limiting_management['min_requests_remaining'] >=
++                            self.rate_limit['requests_remaining']):
++                        if self.rate_limiting_management['wait']:
++                            sleep(ceil(float(self.rate_limit['ms_until_reset']) / 1000))
++                        if self.rate_limiting_management.get('callback_function'):
++                            callback = self.rate_limiting_management['callback_function']
++                            args_dict = self.rate_limiting_management.get('callback_args')
++                            if args_dict:
++                                callback(args_dict)
++                            else:
++                                callback()
++            return response
++
++        # Apply rate-limit handling to the response before body processing.
++        # _last_response is set by Connection._handle_response for both
++        # synchronous responses and Deferred callbacks.
++        if _is_deferred(result):
++            return result.addCallback(apply_rate_limit)
++        update_rate_limit(self._last_response)
+         return result
+ 
+ 
+@@ -300,7 +464,7 @@
+         self.timeout = 7.0  # can attach to session?
+         self.rate_limiting_management = rate_limiting_management
+ 
+-        self._session = requests.Session()
++        self._session = _TreqSession()
+         self._session.headers = {"Accept": "application/json",
+                                  "Accept-Encoding": "gzip"}
+         if access_token and store_hash:

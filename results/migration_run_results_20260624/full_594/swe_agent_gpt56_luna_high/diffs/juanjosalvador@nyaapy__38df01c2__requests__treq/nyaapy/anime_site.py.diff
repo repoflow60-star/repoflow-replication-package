@@ -1,0 +1,163 @@
+--- a/nyaapy/anime_site.py
++++ b/nyaapy/anime_site.py
+@@ -1,6 +1,123 @@
+-import requests
++import threading
++from threading import Event
++
++import treq
++from twisted.internet import reactor
++from twisted.internet.defer import Deferred
++from twisted.python.failure import Failure
++
+ from nyaapy import torrent
+ from nyaapy.parser import parse_nyaa, parse_single, parse_nyaa_rss
++
++
++class HTTPError(RuntimeError):
++    """Raised when a request returns an unsuccessful HTTP status code."""
++
++
++class _Response:
++    """Small synchronous view of a treq response.
++
++    treq is deliberately asynchronous, while the public API of this package
++    has historically been synchronous.  The network operation is completed by
++    ``_get`` before this object is returned, preserving that API for callers.
++    """
++
++    def __init__(self, response, content):
++        self.status_code = response.code
++        self.content = content
++
++        # Nyaa serves UTF-8 pages.  Honor a response-provided encoding when one
++        # is available, and retain a replacement fallback for malformed data.
++        encoding = getattr(response, "encoding", None) or "utf-8"
++        self.text = content.decode(encoding, errors="replace")
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise HTTPError(f"HTTP status {self.status_code}")
++
++
++_reactor_thread = None
++_reactor_ready = Event()
++_reactor_lock = threading.Lock()
++
++
++def _start_reactor():
++    """Start one reusable reactor thread for synchronous treq calls."""
++    global _reactor_thread
++
++    with _reactor_lock:
++        if reactor.running:
++            return
++        if _reactor_thread is not None and _reactor_thread.is_alive():
++            _reactor_ready.wait()
++            return
++
++        _reactor_ready.clear()
++
++        def run_reactor():
++            reactor.callWhenRunning(_reactor_ready.set)
++            reactor.run(installSignalHandlers=False)
++
++        _reactor_thread = threading.Thread(target=run_reactor, daemon=True)
++        _reactor_thread.start()
++        _reactor_ready.wait()
++
++
++def _wait_for(factory):
++    """Run a treq operation and return its result synchronously.
++
++    ``treq`` returns Deferreds.  Keeping this adapter private lets the
++    existing synchronous Nyaa API and its callers continue to work while all
++    HTTP traffic is performed through treq.
++    """
++    _start_reactor()
++    result = []
++    finished = Event()
++    deferred = Deferred()
++
++    def start():
++        try:
++            value = factory()
++            if isinstance(value, Deferred):
++                value.chainDeferred(deferred)
++            else:
++                deferred.callback(value)
++        except BaseException:
++            deferred.errback(Failure())
++
++    def done(value):
++        result.append(value)
++        finished.set()
++        # Turn an errback into a handled callback.  The Failure is re-raised
++        # below after the waiting thread has received it.
++        return None if isinstance(value, Failure) else value
++
++    deferred.addBoth(done)
++    reactor.callFromThread(start)
++    finished.wait()
++
++    value = result[0]
++    if isinstance(value, Failure):
++        value.raiseException()
++    return value
++
++
++def _get(url):
++    """Fetch ``url`` using treq and expose a synchronous response locally."""
++    response = _wait_for(lambda: treq.get(url))
++
++    def read_content():
++        content = getattr(response, "content", None)
++        if callable(content):
++            return content()
++        if content is not None:
++            return content
++        return treq.content(response)
++
++    content = _wait_for(read_content)
++    result = _Response(response, content)
++    result.raise_for_status()
++    return result
+ 
+ 
+ class AnimeTorrentSite:
+@@ -9,7 +126,7 @@
+ 
+     @classmethod
+     def last_uploads(self, number_of_results: int):
+-        r = requests.get(self.URL)
++        r = _get(self.URL)
+ 
+         # If anything up with nyaa servers let the user know.
+         r.raise_for_status()
+@@ -63,7 +180,7 @@
+         if not user:
+             search_uri += "&page=rss"
+ 
+-        http_response = requests.get(search_uri)
++        http_response = _get(search_uri)
+         http_response.raise_for_status()
+ 
+         if user:
+@@ -80,7 +197,7 @@
+ 
+     @classmethod
+     def get(self, view_id: int):
+-        r = requests.get(f"{self.URL}/view/{view_id}")
++        r = _get(f"{self.URL}/view/{view_id}")
+         r.raise_for_status()
+ 
+         json_data = parse_single(request_text=r.content, site=self.SITE)
+@@ -89,7 +206,7 @@
+ 
+     @classmethod
+     def get_from_user(self, username):
+-        r = requests.get(f"{self.URL}/user/{username}")
++        r = _get(f"{self.URL}/user/{username}")
+         r.raise_for_status()
+ 
+         json_data = parse_nyaa(request_text=r.content, limit=None, site=self.SITE)

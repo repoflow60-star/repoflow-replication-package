@@ -1,0 +1,246 @@
+--- a/stackinator/schema.py
++++ b/stackinator/schema.py
+@@ -1,37 +1,205 @@
++import copy
+ import json
+ import pathlib
+-
+-import jsonschema
++import re
++
++from cerberus import Validator
+ import yaml
+ 
+ prefix = pathlib.Path(__file__).parent.resolve()
+ 
+-# create a validator that will insert optional fields with their default values
+-# if they have not been provided.
+-
+-
+-def extend_with_default(validator_class):
+-    validate_properties = validator_class.VALIDATORS["properties"]
+-
+-    def set_defaults(validator, properties, instance, schema):
+-        # if instance is none, it's not possible to set any default for any sub-property
+-        if instance is not None:
+-            for property, subschema in properties.items():
+-                if "default" in subschema:
+-                    instance.setdefault(property, subschema["default"])
+-
+-        for error in validate_properties(
+-            validator,
+-            properties,
+-            instance,
+-            schema,
+-        ):
+-            yield error
+-
+-    return jsonschema.validators.extend(
+-        validator_class,
+-        {"properties": set_defaults},
++_MISSING = object()
++
++
++def _resolve(schema, root):
++    reference = schema.get("$ref")
++    if reference is None:
++        return schema
++
++    value = root
++    for part in reference[2:].split("/"):
++        value = value[part.replace("~1", "/").replace("~0", "~")]
++    return value
++
++
++def _allows_null(schema, root):
++    schema = _resolve(schema, root)
++    if schema.get("type") == "null" or None in schema.get("enum", ()):
++        return True
++
++    alternatives = schema.get("oneOf", schema.get("anyOf"))
++    return alternatives is not None and any(
++        _allows_null(alternative, root) for alternative in alternatives
+     )
++
++
++def _is_null_schema(schema, root):
++    schema = _resolve(schema, root)
++    return schema.get("type") == "null" or schema.get("enum") == [None]
++
++
++def _matches(value, schema, root):
++    schema = _resolve(schema, root)
++    alternatives = schema.get("oneOf", schema.get("anyOf"))
++    if alternatives is not None:
++        return any(_matches(value, alternative, root) for alternative in alternatives)
++
++    schema_type = schema.get("type")
++    if schema_type == "object" and not isinstance(value, dict):
++        return False
++    if schema_type == "array" and not isinstance(value, list):
++        return False
++    if schema_type == "string" and not isinstance(value, str):
++        return False
++    if schema_type == "boolean" and not isinstance(value, bool):
++        return False
++    if schema_type == "integer" and (not isinstance(value, int) or isinstance(value, bool)):
++        return False
++    if schema_type == "number" and (not isinstance(value, (int, float)) or isinstance(value, bool)):
++        return False
++    if schema_type == "null" and value is not None:
++        return False
++    return "enum" not in schema or value in schema["enum"]
++
++
++def _apply_defaults(instance, schema, root):
++    schema = _resolve(schema, root)
++    alternatives = schema.get("oneOf", schema.get("anyOf"))
++    if alternatives is not None:
++        for alternative in alternatives:
++            if _matches(instance, alternative, root):
++                _apply_defaults(instance, alternative, root)
++                break
++
++    if not isinstance(instance, dict):
++        return
++
++    for name, property_schema in schema.get("properties", {}).items():
++        if name not in instance and "default" in property_schema:
++            instance[name] = copy.deepcopy(property_schema["default"])
++        if name in instance:
++            _apply_defaults(instance[name], property_schema, root)
++
++    for pattern, property_schema in schema.get("patternProperties", {}).items():
++        matcher = re.compile(pattern)
++        for name, value in instance.items():
++            if matcher.search(name):
++                _apply_defaults(value, property_schema, root)
++
++
++def _convert_schema(schema, root, value=_MISSING):
++    schema = _resolve(schema, root)
++    result = {}
++
++    alternatives = schema.get("oneOf", schema.get("anyOf"))
++    if alternatives is not None:
++        non_null = [
++            alternative
++            for alternative in alternatives
++            if not _is_null_schema(alternative, root)
++        ]
++        if len(alternatives) == 2 and len(non_null) == 1:
++            result.update(_convert_schema(non_null[0], root, value))
++        else:
++            rule = "oneof" if "oneOf" in schema else "anyof"
++            result[rule] = [
++                _convert_schema(alternative, root, value)
++                for alternative in alternatives
++            ]
++
++    schema_type = schema.get("type")
++    if schema_type == "object":
++        result["type"] = "dict"
++        properties = schema.get("properties", {})
++        required = set(schema.get("required", []))
++        fields = {}
++        for name, property_schema in properties.items():
++            property_value = (
++                value.get(name, _MISSING) if isinstance(value, dict) else _MISSING
++            )
++            field = _convert_schema(property_schema, root, property_value)
++            if name in required:
++                field["required"] = True
++            fields[name] = field
++
++        # JSON Schema patterns search the complete key; Cerberus regex rules match
++        # from the beginning, so materialize matching keys in the current value.
++        if isinstance(value, dict):
++            for name, property_value in value.items():
++                if name in fields:
++                    continue
++                for pattern, property_schema in schema.get("patternProperties", {}).items():
++                    if re.search(pattern, name):
++                        fields[name] = _convert_schema(
++                            property_schema, root, property_value
++                        )
++                        break
++
++        result["schema"] = fields
++        additional_properties = schema.get("additionalProperties", True)
++        if isinstance(additional_properties, dict):
++            result["allow_unknown"] = _convert_schema(additional_properties, root)
++        else:
++            result["allow_unknown"] = additional_properties
++    elif schema_type == "array":
++        result["type"] = "list"
++        if "items" in schema:
++            item_value = value[0] if isinstance(value, list) and value else _MISSING
++            result["schema"] = _convert_schema(schema["items"], root, item_value)
++        if "minItems" in schema:
++            result["min"] = schema["minItems"]
++        if "maxItems" in schema:
++            result["max"] = schema["maxItems"]
++    elif schema_type == "string":
++        result["type"] = "string"
++    elif schema_type == "boolean":
++        result["type"] = "boolean"
++    elif schema_type == "integer":
++        result["type"] = "integer"
++    elif schema_type == "number":
++        result["anyof"] = [{"type": "integer"}, {"type": "float"}]
++    elif schema_type == "null":
++        result["allowed"] = [None]
++
++    if "enum" in schema:
++        result["allowed"] = schema["enum"]
++    if "pattern" in schema:
++        result["regex"] = schema["pattern"]
++    if "minLength" in schema:
++        result["minlength"] = schema["minLength"]
++    if "maxLength" in schema:
++        result["maxlength"] = schema["maxLength"]
++    if "default" in schema:
++        result["default"] = copy.deepcopy(schema["default"])
++
++    if _allows_null(schema, root) or (
++        alternatives is None and schema_type is None and "enum" not in schema
++    ):
++        # Cerberus otherwise rejects None before evaluating a oneof/anyof branch.
++        result["nullable"] = True
++
++    return result
++
++
++class _SchemaValidator:
++    def __init__(self, schema):
++        self._source_schema = schema
++        self._validator = Validator({})
++
++    def validate(self, document, *args, **kwargs):
++        _apply_defaults(document, self._source_schema, self._source_schema)
++        converted = _convert_schema(self._source_schema, self._source_schema, document)
++        rules = converted.pop("schema", {})
++        allow_unknown = converted.pop("allow_unknown", False)
++        self._validator = Validator(rules, allow_unknown=allow_unknown)
++        result = self._validator.validate(document, *args, **kwargs)
++        if not result:
++            raise ValueError(self._validator.errors)
++        return result
++
++    @property
++    def errors(self):
++        return self._validator.errors
+ 
+ 
+ def py2yaml(data, indent):
+@@ -41,7 +209,9 @@
+     return res
+ 
+ 
+-validator = extend_with_default(jsonschema.Draft7Validator)
++def validator(schema):
++    return _SchemaValidator(schema)
++
+ 
+ # load recipe yaml schema
+ config_schema = json.load(open(prefix / "schema/config.json"))

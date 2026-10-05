@@ -1,0 +1,133 @@
+--- a/olclient/validation.py
++++ b/olclient/validation.py
+@@ -0,0 +1,130 @@
++"""Validation helpers used by the Open Library client.
++
++The schema files in this project pre-date the switch to Cerberus and are kept
++in JSON Schema format for compatibility with users that consume them directly.
++This module translates the small JSON Schema vocabulary used by those files to
++an equivalent Cerberus schema before validating a document.
++"""
++
++import json
++import os
++from typing import Any, Dict, Tuple
++
++from cerberus import Validator
++
++
++class SchemaValidationError(ValueError):
++    """Raised when a document does not conform to an Open Library schema."""
++
++    def __init__(self, errors: Dict[str, Any]):
++        self.errors = errors
++        super().__init__(str(errors))
++
++
++def _resolve_ref(ref: str, source_path: str) -> Tuple[Any, str]:
++    """Resolve a local or file-relative JSON Schema reference."""
++    filename, _, fragment = ref.partition('#')
++    target_path = os.path.normpath(
++        os.path.join(os.path.dirname(source_path), filename)
++        if filename
++        else source_path
++    )
++
++    with open(target_path) as schema_file:
++        target = json.load(schema_file)
++
++    for part in fragment.lstrip('/').split('/') if fragment else []:
++        part = part.replace('~1', '/').replace('~0', '~')
++        target = target[part]
++    return target, target_path
++
++
++def _object_rule(schema: Dict[str, Any], source_path: str) -> Dict[str, Any]:
++    """Convert a JSON Schema object rule to a Cerberus dict rule."""
++    required = set(schema.get('required', []))
++    properties = {
++        name: _convert_rule(rule, source_path, required=name in required)
++        for name, rule in schema.get('properties', {}).items()
++    }
++
++    # JSON Schema permits unknown properties unless additionalProperties is
++    # explicitly false.  Preserve that distinction for nested Cerberus dicts.
++    allow_unknown = schema.get('additionalProperties', True)
++    if isinstance(allow_unknown, dict):
++        allow_unknown = _convert_rule(allow_unknown, source_path)
++
++    return {
++        'type': 'dict',
++        'schema': properties,
++        'allow_unknown': allow_unknown,
++    }
++
++
++def _convert_rule(
++    schema: Dict[str, Any], source_path: str, required: bool = False
++) -> Dict[str, Any]:
++    """Convert one JSON Schema rule into a Cerberus field rule."""
++    if '$ref' in schema:
++        referenced, referenced_path = _resolve_ref(schema['$ref'], source_path)
++        result = _convert_rule(referenced, referenced_path, required=required)
++        return result
++
++    result: Dict[str, Any] = {}
++    schema_type = schema.get('type')
++
++    if schema_type == 'object' or 'properties' in schema:
++        result.update(_object_rule(schema, source_path))
++    elif schema_type == 'array':
++        result['type'] = 'list'
++        if 'items' in schema:
++            result['schema'] = _convert_rule(schema['items'], source_path)
++        if 'minItems' in schema:
++            result['minlength'] = schema['minItems']
++        if 'maxItems' in schema:
++            result['maxlength'] = schema['maxItems']
++    elif schema_type == 'string':
++        result['type'] = 'string'
++    elif schema_type == 'number':
++        result['type'] = 'number'
++    elif schema_type == 'integer':
++        result['type'] = 'integer'
++    elif schema_type == 'boolean':
++        result['type'] = 'boolean'
++    elif schema_type == 'null':
++        result['type'] = 'null'
++
++    if 'enum' in schema:
++        result['allowed'] = schema['enum']
++    if 'pattern' in schema:
++        result['regex'] = schema['pattern']
++    if required:
++        result['required'] = True
++    return result
++
++
++def _load_schema(schema_path: str) -> Tuple[Dict[str, Any], bool]:
++    with open(schema_path) as schema_file:
++        schema = json.load(schema_file)
++    rule = _convert_rule(schema, schema_path)
++    return rule['schema'], rule['allow_unknown']
++
++
++def validate(document: Dict[str, Any], schema_path: str) -> None:
++    """Validate *document* with Cerberus using the schema at *schema_path*.
++
++    Cerberus reports failures through ``Validator.errors`` rather than raising
++    an exception, while this client's public API has historically raised on
++    invalid documents.  Keep that API behavior while using Cerberus for the
++    actual validation.
++    """
++    schema, allow_unknown = _load_schema(schema_path)
++    validator = Validator(schema, allow_unknown=allow_unknown)
++    if not validator.validate(document):
++        # jsonschema is intentionally not a runtime dependency anymore.  The
++        # optional import keeps old callers' exception handling working when
++        # they still have the legacy package installed.
++        try:
++            from jsonschema.exceptions import ValidationError as LegacyError
++        except ImportError:
++            raise SchemaValidationError(validator.errors) from None
++        raise LegacyError(validator.errors)

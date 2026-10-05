@@ -1,0 +1,155 @@
+--- a/ninjemail/sms_services/_http.py
++++ b/ninjemail/sms_services/_http.py
+@@ -0,0 +1,152 @@
++"""Small synchronous adapter around treq.
++
++The SMS service classes expose a synchronous API because they are called from
++selenium workflows.  treq itself is Deferred based, so this module keeps the
++HTTP implementation on treq while waiting for each request on a background
++Twisted reactor.  Keeping this boundary in one place also prevents the
++providers from accidentally depending on a particular response API.
++"""
++
++from __future__ import annotations
++
++import json
++import threading
++from dataclasses import dataclass
++from typing import Any
++
++import treq
++from twisted.internet import reactor
++from twisted.internet.defer import Deferred
++from twisted.python.failure import Failure
++
++
++class HTTPError(Exception):
++    """Raised when an HTTP response has a 4xx or 5xx status code."""
++
++
++@dataclass
++class Response:
++    """The response data needed by the SMS providers.
++
++    treq response bodies are asynchronous and can only be consumed once.  The
++    adapter consumes the body before returning, giving the synchronous callers
++    a small, client-independent response object.
++    """
++
++    status_code: int
++    body: bytes
++
++    @property
++    def text(self) -> str:
++        return self.body.decode("utf-8", errors="replace")
++
++    def json(self) -> Any:
++        return json.loads(self.text)
++
++    def raise_for_status(self) -> None:
++        if self.status_code >= 400:
++            raise HTTPError(f"HTTP {self.status_code}")
++
++
++class _ReactorThread:
++    """Run treq Deferreds on a reactor that remains usable between calls."""
++
++    def __init__(self) -> None:
++        self.reactor = reactor
++        self.thread = threading.Thread(
++            target=self._run,
++            name="ninjemail-treq-reactor",
++            daemon=True,
++        )
++        self.thread.start()
++
++    def _run(self) -> None:
++        self.reactor.run(installSignalHandlers=False)
++
++    def wait(self, operation):
++        if threading.current_thread() is self.thread:
++            raise RuntimeError("Synchronous treq request called from its reactor")
++
++        finished = threading.Event()
++        result = []
++
++        def complete(value):
++            result.append(value)
++            finished.set()
++            return value
++
++        def start() -> None:
++            try:
++                deferred = operation()
++            except BaseException as error:
++                complete(error)
++                return
++
++            if isinstance(deferred, Deferred):
++                deferred.addBoth(complete)
++            else:
++                # This also makes the adapter pleasant to use with a simple
++                # synchronous fake in callers' tests.
++                complete(deferred)
++
++        self.reactor.callFromThread(start)
++        finished.wait()
++        value = result[0]
++        if isinstance(value, Failure):
++            value.raiseException()
++        if isinstance(value, BaseException):
++            raise value
++        return value
++
++
++_reactor_thread: _ReactorThread | None = None
++_reactor_lock = threading.Lock()
++
++
++def _get_reactor_thread() -> _ReactorThread:
++    global _reactor_thread
++    with _reactor_lock:
++        if _reactor_thread is None:
++            _reactor_thread = _ReactorThread()
++    return _reactor_thread
++
++
++def _response_body(response):
++    """Turn treq's response Deferred into our buffered response."""
++    body = treq.content(response)
++    if isinstance(body, Deferred):
++        return body.addCallback(lambda value: Response(response.code, value))
++    return Response(response.code, body)
++
++
++def request(method: str, url: str, **kwargs) -> Response:
++    """Perform a treq request and return a buffered synchronous response."""
++    method = method.upper()
++
++    def operation():
++        # A private, non-persistent connection avoids treq's process-wide
++        # connection pool retaining a reactor from another request context.
++        kwargs.setdefault("persistent", False)
++        if method == "GET":
++            response = treq.get(url, reactor=_get_reactor_thread().reactor, **kwargs)
++        elif method == "POST":
++            response = treq.post(url, reactor=_get_reactor_thread().reactor, **kwargs)
++        else:
++            response = treq.request(method, url, reactor=_get_reactor_thread().reactor, **kwargs)
++
++        if isinstance(response, Deferred):
++            return response.addCallback(_response_body)
++        return _response_body(response)
++
++    return _get_reactor_thread().wait(operation)
++
++
++def get(url: str, **kwargs) -> Response:
++    return request("GET", url, **kwargs)
++
++
++def post(url: str, **kwargs) -> Response:
++    return request("POST", url, **kwargs)
++
++
++__all__ = ["HTTPError", "Response", "get", "post", "request"]

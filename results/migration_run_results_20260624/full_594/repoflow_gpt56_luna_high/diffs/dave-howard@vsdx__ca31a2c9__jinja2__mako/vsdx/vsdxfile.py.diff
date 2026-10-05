@@ -1,0 +1,155 @@
+--- a/vsdx/vsdxfile.py
++++ b/vsdx/vsdxfile.py
+@@ -5,7 +5,7 @@
+ import os
+ import re
+ 
+-from jinja2 import Template
++from mako.template import Template
+ 
+ from typing import List
+ from typing import Optional
+@@ -749,6 +749,113 @@
+         for shape in shapes.findall(f"{namespace}Shape"):
+             _replace_shape_text(shape, context)
+ 
++    @staticmethod
++    def _mako_expression(expression: str) -> str:
++        """Translate the expression subset used by the template API."""
++        expression = expression.strip().replace('&gt;', '>').replace('&lt;', '<')
++        expression = re.sub(r'\btrue\b', 'True', expression)
++        expression = re.sub(r'\bfalse\b', 'False', expression)
++        expression = re.sub(r'\bnone\b', 'None', expression)
++
++        parts = re.split(r'\s*\|\s*', expression)
++        expression = parts[0]
++        for filter_expression in parts[1:]:
++            match = re.match(r'([a-zA-Z_][\w]*)(?:\((.*)\))?$', filter_expression.strip())
++            if not match:
++                continue
++            filter_name, filter_args = match.groups()
++            if filter_name == 'lower':
++                expression = f'str({expression}).lower()'
++            elif filter_name == 'upper':
++                expression = f'str({expression}).upper()'
++            elif filter_name == 'trim':
++                expression = f'str({expression}).strip()'
++            elif filter_name == 'length':
++                expression = f'len({expression})'
++            elif filter_name in ('int', 'float', 'str'):
++                expression = f'{filter_name}({expression})'
++            elif filter_name == 'abs':
++                expression = f'abs({expression})'
++            elif filter_name == 'round':
++                expression = f'round({expression}{", " + filter_args if filter_args else ""})'
++            elif filter_name == 'replace' and filter_args is not None:
++                expression = f'str({expression}).replace({filter_args})'
++            elif filter_name == 'join':
++                separator = filter_args or "''"
++                expression = f'{separator}.join(str(item) for item in {expression})'
++        return expression
++
++    @staticmethod
++    def _mako_template_source(source: str) -> str:
++        """Convert template expressions and control delimiters to Mako."""
++        source = re.sub(
++            r'{{(.*?)}}',
++            lambda match: '${' + VisioFile._mako_expression(match.group(1)) + '}',
++            source,
++            flags=re.DOTALL,
++        )
++
++        control_marker = '__VSDX_MAKO_CONTROL__'
++
++        def _control_line(match):
++            keyword = match.group(1)
++            remainder = match.group(2).strip()
++            statement = f'{keyword} {remainder}'.strip()
++            if keyword in ('for', 'if', 'elif', 'else'):
++                statement += ':'
++            return f'{control_marker}\n% {statement}\n{control_marker}'
++
++        return re.sub(
++            r'{%\s*(for|if|elif|else|endif|endfor)\b(.*?)\s*%}',
++            _control_line,
++            source,
++            flags=re.DOTALL,
++        )
++
++    @staticmethod
++    def _render_mako(source: str, context: dict) -> str:
++        class _MakoUndefined:
++            def __bool__(self):
++                return False
++
++            def __str__(self):
++                return ''
++
++            def __repr__(self):
++                return ''
++
++            def __iter__(self):
++                return iter(())
++
++            def __len__(self):
++                return 0
++
++        render_context = dict(context)
++        render_context.setdefault('true', True)
++        render_context.setdefault('false', False)
++        render_context.setdefault('none', None)
++        reserved_names = {
++            'True', 'False', 'None', 'and', 'or', 'not', 'in', 'is',
++            'if', 'else', 'for', 'str', 'int', 'float', 'len', 'abs',
++            'round', 'bool', 'list', 'dict', 'tuple', 'min', 'max', 'sum',
++            'enumerate', 'range',
++        }
++        template_expressions = re.findall(r'{{(.*?)}}', source, flags=re.DOTALL)
++        template_expressions.extend(re.findall(
++            r'{%\s*(?:for|if|elif)\b(.*?)\s*%}', source, flags=re.DOTALL
++        ))
++        for expression in template_expressions:
++            translated = VisioFile._mako_expression(expression)
++            names = re.findall(r'\b[a-zA-Z_]\w*\b', translated)
++            for name in names:
++                if name not in render_context and name not in reserved_names:
++                    render_context[name] = _MakoUndefined()
++        output = Template(
++            VisioFile._mako_template_source(source)
++        ).render(**render_context)
++        marker = '__VSDX_MAKO_CONTROL__'
++        return output.replace(marker + '\n', '').replace(marker, '')
++
+     def jinja_render_vsdx(self, context: dict):
+         """Transform a template VisioFile object using the Jinja language
+         The method updates the VisioFile object loaded from the template file, so does not return any value
+@@ -770,8 +877,7 @@
+ 
+                 source = ET.tostring(page.xml.getroot(), encoding='unicode')
+                 source = VisioFile.unescape_jinja_statements(source)  # unescape chars like < and > inside {%...%}
+-                template = Template(source)
+-                output = template.render(context)
++                output = VisioFile._render_mako(source, context)
+                 page.xml = ET.ElementTree(ET.fromstring(output))  # create ElementTree from Element created from output
+ 
+                 # update loop shape IDs which have been duplicated by Jinja template
+@@ -820,8 +926,7 @@
+                 ref_val = str(shape.__getattribute__(self_ref[0]))
+                 value = value.replace('self.'+self_ref[0], ref_val)
+             # use Jinja template to calculate any self refs found
+-            template = Template(value)  # value might be '{{ 1.0+2.4*3 }}'
+-            value = template.render(context)
++            value = VisioFile._render_mako(value, context)  # value might be '{{ 1.0+2.4*3 }}'
+             if property_name in ['x', 'y']:
+                 shape.__setattr__(property_name, value)
+ 
+@@ -900,8 +1005,7 @@
+         if len(jinja_source):
+             # process last matching value
+             template_source = "{{ "+jinja_source[-1]+" }}"
+-            template = Template(template_source)  # value might be '{{ 1.0+2.4*3 }}'
+-            value = template.render(context)
++            value = VisioFile._render_mako(template_source, context)
+             # is the value truthy - i.e. not 0, False, or empty string, tuple, list or dict
+             print(f"jinja_page_showif(context={context}) statement: {template_source} returns: {type(value)} {value}")
+             if value in ['False', '0', '', '()', '[]', '{}']:

@@ -1,0 +1,112 @@
+--- a/pynubank/utils/http.py
++++ b/pynubank/utils/http.py
+@@ -1,10 +1,20 @@
+-from requests import Response
+-from requests_pkcs12 import get, post
++import json
++import threading
++
++import OpenSSL
++import treq
++from twisted.internet import reactor
++from twisted.internet.threads import blockingCallFromThread
++from twisted.internet.ssl import CertificateOptions
++from twisted.web.client import Agent
+ 
+ from pynubank import NuRequestException
+ 
+ 
+ class HttpClient:
++
++    _reactor_thread = None
++    _reactor_ready = threading.Event()
+ 
+     def __init__(self):
+         self._cert = None
+@@ -28,22 +38,77 @@
+ 
+     @property
+     def _cert_args(self):
+-        return {'pkcs12_data': self._cert, 'pkcs12_password': ''} if self._cert else {}
++        if not self._cert:
++            return {}
+ 
+-    def _handle_response(self, response: Response) -> dict:
+-        if response.status_code != 200:
++        certificate = OpenSSL.crypto.load_pkcs12(self._cert, b'')
++        context = CertificateOptions(
++            privateKey=OpenSSL.crypto.dump_privatekey(
++                OpenSSL.crypto.FILETYPE_PEM, certificate.get_privatekey()),
++            certificate=OpenSSL.crypto.dump_certificate(
++                OpenSSL.crypto.FILETYPE_PEM, certificate.get_certificate()),
++        )
++        return {'agent': Agent(reactor, contextFactory=context)}
++
++    def _handle_response(self, response) -> dict:
++        if self._response_status(response) != 200:
+             raise NuRequestException(response)
+ 
+-        return response.json()
++        return self.json_content(response)
+ 
+-    def raw_get(self, url: str) -> Response:
+-        return get(url, headers=self._headers, **self._cert_args)
++    def raw_get(self, url: str):
++        return self._request('GET', url)
+ 
+-    def raw_post(self, url: str, json: dict) -> Response:
+-        return post(url, json=json, headers=self._headers, **self._cert_args)
++    def raw_post(self, url: str, json: dict):
++        return self._request('POST', url, json)
+ 
+     def get(self, url: str) -> dict:
+         return self._handle_response(self.raw_get(url))
+ 
+     def post(self, url: str, json: dict) -> dict:
+-        return self._handle_response(post(url, json=json, headers=self._headers, **self._cert_args))
++        return self._handle_response(self.raw_post(url, json))
++
++    def json_content(self, response):
++        """Decode a treq response while retaining compatibility with injected clients."""
++        if hasattr(response, 'json'):
++            return response.json()
++        return self._wait(lambda: treq.json_content(response))
++
++    @staticmethod
++    def response_header(response, name: str):
++        headers = response.headers
++        if hasattr(headers, 'getRawHeaders'):
++            values = headers.getRawHeaders(name.encode())
++            if not values:
++                return None
++            value = values[0]
++        else:
++            value = headers.get(name)
++
++        return value.decode() if isinstance(value, bytes) else value
++
++    @staticmethod
++    def _response_status(response):
++        status = getattr(response, 'code', None)
++        return status if status is not None else response.status_code
++
++    def _request(self, method: str, url: str, payload: dict = None):
++        headers = {name: [value] for name, value in self._headers.items()}
++        data = None if payload is None else json.dumps(payload).encode()
++        return self._wait(
++            lambda: treq.request(method, url, headers=headers, data=data, **self._cert_args))
++
++    @classmethod
++    def _wait(cls, operation):
++        if cls._reactor_thread is None and not reactor.running:
++            cls._reactor_ready.clear()
++
++            def run_reactor():
++                reactor.callWhenRunning(cls._reactor_ready.set)
++                reactor.run(installSignalHandlers=False)
++
++            cls._reactor_thread = threading.Thread(target=run_reactor, daemon=True)
++            cls._reactor_thread.start()
++            cls._reactor_ready.wait()
++
++        return blockingCallFromThread(reactor, operation)

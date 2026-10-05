@@ -1,0 +1,103 @@
+--- a/modules/Application/PluginAdaptors/HTTPMixin.py
++++ b/modules/Application/PluginAdaptors/HTTPMixin.py
+@@ -1,11 +1,17 @@
+-import requests
+-from requests.exceptions import RequestException
+ from abc import ABC, abstractmethod
++from io import BytesIO
++import json
++from urllib.parse import urlencode
++
++import pycurl
+ 
+ 
+ class HTTPMixin(ABC):
+     """
+     Very basic code used to make HTTP requests.
++
++    The mixin deliberately keeps the HTTP client details here so that request
++    implementations only need to describe the endpoint and its payload.
+     """
+ 
+     def send(self) -> dict:
+@@ -18,26 +24,64 @@
+                 raise Exception(f'Unsupported HTTP method {self._method()}')
+ 
+     def _get(self) -> dict:
+-        return self._process_response(requests.get(self._endpoint(), headers=self._headers(), auth=self._auth()))
++        return self._request('GET')
+ 
+     def _post(self) -> dict:
+-        if self._is_form_encoded():
+-            headers = self._headers()
+-            headers['Content-Type'] = 'application/x-www-form-urlencoded'
+-            return self._process_response(
+-                requests.post(self._endpoint(), data=self._data(), headers=self._headers(), auth=self._auth()))
+-        return self._process_response(
+-            requests.post(self._endpoint(), json=self._data(), headers=self._headers(), auth=self._auth()))
++        return self._request('POST')
++
++    def _request(self, method: str) -> dict:
++        endpoint = self._endpoint()
++        headers = dict(self._headers() or {})
++        auth = self._auth()
++
++        # Perform the payload conversions explicitly because pycurl sends
++        # the supplied bytes as-is.
++        if method == 'POST':
++            data = self._data()
++            if self._is_form_encoded():
++                headers['Content-Type'] = 'application/x-www-form-urlencoded'
++                payload = urlencode(data or {}, doseq=True)
++            else:
++                headers.setdefault('Content-Type', 'application/json')
++                payload = json.dumps(data)
++        else:
++            payload = None
++
++        body = BytesIO()
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, endpoint)
++            curl.setopt(
++                pycurl.HTTPHEADER,
++                [f'{name}: {value}' for name, value in headers.items()]
++            )
++            curl.setopt(pycurl.WRITEFUNCTION, body.write)
++
++            if auth is not None:
++                username, password = auth
++                curl.setopt(pycurl.HTTPAUTH, pycurl.HTTPAUTH_BASIC)
++                curl.setopt(pycurl.USERPWD, f'{username}:{password}')
++
++            if method == 'GET':
++                curl.setopt(pycurl.HTTPGET, 1)
++            else:
++                curl.setopt(pycurl.POST, 1)
++                curl.setopt(pycurl.POSTFIELDS, payload)
++
++            curl.perform()
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        except pycurl.error:
++            raise Exception(f'Connection failed while calling {endpoint}')
++        finally:
++            curl.close()
++
++        return self._process_response(status_code, endpoint, body.getvalue())
+ 
+     @staticmethod
+-    def _process_response(response: requests.Response) -> dict:
+-        try:
+-            if 200 <= response.status_code < 500:
+-                return response.json()
+-            else:
+-                raise Exception(f"HTTP {response.status_code} error while calling {response.url}")
+-        except RequestException:
+-            raise Exception(f"Connection failed while calling {response.url}")
++    def _process_response(status_code: int, url: str, body: bytes) -> dict:
++        if 200 <= status_code < 500:
++            return json.loads(body.decode('utf-8'))
++        raise Exception(f'HTTP {status_code} error while calling {url}')
+ 
+     @abstractmethod
+     def _method(self) -> str:

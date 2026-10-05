@@ -1,0 +1,128 @@
+--- a/py_clob_client/http_helpers/helpers.py
++++ b/py_clob_client/http_helpers/helpers.py
+@@ -1,4 +1,9 @@
+-import requests
++import json
++from threading import Event, Lock, Thread
++
++import treq
++from twisted.internet import reactor
++from twisted.web.http_headers import Headers
+ 
+ from py_clob_client.clob_types import (
+     DropNotificationParams,
+@@ -16,6 +21,9 @@
+ DELETE = "DELETE"
+ PUT = "PUT"
+ 
++_reactor_lock = Lock()
++_reactor_thread = None
++
+ 
+ def overloadHeaders(method: str, headers: dict) -> dict:
+     if headers is None:
+@@ -32,22 +40,93 @@
+     return headers
+ 
+ 
++def _start_reactor():
++    global _reactor_thread
++
++    if reactor.running:
++        return
++
++    with _reactor_lock:
++        if not reactor.running and _reactor_thread is None:
++            _reactor_thread = Thread(
++                target=reactor.run,
++                kwargs={"installSignalHandlers": False},
++                daemon=True,
++            )
++            _reactor_thread.start()
++
++
++def _request_with_treq(endpoint: str, method: str, headers: dict, data):
++    response_event = Event()
++    response_state = {}
++    request_headers = Headers(
++        {
++            key.encode("ascii"): [str(value).encode("utf-8")]
++            for key, value in headers.items()
++        }
++    )
++    request_data = json.dumps(data).encode("utf-8") if data else None
++
++    def on_error(failure):
++        response_state["error"] = failure.value
++        response_event.set()
++        return failure
++
++    def on_content(content):
++        response_state["content"] = content
++        response_event.set()
++        return content
++
++    def on_response(response):
++        response_state["status_code"] = response.code
++        content_deferred = treq.content(response)
++        content_deferred.addCallbacks(on_content, on_error)
++        return content_deferred
++
++    def make_request():
++        try:
++            request_deferred = treq.request(
++                method=method,
++                url=endpoint,
++                headers=request_headers,
++                data=request_data,
++            )
++            request_deferred.addCallbacks(on_response, on_error)
++        except Exception as error:
++            response_state["error"] = error
++            response_event.set()
++
++    _start_reactor()
++    reactor.callFromThread(make_request)
++    response_event.wait()
++
++    if "error" in response_state:
++        raise response_state["error"]
++
++    return response_state["status_code"], response_state["content"]
++
++
++def _decode_content(content):
++    text = content.decode("utf-8", errors="replace")
++    try:
++        return json.loads(text)
++    except json.JSONDecodeError:
++        return text
++
++
+ def request(endpoint: str, method: str, headers=None, data=None):
+     try:
+         headers = overloadHeaders(method, headers)
+-        resp = requests.request(
+-            method=method, url=endpoint, headers=headers, json=data if data else None
++        status_code, content = _request_with_treq(
++            endpoint, method, headers, data
+         )
+-        if resp.status_code != 200:
+-            raise PolyApiException(resp)
+-
+-        try:
+-            return resp.json()
+-        except requests.JSONDecodeError:
+-            return resp.text
+-
+-    except requests.RequestException:
++    except Exception:
+         raise PolyApiException(error_msg="Request exception!")
++
++    decoded_content = _decode_content(content)
++    if status_code != 200:
++        raise PolyApiException(error_msg=decoded_content, status_code=status_code)
++    return decoded_content
+ 
+ 
+ def post(endpoint, headers=None, data=None):

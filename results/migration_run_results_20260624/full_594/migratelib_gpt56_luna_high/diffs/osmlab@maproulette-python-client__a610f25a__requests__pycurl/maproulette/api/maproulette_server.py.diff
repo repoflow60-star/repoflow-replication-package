@@ -1,0 +1,396 @@
+--- a/maproulette/api/maproulette_server.py
++++ b/maproulette/api/maproulette_server.py
+@@ -1,10 +1,34 @@
+-"""This module contains the basic methods that handle API calls to the MapRoulette API. It uses the requests library to
++"""This module contains the basic methods that handle API calls to the MapRoulette API. It uses the pycurl library to
+ accomplish this."""
+ 
+-import requests
++import pycurl
++import io
+ import json
+ import time
++from urllib.parse import urlencode
+ from .errors import HttpError, InvalidJsonError, ConnectionUnavailableError, UnauthorizedError, NotFoundError
++
++
++class _PycurlHTTPError(Exception):
++    def __init__(self, response):
++        self.response = response
++
++
++class _PycurlResponse:
++    def __init__(self, content, status_code):
++        self.content = content
++        self.status_code = status_code
++
++    @property
++    def text(self):
++        return self.content.decode('utf-8', errors='replace')
++
++    def json(self):
++        return json.loads(self.text)
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise _PycurlHTTPError(self)
+ 
+ 
+ class MapRouletteServer:
+@@ -16,10 +40,9 @@
+         self.certs = configuration.certs
+         self.verify = configuration.verify
+         if self.__check_health():
+-            self.session = requests.Session()
+-            self.session.headers = self.headers
+-            self.session.verify = self.verify
+-            self.session.cert = self.certs
++            self.session = pycurl.Curl()
++            self.session.setopt(pycurl.HTTPHEADER, self._headers())
++            self._set_ssl_options(self.session)
+ 
+     def __check_health(self, retries=3, delay=5):
+         """Checks health of connection to host by pinging the URL set in the configuration
+@@ -29,24 +52,165 @@
+         :returns: True if GET request to ping endpoint is successful
+         """
+         for i in range(retries):
++            curl = pycurl.Curl()
++            response_buffer = io.BytesIO()
+             try:
+-                response = requests.get(
+-                    self.base_url + '/ping',
+-                    headers=self.headers,
+-                    verify=self.verify,
+-                    cert=self.certs
++                curl.setopt(
++                    pycurl.URL,
++                    self.base_url + '/ping'
+                 )
+-                if not response.ok:
++                curl.setopt(pycurl.HTTPHEADER, self._headers())
++                curl.setopt(pycurl.WRITEFUNCTION, response_buffer.write)
++                self._set_ssl_options(curl)
++                curl.perform()
++                status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++                if status_code >= 400:
+                     print(f"Unsuccessful connection. Retrying in {str(delay)} seconds")
+                     time.sleep(delay)
+                 else:
+                     return True
+-            except requests.exceptions.ConnectionError:
++            except pycurl.error:
+                 print(f"Connection not available. Attempt {str(i+1)} out of {str(retries)}")
+                 time.sleep(delay)
++            finally:
++                curl.close()
+ 
+         raise ConnectionUnavailableError(
+             message='Specified server unavailable'
++        )
++
++    def _headers(self, json_body=False, multipart=False):
++        headers = []
++        for key, value in self.headers.items():
++            if multipart and key.lower() == 'content-type':
++                continue
++            headers.append(f"{key}: {value}")
++        if json_body and not any(header.lower().startswith('content-type:') for header in headers):
++            headers.append('Content-Type: application/json')
++        return headers
++
++    def _set_ssl_options(self, curl):
++        if self.verify is False:
++            curl.setopt(pycurl.SSL_VERIFYPEER, 0)
++            curl.setopt(pycurl.SSL_VERIFYHOST, 0)
++        else:
++            curl.setopt(pycurl.SSL_VERIFYPEER, 1)
++            curl.setopt(pycurl.SSL_VERIFYHOST, 2)
++            if isinstance(self.verify, str):
++                curl.setopt(pycurl.CAINFO, self.verify)
++
++        if isinstance(self.certs, (tuple, list)):
++            curl.setopt(pycurl.SSLCERT, self.certs[0])
++            if len(self.certs) > 1:
++                curl.setopt(pycurl.SSLKEY, self.certs[1])
++        elif self.certs:
++            curl.setopt(pycurl.SSLCERT, self.certs)
++
++    def _url_with_params(self, url, params):
++        if params is None:
++            return url
++        if isinstance(params, str):
++            query = params
++        else:
++            query = urlencode(params, doseq=True)
++        separator = '&' if '?' in url else '?'
++        return url + separator + query
++
++    @staticmethod
++    def _multipart_fields(body):
++        fields = []
++        if body is None:
++            return fields
++
++        if hasattr(body, 'items'):
++            body = body.items()
++
++        for name, value in body:
++            if isinstance(value, tuple):
++                filename = value[0] if len(value) > 0 else name
++                content = value[1] if len(value) > 1 else b''
++
++                if hasattr(content, 'read'):
++                    content = content.read()
++
++                if isinstance(content, str):
++                    content = content.encode()
++                elif not isinstance(content, bytes):
++                    content = str(content).encode()
++
++                form_value = (
++                    pycurl.FORM_BUFFER,
++                    filename,
++                    content
++                )
++
++                if len(value) > 2 and value[2]:
++                    form_value = form_value + (
++                        pycurl.FORM_CONTENTTYPE,
++                        value[2]
++                    )
++
++                fields.append((name, form_value))
++            elif hasattr(value, 'read'):
++                content = value.read()
++                if isinstance(content, str):
++                    content = content.encode()
++                filename = getattr(value, 'name', name)
++                fields.append((
++                    name,
++                    (
++                        pycurl.FORM_BUFFER,
++                        filename,
++                        content
++                    )
++                ))
++            else:
++                fields.append((name, value))
++
++        return fields
++
++    def _perform_request(self, method, url, params=None, body=None, files=None):
++        response_buffer = io.BytesIO()
++        url = self._url_with_params(url, params)
++
++        self.session.setopt(pycurl.URL, url)
++        self.session.setopt(pycurl.CUSTOMREQUEST, method)
++        self.session.setopt(pycurl.WRITEFUNCTION, response_buffer.write)
++        self.session.setopt(
++            pycurl.HTTPHEADER,
++            self._headers(
++                json_body=body is not None and files is None,
++                multipart=files is not None
++            )
++        )
++        self._set_ssl_options(self.session)
++        self.session.setopt(pycurl.POSTFIELDS, b'')
++        self.session.setopt(pycurl.HTTPPOST, [])
++
++        if method == 'GET':
++            self.session.setopt(pycurl.HTTPGET, 1)
++            self.session.setopt(pycurl.POST, 0)
++        elif files is not None:
++            self.session.setopt(pycurl.HTTPGET, 0)
++            self.session.setopt(pycurl.POST, 0)
++            self.session.setopt(
++                pycurl.HTTPPOST,
++                self._multipart_fields(files)
++            )
++        else:
++            self.session.setopt(pycurl.HTTPGET, 0)
++            self.session.setopt(pycurl.POST, 1 if method == 'POST' else 0)
++            if body is not None:
++                self.session.setopt(
++                    pycurl.POSTFIELDS,
++                    json.dumps(body).encode()
++                )
++
++        self.session.perform()
++
++        return _PycurlResponse(
++            response_buffer.getvalue(),
++            self.session.getinfo(pycurl.RESPONSE_CODE)
+         )
+ 
+     def get(self, endpoint, params=None):
+@@ -57,13 +221,14 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.get(
+-            self.url + endpoint,
+-            params=params
+-        )
+-        try:
++        try:
++            response = self._perform_request(
++                'GET',
++                self.url + endpoint,
++                params=params
++            )
+             response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
++        except _PycurlHTTPError as e:
+             if e.response.status_code == 404:
+                 raise NotFoundError(
+                     message=self.parse_response_message(e.response),
+@@ -74,11 +239,8 @@
+                     message=self.parse_response_message(e.response),
+                     status=e.response.status_code
+                 ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(
+-                message=self.parse_response_message(e.response),
+-                status=e.response.status_code
+-            ) from None
++        except pycurl.error as e:
++            raise ConnectionUnavailableError(e) from None
+         try:
+             return {
+                 "data": response.json(),
+@@ -99,14 +261,15 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.post(
+-            self.url + endpoint,
+-            params=params,
+-            json=body
+-        )
+-        try:
++        try:
++            response = self._perform_request(
++                'POST',
++                self.url + endpoint,
++                params=params,
++                body=body
++            )
+             response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
++        except _PycurlHTTPError as e:
+             if e.response.status_code == 400:
+                 raise InvalidJsonError(
+                     message=self.parse_response_message(e.response),
+@@ -122,7 +285,7 @@
+                     message=self.parse_response_message(e.response),
+                     status=e.response.status_code
+                 ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
++        except pycurl.error as e:
+             raise ConnectionUnavailableError(e) from None
+         try:
+             return {
+@@ -144,14 +307,15 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.put(
+-            self.url + endpoint,
+-            params=params,
+-            json=body
+-        )
+-        try:
++        try:
++            response = self._perform_request(
++                'PUT',
++                self.url + endpoint,
++                params=params,
++                body=body
++            )
+             response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
++        except _PycurlHTTPError as e:
+             if e.response.status_code == 400:
+                 raise InvalidJsonError(
+                     message=self.parse_response_message(e.response),
+@@ -167,7 +331,7 @@
+                     message=self.parse_response_message(e.response),
+                     status=e.response.status_code
+                 ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
++        except pycurl.error as e:
+             raise ConnectionUnavailableError(e) from None
+         try:
+             return {
+@@ -189,14 +353,15 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.put(
+-            self.url + endpoint,
+-            params=params,
+-            files=body
+-        )
+-        try:
++        try:
++            response = self._perform_request(
++                'PUT',
++                self.url + endpoint,
++                params=params,
++                files=body
++            )
+             response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
++        except _PycurlHTTPError as e:
+             if e.response.status_code == 400:
+                 raise InvalidJsonError(
+                     message=self.parse_response_message(e.response),
+@@ -212,7 +377,7 @@
+                     message=self.parse_response_message(e.response),
+                     status=e.response.status_code
+                 ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
++        except pycurl.error as e:
+             raise ConnectionUnavailableError(e) from None
+         try:
+             return {
+@@ -233,13 +398,14 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.delete(
+-            self.url + endpoint,
+-            params=params
+-        )
+-        try:
++        try:
++            response = self._perform_request(
++                'DELETE',
++                self.url + endpoint,
++                params=params
++            )
+             response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
++        except _PycurlHTTPError as e:
+             if e.response.status_code == 401:
+                 raise UnauthorizedError(
+                     message=self.parse_response_message(e.response),
+@@ -255,7 +421,7 @@
+                     message=self.parse_response_message(e.response),
+                     status=e.response.status_code
+                 ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
++        except pycurl.error as e:
+             raise ConnectionUnavailableError(e) from None
+         try:
+             return {
+@@ -286,7 +452,7 @@
+     def parse_response_message(response):
+         """Method to determine the message body from a response object. Will return None if message cannot be parsed.
+ 
+-        :param response: the Requests response object
++        :param response: the pycurl response object
+         :returns: the response message if parsable, otherwise None
+         """
+         try:

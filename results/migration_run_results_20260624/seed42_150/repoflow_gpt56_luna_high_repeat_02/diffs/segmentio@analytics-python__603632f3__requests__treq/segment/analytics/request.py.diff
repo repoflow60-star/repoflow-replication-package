@@ -1,0 +1,149 @@
+--- a/segment/analytics/request.py
++++ b/segment/analytics/request.py
+@@ -3,14 +3,124 @@
+ from gzip import GzipFile
+ import logging
+ import json
++from threading import Event, Lock, Thread
+ from dateutil.tz import tzutc
+-from requests.auth import HTTPBasicAuth
+-from requests import sessions
++import treq
++from twisted.internet.defer import Deferred
++from twisted.internet import reactor
+ 
+ from segment.analytics.version import VERSION
+ from segment.analytics.utils import remove_trailing_slash
+ 
+-_session = sessions.Session()
++_session = treq
++_reactor_lock = Lock()
++_reactor_ready = Event()
++_reactor_thread = None
++
++
++class _ResponseHeaders(dict):
++    def get(self, key, default=None):
++        return super().get(key.lower(), default)
++
++    def __getitem__(self, key):
++        return super().__getitem__(key.lower())
++
++
++class _ResponseAdapter(object):
++    def __init__(self, response, body):
++        self.status_code = response.code
++        self.reason = self._decode(response.phrase)
++        self.content = body
++        self.text = body.decode('utf-8', errors='replace')
++        self.headers = _ResponseHeaders()
++        for name, values in response.headers.getAllRawHeaders():
++            if values:
++                self.headers[self._decode(name).lower()] = self._decode(values[0])
++
++    @staticmethod
++    def _decode(value):
++        if isinstance(value, bytes):
++            return value.decode('latin1')
++        return value
++
++    def json(self):
++        return json.loads(self.text)
++
++
++def _run_reactor():
++    reactor.callWhenRunning(_reactor_ready.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor():
++    global _reactor_thread
++
++    if reactor.running:
++        return
++
++    with _reactor_lock:
++        if not reactor.running and not (
++                _reactor_thread and _reactor_thread.is_alive()):
++            _reactor_ready.clear()
++            _reactor_thread = Thread(target=_run_reactor, daemon=True)
++            _reactor_thread.start()
++
++    if not _reactor_ready.wait(5):
++        raise RuntimeError('Unable to start the Twisted reactor')
++
++
++def _post(url, data, headers, timeout):
++    """Run treq's Deferred request while preserving this module's sync API."""
++    _ensure_reactor()
++    complete = Event()
++    result = {}
++    request = {}
++
++    def failed(failure):
++        result['error'] = getattr(failure, 'value', failure)
++        complete.set()
++
++    def received_body(response, body):
++        result['response'] = _ResponseAdapter(response, body)
++        complete.set()
++
++    def received(response):
++        body = treq.content(response)
++        body.addCallbacks(
++            lambda value: received_body(response, value),
++            failed,
++        )
++
++    def start():
++        try:
++            request['deferred'] = _session.post(
++                url,
++                data=data.encode('utf-8') if isinstance(data, str) else data,
++                headers={
++                    key.encode('ascii'): [value.encode('ascii')]
++                    for key, value in headers.items()
++                },
++                timeout=timeout,
++                reactor=reactor,
++            )
++            if isinstance(request['deferred'], Deferred):
++                request['deferred'].addCallbacks(received, failed)
++            else:
++                result['response'] = request['deferred']
++                complete.set()
++        except Exception as error:
++            failed(error)
++
++    reactor.callFromThread(start)
++    wait_timeout = None if timeout is None else max(timeout, 0) + 1
++    if not complete.wait(wait_timeout):
++        deferred = request.get('deferred')
++        if deferred is not None:
++            reactor.callFromThread(deferred.cancel)
++        raise TimeoutError('Request timed out')
++    if 'error' in result:
++        raise result['error']
++    return result['response']
+ 
+ 
+ def post(write_key, host=None, gzip=False, timeout=15, proxies=None, oauth_manager=None, **kwargs):
+@@ -42,17 +152,9 @@
+             gz.write(data.encode('utf-8'))
+         data = buf.getvalue()
+ 
+-    kwargs = {
+-        "data": data,
+-        "headers": headers,
+-        "timeout": 15,
+-    }
+-
+-    if proxies:
+-        kwargs['proxies'] = proxies
+     res = None
+     try:
+-        res = _session.post(url, data=data, headers=headers, timeout=timeout)
++        res = _post(url, data, headers, timeout)
+     except Exception as e:
+         log.error(e)
+         raise e

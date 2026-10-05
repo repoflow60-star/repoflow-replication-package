@@ -1,0 +1,205 @@
+--- a/sectxt/__init__.py
++++ b/sectxt/__init__.py
+@@ -21,12 +21,24 @@
+ else:
+     from typing import TypedDict
+ 
++import asyncio
++
+ import dateutil.parser
+-import requests
++import treq
++try:
++    from twisted.internet import asyncioreactor
++    asyncioreactor.install()
++except Exception:
++    pass
++from twisted.internet import defer
++from twisted.internet import ssl as twisted_ssl
++
++try:
++    from OpenSSL.SSL import Error as _OpenSSLError
++except ImportError:
++    _OpenSSLError = None
+ 
+ __version__ = "0.9.6"
+-
+-s = requests.Session()
+ 
+ 
+ class ErrorDict(TypedDict):
+@@ -545,6 +557,77 @@
+         self._url: Optional[str] = None
+         super().__init__(b'', recommend_unknown_fields=recommend_unknown_fields, is_local=is_local)
+ 
++    @staticmethod
++    def _run_deferred(d):
++        """Execute a Twisted Deferred synchronously via asyncio event loop."""
++        loop = asyncio.new_event_loop()
++        try:
++            future = d.asFuture(loop)
++            return loop.run_until_complete(future)
++        finally:
++            loop.close()
++
++    @staticmethod
++    def _get_redirect_chain(resp):
++        """Return a list of responses forming the redirect chain (oldest first)."""
++        chain = []
++        current = resp
++        while current is not None:
++            chain.append(current)
++            current = getattr(current, 'previousResponse', None)
++        chain.reverse()
++        return chain
++
++    @staticmethod
++    def _get_final_url(resp, original_url):
++        """Return the final URL of the response after any redirects."""
++        # Twisted IResponse exposes .request which has absoluteURI
++        req = getattr(resp, 'request', None)
++        if req is not None:
++            uri = getattr(req, 'absoluteURI', None)
++            if uri is not None:
++                if isinstance(uri, bytes):
++                    return uri.decode('utf-8', errors='replace')
++                return uri
++        return original_url
++
++    @defer.inlineCallbacks
++    def _fetch_url(self, url, allow_ssl_errors=False):
++        """Fetch a URL using treq and return (resp, body_bytes) or raise."""
++        headers = {
++            b'User-Agent': [
++                b'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) Gecko/20100101 Firefox/12.0'
++            ]
++        }
++        if allow_ssl_errors:
++            ctx_factory = twisted_ssl.CertificateOptions(verify=False)
++            resp = yield treq.get(
++                url,
++                headers=headers,
++                timeout=5,
++                contextFactory=ctx_factory,
++            )
++        else:
++            resp = yield treq.get(
++                url,
++                headers=headers,
++                timeout=5,
++            )
++        body = yield treq.content(resp)
++        return (resp, body)
++
++    def _is_ssl_error(self, exc):
++        """Return True if the exception is an SSL certificate verification error."""
++        exc_type_name = type(exc).__name__
++        if 'SSL' in exc_type_name or 'Certificate' in exc_type_name or 'Verify' in exc_type_name:
++            return True
++        if _OpenSSLError is not None and isinstance(exc, _OpenSSLError):
++            return True
++        cause = getattr(exc, '__cause__', None) or getattr(exc, '__context__', None)
++        if cause is not None and cause is not exc:
++            return self._is_ssl_error(cause)
++        return False
++
+     def _process(self) -> None:
+         if self.is_local:
+             security_txt_file = open(self._loc, mode="rb")
+@@ -557,35 +640,42 @@
+                 for path in [".well-known/security.txt", "security.txt"]:
+                     url = urlunsplit((scheme, self._loc, path, None, None))
+                     try:
+-                        resp = requests.get(
+-                            url,
+-                            headers={
+-                                'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                              'Gecko/20100101 Firefox/12.0'},
+-                            timeout=5
+-                        )
+-                    except requests.exceptions.SSLError:
++                        resp, body = self._run_deferred(self._fetch_url(url))
++                    except twisted_ssl.SSL.Error as ssl_exc:
+                         if not any(d["code"] == "invalid_cert" for d in self._errors):
+                             self._add_error(
+                                 "invalid_cert",
+                                 "security.txt must be served with a valid TLS certificate.",
+                             )
+                         try:
+-                            resp = requests.get(
+-                                url,
+-                                headers={
+-                                    'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                                  'Gecko/20100101 Firefox/12.0'},
+-                                timeout=5,
+-                                verify=False
++                            resp, body = self._run_deferred(
++                                self._fetch_url(url, allow_ssl_errors=True)
+                             )
+                         except:
+                             continue
++                    except Exception as exc:
++                        if self._is_ssl_error(exc):
++                            if not any(d["code"] == "invalid_cert" for d in self._errors):
++                                self._add_error(
++                                    "invalid_cert",
++                                    "security.txt must be served with a valid TLS certificate.",
++                                )
++                            try:
++                                resp, body = self._run_deferred(
++                                    self._fetch_url(url, allow_ssl_errors=True)
++                                )
++                            except:
++                                continue
++                        else:
++                            continue
+                     except:
+                         continue
+-                    if resp.status_code == 200:
+-                        if resp.history:
+-                            if not resp.url.endswith(path):
++                    if resp.code == 200:
++                        redirect_chain = self._get_redirect_chain(resp)
++                        has_redirects = len(redirect_chain) > 1
++                        final_url = self._get_final_url(resp, url)
++                        if has_redirects:
++                            if not final_url.endswith(path):
+                                 continue
+                         self._path = path
+                         self._url = url
+@@ -603,13 +693,17 @@
+                                 "(legacy place), but must be placed under "
+                                 "the '/.well-known/' path.",
+                             )
+-                        if "content-type" not in resp.headers:
++                        ct_values = resp.headers.getRawHeaders(b'content-type')
++                        if ct_values is None:
+                             self._add_error(
+                                 "no_content_type", "HTTP Content-Type header must be sent."
+                             )
+                         else:
++                            ct_str = ct_values[0]
++                            if isinstance(ct_str, bytes):
++                                ct_str = ct_str.decode('utf-8', errors='replace')
+                             m = Message()
+-                            m['content-type'] = resp.headers["content-type"]
++                            m['content-type'] = ct_str
+                             params = dict(m.get_params())
+                             if "text/plain" not in params:
+                                 self._add_error(
+@@ -625,9 +719,12 @@
+                                     "Charset parameter in Content-Type header must be "
+                                     "'utf-8' if present.",
+                                 )
+-                        self._content = resp.content
+-                        if resp.history:
+-                            self._urls = [resp.history[0].url, resp.url]
++                        self._content = body
++                        if has_redirects:
++                            first_url = self._get_final_url(
++                                redirect_chain[0], url
++                            )
++                            self._urls = [first_url, final_url]
+                         else:
+                             self._urls = [url]
+                         super()._process()

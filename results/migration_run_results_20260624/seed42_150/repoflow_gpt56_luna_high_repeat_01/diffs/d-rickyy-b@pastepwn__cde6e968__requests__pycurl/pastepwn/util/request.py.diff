@@ -1,0 +1,114 @@
+--- a/pastepwn/util/request.py
++++ b/pastepwn/util/request.py
+@@ -1,14 +1,19 @@
+ import logging
++from io import BytesIO
+ from threading import Lock
++from urllib.parse import urlencode, urlparse
++from urllib.request import getproxies, proxy_bypass
+ 
+-from requests import Session, utils
+-from requests.exceptions import Timeout
++import pycurl
++
++from .network import _get_ip_resolve
+ 
+ 
+ class Request:
+     _instance = None
+     _initialized = False
+     _lock = Lock()
++    _request_lock = Lock()
+ 
+     def __new__(cls, *args, **kwargs):
+         # override method to implement singleton
+@@ -22,11 +27,11 @@
+     def __init__(self, proxies=None, headers=None):
+         if not self._initialized:
+             self.logger = logging.getLogger(__name__)
+-            self.session = Session()
++            self.session = pycurl.Curl()
+             self.proxies = proxies
+             self.headers = headers
+             self.logger.info("Using the following custom proxies: %s", proxies)
+-            system_proxies = utils.get_environ_proxies("https://example.com")
++            system_proxies = getproxies()
+             self.logger.info("Using the following system proxies: %s", system_proxies)
+             Request._initialized = True
+ 
+@@ -36,14 +41,68 @@
+         if self.headers is not None:
+             headers.update(self.headers)
+ 
+-        try:
+-            response = self.session.request(*args, headers=headers, proxies=self.proxies, data=data, timeout=timeout, **kwargs)
+-        except Timeout:
+-            url = kwargs.get("url")
+-            self.logger.warning("Timeout while requesting %s!", url)
+-            return ""
++        method = kwargs.get("method", "GET").upper()
++        url = kwargs.get("url")
++        response_buffer = BytesIO()
++        body = self._encode_data(data)
+ 
+-        return response.content.decode("utf-8")
++        with Request._request_lock:
++            self.session.reset()
++            self.session.setopt(pycurl.URL, url)
++            self.session.setopt(pycurl.CUSTOMREQUEST, method)
++            self.session.setopt(pycurl.FOLLOWLOCATION, 1)
++            self.session.setopt(pycurl.HTTPHEADER, [f"{key}: {value}" for key, value in headers.items()])
++            self.session.setopt(pycurl.WRITEFUNCTION, response_buffer.write)
++            self.session.setopt(pycurl.IPRESOLVE, _get_ip_resolve())
++            self.session.setopt(pycurl.PROXY, self._proxy_for_url(url) or "")
++            self.session.setopt(pycurl.ACCEPT_ENCODING, "")
++
++            if method == "GET":
++                self.session.setopt(pycurl.HTTPGET, 1)
++            elif method == "POST":
++                self.session.setopt(pycurl.POST, 1)
++
++            if body is not None:
++                self.session.setopt(pycurl.POSTFIELDS, body)
++
++            if isinstance(timeout, tuple):
++                self.session.setopt(pycurl.CONNECTTIMEOUT, timeout[0] or 0)
++                self.session.setopt(pycurl.TIMEOUT, timeout[1] or 0)
++            else:
++                self.session.setopt(pycurl.CONNECTTIMEOUT, timeout or 0)
++                self.session.setopt(pycurl.TIMEOUT, timeout or 0)
++
++            try:
++                self.session.perform()
++            except pycurl.error as error:
++                if error.args and error.args[0] == pycurl.E_OPERATION_TIMEDOUT:
++                    self.logger.warning("Timeout while requesting %s!", url)
++                    return ""
++                raise
++
++        return response_buffer.getvalue().decode("utf-8")
++
++    @staticmethod
++    def _encode_data(data):
++        if data is None:
++            return None
++        if isinstance(data, bytes):
++            return data
++        if isinstance(data, str):
++            return data.encode("utf-8")
++        if isinstance(data, (dict, list, tuple)):
++            return urlencode(data, doseq=True).encode("utf-8")
++        return str(data).encode("utf-8")
++
++    def _proxy_for_url(self, url):
++        parsed_url = urlparse(url)
++        proxies = getproxies()
++        if self.proxies is not None:
++            proxies.update(self.proxies)
++
++        if parsed_url.hostname and proxy_bypass(parsed_url.hostname):
++            return None
++        return proxies.get(parsed_url.scheme, proxies.get("all"))
+ 
+     def get(self, url, data=None, timeout=5):
+         return self._request_wrapper(method="GET", url=url, data=data, timeout=timeout)

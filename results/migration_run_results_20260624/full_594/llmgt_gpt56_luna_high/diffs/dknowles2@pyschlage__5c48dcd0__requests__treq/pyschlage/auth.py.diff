@@ -1,0 +1,140 @@
+--- a/pyschlage/auth.py
++++ b/pyschlage/auth.py
+@@ -7,8 +7,8 @@
+ 
+ from botocore.exceptions import ClientError
+ import pycognito
+-from pycognito import utils
+-import requests
++from twisted.internet.defer import Deferred, inlineCallbacks, maybeDeferred
++import treq
+ 
+ from .exceptions import NotAuthorizedError, UnknownError
+ 
+@@ -30,13 +30,15 @@
+ 
+ def _translate_auth_errors(
+     # pylint: disable=invalid-name
+-    fn: Callable[..., requests.Response],
++    fn: Callable[..., object],
+     # pylint: enable=invalid-name
+-) -> Callable[..., requests.Response]:
++) -> Callable[..., Deferred]:
+     @wraps(fn)
+-    def wrapper(*args, **kwargs) -> requests.Response:
++    @inlineCallbacks
++    def wrapper(*args, **kwargs) -> Deferred:
+         try:
+-            return fn(*args, **kwargs)
++            response = yield maybeDeferred(fn, *args, **kwargs)
++            return response
+         except ClientError as ex:
+             resp_err = ex.response.get("Error", {})
+             if resp_err.get("Code") in _NOT_AUTHORIZED_ERRORS:
+@@ -50,21 +52,25 @@
+ 
+ def _translate_http_errors(
+     # pylint: disable=invalid-name
+-    fn: Callable[..., requests.Response],
++    fn: Callable[..., object],
+     # pylint: enable=invalid-name
+-) -> Callable[..., requests.Response]:
++) -> Callable[..., Deferred]:
+     @wraps(fn)
+-    def wrapper(*args, **kwargs) -> requests.Response:
+-        resp = fn(*args, **kwargs)
+-        try:
+-            resp.raise_for_status()
+-            return resp
+-        except requests.HTTPError as ex:
++    @inlineCallbacks
++    def wrapper(*args, **kwargs) -> Deferred:
++        resp = yield maybeDeferred(fn, *args, **kwargs)
++        if resp.code >= 400:
++            reason = (
++                resp.phrase.decode()
++                if isinstance(resp.phrase, bytes)
++                else resp.phrase
++            )
+             try:
+-                message = resp.json().get("message", resp.reason)
+-            except requests.JSONDecodeError:
+-                message = resp.reason
+-            raise UnknownError(message) from ex
++                message = (yield treq.json_content(resp)).get("message", reason)
++            except ValueError:
++                message = reason
++            raise UnknownError(message)
++        return resp
+ 
+     return wrapper
+ 
+@@ -80,6 +86,7 @@
+         :param password: The password for the account.
+         :type password: str
+         """
++        self.password = password
+         self.cognito = pycognito.Cognito(
+             username=username,
+             user_pool_region=USER_POOL_REGION,
+@@ -87,11 +94,7 @@
+             client_id=CLIENT_ID,
+             client_secret=CLIENT_SECRET,
+         )
+-        self.auth = utils.RequestsSrpAuth(
+-            password=password,
+-            cognito=self.cognito,
+-        )
+-        self._user_id: str | None = None
++        self._user_id: Deferred | None = None
+ 
+     @_translate_auth_errors
+     def authenticate(self):
+@@ -100,32 +103,39 @@
+         :raise pyschlage.exceptions.NotAuthorizedError: When authentication fails.
+         :raise pyschlage.exceptions.UnknownError: On other errors.
+         """
+-        self.auth(requests.Request())
++        self.cognito.authenticate(password=self.password)
+ 
+     @property
+-    def user_id(self) -> str:
++    def user_id(self) -> Deferred:
+         """Returns the unique user id for the authenticated user."""
+         if self._user_id is None:
+             self._user_id = self._get_user_id()
+         return self._user_id
+ 
+-    def _get_user_id(self) -> str:
+-        resp = self.request("get", "users/@me")
+-        return resp.json()["identityId"]
++    @inlineCallbacks
++    def _get_user_id(self) -> Deferred:
++        resp = yield self.request("get", "users/@me")
++        data = yield treq.json_content(resp)
++        return data["identityId"]
+ 
+     @_translate_http_errors
+     @_translate_auth_errors
+     def request(
+         self, method: str, path: str, base_url: str = BASE_URL, **kwargs
+-    ) -> requests.Response:
++    ) -> Deferred:
+         """Performs a request against the Schlage WiFi cloud service.
+ 
+         :meta private:
+         """
+-        kwargs["auth"] = self.auth
++        if self.cognito.access_token is None:
++            self.cognito.authenticate(password=self.password)
++        kwargs.pop("auth", None)
+         if "headers" not in kwargs:
+             kwargs["headers"] = {}
+         kwargs["headers"]["X-Api-Key"] = API_KEY
++        kwargs["headers"]["Authorization"] = (
++            f"Bearer {self.cognito.access_token}"
++        )
+         kwargs.setdefault("timeout", _DEFAULT_TIMEOUT)
+         # pylint: disable=missing-timeout
+-        return requests.request(method, f"{base_url}/{path.lstrip('/')}", **kwargs)
++        return treq.request(method, f"{base_url}/{path.lstrip('/')}", **kwargs)

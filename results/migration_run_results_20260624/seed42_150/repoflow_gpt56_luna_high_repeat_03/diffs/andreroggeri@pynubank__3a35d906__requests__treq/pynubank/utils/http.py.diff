@@ -1,0 +1,172 @@
+--- a/pynubank/utils/http.py
++++ b/pynubank/utils/http.py
+@@ -1,7 +1,110 @@
+-from requests import Response
+-from requests_pkcs12 import get, post
++import json as jsonlib
++import threading
++from typing import Any, Callable
++
++import OpenSSL
++import treq
++from cryptography.hazmat.primitives import serialization
++from cryptography.hazmat.primitives.serialization import pkcs12
++from twisted.internet import reactor
++from twisted.internet.ssl import CertificateOptions
++from twisted.web.client import Agent
++
++from treq import get, post
+ 
+ from pynubank import NuRequestException
++
++
++_reactor_lock = threading.Lock()
++_reactor_thread = None
++
++
++class _TreqHeaders:
++    def __init__(self, headers):
++        self._headers = headers
++
++    def get(self, name, default=None):
++        if hasattr(self._headers, 'getRawHeaders'):
++            values = self._headers.getRawHeaders(name)
++        else:
++            values = self._headers.get(name)
++            if values is None:
++                values = self._headers.get(name.lower())
++
++        if not values:
++            return default
++
++        value = values[0] if isinstance(values, (list, tuple)) else values
++        return value.decode() if isinstance(value, bytes) else value
++
++
++class _TreqResult:
++    def __init__(self, response, body: bytes, url: str):
++        self.status_code = response.code
++        self.url = url
++        self.headers = _TreqHeaders(response.headers)
++        self.content = body
++
++    def json(self):
++        return jsonlib.loads(self.content)
++
++
++def _start_reactor():
++    global _reactor_thread
++    with _reactor_lock:
++        if reactor.running:
++            return
++        if _reactor_thread is None:
++            _reactor_thread = threading.Thread(
++                target=reactor.run,
++                kwargs={'installSignalHandlers': False},
++                daemon=True,
++            )
++            _reactor_thread.start()
++
++
++def _sync_request(request_factory: Callable[[], Any], url: str):
++    result = []
++    completed = threading.Event()
++
++    def finish(value=None, failure=None):
++        if completed.is_set():
++            return
++        result.append(failure if failure is not None else value)
++        completed.set()
++
++    def on_response(response):
++        content = treq.content(response)
++
++        def on_content(body):
++            finish(_TreqResult(response, body, url))
++            return body
++
++        content.addCallback(on_content)
++        content.addErrback(lambda failure: finish(failure=failure))
++        return content
++
++    def request():
++        try:
++            response = request_factory()
++            if hasattr(response, 'addCallback'):
++                response.addCallback(on_response)
++                response.addErrback(lambda failure: finish(failure=failure))
++            else:
++                finish(response)
++        except Exception as error:
++            finish(failure=error)
++
++    _start_reactor()
++    reactor.callFromThread(request)
++    completed.wait()
++
++    value = result[0]
++    if hasattr(value, 'raiseException'):
++        value.raiseException()
++    if isinstance(value, BaseException):
++        raise value
++    return value
+ 
+ 
+ class HttpClient:
+@@ -28,22 +131,49 @@
+ 
+     @property
+     def _cert_args(self):
+-        return {'pkcs12_data': self._cert, 'pkcs12_password': ''} if self._cert else {}
++        if not self._cert:
++            return {}
+ 
+-    def _handle_response(self, response: Response) -> dict:
++        private_key, certificate, _ = pkcs12.load_key_and_certificates(self._cert, None)
++        if private_key is None or certificate is None:
++            return {}
++
++        private_key_pem = private_key.private_bytes(
++            serialization.Encoding.PEM,
++            serialization.PrivateFormat.TraditionalOpenSSL,
++            serialization.NoEncryption(),
++        )
++        certificate_pem = certificate.public_bytes(serialization.Encoding.PEM)
++        context = CertificateOptions(
++            privateKey=OpenSSL.crypto.load_privatekey(OpenSSL.crypto.FILETYPE_PEM, private_key_pem),
++            certificate=OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, certificate_pem),
++        )
++        return {'agent': Agent(reactor, contextFactory=context)}
++
++    def _handle_response(self, response: Any) -> dict:
+         if response.status_code != 200:
+             raise NuRequestException(response)
+ 
+         return response.json()
+ 
+-    def raw_get(self, url: str) -> Response:
+-        return get(url, headers=self._headers, **self._cert_args)
++    def raw_get(self, url: str) -> Any:
++        request = lambda: get(url, headers=self._request_headers, **self._cert_args)
++        return _sync_request(request, url)
+ 
+-    def raw_post(self, url: str, json: dict) -> Response:
+-        return post(url, json=json, headers=self._headers, **self._cert_args)
++    def raw_post(self, url: str, json: dict) -> Any:
++        data = jsonlib.dumps(json).encode()
++        request = lambda: post(url, data=data, headers=self._request_headers, **self._cert_args)
++        return _sync_request(request, url)
+ 
+     def get(self, url: str) -> dict:
+         return self._handle_response(self.raw_get(url))
+ 
+     def post(self, url: str, json: dict) -> dict:
+-        return self._handle_response(post(url, json=json, headers=self._headers, **self._cert_args))
++        return self._handle_response(self.raw_post(url, json))
++
++    @property
++    def _request_headers(self):
++        return {
++            name.encode('ascii'): [value.encode('utf-8')]
++            for name, value in self._headers.items()
++        }

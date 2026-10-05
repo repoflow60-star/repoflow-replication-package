@@ -1,0 +1,165 @@
+--- a/authomize/rest_api_client/client/base_client.py
++++ b/authomize/rest_api_client/client/base_client.py
+@@ -1,7 +1,9 @@
++import json
++from io import BytesIO
+ from typing import Optional
+-
+-import requests
+-from requests import Response
++from urllib.parse import urlencode
++
++import pycurl
+ 
+ AUTHOMIZE_API_URL = 'https://api.authomize.com'
+ 
+@@ -9,13 +11,130 @@
+ class ClientError(Exception):
+     def __init__(self, message):
+         self.message = message
++
++
++class _CurlResponse:
++    def __init__(self, content, headers, status_code, url):
++        self.content = content
++        self.headers = headers
++        self.status_code = status_code
++        self.url = url
++        self.reason = ''
++
++    @property
++    def ok(self):
++        return self.status_code < 400
++
++    @property
++    def text(self):
++        return self.content.decode('utf-8', errors='replace')
++
++    def json(self):
++        return json.loads(self.text)
++
++    def raise_for_status(self):
++        if not self.ok:
++            raise ClientError(
++                message={
++                    'status_code': self.status_code,
++                    'url': self.url,
++                    'message': self.reason or 'HTTP error',
++                    'raw': self.content,
++                },
++            )
++
++
++class _CurlSession:
++    def __init__(self):
++        self.headers = {}
++
++    def _request(self, method, url, params=None, headers=None, body=None):
++        if params:
++            query_items = [
++                (key, value)
++                for key, value in params.items()
++                if value is not None
++            ]
++            query = urlencode(query_items, doseq=True)
++            if query:
++                url = f'{url}&{query}' if '?' in url else f'{url}?{query}'
++
++        response_buffer = BytesIO()
++        header_buffer = BytesIO()
++        curl = pycurl.Curl()
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.FOLLOWLOCATION, 1)
++        curl.setopt(pycurl.WRITEFUNCTION, response_buffer.write)
++        curl.setopt(pycurl.HEADERFUNCTION, header_buffer.write)
++
++        request_headers = dict(self.headers)
++        if headers:
++            request_headers.update(headers)
++        curl.setopt(
++            pycurl.HTTPHEADER,
++            [f'{key}: {value}' for key, value in request_headers.items()],
++        )
++
++        if method == 'GET':
++            curl.setopt(pycurl.HTTPGET, 1)
++        elif method == 'POST':
++            curl.setopt(pycurl.POST, 1)
++            if body is not None:
++                curl.setopt(
++                    pycurl.POSTFIELDS,
++                    body.encode('utf-8') if isinstance(body, str) else body,
++                )
++        else:
++            curl.setopt(pycurl.CUSTOMREQUEST, method)
++            if body is not None:
++                curl.setopt(
++                    pycurl.POSTFIELDS,
++                    body.encode('utf-8') if isinstance(body, str) else body,
++                )
++
++        try:
++            curl.perform()
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++            effective_url = curl.getinfo(pycurl.EFFECTIVE_URL) or url
++        finally:
++            curl.close()
++
++        response_headers = {}
++        for line in header_buffer.getvalue().splitlines():
++            if line.startswith((b'HTTP/', b'ICY ')):
++                response_headers = {}
++                continue
++            key, separator, value = line.partition(b':')
++            if separator:
++                response_headers[key.decode('latin1').lower()] = value.decode(
++                    'latin1'
++                ).strip()
++
++        return _CurlResponse(
++            content=response_buffer.getvalue(),
++            headers=response_headers,
++            status_code=status_code,
++            url=effective_url,
++        )
++
++    def get(self, url, params=None):
++        return self._request('GET', url, params=params)
++
++    def post(self, url, headers=None, data=None):
++        return self._request('POST', url, headers=headers, body=data)
++
++    def patch(self, url, headers=None, data=None):
++        return self._request('PATCH', url, headers=headers, body=data)
++
++    def delete(self, url, params=None):
++        return self._request('DELETE', url, params=params)
+ 
+ 
+ class BaseClient:
+     def __init__(self, auth_token: str, base_url: str = AUTHOMIZE_API_URL):
+         self.auth_token = auth_token
+         self.base_url = base_url
+-        self.session = requests.Session()
++        self.session = _CurlSession()
+         self.session.headers.update({'Authorization': self.authorization_header})
+ 
+     @property
+@@ -23,7 +142,7 @@
+         raise NotImplementedError()
+ 
+     @staticmethod
+-    def _handle_response(response: Response):
++    def _handle_response(response: _CurlResponse):
+         if response.ok:
+             return BaseClient._handle_ok_response(response)
+         try:
+@@ -38,7 +157,7 @@
+         response.raise_for_status()
+ 
+     @staticmethod
+-    def _handle_ok_response(response: Response) -> dict:
++    def _handle_ok_response(response: _CurlResponse) -> dict:
+         if content_type := response.headers.get('content-type'):
+             if content_type.startswith('application/json'):
+                 return response.json()

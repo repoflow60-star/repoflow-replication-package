@@ -1,0 +1,180 @@
+--- a/cas.py
++++ b/cas.py
+@@ -1,12 +1,110 @@
++import asyncio
+ import datetime
++import inspect
+ import logging
++import threading
+ from uuid import uuid4
+ 
+-import requests
++import aiohttp
+ from lxml import etree
+ from six.moves.urllib import parse as urllib_parse
+ 
+ logger = logging.getLogger(__name__)
++
++
++def _run_async(awaitable):
++    """Run an aiohttp operation from the library's synchronous API.
++
++    ``python-cas`` historically exposed synchronous methods.  aiohttp is an
++    asynchronous client, so the default transport runs each request in an
++    event loop.  If the caller already owns a running loop, use a short-lived
++    worker thread rather than trying to nest event loops in that thread.
++    """
++    async def wait_for_result():
++        return await awaitable
++
++    try:
++        asyncio.get_running_loop()
++    except RuntimeError:
++        return asyncio.run(wait_for_result())
++
++    result = []
++    error = []
++
++    def run_in_thread():
++        try:
++            result.append(asyncio.run(wait_for_result()))
++        except BaseException as exc:  # propagate the original request error
++            error.append(exc)
++
++    thread = threading.Thread(target=run_in_thread)
++    thread.start()
++    thread.join()
++    if error:
++        raise error[0]
++    return result[0]
++
++
++class _AiohttpResponse(object):
++    """Small response adapter retaining the response API used by CASClient."""
++
++    def __init__(self, status, content):
++        self.status_code = status
++        self.content = content
++
++    def iter_lines(self, chunk_size=8192):
++        del chunk_size  # aiohttp has already buffered the response body
++        return iter(line.decode('utf-8') for line in self.content.splitlines())
++
++    def close(self):
++        # The aiohttp response and its session are closed by the request
++        # context manager before this adapter is returned.
++        pass
++
++
++class _AiohttpSession(object):
++    """Synchronous facade over aiohttp used for backwards compatibility."""
++
++    @staticmethod
++    async def _request(method, url, **kwargs):
++        verify = kwargs.pop('verify', True)
++        kwargs.pop('stream', None)
++        kwargs['ssl'] = None if verify else False
++
++        async with aiohttp.ClientSession() as session:
++            async with session.request(method, url, **kwargs) as response:
++                return _AiohttpResponse(response.status, await response.read())
++
++    def request(self, method, url, **kwargs):
++        return _run_async(self._request(method, url, **kwargs))
++
++    def get(self, url, **kwargs):
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, data=None, **kwargs):
++        if data is not None:
++            kwargs['data'] = data
++        return self.request('POST', url, **kwargs)
++
++
++def _read_aiohttp_response(request):
++    """Read and close a response returned by an externally supplied session."""
++    async def read_response():
++        if inspect.isawaitable(request):
++            request_response = await request
++        else:
++            request_response = request
++
++        if hasattr(request_response, '__aenter__'):
++            async with request_response as response:
++                return _AiohttpResponse(response.status, await response.read())
++
++        content = await request_response.read()
++        if hasattr(request_response, 'release'):
++            request_response.release()
++        return _AiohttpResponse(request_response.status, content)
++
++    return _run_async(read_response())
+ 
+ 
+ class CASError(ValueError):
+@@ -79,7 +177,21 @@
+         self.renew = renew
+         self.username_attribute = username_attribute
+         self.verify_ssl_certificate = verify_ssl_certificate
+-        self.session = session or requests.sessions.Session()
++        self.session = session or _AiohttpSession()
++
++    def _request(self, method, url, **kwargs):
++        """Issue a request using either a legacy or an aiohttp session."""
++        request_method = getattr(self.session, method)
++        if isinstance(self.session, aiohttp.ClientSession):
++            verify = kwargs.pop('verify', True)
++            kwargs.pop('stream', None)
++            kwargs['ssl'] = None if verify else False
++            return _read_aiohttp_response(request_method(url, **kwargs))
++
++        response = request_method(url, **kwargs)
++        if inspect.isawaitable(response) or hasattr(response, '__aenter__'):
++            return _read_aiohttp_response(response)
++        return response
+ 
+     def verify_ticket(self, ticket):
+         """Verify ticket.
+@@ -140,7 +252,8 @@
+         Raises:
+             CASError: Non 200 http code or bad XML body.
+         """
+-        response = self.session.get(self.get_proxy_url(pgt), verify=self.verify_ssl_certificate)
++        response = self._request(
++            'get', self.get_proxy_url(pgt), verify=self.verify_ssl_certificate)
+         if response.status_code == 200:
+             from lxml import etree
+             root = etree.fromstring(response.content)
+@@ -172,7 +285,8 @@
+         params = [('ticket', ticket), ('service', self.service_url)]
+         url = (urllib_parse.urljoin(self.server_url, 'validate') + '?' +
+                urllib_parse.urlencode(params))
+-        page = self.session.get(
++        page = self._request(
++            'get',
+             url,
+             stream=True,
+             verify=self.verify_ssl_certificate
+@@ -212,7 +326,8 @@
+         if self.proxy_callback:
+             params.update({'pgtUrl': self.proxy_callback})
+         base_url = urllib_parse.urljoin(self.server_url, self.url_suffix)
+-        page = self.session.get(
++        page = self._request(
++            'get',
+             base_url,
+             params=params,
+             verify=self.verify_ssl_certificate
+@@ -380,9 +495,10 @@
+         saml_validate_url = urllib_parse.urljoin(
+             self.server_url, 'samlValidate',
+         )
+-        return self.session.post(
++        return self._request(
++            'post',
+             saml_validate_url,
+-            self.get_saml_assertion(ticket),
++            data=self.get_saml_assertion(ticket),
+             params=params,
+             headers=headers)
+ 

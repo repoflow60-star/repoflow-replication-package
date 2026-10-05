@@ -1,0 +1,119 @@
+--- a/iconsdk/providers/http_provider.py
++++ b/iconsdk/providers/http_provider.py
+@@ -19,13 +19,34 @@
+ from typing import Union, Optional
+ from urllib.parse import urlparse, urlunparse
+ 
+-import requests
++import treq
+ from multimethod import multimethod
++from twisted.internet.selectreactor import SelectReactor
++from twisted.web.client import Agent
+ from websocket import WebSocket, WebSocketTimeoutException
+ 
+ from iconsdk.exception import JSONRPCException, URLException
+ from iconsdk.providers.provider import Provider, MonitorSpec, Monitor, MonitorTimeoutException
+ from iconsdk.utils import to_dict
++
++
++class _TreqResponse:
++    """Synchronous response facade used by the existing provider API.
++
++    ``treq`` returns a Twisted response and exposes its body asynchronously.
++    HTTPProvider has historically been synchronous, so the body is collected
++    before this facade is returned.  Keeping the small facade local also keeps
++    response parsing independent from either HTTP client implementation.
++    """
++
++    def __init__(self, response, content: bytes):
++        self._response = response
++        self.content = content
++        self.code = response.code
++        self.ok = 200 <= response.code < 400
++
++    def __getattr__(self, name):
++        return getattr(self._response, name)
+ 
+ 
+ class HTTPProvider(Provider):
+@@ -119,11 +140,67 @@
+             yield key, value
+ 
+     @staticmethod
+-    def _make_post_request(request_url: str, data: dict, **kwargs) -> requests.Response:
++    def _make_post_request(request_url: str, data: dict, **kwargs) -> _TreqResponse:
++        """POST an RPC request through treq while retaining the sync API.
++
++        Treq is Deferred-based, whereas the SDK's Provider interface is
++        intentionally synchronous.  A private reactor is used for each
++        request, which avoids trying to start/stop Twisted's process-global
++        reactor repeatedly and also works when callers make several requests
++        in sequence.
++        """
+         kwargs.setdefault('timeout', 10)
+-        with requests.Session() as session:
+-            response = session.post(url=request_url, data=json.dumps(data), **kwargs)
+-        return response
++
++        # ``requests`` accepted ``verify`` but treq does not have a matching
++        # request keyword.  Treq/ Twisted verifies TLS certificates by default;
++        # discard the legacy value rather than passing an unsupported keyword.
++        kwargs.pop('verify', None)
++
++        reactor = SelectReactor()
++        agent = Agent(reactor)
++        request = treq.post(
++            request_url,
++            data=json.dumps(data).encode('utf-8'),
++            agent=agent,
++            reactor=reactor,
++            **kwargs,
++        )
++
++        def read_content(response):
++            return treq.content(response).addCallback(
++                lambda content: _TreqResponse(response, content)
++            )
++
++        request.addCallback(read_content)
++        return HTTPProvider._wait_for_deferred(request, reactor)
++
++    @staticmethod
++    def _wait_for_deferred(deferred, reactor):
++        """Resolve a Deferred using the request's private reactor."""
++        result = []
++        failure = []
++
++        def succeeded(value):
++            result.append(value)
++            if reactor.running:
++                reactor.stop()
++            return value
++
++        def failed(error):
++            failure.append(error)
++            if reactor.running:
++                reactor.stop()
++            return error
++
++        deferred.addCallbacks(succeeded, failed)
++        # A mocked/short-circuited Deferred may already have fired before the
++        # callbacks were added.  In that case there is no reactor to run.
++        if not result and not failure:
++            reactor.run()
++
++        if failure:
++            failure[0].raiseException()
++        return result[0]
+ 
+     def _make_id(self) -> int:
+         return int(time())
+@@ -147,7 +224,7 @@
+             raise JSONRPCException(f'Unknown response: {raw_response}')
+ 
+     @staticmethod
+-    def _return_custom_response(response: requests.Response, full_response: bool = False) -> Union[str, list, dict]:
++    def _return_custom_response(response: _TreqResponse, full_response: bool = False) -> Union[str, list, dict]:
+         content = json.loads(response.content)
+         if full_response:
+             return content

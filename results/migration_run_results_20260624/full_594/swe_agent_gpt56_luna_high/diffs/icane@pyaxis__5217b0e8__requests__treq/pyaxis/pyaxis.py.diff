@@ -1,0 +1,140 @@
+--- a/pyaxis/pyaxis.py
++++ b/pyaxis/pyaxis.py
+@@ -27,11 +27,101 @@
+ 
+ from pandas import Series
+ 
+-import requests
++import treq
++from requests import exceptions as requests_exceptions
++from twisted.internet import defer
++from twisted.internet import error as twisted_error
++from twisted.internet.selectreactor import SelectReactor
++from twisted.python.failure import Failure
++from twisted.web._newclient import ResponseNeverReceived
+ 
+ from pyaxis.metadata_processing import metadata_extract, metadata_split_to_dict, multilingual_parse
+-
+ from pyaxis.data_processing import get_dimensions, build_dataframe
++
++
++_HTTP_ERRORS = (
++    twisted_error.ConnectError,
++    twisted_error.ConnectionAborted,
++    twisted_error.ConnectionClosed,
++    twisted_error.ConnectionLost,
++    twisted_error.ConnectionRefusedError,
++    twisted_error.DNSLookupError,
++    twisted_error.NoRouteError,
++    ResponseNeverReceived,
++)
++
++
++def _run_treq_request(uri, timeout, encoding):
++    """Run one treq request synchronously.
++
++    ``treq`` is built on Twisted and consequently returns a Deferred.  The
++    public parser API is synchronous, so a short-lived reactor is used for
++    each URL read.  A private reactor also means that repeated calls to
++    :func:`read` do not try to restart Twisted's global reactor.
++    """
++    reactor = SelectReactor()
++
++    def response_body(response):
++        """Read and decode the body, translating HTTP status failures."""
++        status_code = getattr(response, 'code',
++                              getattr(response, 'status_code', 200))
++        phrase = getattr(response, 'phrase',
++                         getattr(response, 'reason', ''))
++        if isinstance(phrase, bytes):
++            phrase = phrase.decode('ascii', errors='replace')
++
++        # Consume the body before stopping the reactor.  This is important
++        # for treq's connection handling, including error responses.
++        body = defer.maybeDeferred(response.content)
++
++        def body_received(content):
++            if status_code >= 400:
++                http_error = requests_exceptions.HTTPError(
++                    '{} {}'.format(status_code, phrase), response=response)
++                return Failure(http_error)
++            return content.decode(encoding)
++
++        return body.addCallback(body_received)
++
++    def translate_failure(failure):
++        """Keep the old public requests exception behaviour."""
++        if failure.check(requests_exceptions.RequestException):
++            return failure
++        if failure.check(twisted_error.TimeoutError,
++                         defer.CancelledError):
++            return Failure(requests_exceptions.ConnectTimeout(
++                str(failure.value)))
++        if failure.check(ValueError):
++            return Failure(requests_exceptions.InvalidURL(
++                str(failure.value)))
++        if failure.check(*_HTTP_ERRORS):
++            return Failure(requests_exceptions.ConnectionError(
++                str(failure.value)))
++        return failure
++
++    result = []
++
++    def finished(value):
++        result.append(value)
++        if reactor.running:
++            reactor.stop()
++        else:
++            reactor.callWhenRunning(reactor.stop)
++        # Consume the Deferred's result here.  The original value is retained
++        # in ``result`` and is re-raised below when it is a Failure.
++        return None
++
++    request = defer.maybeDeferred(
++        treq.get, uri, timeout=timeout, reactor=reactor, persistent=False)
++    request.addCallback(response_body)
++    request.addErrback(translate_failure)
++    request.addBoth(finished)
++    reactor.run()
++
++    value = result[0]
++    if isinstance(value, Failure):
++        value.raiseException()
++    return value
+ 
+ 
+ logging.basicConfig(level=logging.INFO)
+@@ -83,25 +173,18 @@
+ 
+     if uri_type(uri) == 'URL':
+         try:
+-            response = requests.get(uri, stream=True, timeout=timeout)
+-            response.raise_for_status()
+-            response.encoding = encoding
+-            raw_pcaxis = response.text
+-            response.close()
+-        except requests.exceptions.ConnectTimeout as connect_timeout:
++            raw_pcaxis = _run_treq_request(uri, timeout, encoding)
++        except requests_exceptions.ConnectTimeout as connect_timeout:
+             logger.error('ConnectionTimeout = %s', str(connect_timeout))
+             raise
+-        except requests.exceptions.ConnectionError as connection_error:
++        except requests_exceptions.ConnectionError as connection_error:
+             logger.error('ConnectionError = %s', str(connection_error))
+             raise
+-        except requests.exceptions.HTTPError as http_error:
+-            logger.error('HTTPError = %s',
+-                         str(http_error.response.status_code) + ' ' +
+-                         http_error.response.reason)
+-            raise
+-        except requests.exceptions.InvalidURL as url_error:
+-            logger.error('URLError = ' + url_error.response.status_code + ' ' +
+-                         url_error.response.reason)
++        except requests_exceptions.HTTPError as http_error:
++            logger.error('HTTPError = %s', str(http_error))
++            raise
++        except requests_exceptions.InvalidURL as url_error:
++            logger.error('URLError = %s', str(url_error))
+             raise
+         except Exception:
+             import traceback

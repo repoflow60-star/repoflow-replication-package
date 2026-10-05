@@ -1,0 +1,210 @@
+--- a/census/core.py
++++ b/census/core.py
+@@ -1,15 +1,30 @@
++import json
+ import warnings
+ from functools import wraps, lru_cache
+ from importlib.metadata import version
+ 
++import treq
++from twisted.internet.defer import inlineCallbacks
++from twisted.web.http_headers import Headers
++
+ __version__ = version('census')
+ 
+ ALL = '*'
+ 
+ 
++class TreqSession(object):
++    def __init__(self, *args, **kwargs):
++        self.headers = {}
++
++    def get(self, url, params=None):
++        headers = Headers()
++        for key, value in self.headers.items():
++            headers.addRawHeader(key.encode('ascii'), value.encode('utf-8'))
++        return treq.get(url, params=params, headers=headers)
++
++
+ def new_session(*args, **kwargs):
+-    import requests
+-    return requests.session(*args, **kwargs)
++    return TreqSession(*args, **kwargs)
+ 
+ 
+ class APIKeyError(Exception):
+@@ -54,10 +69,11 @@
+ 
+ def retry_on_transient_error(func):
+ 
++    @inlineCallbacks
+     def wrapper(self, *args, **kwargs):
+         for _ in range(max(self.retries - 1, 0)):
+             try:
+-                result = func(self, *args, **kwargs)
++                result = yield func(self, *args, **kwargs)
+             except CensusException as e:
+                 if "There was an error while running your query.  We've logged the error and we'll correct it ASAP.  Sorry for the inconvenience." in str(e):
+                     pass
+@@ -66,7 +82,7 @@
+             else:
+                 return result
+         else:
+-            return func(self, *args, **kwargs)
++            return (yield func(self, *args, **kwargs))
+ 
+     return wrapper
+ 
+@@ -102,6 +118,7 @@
+             self.default_year = year
+         self.retries = retries
+ 
++    @inlineCallbacks
+     def tables(self, year=None):
+         """
+         Returns a list of the data tables available from this source.
+@@ -112,12 +129,14 @@
+ 
+         # Query the table metadata as raw JSON
+         tables_url = self.groups_url % (year, self.dataset)
+-        resp = self.session.get(tables_url)
++        resp = yield self.session.get(tables_url)
+ 
+         # Pass it out
+-        return resp.json()['groups']
+-
+-    @supported_years()
++        obj = yield treq.json_content(resp)
++        return obj['groups']
++
++    @supported_years()
++    @inlineCallbacks
+     def fields(self, year=None, flat=False):
+         if year is None:
+             year = self.default_year
+@@ -126,8 +145,8 @@
+ 
+         fields_url = self.definitions_url % (year, self.dataset)
+ 
+-        resp = self.session.get(fields_url)
+-        obj = resp.json()
++        resp = yield self.session.get(fields_url)
++        obj = yield treq.json_content(resp)
+ 
+         if flat:
+ 
+@@ -146,6 +165,7 @@
+ 
+         return data
+ 
++    @inlineCallbacks
+     def get(self, fields, geo, year=None, **kwargs):
+         """
+         The API only accepts up to 50 fields on each query.
+@@ -154,13 +174,15 @@
+         GEO_ID is not reliably present in pre-2010 requests.
+         """
+         sort_by_geoid = len(fields) > 49 and (not year or year > 2009)
+-        all_results = (self.query(forty_nine_fields, geo, year, sort_by_geoid=sort_by_geoid, **kwargs)
+-                       for forty_nine_fields in chunks(fields, 49))
++        all_results = []
++        for forty_nine_fields in chunks(fields, 49):
++            all_results.append((yield self.query(forty_nine_fields, geo, year, sort_by_geoid=sort_by_geoid, **kwargs)))
+         merged_results = [merge(result) for result in zip(*all_results)]
+ 
+         return merged_results
+ 
+     @retry_on_transient_error
++    @inlineCallbacks
+     def query(self, fields, geo, year=None, sort_by_geoid=False, **kwargs):
+         if year is None:
+             year = self.default_year
+@@ -183,19 +205,22 @@
+         if 'in' in geo:
+             params['in'] = geo['in']
+ 
+-        resp = self.session.get(url, params=params)
+-
+-        if resp.status_code == 200:
++        resp = yield self.session.get(url, params=params)
++
++        if resp.code == 200:
++            body = yield treq.content(resp)
+             try:
+-                data = resp.json()
++                data = json.loads(body)
+             except ValueError as ex:
+-                if '<title>Invalid Key</title>' in resp.text:
+-                    raise APIKeyError(' '.join(resp.text.splitlines()))
++                text = body.decode('utf-8')
++                if '<title>Invalid Key</title>' in text:
++                    raise APIKeyError(' '.join(text.splitlines()))
+                 else:
+                     raise ex
+ 
+             headers = data.pop(0)
+             types = [self._field_type(header, year) for header in headers]
++            types = [yield field_type for field_type in types]
+             results = [{header: (cast(item) if item is not None else None)
+                         for header, cast, item
+                         in zip(headers, types, d)}
+@@ -207,16 +232,18 @@
+                     results = sorted(results, key=lambda x: x.pop('GEO_ID'))
+             return results
+ 
+-        elif resp.status_code == 204:
++        elif resp.code == 204:
+             return []
+ 
+         else:
+-            raise CensusException(resp.text)
++            text = yield treq.text_content(resp)
++            raise CensusException(text)
+ 
+     @lru_cache(maxsize=1024)
++    @inlineCallbacks
+     def _field_type(self, field, year):
+         url = self.definition_url % (year, self.dataset, field)
+-        resp = self.session.get(url)
++        resp = yield self.session.get(url)
+ 
+         types = {"fips-for": str,
+                  "fips-in": str,
+@@ -225,8 +252,9 @@
+                  "float": float,
+                  "string": str}
+ 
+-        if resp.status_code == 200:
+-            predicate_type = resp.json().get("predicateType", "string")
++        if resp.code == 200:
++            obj = yield treq.json_content(resp)
++            predicate_type = obj.get("predicateType", "string")
+             return types[predicate_type]
+         else:
+             return str
+@@ -285,8 +313,9 @@
+     def state_legislative_district_lower(self, fields, state_fips, legislative_district, **kwargs):
+         return self.get(fields, geo={
+             'for': 'state legislative district (lower chamber):{}'.format(str(legislative_district).zfill(3)),
+-            'in': 'state:{}'.format(state_fips),
+-        }, **kwargs)
++            'in': 'state:{}'.format(legislative_district).zfill(3),
++        }, **kwargs)
++
+     @supported_years()
+     def combined_statistical_area(self, fields, csa, **kwargs):
+         return self.get(fields, geo={
+@@ -299,6 +328,7 @@
+             'for': ('metropolitan statistical area/' +
+                 'micropolitan statistical area:{}'.format(msa)), 
+         }, **kwargs)
++
+ 
+ class ACSClient(Client):
+ 
+@@ -605,4 +635,4 @@
+     @property
+     def acs(self):
+         warnings.warn('Use acs5 instead of acs', DeprecationWarning)
+-        return self._acs
++        return self._acs

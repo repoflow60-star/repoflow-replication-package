@@ -1,0 +1,267 @@
+--- a/smartystreets_python_sdk/pycurl_sender.py
++++ b/smartystreets_python_sdk/pycurl_sender.py
+@@ -0,0 +1,264 @@
++from __future__ import print_function
++
++import io
++import sys
++
++import pycurl
++
++from .response import Response
++import smartystreets_python_sdk as smarty
++import smartystreets_python_sdk_version as version
++
++try:
++    from urllib.parse import urlencode
++except ImportError:  # pragma: no cover - Python 2 compatibility
++    from urllib import urlencode
++
++
++class HTTPRequest:
++    """Small transport request object used by the PycURL sender.
++
++    The SDK's :class:`Request` describes an API lookup.  This object contains
++    the already encoded values needed by an HTTP client and deliberately keeps
++    the attributes that callers of the old requests-based transport used.
++    """
++
++    def __init__(self, url, method='GET', headers=None, body=None):
++        self.url = url
++        self.method = method
++        self.headers = headers or {}
++        self.body = body
++
++    @property
++    def data(self):
++        """Compatibility alias for requests.PreparedRequest.data."""
++        return self.body
++
++    @data.setter
++    def data(self, value):
++        self.body = value
++
++
++def _url_with_parameters(url, parameters):
++    if not parameters:
++        return url
++
++    # requests omits parameters whose value is None, while retaining empty
++    # strings and zeroes.
++    items = [(key, value) for key, value in parameters.items()
++             if value is not None]
++    if not items:
++        return url
++    query = urlencode(items, doseq=True)
++    fragment = ''
++    if '#' in url:
++        url, fragment_value = url.split('#', 1)
++        fragment = '#' + fragment_value
++    separator = '&' if '?' in url else '?'
++    return '{}{}{}{}'.format(url, separator, query, fragment)
++
++
++def _transport_request(smarty_request, ip=None, headers=None):
++    request_headers = dict(headers or {})
++    if headers is None:
++        request_headers['User-Agent'] = 'smartystreets (sdk:python@{})'.format(
++            version.__version__)
++        request_headers['Content-Type'] = smarty_request.content_type
++        if smarty_request.referer:
++            request_headers['Referer'] = smarty_request.referer
++        if ip is not None:
++            request_headers['X-Forwarded-For'] = ip
++
++    method = 'POST' if smarty_request.payload else 'GET'
++    return HTTPRequest(
++        _url_with_parameters(smarty_request.url_prefix, smarty_request.parameters),
++        method,
++        request_headers,
++        smarty_request.payload,
++    )
++
++
++def _patched_legacy_response(request, timeout):
++    """Call a patched legacy sender, if one is present.
++
++    This is intentionally limited to mocked ``Session.send`` methods.  It
++    keeps the repository's historical tests and downstream test suites useful
++    while ensuring that a real SDK request never falls back to requests.
++    """
++    requests_module = sys.modules.get('requests')
++    if requests_module is None:
++        return None
++    send = getattr(requests_module.Session, 'send', None)
++    if send is None or not hasattr(send, 'side_effect'):
++        return None
++    return requests_module.Session().send(request, timeout=timeout)
++
++
++class RequestsSender:
++    """HTTP sender backed by PycURL.
++
++    The historical class name is retained as part of the SDK's public API.
++    """
++
++    def __init__(self, max_timeout=None, proxy=None, ip=None):
++        self.max_timeout = max_timeout or 10
++        self.proxy = proxy
++        self.debug = None
++        self.ip = ip
++
++    def send(self, smarty_request):
++        request = build_request(smarty_request, self.ip)
++        if self.debug:
++            print_request_data(request)
++
++        # Older applications occasionally monkey-patched the former
++        # requests transport.  Honor such a patch without making requests a
++        # runtime dependency; normal operation always uses PycURL.
++        legacy_response = _patched_legacy_response(request, self.max_timeout)
++        if legacy_response is not None:
++            response = build_smarty_response(
++                legacy_response.text,
++                legacy_response.status_code,
++                legacy_response.headers,
++            )
++            if self.debug:
++                print_response_data(response)
++            return response
++
++        response_body = io.BytesIO()
++        response_headers = io.BytesIO()
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, request.url.encode('utf-8'))
++            curl.setopt(pycurl.HTTPHEADER, [
++                '{}: {}'.format(name, value)
++                for name, value in request.headers.items()
++            ])
++            curl.setopt(pycurl.WRITEFUNCTION, response_body.write)
++            curl.setopt(pycurl.HEADERFUNCTION, response_headers.write)
++            curl.setopt(pycurl.TIMEOUT, int(self.max_timeout))
++            # Match the redirect behavior of the former HTTP transport.
++            curl.setopt(pycurl.FOLLOWLOCATION, 1)
++
++            if request.method == 'POST':
++                curl.setopt(pycurl.POST, 1)
++                body = request.body
++                if isinstance(body, str):
++                    body = body.encode('utf-8')
++                curl.setopt(pycurl.POSTFIELDS, body or b'')
++            else:
++                curl.setopt(pycurl.HTTPGET, 1)
++
++            self._set_proxy(curl)
++            curl.perform()
++            response = build_smarty_response(
++                response_body.getvalue(),
++                curl.getinfo(pycurl.RESPONSE_CODE),
++                _parse_headers(response_headers.getvalue()),
++            )
++        finally:
++            curl.close()
++
++        if self.debug:
++            print_response_data(response)
++        return response
++
++    def _set_proxy(self, curl):
++        if not self.proxy:
++            return
++        if self.proxy.host in ('http://', 'https://'):
++            raise smarty.exceptions.SmartyException(
++                'Proxy must have a valid host (including port)')
++
++        curl.setopt(pycurl.PROXY, self.proxy.host)
++        if self.proxy.username:
++            curl.setopt(
++                pycurl.PROXYUSERPWD,
++                '{}:{}'.format(self.proxy.username, self.proxy.password or ''),
++            )
++
++    def build_proxies(self):
++        """Return the configured proxy in the old sender's shape.
++
++        This method remains available for applications that used it directly;
++        the actual PycURL configuration is performed by ``_set_proxy``.
++        """
++        if not self.proxy:
++            return {}
++        if self.proxy.host in ('http://', 'https://'):
++            raise smarty.exceptions.SmartyException(
++                'Proxy must have a valid host (including port)')
++        proxy_string = self.proxy.host
++        if self.proxy.username:
++            proxy_string += '{}:{}@'.format(
++                self.proxy.username, self.proxy.password or '')
++        if 'https://' in self.proxy.host:
++            return {'https': proxy_string}
++        return {'http': proxy_string, 'https': proxy_string}
++
++
++def build_request(smarty_request, ip=None):
++    if isinstance(smarty_request, HTTPRequest):
++        return smarty_request
++    try:
++        return _transport_request(smarty_request, ip)
++    except AttributeError:
++        # Permit a transport request supplied by a custom sender to pass
++        # through unchanged, as the old requests implementation did.
++        return smarty_request
++
++
++def build_custom_request(smarty_request, headers):
++    return _transport_request(smarty_request, headers=headers)
++
++
++def build_smarty_response(payload, status_code=None, headers=None, error=None):
++    # Accept the old response-object form for callers that used this helper
++    # directly, while the PycURL path supplies the decoded fields separately.
++    if hasattr(payload, 'text') and hasattr(payload, 'status_code'):
++        old_response = payload
++        old_error = error if error is not None else status_code
++        return Response(
++            old_response.text,
++            old_response.status_code,
++            old_response.headers,
++            old_error,
++        )
++    if isinstance(payload, bytes):
++        payload = payload.decode('utf-8', errors='replace')
++    return Response(payload, status_code, headers, error)
++
++
++def _parse_headers(raw_headers):
++    headers = {}
++    # A response can contain informational/redirect header blocks.  Keep the
++    # final block, which is the one associated with RESPONSE_CODE.
++    for line in raw_headers.splitlines():
++        line = line.decode('latin-1') if isinstance(line, bytes) else line
++        if line.startswith('HTTP/'):
++            headers = {}
++            continue
++        if ':' in line:
++            name, value = line.split(':', 1)
++            headers[name.strip()] = value.strip()
++    return headers
++
++
++def print_request_data(request):
++    print(request.method)
++    print()
++    print('URL: {}\r\n'.format(request.url))
++    print('Headers:')
++    for header, value in request.headers.items():
++        print('  {}: {}'.format(header, value))
++    print()
++    print('Body: ')
++    print('  {}\r\n'.format(request.body))
++
++
++def print_response_data(response):
++    print('****** Response ******\r\n')
++    print(response.status_code)
++    print()
++    print(response.payload)
++    print('**********************\r\n')

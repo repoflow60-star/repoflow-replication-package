@@ -1,0 +1,100 @@
+--- a/growthbook/growthbook.py
++++ b/growthbook/growthbook.py
+@@ -29,8 +29,6 @@
+ from aiohttp.client_exceptions import ClientConnectorError, ClientResponseError, ClientPayloadError
+ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+ from cryptography.hazmat.primitives import padding
+-from urllib3 import PoolManager
+-
+ logger = logging.getLogger("growthbook")
+ 
+ 
+@@ -950,7 +948,6 @@
+ class FeatureRepository(object):
+     def __init__(self) -> None:
+         self.cache: AbstractFeatureCache = InMemoryFeatureCache()
+-        self.http: Optional[PoolManager] = None
+         self.sse_client: Optional[SSEClient] = None
+ 
+     def set_cache(self, cache: AbstractFeatureCache) -> None:
+@@ -991,20 +988,74 @@
+                 return res
+         return cached
+ 
++    @staticmethod
++    def _run_async(coroutine):
++        try:
++            loop = asyncio.get_event_loop()
++        except RuntimeError:
++            loop = asyncio.new_event_loop()
++            asyncio.set_event_loop(loop)
++            owns_loop = True
++        else:
++            if loop.is_closed():
++                loop = asyncio.new_event_loop()
++                asyncio.set_event_loop(loop)
++                owns_loop = True
++            else:
++                owns_loop = False
++
++        if not loop.is_running():
++            try:
++                return loop.run_until_complete(coroutine)
++            finally:
++                if owns_loop:
++                    loop.close()
++                    asyncio.set_event_loop(None)
++
++        result = []
++        errors = []
++
++        def run_in_thread():
++            thread_loop = asyncio.new_event_loop()
++            asyncio.set_event_loop(thread_loop)
++            try:
++                result.append(thread_loop.run_until_complete(coroutine))
++            except BaseException as error:
++                errors.append(error)
++            finally:
++                thread_loop.close()
++                asyncio.set_event_loop(None)
++
++        thread = threading.Thread(target=run_in_thread)
++        thread.start()
++        thread.join()
++
++        if errors:
++            raise errors[0]
++        return result[0]
++
++    async def _get_async(self, url: str) -> Tuple[int, bytes]:
++        async with aiohttp.ClientSession() as session:
++            async with session.get(url) as response:
++                return response.status, await response.read()
++
+     # Perform the GET request (separate method for easy mocking)
+     def _get(self, url: str):
+-        self.http = self.http or PoolManager()
+-        return self.http.request("GET", url)
++        return self._run_async(self._get_async(url))
+     
+     def _fetch_and_decode(self, api_host: str, client_key: str) -> Optional[Dict]:
+         try:
+-            r = self._get(self._get_features_url(api_host, client_key))
+-            if r.status >= 400:
++            response = self._get(self._get_features_url(api_host, client_key))
++            if isinstance(response, tuple):
++                status, body = response
++            else:
++                status, body = response.status, response.data
++            if status >= 400:
+                 logger.warning(
+-                    "Failed to fetch features, received status code %d", r.status
++                    "Failed to fetch features, received status code %d", status
+                 )
+                 return None
+-            decoded = json.loads(r.data.decode("utf-8"))
++            decoded = json.loads(body.decode("utf-8"))
+             return decoded
+         except Exception:
+             logger.warning("Failed to decode feature JSON from GrowthBook API")

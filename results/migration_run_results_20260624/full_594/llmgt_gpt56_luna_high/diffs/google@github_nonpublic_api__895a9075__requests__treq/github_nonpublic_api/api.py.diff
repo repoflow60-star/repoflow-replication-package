@@ -1,0 +1,323 @@
+--- a/github_nonpublic_api/api.py
++++ b/github_nonpublic_api/api.py
+@@ -19,27 +19,48 @@
+ from enum import Enum
+ import re
+ from urllib.parse import urljoin
++from http.cookiejar import CookieJar
+ 
+ import html5lib
+ import pyotp
+-import requests
++import treq
+ from absl import logging
+ from configobj import ConfigObj
++from twisted.internet import reactor
++from twisted.internet.defer import Deferred, inlineCallbacks, returnValue
++from twisted.web.client import Agent, BrowserLikeRedirectAgent, CookieAgent
++from treq.client import HTTPClient
+ from typing import Optional
+ 
+ 
++def _create_session() -> HTTPClient:
++    cookie_jar = CookieJar()
++    session = HTTPClient(
++        BrowserLikeRedirectAgent(CookieAgent(Agent(reactor), cookie_jar))
++    )
++    session.cookies = cookie_jar
++    return session
++
++
++def _raise_for_status(response):
++    if response.code >= 400:
++        raise RuntimeError("HTTP status code: %s" % response.code)
++
++
++@inlineCallbacks
+ def _get_and_submit_form(
+     session, url: str, data_callback=None, form_matcher=lambda form: True
+ ):
++    if isinstance(session, Deferred):
++        session = yield session
++
+     logging.info("Fetching URL %s", url)
+-    response = session.get(url)
+-    response.raise_for_status()
+-
+-    logging.info("Fetching URL %s", response.url)
+-    for redirect_response in response.history:
+-        logging.info("Redirected from: %s", redirect_response.url)
+-
+-    doc = html5lib.parse(response.text, namespaceHTMLElements=False)
++    response = yield session.get(url)
++    _raise_for_status(response)
++
++    doc = html5lib.parse(
++        (yield treq.text(response)), namespaceHTMLElements=False
++    )
+     forms = doc.findall(".//form")
+ 
+     submit_form = None
+@@ -69,26 +90,31 @@
+     submit_url = urljoin(url, action_url)
+     logging.info("Posting form to URL %s", submit_url)
+ 
+-    response = session.post(submit_url, data=data)
+-    response.raise_for_status()
+-    return response
+-
+-
++    response = yield session.post(submit_url, data=data)
++    _raise_for_status(response)
++    returnValue(response)
++
++
++@inlineCallbacks
+ def _get_url_with_session(session, url: str):
++    if isinstance(session, Deferred):
++        session = yield session
++
+     logging.info("Fetching URL %s", url)
+-    response = session.get(url)
+-    response.raise_for_status()
+-    return response
+-
+-
++    response = yield session.get(url)
++    _raise_for_status(response)
++    returnValue(response)
++
++
++@inlineCallbacks
+ def create_login_session(
+     username: str,
+     password: str,
+     tfa_callback,
+-    session: Optional[requests.Session] = None,
+-) -> requests.Session:
+-    """Create a requests.Session object with logged in GitHub cookies for the user."""
+-    session = session or requests.Session()
++    session: Optional[HTTPClient] = None,
++) -> Deferred:
++    """Create an HTTPClient object with logged in GitHub cookies for the user."""
++    session = session or _create_session()
+ 
+     # Clear cookies before re-authentication
+     session.cookies.clear()
+@@ -96,20 +122,20 @@
+     def _login_callback(data):
+         data.update(dict(login=username, password=password))
+ 
+-    _get_and_submit_form(
++    yield _get_and_submit_form(
+         session=session, url="https://github.com/login", data_callback=_login_callback
+     )
+ 
+     def _tfa_callback(data):
+         data.update(dict(otp=tfa_callback()))
+ 
+-    _get_and_submit_form(
++    yield _get_and_submit_form(
+         session=session,
+         url="https://github.com/sessions/two-factor",
+         data_callback=_tfa_callback,
+     )
+ 
+-    return session
++    returnValue(session)
+ 
+ 
+ _CREATE_ORG_URL = "https://github.com/account/organizations/new?plan=free"
+@@ -150,7 +176,7 @@
+         username: str,
+         password: str,
+         tfa_callback=None,
+-        session: Optional[requests.Session] = None,
++        session: Optional[HTTPClient] = None,
+     ):
+         self._session = session or create_login_session(
+             username=username,
+@@ -159,7 +185,8 @@
+             session=session,
+         )
+ 
+-    def request_usage(self, enterprise_name: str, days: int = 30) -> requests.Response:
++    @inlineCallbacks
++    def request_usage(self, enterprise_name: str, days: int = 30) -> Deferred:
+         """Requests a GitHub usage report.
+ 
+         Github will send an email link when the report is available.
+@@ -170,20 +197,22 @@
+ 
+         action = f"/enterprises/{enterprise_name}/settings/metered_exports"
+         url = url = _REQUEST_USAGE_URL.format(enterprise_name=enterprise_name)
+-        return _get_and_submit_form(
++        response = yield _get_and_submit_form(
+             session=self._session,
+             url=url,
+             data_callback=_request_usage_callback,
+             form_matcher=lambda form: form.attrib.get("action") == action,
+         )
+-
++        returnValue(response)
++
++    @inlineCallbacks
+     def create_organization(
+         self,
+         org_name: str,
+         contact_email: str,
+         org_usage: OrganizationUsage,
+         business_name: Optional[str] = None,
+-    ) -> requests.Response:
++    ) -> Deferred:
+         """Create the specified GitHub organization.
+ 
+         Right now, only creates free tier organizations.
+@@ -198,51 +227,59 @@
+             if org_usage == OrganizationUsage.BUSINESS:
+                 data["organization[company_name]"] = business_name
+ 
+-        return _get_and_submit_form(
++        response = yield _get_and_submit_form(
+             session=self._session,
+             url=_CREATE_ORG_URL,
+             data_callback=_create_org_callback,
+             form_matcher=lambda f: f.attrib.get("id") == "org-new-form",
+         )
+-
++        returnValue(response)
++
++    @inlineCallbacks
+     def install_application_in_organization(
+         self, app_name: str, org_id: int
+-    ) -> requests.Response:
++    ) -> Deferred:
+         """Installs the specified app on the given organization."""
+         url = _INSTALL_APP_URL.format(app_name=app_name, org_id=org_id)
+ 
+         def _install_app_callback(data):
+             data["install_target"] = "all"
+ 
+-        return _get_and_submit_form(
++        response = yield _get_and_submit_form(
+             session=self._session,
+             url=url,
+             data_callback=_install_app_callback,
+             form_matcher=lambda form: app_name in form.attrib.get("action"),
+         )
+-
++        returnValue(response)
++
++    @inlineCallbacks
+     def toggle_app_suspended(
+         self, org_name: str, app_install_id: int
+-    ) -> requests.Response:
++    ) -> Deferred:
+         """Set this applicaiton install to be suspended or not."""
+         url = _APP_SUSPEND_URL.format(org_name=org_name, app_install_id=app_install_id)
+ 
+-        return _get_and_submit_form(
++        response = yield _get_and_submit_form(
+             session=self._session,
+             url=url,
+             form_matcher=lambda f: "suspended" in f.attrib.get("action"),
+         )
+-
++        returnValue(response)
++
++    @inlineCallbacks
+     def download_usage_report(
+         self, enterprise_name: str, report_id: int
+-    ) -> requests.Response:
++    ) -> Deferred:
+         """Download a usage report based on an id recieved in an email"""
+         url = _USAGE_REPORT_URL.format(
+             enterprise_name=enterprise_name, report_id=report_id
+         )
+-        return _get_url_with_session(session=self._session, url=url)
+-
+-    def request_dormant_users_report(self, enterprise_name: str) -> requests.Response:
++        response = yield _get_url_with_session(session=self._session, url=url)
++        returnValue(response)
++
++    @inlineCallbacks
++    def request_dormant_users_report(self, enterprise_name: str) -> Deferred:
+         """Requests a GitHub dormant users report.
+ 
+         Github will send an email link when the report is available.
+@@ -250,32 +287,37 @@
+ 
+         action = f"/enterprises/{enterprise_name}/settings/dormant-users/exports"
+         url = url = _REQUEST_DORMANTUSERS_URL.format(enterprise_name=enterprise_name)
+-        return _get_and_submit_form(
++        response = yield _get_and_submit_form(
+             session=self._session,
+             url=url,
+             form_matcher=lambda form: form.attrib.get("action") == action,
+         )
+-
+-    def download_dormant_users_report(self, enterprise_name: str) -> requests.Response:
++        returnValue(response)
++
++    @inlineCallbacks
++    def download_dormant_users_report(self, enterprise_name: str) -> Deferred:
+         """Download a usage report based on an id received in an email"""
+         url = _REQUEST_DORMANTUSERS_URL.format(enterprise_name=enterprise_name)
+-        page = _get_url_with_session(session=self._session, url=url)
++        page = yield _get_url_with_session(session=self._session, url=url)
++        page_content = yield treq.content(page)
+         link = re.search(
+             r"https://github.com/enterprises/alphabet/settings/dormant-users/exports/[0-9A-Fa-f]{8}\\-[0-9A-Fa-f]{4}\\-[0-9A-Fa-f]{4}\\-[0-9A-Fa-f]{4}\\-[0-9A-Fa-f]{12}",
+-            page.content,
++            page_content,
+         )
+         if link is None:
+             raise ValueError("Unable to find dormant users report link in content.")
+-        return _get_url_with_session(session=self._session, url=link.group(0))
+-
++        response = yield _get_url_with_session(session=self._session, url=link.group(0))
++        returnValue(response)
++
++    @inlineCallbacks
+     def approve_updated_app_permissions(
+         self,
+         org_name: str,
+         app_install_id: str,
+-    ) -> requests.Response:
++    ) -> Deferred:
+         """Approve a request for updated permissions for a GitHub app installation in an org"""
+ 
+-        return _get_and_submit_form(
++        response = yield _get_and_submit_form(
+             session=self._session,
+             url=_UPDATE_APP_INSTALL_URL.format(
+                 org_name=org_name,
+@@ -284,7 +326,9 @@
+             form_matcher=lambda f: f.attrib.get("class")
+             == "js-integrations-install-form",
+         )
+-
++        returnValue(response)
++
++    @inlineCallbacks
+     def update_security_analysis_settings(
+         self,
+         org_name: str,
+@@ -297,7 +341,7 @@
+         if code_scanning_autofix is not None:
+             def _data_callback(data):
+                 data['code_scanning_autofix'] = 'enabled' if code_scanning_autofix else 'disabled'
+-            _get_and_submit_form(
++            yield _get_and_submit_form(
+                 session=self._session,
+                 url=_UPDATE_GHAS_SETTINGS_URL.format(
+                     org_name=org_name,
+@@ -308,7 +352,7 @@
+         if code_scanning_autofix_third_party_tools is not None:
+             def _data_callback(data):
+                 data['code_scanning_autofix_third_party_tools'] = 'enabled' if code_scanning_autofix_third_party_tools else 'disabled'
+-            _get_and_submit_form(
++            yield _get_and_submit_form(
+                 session=self._session,
+                 url=_UPDATE_GHAS_SETTINGS_URL.format(
+                     org_name=org_name,

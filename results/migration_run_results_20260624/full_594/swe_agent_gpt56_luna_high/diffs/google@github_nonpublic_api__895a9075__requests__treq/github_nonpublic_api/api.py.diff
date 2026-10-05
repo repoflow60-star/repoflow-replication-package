@@ -1,0 +1,396 @@
+--- a/github_nonpublic_api/api.py
++++ b/github_nonpublic_api/api.py
+@@ -22,24 +22,100 @@
+ 
+ import html5lib
+ import pyotp
+-import requests
++import treq
+ from absl import logging
+ from configobj import ConfigObj
+-from typing import Optional
+-
+-
+-def _get_and_submit_form(
+-    session, url: str, data_callback=None, form_matcher=lambda form: True
+-):
+-    logging.info("Fetching URL %s", url)
+-    response = session.get(url)
+-    response.raise_for_status()
+-
+-    logging.info("Fetching URL %s", response.url)
+-    for redirect_response in response.history:
+-        logging.info("Redirected from: %s", redirect_response.url)
+-
+-    doc = html5lib.parse(response.text, namespaceHTMLElements=False)
++from http.cookiejar import CookieJar
++from twisted.internet import defer, reactor
++from twisted.web.client import Agent
++from typing import Any, Optional
++
++
++class _TreqSession:
++    """A small, cookie-preserving session built on top of treq.
++
++    ``treq`` exposes an asynchronous HTTP client rather than a synchronous
++    session object. Keeping the session abstraction here lets the rest of the API
++    retain its cookie and redirect handling while
++    returning Deferreds for real network requests.
++    """
++
++    def __init__(self):
++        self.cookies = CookieJar()
++        self._client = treq.client.HTTPClient(
++            Agent(reactor), cookiejar=self.cookies
++        )
++        # create_login_session replaces this with the completed login chain.
++        # Every normal request waits for authentication before starting.
++        self._ready = defer.succeed(None)
++
++    def get(self, url: str, **kwargs):
++        return self._ready.addCallback(
++            lambda _: self._client.get(url, **kwargs)
++        )
++
++    def post(self, url: str, data=None, **kwargs):
++        return self._ready.addCallback(
++            lambda _: self._client.post(url, data=data, **kwargs)
++        )
++
++
++class _TreqLoginSession:
++    """Session view used while constructing the login request chain."""
++
++    def __init__(self, session: _TreqSession):
++        self.cookies = session.cookies
++        self._client = session._client
++
++    def get(self, url: str, **kwargs):
++        return self._client.get(url, **kwargs)
++
++    def post(self, url: str, data=None, **kwargs):
++        return self._client.post(url, data=data, **kwargs)
++
++
++def _is_deferred(value: Any) -> bool:
++    return isinstance(value, defer.Deferred)
++
++
++def _raise_for_status(response):
++    """Raise for an unsuccessful response from either a test double or treq."""
++    # The existing public helpers accept session-like objects, which is useful
++    # to callers and keeps the old unit-test doubles working.
++    raise_for_status = getattr(response, "raise_for_status", None)
++    if callable(raise_for_status):
++        raise_for_status()
++        return
++
++    code = response.code
++    if code < 200 or code >= 400:
++        raise RuntimeError("HTTP request failed with status code %s" % code)
++
++
++def _response_text(response):
++    text = response.text
++    return text() if callable(text) else text
++
++
++def _response_content(response):
++    content = response.content
++    return content() if callable(content) else content
++
++
++def _log_response(response, requested_url: str):
++    response_url = getattr(response, "url", requested_url)
++    logging.info("Fetching URL %s", response_url)
++    history = getattr(response, "history", ())
++    history = history() if callable(history) else history
++    for redirect_response in history:
++        logging.info(
++            "Redirected from: %s",
++            getattr(redirect_response, "url", requested_url),
++        )
++
++
++def _parse_form(response_text, url: str, data_callback, form_matcher):
++    doc = html5lib.parse(response_text, namespaceHTMLElements=False)
+     forms = doc.findall(".//form")
+ 
+     submit_form = None
+@@ -68,47 +144,154 @@
+ 
+     submit_url = urljoin(url, action_url)
+     logging.info("Posting form to URL %s", submit_url)
+-
++    return submit_url, data
++
++
++@defer.inlineCallbacks
++def _get_and_submit_form_deferred(
++    get_result,
++    session,
++    url: str,
++    data_callback,
++    form_matcher,
++    response_already_read=False,
++):
++    response = yield get_result
++    if response_already_read:
++        response_text = response
++    else:
++        _raise_for_status(response)
++        _log_response(response, url)
++        response_text = yield defer.maybeDeferred(_response_text, response)
++    submit_url, data = _parse_form(
++        response_text, url, data_callback, form_matcher
++    )
++    response = yield defer.maybeDeferred(session.post, submit_url, data=data)
++    _raise_for_status(response)
++    return defer.returnValue(response)
++
++
++@defer.inlineCallbacks
++def _download_dormant_users_report_deferred(
++    page_result, session, enterprise_name: str
++):
++    page = yield defer.maybeDeferred(lambda: page_result)
++    content = yield defer.maybeDeferred(_response_content, page)
++    if isinstance(content, bytes):
++        content = content.decode("utf-8", errors="replace")
++    pattern = (
++        rf"https://github.com/enterprises/{re.escape(enterprise_name)}"
++        r"/settings/dormant-users/exports/"
++        r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
++        r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
++    )
++    link = re.search(pattern, content)
++    if link is None:
++        raise ValueError("Unable to find dormant users report link in content.")
++    report = _get_url_with_session(session=session, url=link.group(0))
++    if _is_deferred(report):
++        report = yield report
++    return defer.returnValue(report)
++
++
++def _get_and_submit_form(
++    session, url: str, data_callback=None, form_matcher=lambda form: True
++):
++    logging.info("Fetching URL %s", url)
++    get_result = session.get(url)
++    if _is_deferred(get_result):
++        return _get_and_submit_form_deferred(
++            get_result, session, url, data_callback, form_matcher
++        )
++
++    _raise_for_status(get_result)
++    _log_response(get_result, url)
++    response_text = _response_text(get_result)
++    if _is_deferred(response_text):
++        return _get_and_submit_form_deferred(
++            response_text,
++            session,
++            url,
++            data_callback,
++            form_matcher,
++            response_already_read=True,
++        )
++    submit_url, data = _parse_form(
++        response_text, url, data_callback, form_matcher
++    )
+     response = session.post(submit_url, data=data)
+-    response.raise_for_status()
++    if _is_deferred(response):
++        return response.addCallback(
++            lambda result: (_raise_for_status(result), result)[1]
++        )
++    _raise_for_status(response)
+     return response
++
++
++@defer.inlineCallbacks
++def _get_url_deferred(get_result):
++    response = yield get_result
++    _raise_for_status(response)
++    return defer.returnValue(response)
+ 
+ 
+ def _get_url_with_session(session, url: str):
+     logging.info("Fetching URL %s", url)
+-    response = session.get(url)
+-    response.raise_for_status()
+-    return response
++    get_result = session.get(url)
++    if _is_deferred(get_result):
++        return _get_url_deferred(get_result)
++    _raise_for_status(get_result)
++    return get_result
+ 
+ 
+ def create_login_session(
+     username: str,
+     password: str,
+     tfa_callback,
+-    session: Optional[requests.Session] = None,
+-) -> requests.Session:
+-    """Create a requests.Session object with logged in GitHub cookies for the user."""
+-    session = session or requests.Session()
+-
+-    # Clear cookies before re-authentication
++    session: Optional[Any] = None,
++):
++    """Create a treq-backed session with logged in GitHub cookies."""
++    session = session or _TreqSession()
++
++    # Clear cookies before re-authentication.
+     session.cookies.clear()
+ 
+     def _login_callback(data):
+         data.update(dict(login=username, password=password))
+ 
++    def _tfa_callback(data):
++        data.update(dict(otp=tfa_callback()))
++
++    if isinstance(session, _TreqSession):
++        # Authentication itself must bypass _ready; otherwise the first
++        # login request would wait for the chain that contains that request.
++        login_session = _TreqLoginSession(session)
++        first_login = _get_and_submit_form(
++            session=login_session,
++            url="https://github.com/login",
++            data_callback=_login_callback,
++        )
++
++        def _submit_tfa(_):
++            return _get_and_submit_form(
++                session=login_session,
++                url="https://github.com/sessions/two-factor",
++                data_callback=_tfa_callback,
++            )
++
++        session._ready = first_login.addCallback(_submit_tfa)
++        return session
++
++    # Preserve support for caller-provided session-like objects, including
++    # synchronous test doubles.
+     _get_and_submit_form(
+         session=session, url="https://github.com/login", data_callback=_login_callback
+     )
+-
+-    def _tfa_callback(data):
+-        data.update(dict(otp=tfa_callback()))
+-
+     _get_and_submit_form(
+         session=session,
+         url="https://github.com/sessions/two-factor",
+         data_callback=_tfa_callback,
+     )
+-
+     return session
+ 
+ 
+@@ -150,7 +333,7 @@
+         username: str,
+         password: str,
+         tfa_callback=None,
+-        session: Optional[requests.Session] = None,
++        session: Optional[Any] = None,
+     ):
+         self._session = session or create_login_session(
+             username=username,
+@@ -159,7 +342,7 @@
+             session=session,
+         )
+ 
+-    def request_usage(self, enterprise_name: str, days: int = 30) -> requests.Response:
++    def request_usage(self, enterprise_name: str, days: int = 30) -> Any:
+         """Requests a GitHub usage report.
+ 
+         Github will send an email link when the report is available.
+@@ -183,7 +366,7 @@
+         contact_email: str,
+         org_usage: OrganizationUsage,
+         business_name: Optional[str] = None,
+-    ) -> requests.Response:
++    ) -> Any:
+         """Create the specified GitHub organization.
+ 
+         Right now, only creates free tier organizations.
+@@ -207,7 +390,7 @@
+ 
+     def install_application_in_organization(
+         self, app_name: str, org_id: int
+-    ) -> requests.Response:
++    ) -> Any:
+         """Installs the specified app on the given organization."""
+         url = _INSTALL_APP_URL.format(app_name=app_name, org_id=org_id)
+ 
+@@ -223,7 +406,7 @@
+ 
+     def toggle_app_suspended(
+         self, org_name: str, app_install_id: int
+-    ) -> requests.Response:
++    ) -> Any:
+         """Set this applicaiton install to be suspended or not."""
+         url = _APP_SUSPEND_URL.format(org_name=org_name, app_install_id=app_install_id)
+ 
+@@ -235,14 +418,14 @@
+ 
+     def download_usage_report(
+         self, enterprise_name: str, report_id: int
+-    ) -> requests.Response:
++    ) -> Any:
+         """Download a usage report based on an id recieved in an email"""
+         url = _USAGE_REPORT_URL.format(
+             enterprise_name=enterprise_name, report_id=report_id
+         )
+         return _get_url_with_session(session=self._session, url=url)
+ 
+-    def request_dormant_users_report(self, enterprise_name: str) -> requests.Response:
++    def request_dormant_users_report(self, enterprise_name: str) -> Any:
+         """Requests a GitHub dormant users report.
+ 
+         Github will send an email link when the report is available.
+@@ -256,14 +439,29 @@
+             form_matcher=lambda form: form.attrib.get("action") == action,
+         )
+ 
+-    def download_dormant_users_report(self, enterprise_name: str) -> requests.Response:
++    def download_dormant_users_report(self, enterprise_name: str) -> Any:
+         """Download a usage report based on an id received in an email"""
+         url = _REQUEST_DORMANTUSERS_URL.format(enterprise_name=enterprise_name)
+         page = _get_url_with_session(session=self._session, url=url)
+-        link = re.search(
+-            r"https://github.com/enterprises/alphabet/settings/dormant-users/exports/[0-9A-Fa-f]{8}\\-[0-9A-Fa-f]{4}\\-[0-9A-Fa-f]{4}\\-[0-9A-Fa-f]{4}\\-[0-9A-Fa-f]{12}",
+-            page.content,
+-        )
++        if _is_deferred(page):
++            return _download_dormant_users_report_deferred(
++                page, self._session, enterprise_name
++            )
++
++        content = _response_content(page)
++        if _is_deferred(content):
++            return _download_dormant_users_report_deferred(
++                page, self._session, enterprise_name
++            )
++        if isinstance(content, bytes):
++            content = content.decode("utf-8", errors="replace")
++        pattern = (
++            rf"https://github.com/enterprises/{re.escape(enterprise_name)}"
++            r"/settings/dormant-users/exports/"
++            r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
++            r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
++        )
++        link = re.search(pattern, content)
+         if link is None:
+             raise ValueError("Unable to find dormant users report link in content.")
+         return _get_url_with_session(session=self._session, url=link.group(0))
+@@ -272,7 +470,7 @@
+         self,
+         org_name: str,
+         app_install_id: str,
+-    ) -> requests.Response:
++    ) -> Any:
+         """Approve a request for updated permissions for a GitHub app installation in an org"""
+ 
+         return _get_and_submit_form(

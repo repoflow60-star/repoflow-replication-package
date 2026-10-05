@@ -1,0 +1,178 @@
+--- a/authomize/rest_api_client/client/base_client.py
++++ b/authomize/rest_api_client/client/base_client.py
+@@ -1,7 +1,9 @@
++import json
++from io import BytesIO
+ from typing import Optional
++from urllib.parse import urlencode, urlsplit, urlunsplit
+ 
+-import requests
+-from requests import Response
++import pycurl
+ 
+ AUTHOMIZE_API_URL = 'https://api.authomize.com'
+ 
+@@ -11,19 +13,55 @@
+         self.message = message
+ 
+ 
++class _HTTPError(Exception):
++    pass
++
++
++class _Response:
++    def __init__(self, status_code, url, headers, content, reason):
++        self.status_code = status_code
++        self.url = url
++        self.headers = headers
++        self.content = content
++        self.reason = reason
++
++    @property
++    def ok(self):
++        return self.status_code < 400
++
++    @property
++    def text(self):
++        content_type = self.headers.get('content-type', '')
++        encoding = 'utf-8'
++        for item in content_type.split(';')[1:]:
++            name, separator, value = item.strip().partition('=')
++            if separator and name.lower() == 'charset':
++                encoding = value.strip(' "\'')
++                break
++        return self.content.decode(encoding, errors='replace')
++
++    def json(self):
++        return json.loads(self.content)
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise _HTTPError(
++                f'{self.status_code} {self.reason} for url: {self.url}',
++            )
++
++
+ class BaseClient:
+     def __init__(self, auth_token: str, base_url: str = AUTHOMIZE_API_URL):
+         self.auth_token = auth_token
+         self.base_url = base_url
+-        self.session = requests.Session()
+-        self.session.headers.update({'Authorization': self.authorization_header})
++        self.session = pycurl.Curl()
+ 
+     @property
+     def authorization_header(self) -> str:
+         raise NotImplementedError()
+ 
+     @staticmethod
+-    def _handle_response(response: Response):
++    def _handle_response(response: _Response):
+         if response.ok:
+             return BaseClient._handle_ok_response(response)
+         try:
+@@ -38,7 +76,7 @@
+         response.raise_for_status()
+ 
+     @staticmethod
+-    def _handle_ok_response(response: Response) -> dict:
++    def _handle_ok_response(response: _Response) -> dict:
+         if content_type := response.headers.get('content-type'):
+             if content_type.startswith('application/json'):
+                 return response.json()
+@@ -54,28 +92,89 @@
+ 
+     def http_get(self, url, params=None):
+         url = self.base_url + url
+-        response = self.session.get(url, params=params)
++        response = self._request('GET', url, params=params)
+         return self._handle_response(response)
+ 
+     def http_post(self, url: str, body: Optional[str] = None):
+         url = self.base_url + url
+-        response = self.session.post(
++        response = self._request(
++            'POST',
+             url,
+             headers={'Content-Type': 'application/json'},
+-            data=body,
++            body=body,
+         )
+         return self._handle_response(response)
+ 
+     def http_patch(self, url: str, body: Optional[str] = None):
+         url = self.base_url + url
+-        response = self.session.patch(
++        response = self._request(
++            'PATCH',
+             url,
+             headers={'Content-Type': 'application/json'},
+-            data=body,
++            body=body,
+         )
+         return self._handle_response(response)
+ 
+     def http_delete(self, url: str, params=None):
+         url = self.base_url + url
+-        response = self.session.delete(url, params=params)
++        response = self._request('DELETE', url, params=params)
+         return self._handle_response(response)
++
++    def _request(self, method, url, params=None, headers=None, body=None):
++        if params:
++            parts = urlsplit(url)
++            query = urlencode(
++                [(key, value) for key, value in params.items() if value is not None],
++                doseq=True,
++            )
++            if parts.query and query:
++                query = f'{parts.query}&{query}'
++            elif parts.query:
++                query = parts.query
++            url = urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
++
++        response_body = BytesIO()
++        response_headers = {}
++        reason = ''
++
++        def receive_header(line):
++            nonlocal reason
++            decoded = line.decode('iso-8859-1').strip()
++            if decoded.startswith('HTTP/'):
++                response_headers.clear()
++                status = decoded.split(' ', 2)
++                reason = status[2] if len(status) == 3 else ''
++            elif ':' in decoded:
++                name, value = decoded.split(':', 1)
++                response_headers[name.lower()] = value.strip()
++            return len(line)
++
++        request_headers = {'Authorization': self.authorization_header}
++        if headers:
++            request_headers.update(headers)
++
++        self.session.reset()
++        self.session.setopt(pycurl.URL, url)
++        self.session.setopt(pycurl.CUSTOMREQUEST, method)
++        self.session.setopt(
++            pycurl.HTTPHEADER,
++            [f'{name}: {value}' for name, value in request_headers.items()],
++        )
++        self.session.setopt(pycurl.WRITEFUNCTION, response_body.write)
++        self.session.setopt(pycurl.HEADERFUNCTION, receive_header)
++        self.session.setopt(pycurl.FOLLOWLOCATION, True)
++        self.session.setopt(pycurl.ACCEPT_ENCODING, '')
++        if body is not None or method in {'POST', 'PATCH'}:
++            self.session.setopt(pycurl.POSTFIELDS, body or '')
++        self.session.perform()
++
++        effective_url = self.session.getinfo(pycurl.EFFECTIVE_URL)
++        if isinstance(effective_url, bytes):
++            effective_url = effective_url.decode('utf-8', errors='replace')
++        return _Response(
++            status_code=self.session.getinfo(pycurl.RESPONSE_CODE),
++            url=effective_url or url,
++            headers=response_headers,
++            content=response_body.getvalue(),
++            reason=reason,
++        )

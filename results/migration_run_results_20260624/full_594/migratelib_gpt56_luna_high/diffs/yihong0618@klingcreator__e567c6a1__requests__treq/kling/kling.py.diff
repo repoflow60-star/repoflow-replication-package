@@ -1,0 +1,447 @@
+--- a/kling/kling.py
++++ b/kling/kling.py
+@@ -7,10 +7,10 @@
+ from http.cookies import SimpleCookie
+ 
+ from fake_useragent import UserAgent
+-import requests
+-from requests.utils import cookiejar_from_dict
++import treq
++from twisted.internet.defer import ensureDeferred, gatherResults
++from twisted.internet.task import react
+ from rich import print
+-import threading
+ 
+ browser_version = "edge101"
+ ua = UserAgent(browsers=["edge"])
+@@ -18,13 +18,52 @@
+ base_url_not_cn = "https://klingai.com/"
+ 
+ 
+-def call_for_daily_check(session: requests.Session, is_cn: bool) -> bool:
++class TreqSession:
++    def __init__(self) -> None:
++        self.headers = {}
++        self.cookies = {}
++
++    @staticmethod
++    def _format_headers(headers):
++        formatted_headers = {}
++        for key, value in headers.items():
++            if isinstance(key, str):
++                key = key.encode()
++            if not isinstance(value, (list, tuple)):
++                value = [value]
++            formatted_headers[key] = [
++                item.encode() if isinstance(item, str) else item for item in value
++            ]
++        return formatted_headers
++
++    def _request(self, method: str, url: str, **kwargs):
++        request_headers = dict(self.headers)
++        request_headers.update(kwargs.pop("headers", {}))
++        if self.cookies:
++            request_headers["Cookie"] = "; ".join(
++                f"{key}={value}" for key, value in self.cookies.items()
++            )
++        return treq.request(
++            method,
++            url,
++            headers=self._format_headers(request_headers),
++            **kwargs,
++        )
++
++    def get(self, url: str, **kwargs):
++        return self._request("GET", url, **kwargs)
++
++    def post(self, url: str, **kwargs):
++        return self._request("POST", url, **kwargs)
++
++
++async def call_for_daily_check(session: TreqSession, is_cn: bool) -> bool:
+     if is_cn:
+-        r = session.get(f"{base_url}api/pay/reward?activity=login_bonus_daily")
++        r = await session.get(f"{base_url}api/pay/reward?activity=login_bonus_daily")
+     else:
+-        r = session.get(f"{base_url_not_cn}api/pay/reward?activity=login_bonus_daily")
+-    if r.ok:
+-        print(f"Call daily login success with {is_cn}:\n{r.json()}\n")
++        r = await session.get(f"{base_url_not_cn}api/pay/reward?activity=login_bonus_daily")
++    if r.code < 400:
++        print(f"Call daily login success with {is_cn}:\n{await r.json()}\n")
+         return True
+ 
+     raise Exception(
+@@ -39,13 +78,13 @@
+ 
+ 
+ class BaseGen:
+-    def __init__(self, cookie: str) -> None:
+-        self.session: requests.Session = requests.Session()
++    async def __init__(self, cookie: str) -> None:
++        self.session: TreqSession = TreqSession()
+         self.cookie = cookie
+         self.session.cookies, is_cn = self.parse_cookie_string(self.cookie)
++        self.is_cn = is_cn
+         self.session.headers["user-agent"] = ua.random
+-        # check the daily login
+-        call_for_daily_check(self.session, is_cn)
++
+         if is_cn:
+             self.base_url = base_url
+             image_upload_base_url = "https://upload.kuaishouzt.com/"
+@@ -67,35 +106,37 @@
+         # store the video id list maybe for future use or extend
+         self.video_id_list = []
+ 
++    async def initialize(self) -> None:
++        # check the daily login
++        await call_for_daily_check(self.session, self.is_cn)
++
+     @staticmethod
+     def parse_cookie_string(cookie_string):
+         cookie = SimpleCookie()
+         cookie.load(cookie_string)
+         cookies_dict = {}
+-        cookiejar = None
++        cookiejar = {}
+         is_cn = False
+         for key, morsel in cookie.items():
+             if key.startswith("kuaishou"):
+                 is_cn = True
+             cookies_dict[key] = morsel.value
+-            cookiejar = cookiejar_from_dict(
+-                cookies_dict, cookiejar=None, overwrite=True
+-            )
++            cookiejar = cookies_dict
+         return cookiejar, is_cn
+ 
+-    def get_account_point(self) -> float:
+-        bonus_req = self.session.get(self.daily_url)
+-        bonus_data = bonus_req.json()
++    async def get_account_point(self) -> float:
++        bonus_req = await self.session.get(self.daily_url)
++        bonus_data = await bonus_req.json()
+         assert bonus_data.get("status") == 200
+ 
+-        point_req = self.session.get(self.point_url)
+-        point_data = point_req.json()
++        point_req = await self.session.get(self.point_url)
++        point_data = await point_req.json()
+         assert point_data.get("status") == 200
+ 
+         total_point = point_data["data"]["total"]
+         return total_point / 100
+ 
+-    def image_uploader(self, image_path) -> str:
++    async def image_uploader(self, image_path) -> str:
+         """
+         from https://github.com/dolacmeo/acfunsdk/blob/ece6f42e2736b316fea35d89ba1d0ccbec6c98f7/acfun/page/utils.py
+         great thanks to him
+@@ -105,41 +146,41 @@
+         # get the image file name
+         file_name = image_path.split("/")[-1]
+         upload_url = self.apis_dict["image_upload_gettoken"] + file_name
+-        token_req = self.session.get(upload_url)
+-        token_data = token_req.json()
++        token_req = await self.session.get(upload_url)
++        token_data = await token_req.json()
+ 
+         assert token_data.get("status") == 200
+ 
+         token = token_data["data"]["token"]
+         resume_url = self.apis_dict["image_upload_resume"] + token
+-        resume_req = self.session.get(resume_url)
+-        resume_data = resume_req.json()
++        resume_req = await self.session.get(resume_url)
++        resume_data = await resume_req.json()
+ 
+         assert resume_data.get("result") == 1
+-        fragment_req = self.session.post(
++        fragment_req = await self.session.post(
+             self.apis_dict["image_upload_fragment"],
+             data=image_data,
+             params=dict(upload_token=token, fragment_id=0),
+             headers={"Content-Type": "application/octet-stream"},
+         )
+-        fragment_data = fragment_req.json()
++        fragment_data = await fragment_req.json()
+         assert fragment_data.get("result") == 1
+-        complete_req = self.session.post(
++        complete_req = await self.session.post(
+             self.apis_dict["image_upload_complete"],
+             params=dict(upload_token=token, fragment_count=1),
+         )
+-        complete_data = complete_req.json()
++        complete_data = await complete_req.json()
+         assert complete_data.get("result") == 1
+         verify_url = self.apis_dict["image_upload_geturl"] + token
+-        result_req = self.session.get(verify_url)
+-        result_data = result_req.json()
++        result_req = await self.session.get(verify_url)
++        result_data = await result_req.json()
+         assert result_data.get("status") == 200
+         return result_data.get("data").get("url")
+ 
+-    def fetch_metadata(self, task_id: str) -> tuple[dict, TaskStatus]:
++    async def fetch_metadata(self, task_id: str) -> tuple[dict, TaskStatus]:
+         url = f"{self.base_url}api/task/status?taskId={task_id}"
+-        response = self.session.get(url)
+-        data = response.json().get("data")
++        response = await self.session.get(url)
++        data = (await response.json()).get("data")
+         assert data is not None
+         # this is very interesting it use resolution to check if the image is ready
+         if data.get("status") >= 90:
+@@ -152,9 +193,9 @@
+ 
+ class VideoGen(BaseGen):
+ 
+-    def extend_video(self, video_id: int, prompt: str = "") -> str:
++    async def extend_video(self, video_id: int, prompt: str = "") -> str:
+         # get the video url and init_prompt
+-        data, status = self.fetch_metadata(video_id)
++        data, status = await self.fetch_metadata(video_id)
+         assert status == TaskStatus.COMPLETED
+         works = data.get("works", [])
+         if not works:
+@@ -205,17 +246,17 @@
+                 },
+             ],
+         }
+-        return self._get_video_with_payload(payload)
+-
+-    def _get_video_with_payload(self, payload: dict) -> list:
+-        response = self.session.post(
++        return await self._get_video_with_payload(payload)
++
++    async def _get_video_with_payload(self, payload: dict) -> list:
++        response = await self.session.post(
+             self.submit_url,
+             json=payload,
+         )
+-        if not response.ok:
+-            print(response.text)
++        if response.code >= 400:
++            print(await response.text())
+             raise Exception(f"Error response {str(response)}")
+-        response_body = response.json()
++        response_body = await response.json()
+         if response_body.get("data").get("status") == 7:
+             message = response_body.get("data").get("message")
+             raise Exception(f"Request failed message {message}")
+@@ -230,7 +271,7 @@
+         while True:
+             if int(time.time() - start_wait) > 1200:
+                 raise Exception("Request timeout")
+-            image_data, status = self.fetch_metadata(request_id)
++            image_data, status = await self.fetch_metadata(request_id)
+             if status == TaskStatus.PENDING:
+                 print(".", end="", flush=True)
+                 # spider rule
+@@ -253,7 +294,7 @@
+                             result.append(resource)
+                 return result
+ 
+-    def get_video(
++    async def get_video(
+         self,
+         prompt: str,
+         image_path: Optional[str] = None,
+@@ -265,7 +306,7 @@
+         self.session.headers["user-agent"] = ua.random
+         if image_path or image_url:
+             if image_path:
+-                image_payload_url = self.image_uploader(image_path)
++                image_payload_url = await self.image_uploader(image_path)
+             else:
+                 image_payload_url = image_url
+             if is_high_quality:
+@@ -356,14 +397,14 @@
+             }
+         if auto_extend:
+             print("will generate and extending video...")
+-            self._get_video_with_payload(payload)
++            await self._get_video_with_payload(payload)
+             print("Auto extending video...")
+             video_id = self.video_id_list.pop()
+-            return self.extend_video(video_id)
++            return await self.extend_video(video_id)
+         else:
+-            return self._get_video_with_payload(payload)
+-
+-    def save_video(
++            return await self._get_video_with_payload(payload)
++
++    async def save_video(
+         self,
+         prompt: str,
+         output_dir: str,
+@@ -375,7 +416,7 @@
+     ) -> None:
+         mp4_index = 0
+         try:
+-            links = self.get_video(
++            links = await self.get_video(
+                 prompt,
+                 image_path=image_path,
+                 image_url=image_url,
+@@ -395,17 +436,17 @@
+         link = links[0]
+         while os.path.exists(os.path.join(output_dir, f"{mp4_index}.mp4")):
+             mp4_index += 1
+-        response = self.session.get(link)
+-        if response.status_code != 200:
++        response = await self.session.get(link)
++        if response.code != 200:
+             raise Exception("Could not download image")
+         # save response to file
+         with open(os.path.join(output_dir, f"{mp4_index}.mp4"), "wb") as output_file:
+-            output_file.write(response.content)
++            output_file.write(await response.content())
+         mp4_index += 1
+ 
+ 
+ class ImageGen(BaseGen):
+-    def get_images(
++    async def get_images(
+         self,
+         prompt: str,
+         image_path: Optional[str] = None,
+@@ -414,7 +455,7 @@
+         self.session.headers["user-agent"] = ua.random
+         if image_path or image_url:
+             if image_path:
+-                image_payload_url = self.image_uploader(image_path)
++                image_payload_url = await self.image_uploader(image_path)
+             else:
+                 image_payload_url = image_url
+             payload = {
+@@ -478,14 +519,14 @@
+                 "inputs": [],
+             }
+ 
+-        response = self.session.post(
++        response = await self.session.post(
+             self.submit_url,
+             json=payload,
+         )
+-        if not response.ok:
+-            print(response.text)
++        if response.code >= 400:
++            print(await response.text())
+             raise Exception(f"Error response {str(response)}")
+-        response_body = response.json()
++        response_body = await response.json()
+         if response_body.get("data").get("status") == 7:
+             message = response_body.get("data").get("message")
+             raise Exception(f"Request failed message {message}")
+@@ -497,7 +538,7 @@
+         while True:
+             if int(time.time() - start_wait) > 1200:
+                 raise Exception("Request timeout")
+-            image_data, status = self.fetch_metadata(request_id)
++            image_data, status = await self.fetch_metadata(request_id)
+             if status == TaskStatus.PENDING:
+                 print(".", end="", flush=True)
+                 # spider rule
+@@ -520,7 +561,7 @@
+                             result.append(resource)
+                 return result
+ 
+-    def save_images(
++    async def save_images(
+         self,
+         prompt: str,
+         output_dir: str,
+@@ -529,7 +570,7 @@
+     ) -> None:
+         png_index = 0
+         try:
+-            links = self.get_images(prompt, image_path, image_url)
++            links = await self.get_images(prompt, image_path, image_url)
+         except Exception as e:
+             print(e)
+             raise
+@@ -537,30 +578,29 @@
+             os.mkdir(output_dir)
+         print()
+ 
+-        def download_image(link: str, index: int) -> None:
+-            response = self.session.get(link)
+-            if response.status_code != 200:
++        async def download_image(link: str, index: int) -> None:
++            response = await self.session.get(link)
++            if response.code != 200:
+                 raise Exception("Could not download image")
+             # save response to file
+             with open(os.path.join(output_dir, f"{index}.png"), "wb") as output_file:
+-                output_file.write(response.content)
+-
+-        threads = []
++                output_file.write(await response.content())
++
++        downloads = []
+         for link in links:
+             while os.path.exists(os.path.join(output_dir, f"{png_index}.png")):
+                 png_index += 1
+             print(link)
+-            thread = threading.Thread(target=download_image, args=(link, png_index))
+-            threads.append(thread)
+-            thread.start()
++            downloads.append(
++                ensureDeferred(download_image(link, png_index))
++            )
+             png_index += 1
+ 
+-        # Wait for all threads to complete
+-        for thread in threads:
+-            thread.join()
+-
+-
+-def main():
++        # Wait for all downloads to complete
++        await gatherResults(downloads)
++
++
++async def main():
+     parser = argparse.ArgumentParser()
+     parser.add_argument("-U", help="Auth cookie from browser", type=str, default="")
+     parser.add_argument(
+@@ -613,19 +653,21 @@
+         image_generator = ImageGen(
+             os.environ.get("KLING_COOKIE") or args.U,
+         )
+-        image_generator.save_images(
++        await image_generator.initialize()
++        await image_generator.save_images(
+             prompt=args.prompt,
+             output_dir=args.output_dir,
+             image_path=args.I,
+         )
+         print(
+-            f"The balance of points in your account is: {image_generator.get_account_point()}"
++            f"The balance of points in your account is: {await image_generator.get_account_point()}"
+         )
+     else:
+         video_generator = VideoGen(
+             os.environ.get("KLING_COOKIE") or args.U,
+         )
+-        video_generator.save_video(
++        await video_generator.initialize()
++        await video_generator.save_video(
+             prompt=args.prompt,
+             output_dir=args.output_dir,
+             image_path=args.I,
+@@ -634,9 +676,9 @@
+             model_name=args.model_name,
+         )
+         print(
+-            f"The balance of points in your account is: {video_generator.get_account_point()}"
++            f"The balance of points in your account is: {await video_generator.get_account_point()}"
+         )
+ 
+ 
+ if __name__ == "__main__":
+-    main()
++    react(lambda reactor: ensureDeferred(main()))

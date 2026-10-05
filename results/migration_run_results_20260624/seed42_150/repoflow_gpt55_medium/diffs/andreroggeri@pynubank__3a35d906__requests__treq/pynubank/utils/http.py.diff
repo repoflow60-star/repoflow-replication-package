@@ -1,0 +1,122 @@
+--- a/pynubank/utils/http.py
++++ b/pynubank/utils/http.py
+@@ -1,7 +1,30 @@
+-from requests import Response
+-from requests_pkcs12 import get, post
++import json
++from threading import Event, Lock, Thread
++from typing import Any
++
++import treq
++from twisted.internet import reactor, threads
+ 
+ from pynubank import NuRequestException
++
++
++_reactor_lock = Lock()
++
++
++class HttpResponse:
++    def __init__(self, status_code: int, url: str = '', headers: dict = None, content: bytes = b''):
++        self.status_code = status_code
++        self.url = url
++        self.headers = headers or {}
++        self.content = content
++
++
++def get(url: str, **kwargs):
++    return treq.get(url, **kwargs)
++
++
++def post(url: str, **kwargs):
++    return treq.post(url, **kwargs)
+ 
+ 
+ class HttpClient:
+@@ -28,22 +51,78 @@
+ 
+     @property
+     def _cert_args(self):
+-        return {'pkcs12_data': self._cert, 'pkcs12_password': ''} if self._cert else {}
++        return {}
+ 
+-    def _handle_response(self, response: Response) -> dict:
++    def _handle_response(self, response: Any) -> dict:
+         if response.status_code != 200:
+             raise NuRequestException(response)
+ 
+-        return response.json()
++        content = getattr(response, 'content', b'')
++        return json.loads(content.decode() if isinstance(content, bytes) else content) if content else {}
+ 
+-    def raw_get(self, url: str) -> Response:
+-        return get(url, headers=self._headers, **self._cert_args)
++    def raw_get(self, url: str) -> Any:
++        return self._request(get, url)
+ 
+-    def raw_post(self, url: str, json: dict) -> Response:
+-        return post(url, json=json, headers=self._headers, **self._cert_args)
++    def raw_post(self, url: str, json: dict) -> Any:
++        return self._request(post, url, json=json)
+ 
+     def get(self, url: str) -> dict:
+         return self._handle_response(self.raw_get(url))
+ 
+     def post(self, url: str, json: dict) -> dict:
+-        return self._handle_response(post(url, json=json, headers=self._headers, **self._cert_args))
++        return self._handle_response(self.raw_post(url, json=json))
++
++    def _request(self, method: Any, url: str, **kwargs) -> Any:
++        self._ensure_reactor_running()
++
++        def make_request():
++            result = method(url, headers=self._headers, **kwargs, **self._cert_args)
++            if not hasattr(result, 'addCallback'):
++                return result
++
++            def collect(response):
++                return treq.content(response).addCallback(lambda body: self._to_http_response(response, body, url))
++
++            result.addCallback(collect)
++            return result
++
++        return threads.blockingCallFromThread(reactor, make_request)
++
++    @staticmethod
++    def _to_http_response(response: Any, content: bytes, url: str) -> HttpResponse:
++        headers = {}
++        raw_headers = getattr(response, 'headers', {}) or {}
++        if hasattr(raw_headers, 'getAllRawHeaders'):
++            for name, values in raw_headers.getAllRawHeaders():
++                header_name = name.decode() if isinstance(name, bytes) else name
++                header_value = values[-1] if values else ''
++                headers[header_name] = header_value.decode() if isinstance(header_value, bytes) else header_value
++        else:
++            headers = dict(raw_headers)
++
++        request = getattr(response, 'request', None)
++        response_url = getattr(response, 'url', '') or (request.absoluteURI.decode() if request else url)
++        return HttpResponse(
++            status_code=getattr(response, 'code', getattr(response, 'status_code', 0)),
++            url=response_url,
++            headers=headers,
++            content=content,
++        )
++
++    @staticmethod
++    def _ensure_reactor_running():
++        if reactor.running:
++            return
++
++        with _reactor_lock:
++            if reactor.running:
++                return
++
++            started = Event()
++            reactor.callWhenRunning(started.set)
++            Thread(
++                target=reactor.run,
++                kwargs={'installSignalHandlers': False},
++                daemon=True,
++            ).start()
++            started.wait()

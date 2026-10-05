@@ -1,0 +1,155 @@
+--- a/pastepwn/util/request.py
++++ b/pastepwn/util/request.py
+@@ -1,8 +1,109 @@
+ import logging
+-from threading import Lock
++import socket
++from threading import Event, Lock, Thread
++from urllib.parse import urlsplit
++from urllib.request import getproxies
+ 
+-from requests import Session, utils
+-from requests.exceptions import Timeout
++import treq
++from twisted.internet import reactor
++from twisted.internet.endpoints import HostnameEndpoint, TCP4ClientEndpoint, TCP6ClientEndpoint
++from twisted.internet.error import TimeoutError
++from twisted.internet.threads import blockingCallFromThread
++from twisted.web.client import Agent, ProxyAgent
++from twisted.web.http_headers import Headers
++
++from .network import get_ip_version
++
++
++_reactor_lock = Lock()
++_reactor_ready = Event()
++_reactor_thread = None
++
++
++class _EndpointFactory:
++    def __init__(self, reactor_instance, ip_version):
++        self.reactor = reactor_instance
++        self.ip_version = ip_version
++
++    def endpointForURI(self, uri):  # noqa: N802
++        return _endpoint_for_host(self.reactor, self.ip_version, uri.host, uri.port)
++
++
++def _endpoint_for_host(reactor_instance, ip_version, host, port):
++    endpoint = HostnameEndpoint
++    if ip_version == socket.AF_INET:
++        endpoint = TCP4ClientEndpoint
++    elif ip_version == socket.AF_INET6:
++        endpoint = TCP6ClientEndpoint
++    return endpoint(reactor_instance, host, port)
++
++
++def _run_reactor():
++    reactor.callWhenRunning(_reactor_ready.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor():
++    global _reactor_thread
++
++    with _reactor_lock:
++        if reactor.running:
++            _reactor_ready.set()
++        elif _reactor_thread is None:
++            _reactor_thread = Thread(target=_run_reactor, name="pastepwn-twisted-reactor", daemon=True)
++            _reactor_thread.start()
++
++    _reactor_ready.wait()
++
++
++def _headers_to_treq(headers):
++    values = {}
++    for name, value in headers.items():
++        if not isinstance(value, (list, tuple)):
++            value = [value]
++        values[_to_bytes(name)] = [_to_bytes(item) for item in value]
++    return Headers(values)
++
++
++def _to_bytes(value):
++    if isinstance(value, bytes):
++        return value
++    return str(value).encode("utf-8")
++
++
++def _proxy_for_url(url, proxies):
++    if not isinstance(proxies, dict):
++        return None
++
++    scheme = urlsplit(url).scheme.lower()
++    return proxies.get(scheme) or proxies.get(scheme.upper()) or proxies.get("all")
++
++
++def _proxy_agent(url, proxies):
++    proxy_url = _proxy_for_url(url, proxies)
++    if not proxy_url:
++        return None
++
++    proxy = urlsplit(proxy_url)
++    endpoint = _endpoint_for_host(reactor, get_ip_version(), proxy.hostname, proxy.port or 80)
++    return ProxyAgent(reactor, endpoint)
++
++
++def _request_in_reactor(method, url, data, timeout, headers, proxies):
++    agent = _proxy_agent(url, proxies)
++    if agent is None:
++        agent = Agent.usingEndpointFactory(reactor, _EndpointFactory(reactor, get_ip_version()))
++    deferred = treq.request(
++        method,
++        url,
++        data=data,
++        headers=_headers_to_treq(headers),
++        timeout=timeout,
++        agent=agent,
++    )
++    deferred.addCallback(treq.content)
++    deferred.addCallback(lambda content: content.decode("utf-8"))
++    return deferred
+ 
+ 
+ class Request:
+@@ -22,11 +123,10 @@
+     def __init__(self, proxies=None, headers=None):
+         if not self._initialized:
+             self.logger = logging.getLogger(__name__)
+-            self.session = Session()
+             self.proxies = proxies
+             self.headers = headers
+             self.logger.info("Using the following custom proxies: %s", proxies)
+-            system_proxies = utils.get_environ_proxies("https://example.com")
++            system_proxies = getproxies()
+             self.logger.info("Using the following system proxies: %s", system_proxies)
+             Request._initialized = True
+ 
+@@ -37,13 +137,23 @@
+             headers.update(self.headers)
+ 
+         try:
+-            response = self.session.request(*args, headers=headers, proxies=self.proxies, data=data, timeout=timeout, **kwargs)
+-        except Timeout:
++            _ensure_reactor()
++            response = blockingCallFromThread(
++                reactor,
++                _request_in_reactor,
++                kwargs.get("method"),
++                kwargs.get("url"),
++                data,
++                timeout,
++                headers,
++                self.proxies,
++            )
++        except TimeoutError:
+             url = kwargs.get("url")
+             self.logger.warning("Timeout while requesting %s!", url)
+             return ""
+ 
+-        return response.content.decode("utf-8")
++        return response
+ 
+     def get(self, url, data=None, timeout=5):
+         return self._request_wrapper(method="GET", url=url, data=data, timeout=timeout)

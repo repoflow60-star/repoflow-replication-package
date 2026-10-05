@@ -1,0 +1,417 @@
+--- a/pdpyras.py
++++ b/pdpyras.py
+@@ -1,8 +1,8 @@
+-
+ # Copyright (c) PagerDuty.
+ # See LICENSE for details.
+ 
+ # Standard libraries
++import json
+ import logging
+ import sys
+ import time
+@@ -10,15 +10,15 @@
+ from datetime import datetime
+ from random import random
+ from typing import Iterator, Union
++from urllib.parse import urlencode
+ from warnings import warn
+ 
+ # Upstream components on which this client is based:
+-from requests import Response, Session
+-from requests import __version__ as REQUESTS_VERSION
++import urllib3
++from urllib3 import __version__ as URLLIB3_VERSION
+ 
+ # HTTP client exceptions:
+ from urllib3.exceptions import HTTPError, PoolError
+-from requests.exceptions import RequestException
+ 
+ __version__ = '5.4.0'
+ 
+@@ -394,13 +394,13 @@
+     The canonical path from the API documentation corresponding to a URL
+ 
+     This is used to identify and classify URLs according to which particular API
+-    within REST API v2 it belongs to.
++    within REST API v2 it belongs.
+ 
+     Explicitly supported canonical paths are defined in the list
+     :attr:`CANONICAL_PATHS` and are the path part of any given API's URL. The
+     path for a given API is what is shown at the top of its reference page, i.e.
+-    ``/users/{id}/contact_methods`` for retrieving a user's contact methods
+-    (GET) or creating a new one (POST).
++    ``/users/{id}/contact_methods`` for retrieving a user's contact methods (GET)
++    or creating a new one (POST).
+ 
+     :param base_url: The base URL of the API
+     :param url: A non-normalized URL (a path or full URL)
+@@ -507,9 +507,9 @@
+     :param method: The HTTP method
+     :param path: A canonical API path i.e. as returned by ``canonical_path``
+     :returns:
+-        A 2-tuple. The first element is the wrapper name that should be used for
+-        the request body, and the second is the wrapper name to be used for the
+-        response body. For either elements, if ``None`` is returned, that
++        A 2-tuple. The first element is the wrapper name that should be used
++        for the request body, and the second is the wrapper name to be used for
++        the response body. For either elements, if ``None`` is returned, that
+         signals to disable wrapping and pass the user-supplied request body or
+         API response body object unmodified.
+     """
+@@ -562,7 +562,7 @@
+     given path in :attr:`ENTITY_WRAPPER_CONFIG`.
+ 
+     :param method: The HTTP method
+-    :param path: A canonical API path i.e. as returned by ``canonical_path``
++    :param path: A canonical API path i.e. as returned by :func:`canonical_path`
+     """
+     m = method.upper()
+     path_nodes = path.split('/')
+@@ -624,7 +624,7 @@
+     Makes methods return the full response body object after decoding from JSON.
+ 
+     Intended for use on functions that take a URL positional argument followed
+-    by keyword arguments and return a `requests.Response`_ object.
++    by keyword arguments and return a Response object.
+     """
+     doc = method.__doc__
+     def call(self, url, **kw):
+@@ -680,16 +680,14 @@
+     the ``json`` keyword argument will be normalized to include the wrapper.
+ 
+     Methods using this decorator will raise a :class:`PDHTTPError` with its
+-    ``response`` property being being the `requests.Response`_ object in the
+-    case of any error (as of version 4.2 this is subclassed as
+-    :class:`PDHTTPError`), so that the implementer can access it by catching the
+-    exception, and thus design their own custom logic around different types of
+-    error responses.
++    ``response`` property being the Response object in the case of any error,
++    so that the implementer can access it by catching the exception, and thus
++    design their own custom logic around different types of error responses.
+ 
+     :param method: Method being decorated. Must take one positional argument
+         after ``self`` that is the URL/path to the resource, followed by keyword
+         any number of keyword arguments, and must return an object of class
+-        `requests.Response`_, and be named after the HTTP method but with "r"
++        Response, and be named after the HTTP method but with "r"
+         prepended.
+     :returns: A callable object; the reformed method
+     """
+@@ -862,12 +860,47 @@
+ ### CLASSES ###
+ ###############
+ 
+-class PDSession(Session):
++class _Request:
++    def __init__(self, method, url):
++        self.method = method
++        self.url = url
++
++class _Elapsed:
++    def __init__(self, seconds):
++        self.seconds = seconds
++
++    def total_seconds(self):
++        return self.seconds
++
++class Response:
++    def __init__(self, response, method, url, elapsed):
++        self.status_code = response.status
++        self.headers = response.headers
++        self.content = response.data
++        self.request = _Request(method, url)
++        self.elapsed = _Elapsed(elapsed)
++
++    @property
++    def ok(self):
++        return self.status_code < 400
++
++    @property
++    def text(self):
++        content_type = self.headers.get('content-type', '')
++        encoding = 'utf-8'
++        if 'charset=' in content_type:
++            encoding = content_type.split('charset=', 1)[1].split(';', 1)[0].strip()
++        return self.content.decode(encoding, errors='replace')
++
++    def json(self):
++        return json.loads(self.text)
++
++class PDSession(urllib3.PoolManager):
+     """
+     Base class for making HTTP requests to PagerDuty APIs
+ 
+-    This is an opinionated wrapper of `requests.Session`_, with a few additional
+-    features:
++    This is an opinionated wrapper of `urllib3.PoolManager`_, with a few
++    additional features:
+ 
+     - The client will reattempt the request with auto-increasing cooldown/retry
+       intervals, with attempt limits configurable through the :attr:`retry`
+@@ -911,7 +944,7 @@
+     """
+ 
+     parent = None
+-    """The ``super`` object (`requests.Session`_)"""
++    """The ``super`` object (`urllib3.PoolManager`_)"""
+ 
+     permitted_methods = ()
+     """
+@@ -937,7 +970,7 @@
+       encountered first), and then return the final response.
+ 
+     The default behavior is to retry without limit on status 429, raise an
+-    exception on a 401, and return the `requests.Response`_ object in any other case
++    exception on a 401, and return the Response object in any other case
+     (assuming a HTTP response was received from the server).
+     """
+ 
+@@ -959,7 +992,7 @@
+ 
+     timeout = TIMEOUT
+     """
+-    This is the value sent to `Requests`_ as the ``timeout`` parameter that
++    This is the value sent to urllib3 as the ``timeout`` parameter that
+     determines the TCP read timeout.
+     """
+ 
+@@ -967,7 +1000,8 @@
+ 
+     def __init__(self, api_key: str, debug=False):
+         self.parent = super(PDSession, self)
+-        self.parent.__init__()
++        self.parent.__init__(retries=False)
++        self.headers = {}
+         self.api_key = api_key
+         self.log = logging.getLogger(__name__)
+         self.print_debug = debug
+@@ -1048,7 +1082,7 @@
+         Append special additional per-request headers.
+ 
+         :param method:
+-            The HTTP method, in upper case.
++            The method, in upper case.
+         :param user_headers:
+             Headers that can be specified to override default values.
+         :returns:
+@@ -1089,6 +1123,18 @@
+             delattr(self, '_debugHandler')
+         # else: no-op; only happens if debug is set to the same value twice
+ 
++    def get(self, url, **kwargs) -> Response:
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, **kwargs) -> Response:
++        return self.request('POST', url, **kwargs)
++
++    def put(self, url, **kwargs) -> Response:
++        return self.request('PUT', url, **kwargs)
++
++    def delete(self, url, **kwargs) -> Response:
++        return self.request('DELETE', url, **kwargs)
++
+     def request(self, method, url, **kwargs) -> Response:
+         """
+         Make a generic PagerDuty API request.
+@@ -1100,11 +1146,11 @@
+             The path/URL to request. If it does not start with the base URL, the
+             base URL will be prepended.
+         :param **kwargs:
+-            Custom keyword arguments to pass to ``requests.Session.request``.
++            Custom keyword arguments to pass to ``urllib3.PoolManager.request``.
+         :type method: str
+         :type url: str
+         :returns:
+-            The `requests.Response`_ object corresponding to the HTTP response
++            The Response object corresponding to the HTTP response
+         """
+         sleep_timer = self.sleep_timer
+         network_attempts = 0
+@@ -1122,20 +1168,37 @@
+         headers = kwargs.get('headers', {})
+         req_kw.update({
+             'headers': self.prepare_headers(method, user_headers=headers),
+-            'stream': False,
++            'preload_content': True,
+             'timeout': self.timeout
+         })
+ 
+         # Special changes to user-supplied parameters, for convenience
+-        if 'params' in kwargs and kwargs['params']:
+-            req_kw['params'] = self.normalize_params(kwargs['params'])
++        if 'params' in req_kw:
++            params = req_kw.pop('params')
++            if params:
++                params = self.normalize_params(params)
++                query_string = urlencode(params, doseq=True)
++                separator = '&' if '?' in full_url else '?'
++                full_url += separator + query_string
++
++        if 'json' in req_kw:
++            req_kw['body'] = json.dumps(req_kw.pop('json'))
++
++        req_kw.pop('stream', None)
+ 
+         # Make the request (and repeat w/cooldown if the rate limit is reached):
+         while True:
+             try:
+-                response = self.parent.request(method, full_url, **req_kw)
++                request_started = time.monotonic()
++                raw_response = self.parent.request(method, full_url, **req_kw)
++                response = Response(
++                    raw_response,
++                    method,
++                    full_url,
++                    time.monotonic() - request_started,
++                )
+                 self.postprocess(response)
+-            except (HTTPError, PoolError, RequestException) as e:
++            except (HTTPError, PoolError) as e:
+                 network_attempts += 1
+                 if network_attempts > self.max_network_attempts:
+                     error_msg = f"{endpoint}: Non-transient network " \
+@@ -1237,12 +1300,13 @@
+ 
+     @property
+     def user_agent(self) -> str:
+-        return 'pdpyras/%s python-requests/%s Python/%d.%d'%(
++        return 'pdpyras/%s python-urllib3/%s Python/%d.%d'%(
+             __version__,
+-            REQUESTS_VERSION,
++            URLLIB3_VERSION,
+             sys.version_info.major,
+             sys.version_info.minor
+         )
++
+ 
+ class EventsAPISession(PDSession):
+ 
+@@ -1306,7 +1370,7 @@
+         Resolve an alert via Events API.
+ 
+         :param dedup_key:
+-            The deduplication key of the alert to resolve.
++            The deduplication key of the alert to set to the resolved state.
+         """
+         return self.send_event('resolve', dedup_key=dedup_key)
+ 
+@@ -1357,7 +1421,7 @@
+ 
+     def post(self, *args, **kw) -> Response:
+         """
+-        Override of ``requests.Session.post``
++        Override of ``PDSession.post``
+ 
+         Adds the ``routing_key`` parameter to the body before sending.
+         """
+@@ -1540,7 +1604,7 @@
+     PagerDuty REST API v2 session object class.
+ 
+     Implements the most generic and oft-implemented aspects of PagerDuty's REST
+-    API v2 as an opinionated wrapper of `requests.Session`_.
++    API v2 as an opinionated wrapper of `urllib3.PoolManager`_.
+ 
+     Inherits from :class:`PDSession`.
+ 
+@@ -1689,9 +1753,9 @@
+         (all-lowercase strings) so that case doesn't need to match in the query argument
+         (which is also interpreted by the API as case-insensitive).
+ 
+-        If said behavior differs for a given API, i.e. the uniqueness constraint on a
+-        field is case-sensitive, it should still return the correct results because the
+-        search term sent to the index in the querystring is not lower-cased.
++        If said behavior differs for a given API, i.e. the uniqueness constraint on
++        a field is case-sensitive, it should still return the correct results because
++        the search term sent to the index in the querystring is not lower-cased.
+ 
+         :param resource:
+             The name of the resource endpoint to query, i.e.
+@@ -1735,7 +1799,7 @@
+         it implements classic pagination, a.k.a. numeric pagination.
+ 
+         Each yielded value is a dict object representing a result returned from
+-        the index. For example, if requesting the ``/users`` endpoint, each
++        the API. For example, if requesting the ``/users`` endpoint, each
+         yielded value will be an entry of the ``users`` array property in the
+         response.
+ 
+@@ -1964,7 +2028,7 @@
+             existing one. The underlying AP must support entity wrapping to use
+             this method with it.
+         :param attr:
+-            Name of the attribute to use as the idempotency key. For instance,
++            Name of the attribute to use as an idempotency key. For instance,
+             "email" when the resource is "users" will not create the user if a
+             user with the email address given in ``values`` already exists.
+         :param values:
+@@ -2000,11 +2064,11 @@
+         Records performance information / request metadata about the API call.
+ 
+         :param response:
+-            The `requests.Response`_ object returned by the request method
++            The Response object returned by the request method
+         :param suffix:
+             Optional suffix to append to the key
+         :type method: str
+-        :type response: `requests.Response`_
++        :type response: Response
+         :type suffix: str or None
+         """
+         method = response.request.method.upper()
+@@ -2058,7 +2122,7 @@
+             representing an API resource that contains an item with key ``self``
+             whose value is the URL of the resource.
+         :param **kw:
+-            Custom keyword arguments to pass to ``requests.Session.delete``
++            Custom keyword arguments to pass to ``PDSession.delete``
+         :type resource: str or dict
+         """
+         return self.delete(resource, **kw)
+@@ -2077,7 +2141,7 @@
+             representing an API resource that contains an item with key ``self``
+             whose value is the URL of the resource.
+         :param **kw:
+-            Custom keyword arguments to pass to ``requests.Session.get``
++            Custom keyword arguments to pass to ``PDSession.get``
+         :returns:
+             Dictionary representation of the requested object
+         :type resource: str or dict
+@@ -2095,7 +2159,7 @@
+             The path/URL to which to send the POST request, which should be an
+             index endpoint.
+         :param **kw:
+-            Custom keyword arguments to pass to ``requests.Session.post``
++            Custom keyword arguments to pass to ``PDSession.post``
+         :returns:
+             Dictionary representation of the created object
+         :type path: str
+@@ -2115,7 +2179,7 @@
+             representing an API resource that contains an item with key ``self``
+             whose value is the URL of the resource.
+         :param **kw:
+-            Custom keyword arguments to pass to ``requests.Session.put``
++            Custom keyword arguments to pass to ``PDSession.put``
+         :returns:
+             Dictionary representation of the updated object
+         """
+@@ -2186,11 +2250,11 @@
+ 
+     This class was created to make it easier to more cleanly handle errors by
+     way of a class that is guaranteed to have its ``response`` be a valid
+-    `requests.Response`_ object.
++    Response object.
+ 
+     Whereas, the more generic :class:`PDClientError` could also be used
+     to denote such things as non-transient network errors wherein no response
+-    was recevied from the API.
++    was received from the API.
+ 
+     For instance, instead of this:
+ 
+@@ -2226,4 +2290,4 @@
+     changes before GA, or in cases of HTTP status 5xx where a successful
+     response is required.
+     """
+-    pass
++    pass

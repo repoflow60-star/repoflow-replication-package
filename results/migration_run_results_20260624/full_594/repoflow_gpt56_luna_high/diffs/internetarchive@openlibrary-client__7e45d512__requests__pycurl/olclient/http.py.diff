@@ -1,0 +1,210 @@
+--- a/olclient/http.py
++++ b/olclient/http.py
+@@ -0,0 +1,207 @@
++"""Small synchronous HTTP interface backed by pycurl."""
++
++import json as jsonlib
++import re
++from http.cookies import CookieError, SimpleCookie
++from io import BytesIO
++from urllib.parse import urlencode, urlsplit, urlunsplit
++
++import pycurl
++
++
++class RequestException(Exception):
++    """Exception raised for transport and HTTP status failures."""
++
++    def __init__(self, message, response=None):
++        super().__init__(message)
++        self.response = response
++
++
++class PycurlHeaders(dict):
++    """Header mapping with case-insensitive lookup."""
++
++    def __getitem__(self, key):
++        key = key.lower()
++        for name, value in self.items():
++            if name.lower() == key:
++                return value
++        raise KeyError(key)
++
++    def get(self, key, default=None):
++        try:
++            return self[key]
++        except KeyError:
++            return default
++
++
++class PycurlResponse:
++    """Response object exposing the subset used by the client."""
++
++    def __init__(self, content, status_code, url, headers):
++        self.content = content
++        self.status_code = status_code
++        self.url = url
++        self.headers = PycurlHeaders(headers)
++
++    @property
++    def text(self):
++        content_type = self.headers.get('content-type', '')
++        match = re.search(r'charset=([^;\s]+)', content_type, re.IGNORECASE)
++        encoding = match.group(1) if match else 'utf-8'
++        try:
++            return self.content.decode(encoding)
++        except (LookupError, UnicodeDecodeError):
++            return self.content.decode('utf-8', errors='replace')
++
++    @property
++    def ok(self):
++        return self.status_code < 400
++
++    def json(self):
++        return jsonlib.loads(self.text)
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise RequestException(
++                f'{self.status_code} HTTP error for {self.url}', response=self
++            )
++        return None
++
++
++class PycurlSession:
++    """Session methods implemented with real pycurl calls."""
++
++    def __init__(self):
++        self.cookies = {}
++
++    def _cookie_header(self):
++        return '; '.join(f'{name}={value}' for name, value in self.cookies.items())
++
++    def _add_query(self, url, params):
++        if not params:
++            return url
++        parts = urlsplit(url)
++        query = urlencode(params, doseq=True)
++        combined_query = '&'.join(part for part in (parts.query, query) if part)
++        return urlunsplit((parts.scheme, parts.netloc, parts.path, combined_query, parts.fragment))
++
++    def _update_cookies(self, cookie_headers):
++        for header in cookie_headers:
++            cookie = SimpleCookie()
++            try:
++                cookie.load(header)
++            except (CookieError, ValueError):
++                continue
++            for name, morsel in cookie.items():
++                if morsel.value:
++                    self.cookies[name] = morsel.value
++
++    def request(
++        self,
++        method,
++        url,
++        params=None,
++        data=None,
++        headers=None,
++        json=None,
++        files=None,
++        **kwargs,
++    ):
++        del kwargs
++        url = self._add_query(url, params)
++        body = jsonlib.dumps(json) if json is not None else data
++        response_body = BytesIO()
++        response_headers = {}
++        set_cookie_headers = []
++        curl = pycurl.Curl()
++        mime = None
++
++        def receive_header(line):
++            decoded = line.decode('iso-8859-1').strip()
++            if not decoded or ':' not in decoded:
++                return len(line)
++            name, value = decoded.split(':', 1)
++            value = value.strip()
++            if name.lower() == 'set-cookie':
++                set_cookie_headers.append(value)
++            response_headers[name] = value
++            return len(line)
++
++        request_headers = [f'{name}: {value}' for name, value in (headers or {}).items()]
++        cookie_header = self._cookie_header()
++        if cookie_header:
++            request_headers.append(f'Cookie: {cookie_header}')
++
++        try:
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.FOLLOWLOCATION, True)
++            curl.setopt(pycurl.WRITEDATA, response_body)
++            curl.setopt(pycurl.HEADERFUNCTION, receive_header)
++            if request_headers:
++                curl.setopt(pycurl.HTTPHEADER, request_headers)
++
++            if files:
++                mime = curl.mime()
++                fields = dict(files)
++                if isinstance(body, dict):
++                    fields = dict(body, **fields)
++                for name, value in fields.items():
++                    part = mime.addpart()
++                    part.set_name(str(name))
++                    if isinstance(value, tuple):
++                        filename = value[0]
++                        part_data = value[1]
++                        content_type = value[2] if len(value) > 2 else None
++                        if filename is not None:
++                            part.set_filename(str(filename))
++                        if content_type:
++                            part.set_type(str(content_type))
++                        part.set_data(
++                            part_data
++                            if isinstance(part_data, bytes)
++                            else str(part_data).encode('utf-8')
++                        )
++                    else:
++                        part.set_data(str(value).encode('utf-8'))
++                curl.setopt(pycurl.MIMEPOST, mime)
++            elif isinstance(body, dict):
++                body = urlencode(body, doseq=True)
++
++            method = method.upper()
++            if method == 'GET':
++                curl.setopt(pycurl.HTTPGET, True)
++            elif method == 'POST':
++                curl.setopt(pycurl.POST, True)
++            else:
++                curl.setopt(pycurl.CUSTOMREQUEST, method)
++
++            if not files and body is not None:
++                curl.setopt(pycurl.POSTFIELDS, body)
++
++            curl.perform()
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++            effective_url = curl.getinfo(pycurl.EFFECTIVE_URL) or url
++        except pycurl.error as error:
++            raise RequestException(str(error)) from error
++        finally:
++            curl.close()
++
++        self._update_cookies(set_cookie_headers)
++        return PycurlResponse(
++            response_body.getvalue(),
++            status_code,
++            effective_url,
++            response_headers,
++        )
++
++    def get(self, url, **kwargs):
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, data=None, **kwargs):
++        return self.request('POST', url, data=data, **kwargs)
++
++    def put(self, url, data=None, **kwargs):
++        return self.request('PUT', url, data=data, **kwargs)
++
++    def close(self):
++        return None

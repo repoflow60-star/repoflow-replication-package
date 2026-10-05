@@ -1,0 +1,133 @@
+--- a/resend/request.py
++++ b/resend/request.py
+@@ -1,6 +1,8 @@
++import json
++from io import BytesIO
+ from typing import Any, Dict, Generic, List, Union, cast
+ 
+-import requests
++import pycurl
+ from typing_extensions import Literal, TypeVar
+ 
+ import resend
+@@ -10,6 +12,27 @@
+ RequestVerb = Literal["get", "post", "put", "patch", "delete"]
+ 
+ T = TypeVar("T")
++
++
++class _Response:
++    """Small response adapter exposing the interface used by the SDK.
++
++    PycURL is a low-level binding and does not provide a response object. The
++    adapter keeps the rest of the SDK independent of that implementation
++    detail while retaining the response attributes used by the SDK.
++    """
++
++    def __init__(self, content: bytes, status_code: int, headers: Dict[str, str]):
++        self.content = content
++        self.status_code = status_code
++        self.headers = headers
++
++    @property
++    def text(self) -> str:
++        return self.content.decode("utf-8", errors="replace")
++
++    def json(self) -> Any:
++        return json.loads(self.text)
+ 
+ 
+ # This class wraps the HTTP request creation logic
+@@ -33,7 +56,7 @@
+             Union[T, None]: A generic type of the Request class or None
+ 
+         Raises:
+-            requests.HTTPError: If the request fails
++            pycurl.error: If the request cannot be performed
+         """
+         resp = self.make_request(url=f"{resend.api_url}{self.path}")
+ 
+@@ -43,7 +66,7 @@
+ 
+         # this is a safety net, if we get here it means the Resend API is having issues
+         # and most likely the gateway is returning htmls
+-        if "application/json" not in resp.headers["content-type"]:
++        if "application/json" not in resp.headers.get("content-type", "").lower():
+             raise_for_code_and_type(
+                 code=500,
+                 message="Failed to parse Resend API response. Please try again.",
+@@ -87,26 +110,64 @@
+             "Accept": "application/json",
+             "Authorization": f"Bearer {resend.api_key}",
+             "User-Agent": f"resend-python:{get_version()}",
++            "Content-Type": "application/json",
+         }
+ 
+-    def make_request(self, url: str) -> requests.Response:
+-        """make_request is a helper function that makes the actual
+-        HTTP request to the Resend API.
++    @staticmethod
++    def __parse_headers(raw_headers: bytes) -> Dict[str, str]:
++        """Convert libcurl's raw response headers into a header mapping."""
++        headers: Dict[str, str] = {}
++        for raw_line in raw_headers.splitlines():
++            # A response can contain interim (1xx) or redirect headers. Only
++            # the headers from the final response should be exposed.
++            if raw_line.startswith(b"HTTP/"):
++                headers = {}
++                continue
++            if b":" not in raw_line:
++                continue
++            name, value = raw_line.split(b":", 1)
++            headers[name.decode("iso-8859-1").strip().lower()] = value.decode(
++                "iso-8859-1"
++            ).strip()
++        return headers
++
++    def make_request(self, url: str) -> _Response:
++        """Make the actual HTTP request to the Resend API with pycurl.
+ 
+         Args:
+             url (str): The URL to make the request to
+ 
+         Returns:
+-            requests.Response: The response object from the request
++            _Response: A response adapter containing the body, status, and headers
+ 
+         Raises:
+-            requests.HTTPError: If the request fails
++            pycurl.error: If libcurl cannot perform the request
+         """
+         headers = self.__get_headers()
+-        params = self.params
+-        verb = self.verb
++        payload = json.dumps(self.params).encode("utf-8")
+ 
++        body = BytesIO()
++        response_headers = BytesIO()
++        curl = pycurl.Curl()
+         try:
+-            return requests.request(verb, url, json=params, headers=headers)
+-        except requests.HTTPError as e:
+-            raise e
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.CUSTOMREQUEST, self.verb.upper())
++            # Match the redirect behavior of the previous HTTP client.
++            curl.setopt(pycurl.FOLLOWLOCATION, True)
++            curl.setopt(
++                pycurl.HTTPHEADER,
++                [f"{name}: {value}" for name, value in headers.items()],
++            )
++            curl.setopt(pycurl.POSTFIELDS, payload)
++            curl.setopt(pycurl.WRITEFUNCTION, body.write)
++            curl.setopt(pycurl.HEADERFUNCTION, response_headers.write)
++            curl.perform()
++            status_code = int(curl.getinfo(pycurl.RESPONSE_CODE))
++        finally:
++            curl.close()
++
++        return _Response(
++            content=body.getvalue(),
++            status_code=status_code,
++            headers=self.__parse_headers(response_headers.getvalue()),
++        )

@@ -1,0 +1,194 @@
+--- a/sectxt/__init__.py
++++ b/sectxt/__init__.py
+@@ -2,6 +2,7 @@
+ # SPDX-License-Identifier: EUPL-1.2
+ #
+ import codecs
++import ssl
+ 
+ import langcodes
+ import re
+@@ -22,11 +23,15 @@
+     from typing import TypedDict
+ 
+ import dateutil.parser
+-import requests
++import treq
++from twisted.internet.defer import inlineCallbacks, returnValue
++from twisted.internet.error import CertificateError
++from twisted.internet.selectreactor import SelectReactor
++from twisted.internet.ssl import CertificateOptions
++from twisted.python.failure import Failure
++from twisted.web.client import Agent
+ 
+ __version__ = "0.9.6"
+-
+-s = requests.Session()
+ 
+ 
+ class ErrorDict(TypedDict):
+@@ -557,35 +562,26 @@
+                 for path in [".well-known/security.txt", "security.txt"]:
+                     url = urlunsplit((scheme, self._loc, path, None, None))
+                     try:
+-                        resp = requests.get(
+-                            url,
+-                            headers={
+-                                'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                              'Gecko/20100101 Firefox/12.0'},
+-                            timeout=5
+-                        )
+-                    except requests.exceptions.SSLError:
++                        resp, content = self._request(url)
++                    except Exception as error:
++                        if not self._is_certificate_error(error):
++                            continue
+                         if not any(d["code"] == "invalid_cert" for d in self._errors):
+                             self._add_error(
+                                 "invalid_cert",
+                                 "security.txt must be served with a valid TLS certificate.",
+                             )
+                         try:
+-                            resp = requests.get(
+-                                url,
+-                                headers={
+-                                    'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                                  'Gecko/20100101 Firefox/12.0'},
+-                                timeout=5,
+-                                verify=False
+-                            )
+-                        except:
++                            resp, content = self._request(url, verify=False)
++                        except Exception:
+                             continue
+-                    except:
++                    except Exception:
+                         continue
+-                    if resp.status_code == 200:
+-                        if resp.history:
+-                            if not resp.url.endswith(path):
++                    if resp.code == 200:
++                        history = self._response_history(resp)
++                        response_url = self._response_url(resp, url)
++                        if history:
++                            if not response_url.endswith(path):
+                                 continue
+                         self._path = path
+                         self._url = url
+@@ -603,13 +599,14 @@
+                                 "(legacy place), but must be placed under "
+                                 "the '/.well-known/' path.",
+                             )
+-                        if "content-type" not in resp.headers:
++                        content_type = self._header(resp.headers, "content-type")
++                        if content_type is None:
+                             self._add_error(
+                                 "no_content_type", "HTTP Content-Type header must be sent."
+                             )
+                         else:
+                             m = Message()
+-                            m['content-type'] = resp.headers["content-type"]
++                            m["content-type"] = content_type
+                             params = dict(m.get_params())
+                             if "text/plain" not in params:
+                                 self._add_error(
+@@ -625,9 +622,12 @@
+                                     "Charset parameter in Content-Type header must be "
+                                     "'utf-8' if present.",
+                                 )
+-                        self._content = resp.content
+-                        if resp.history:
+-                            self._urls = [resp.history[0].url, resp.url]
++                        self._content = content
++                        if history:
++                            self._urls = [
++                                self._response_url(history[-1], url),
++                                response_url,
++                            ]
+                         else:
+                             self._urls = [url]
+                         super()._process()
+@@ -637,3 +637,83 @@
+                     break
+             if not security_txt_found:
+                 self._add_error("no_security_txt", "security.txt could not be located.")
++
++    @inlineCallbacks
++    def _request_deferred(self, reactor, url: str, verify: bool):
++        request_args = {
++            "headers": {
++                "User-Agent": "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) "
++                "Gecko/20100101 Firefox/12.0"
++            },
++            "timeout": 5,
++            "reactor": reactor,
++            "browser_like_redirects": True,
++        }
++        if not verify:
++            request_args["agent"] = Agent(
++                reactor, contextFactory=CertificateOptions(verify=False)
++            )
++        response = yield treq.get(url, **request_args)
++        content = yield treq.content(response)
++        returnValue((response, content))
++
++    def _request(self, url: str, verify: bool = True):
++        reactor = SelectReactor()
++        result = []
++
++        def finish(value):
++            result.append(value)
++            if reactor.running:
++                reactor.stop()
++            return None
++
++        self._request_deferred(reactor, url, verify).addBoth(finish)
++        if not result:
++            reactor.run()
++        response = result[0]
++        if isinstance(response, Failure):
++            response.raiseException()
++        return response
++
++    @staticmethod
++    def _is_certificate_error(error) -> bool:
++        if isinstance(error, (CertificateError, ssl.SSLError)):
++            return True
++        for reason in getattr(error, "reasons", ()):
++            reason = getattr(reason, "value", reason)
++            if SecurityTXT._is_certificate_error(reason):
++                return True
++        return type(error).__name__ == "VerificationError"
++
++    @staticmethod
++    def _header(headers, name: str):
++        if hasattr(headers, "getRawHeaders"):
++            values = headers.getRawHeaders(name)
++            if values:
++                value = values[0]
++            else:
++                return None
++        else:
++            value = headers.get(name)
++            if value is None:
++                return None
++        if isinstance(value, bytes):
++            return value.decode("latin1")
++        return value
++
++    @staticmethod
++    def _response_history(response):
++        history = []
++        previous = getattr(response, "previousResponse", None)
++        while previous is not None:
++            history.append(previous)
++            previous = getattr(previous, "previousResponse", None)
++        return history
++
++    @staticmethod
++    def _response_url(response, fallback: str) -> str:
++        request = getattr(response, "request", None)
++        value = getattr(request, "absoluteURI", fallback)
++        if isinstance(value, bytes):
++            return value.decode("ascii")
++        return value

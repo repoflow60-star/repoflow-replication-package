@@ -1,0 +1,171 @@
+--- a/whatsapp_api_client_python/API.py
++++ b/whatsapp_api_client_python/API.py
+@@ -2,8 +2,12 @@
+ import logging
+ from typing import Any, NoReturn, Optional
+ 
+-from requests import Response, Session
+-from requests.adapters import HTTPAdapter, Retry
++import treq
++from treq.client import HTTPClient
++from twisted.internet import reactor
++from twisted.internet.defer import Deferred, inlineCallbacks
++from twisted.internet.task import deferLater
++from twisted.web.http_headers import Headers
+ 
+ from .response import Response as GreenAPIResponse
+ from .tools import (
+@@ -49,7 +53,7 @@
+         self.idInstance = idInstance
+         self.apiTokenInstance = apiTokenInstance
+ 
+-        self.session = Session()
++        self.session = HTTPClient()
+         self.__prepare_session()
+ 
+         self.account = account.Account(self)
+@@ -66,13 +70,14 @@
+         self.logger = logging.getLogger("whatsapp-api-client-python")
+         self.__prepare_logger()
+ 
++    @inlineCallbacks
+     def request(
+             self,
+             method: str,
+             url: str,
+             payload: Optional[dict] = None,
+             files: Optional[dict] = None
+-    ) -> GreenAPIResponse:
++    ) -> Deferred:
+         url = url.replace("{{host}}", self.host)
+         url = url.replace("{{media}}", self.media)
+         url = url.replace("{{idInstance}}", self.idInstance)
+@@ -80,13 +85,24 @@
+ 
+         try:
+             if not files:
+-                response = self.session.request(
+-                    method=method, url=url, json=payload, timeout=self.host_timeout
++                response = yield self.__request(
++                    method=method,
++                    url=url,
++                    headers=self.session_headers,
++                    json=payload,
++                    timeout=self.host_timeout
+                 )
+             else:
+-                response = self.session.request(
+-                    method=method, url=url, data=payload, files=files, timeout=self.media_timeout
+-                )
++                response = yield self.__request(
++                    method=method,
++                    url=url,
++                    headers=self.session_headers,
++                    data=payload,
++                    files=files,
++                    timeout=self.media_timeout
++                )
++
++            response_text = yield treq.text(response)
+         except Exception as error:
+             error_message = f"Request was failed with error: {error}."
+ 
+@@ -96,13 +112,17 @@
+ 
+             return GreenAPIResponse(None, error_message)
+ 
+-        self.__handle_response(response)
+-
+-        return GreenAPIResponse(response.status_code, response.text)
+-
+-    def raw_request(self, **arguments: Any) -> GreenAPIResponse:
++        self.__handle_response(response, response_text)
++
++        return GreenAPIResponse(response.code, response_text)
++
++    @inlineCallbacks
++    def raw_request(self, **arguments: Any) -> Deferred:
+         try:
+-            response = self.session.request(**arguments)
++            arguments.setdefault("headers", self.session_headers)
++
++            response = yield self.__request(**arguments)
++            response_text = yield treq.text(response)
+         except Exception as error:
+             error_message = f"Request was failed with error: {error}."
+ 
+@@ -112,19 +132,45 @@
+ 
+             return GreenAPIResponse(None, error_message)
+ 
+-        self.__handle_response(response)
+-
+-        return GreenAPIResponse(response.status_code, response.text)
+-
+-    def __handle_response(self, response: Response) -> Optional[NoReturn]:
+-        status_code = response.status_code
++        self.__handle_response(response, response_text)
++
++        return GreenAPIResponse(response.code, response_text)
++
++    @inlineCallbacks
++    def __request(self, **arguments: Any) -> Deferred:
++        for attempt in range(4):
++            try:
++                response = yield self.session.request(**arguments)
++            except Exception:
++                if attempt == 3:
++                    raise
++
++                if attempt > 0:
++                    yield deferLater(reactor, 2 ** attempt, lambda: None)
++
++                continue
++
++            if response.code != 429 or attempt == 3:
++                return response
++
++            yield treq.content(response)
++
++            if attempt > 0:
++                yield deferLater(reactor, 2 ** attempt, lambda: None)
++
++    def __handle_response(
++            self,
++            response: Any,
++            response_text: str
++    ) -> Optional[NoReturn]:
++        status_code = response.code
+         if status_code != 200 or self.debug_mode:
+             try:
+                 data = json.dumps(
+-                    json.loads(response.text), ensure_ascii=False, indent=4
++                    json.loads(response_text), ensure_ascii=False, indent=4
+                 )
+             except json.JSONDecodeError:
+-                data = response.text
++                data = response_text
+ 
+             if status_code != 200:
+                 error_message = (
+@@ -159,17 +205,9 @@
+             self.logger.setLevel(logging.DEBUG)
+ 
+     def __prepare_session(self) -> None:
+-        self.session.headers["Connection"] = "close"
+-
+-        retry = Retry(
+-            total=3,
+-            backoff_factor=1.0,
+-            allowed_methods=None,
+-            status_forcelist=[429]
+-        )
+-
+-        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
++        self.session_headers = Headers({
++            b"Connection": [b"close"]
++        })
+ 
+ 
+ class GreenAPI(GreenApi):

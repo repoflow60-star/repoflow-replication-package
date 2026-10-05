@@ -1,0 +1,151 @@
+--- a/whatsapp_api_client_python/API.py
++++ b/whatsapp_api_client_python/API.py
+@@ -1,9 +1,9 @@
++import asyncio
+ import json
+ import logging
+ from typing import Any, NoReturn, Optional
+ 
+-from requests import Response, Session
+-from requests.adapters import HTTPAdapter, Retry
++import aiohttp
+ 
+ from .response import Response as GreenAPIResponse
+ from .tools import (
+@@ -18,6 +18,36 @@
+     serviceMethods,
+     webhooks
+ )
++
++
++class _AioHttpSession:
++    """Synchronous session facade backed by aiohttp."""
++
++    def __init__(self):
++        self.headers = {}
++
++    def request(self, **arguments: Any) -> tuple:
++        return asyncio.run(self._request(**arguments))
++
++    async def _request(self, **arguments: Any) -> tuple:
++        async with aiohttp.ClientSession(headers=dict(self.headers)) as session:
++            for attempt in range(4):
++                try:
++                    async with session.request(**arguments) as response:
++                        response_text = await response.text()
++                        if response.status != 429 or attempt == 3:
++                            return response.status, response_text
++                except (aiohttp.ClientError, asyncio.TimeoutError):
++                    if attempt == 3:
++                        raise
++
++                await asyncio.sleep(1.0 * (2 ** attempt))
++
++        raise RuntimeError("Request retry loop exited unexpectedly")
++
++
++# Keep the session construction point available to consumers that customize it.
++Session = _AioHttpSession
+ 
+ 
+ class GreenApi:
+@@ -84,8 +114,31 @@
+                     method=method, url=url, json=payload, timeout=self.host_timeout
+                 )
+             else:
++                form = aiohttp.FormData()
++                if payload:
++                    for name, value in payload.items():
++                        form.add_field(name, value)
++
++                for name, file_data in files.items():
++                    if isinstance(file_data, tuple):
++                        if len(file_data) == 3:
++                            form.add_field(
++                                name,
++                                file_data[1],
++                                filename=file_data[0],
++                                content_type=file_data[2]
++                            )
++                        elif len(file_data) == 2:
++                            form.add_field(
++                                name, file_data[1], filename=file_data[0]
++                            )
++                        else:
++                            form.add_field(name, file_data)
++                    else:
++                        form.add_field(name, file_data)
++
+                 response = self.session.request(
+-                    method=method, url=url, data=payload, files=files, timeout=self.media_timeout
++                    method=method, url=url, data=form, timeout=self.media_timeout
+                 )
+         except Exception as error:
+             error_message = f"Request was failed with error: {error}."
+@@ -96,9 +149,10 @@
+ 
+             return GreenAPIResponse(None, error_message)
+ 
+-        self.__handle_response(response)
+-
+-        return GreenAPIResponse(response.status_code, response.text)
++        status_code, response_text = self.__response_parts(response)
++        self.__handle_response(status_code, response_text)
++
++        return GreenAPIResponse(status_code, response_text)
+ 
+     def raw_request(self, **arguments: Any) -> GreenAPIResponse:
+         try:
+@@ -112,19 +166,27 @@
+ 
+             return GreenAPIResponse(None, error_message)
+ 
+-        self.__handle_response(response)
+-
+-        return GreenAPIResponse(response.status_code, response.text)
+-
+-    def __handle_response(self, response: Response) -> Optional[NoReturn]:
+-        status_code = response.status_code
++        status_code, response_text = self.__response_parts(response)
++        self.__handle_response(status_code, response_text)
++
++        return GreenAPIResponse(status_code, response_text)
++
++    @staticmethod
++    def __response_parts(response: Any) -> tuple:
++        if isinstance(response, tuple):
++            return response
++        return response.status_code, response.text
++
++    def __handle_response(
++            self, status_code: int, response_text: str
++    ) -> Optional[NoReturn]:
+         if status_code != 200 or self.debug_mode:
+             try:
+                 data = json.dumps(
+-                    json.loads(response.text), ensure_ascii=False, indent=4
++                    json.loads(response_text), ensure_ascii=False, indent=4
+                 )
+             except json.JSONDecodeError:
+-                data = response.text
++                data = response_text
+ 
+             if status_code != 200:
+                 error_message = (
+@@ -161,16 +223,6 @@
+     def __prepare_session(self) -> None:
+         self.session.headers["Connection"] = "close"
+ 
+-        retry = Retry(
+-            total=3,
+-            backoff_factor=1.0,
+-            allowed_methods=None,
+-            status_forcelist=[429]
+-        )
+-
+-        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+-
+ 
+ class GreenAPI(GreenApi):
+     pass

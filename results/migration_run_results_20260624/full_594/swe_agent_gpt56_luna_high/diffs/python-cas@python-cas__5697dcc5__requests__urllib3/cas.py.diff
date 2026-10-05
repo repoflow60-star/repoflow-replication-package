@@ -1,0 +1,197 @@
+--- a/cas.py
++++ b/cas.py
+@@ -1,10 +1,104 @@
+ import datetime
+ import logging
++import ssl
+ from uuid import uuid4
+ 
+-import requests
++import urllib3
+ from lxml import etree
+ from six.moves.urllib import parse as urllib_parse
++
++
++def _request_get(session, url, params=None, stream=False):
++    """Make a GET request using an urllib3 manager or a custom session.
++
++    urllib3's :class:`PoolManager` exposes ``request`` rather than the
++    convenience methods provided by higher-level HTTP clients.  Keeping the
++    small amount of dispatching here also means that callers can continue to
++    provide a session object with a ``get`` method (as supported by the public API).
++    """
++    get = getattr(session, 'get', None)
++    if callable(get):
++        kwargs = {}
++        if params is not None:
++            kwargs['params'] = params
++        if stream:
++            kwargs['stream'] = True
++        return get(url, **kwargs)
++
++    kwargs = {}
++    if params is not None:
++        kwargs['fields'] = params
++    if stream:
++        kwargs['preload_content'] = False
++    return session.request('GET', url, **kwargs)
++
++
++def _request_post(session, url, body, params=None, headers=None):
++    """Make a POST request using urllib3's request API."""
++    post = getattr(session, 'post', None)
++    if callable(post):
++        kwargs = {'data': body}
++        if params is not None:
++            kwargs['params'] = params
++        if headers is not None:
++            kwargs['headers'] = headers
++        return post(url, **kwargs)
++
++    # urllib3 uses ``fields`` for POST bodies, so query parameters must be
++    # added to the URL when a separate request body is being sent.
++    if params:
++        separator = '&' if '?' in url else '?'
++        url = ''.join([url, separator, urllib_parse.urlencode(params)])
++    kwargs = {'body': body}
++    if headers is not None:
++        kwargs['headers'] = headers
++    return session.request('POST', url, **kwargs)
++
++
++def _response_status(response):
++    """Return the status from either an urllib3 or compatible response."""
++    status = getattr(response, 'status', None)
++    if isinstance(status, int):
++        return status
++    return getattr(response, 'status_code', status)
++
++
++def _response_content(response):
++    """Return response bytes for urllib3 and response-like custom objects."""
++    # Custom sessions may return response objects that expose ``content``.
++    # urllib3 HTTPResponse exposes the body as ``data``.
++    content = getattr(response, 'content', None)
++    if isinstance(content, (bytes, bytearray, str)):
++        return content
++    return response.data
++
++
++def _response_lines(response, chunk_size):
++    """Yield decoded response lines from compatible or urllib3 responses."""
++    iter_lines = getattr(response, 'iter_lines', None)
++    if callable(iter_lines):
++        lines = iter_lines(chunk_size=chunk_size)
++    else:
++        def stream_lines():
++            pending = b''
++            for chunk in response.stream(amt=chunk_size):
++                if isinstance(chunk, str):
++                    chunk = chunk.encode('utf-8')
++                pending += chunk
++                split = pending.split(b'\n')
++                pending = split.pop()
++                for line in split:
++                    yield line.rstrip(b'\r')
++            if pending:
++                yield pending.rstrip(b'\r')
++
++        lines = stream_lines()
++
++    for line in lines:
++        if isinstance(line, bytes):
++            line = line.decode('utf-8')
++        yield line
++
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -79,7 +173,11 @@
+         self.renew = renew
+         self.username_attribute = username_attribute
+         self.verify_ssl_certificate = verify_ssl_certificate
+-        self.session = session or requests.sessions.Session()
++        if session is not None:
++            self.session = session
++        else:
++            cert_reqs = ssl.CERT_REQUIRED if verify_ssl_certificate else ssl.CERT_NONE
++            self.session = urllib3.PoolManager(cert_reqs=cert_reqs)
+ 
+     def verify_ticket(self, ticket):
+         """Verify ticket.
+@@ -140,10 +238,10 @@
+         Raises:
+             CASError: Non 200 http code or bad XML body.
+         """
+-        response = self.session.get(self.get_proxy_url(pgt), verify=self.verify_ssl_certificate)
+-        if response.status_code == 200:
++        response = _request_get(self.session, self.get_proxy_url(pgt))
++        if _response_status(response) == 200:
+             from lxml import etree
+-            root = etree.fromstring(response.content)
++            root = etree.fromstring(_response_content(response))
+             tickets = root.xpath(
+                 "//cas:proxyTicket",
+                 namespaces={"cas": "http://www.yale.edu/tp/cas"}
+@@ -156,7 +254,7 @@
+             )
+             if len(errors) == 1:
+                 raise CASError(errors[0].attrib['code'], errors[0].text)
+-        raise CASError("Bad http code %s" % response.status_code)
++        raise CASError("Bad http code %s" % _response_status(response))
+ 
+ 
+ class CASClientV1(CASClientBase):
+@@ -172,13 +270,9 @@
+         params = [('ticket', ticket), ('service', self.service_url)]
+         url = (urllib_parse.urljoin(self.server_url, 'validate') + '?' +
+                urllib_parse.urlencode(params))
+-        page = self.session.get(
+-            url,
+-            stream=True,
+-            verify=self.verify_ssl_certificate
+-        )
+-        try:
+-            page_iterator = page.iter_lines(chunk_size=8192)
++        page = _request_get(self.session, url, stream=True)
++        try:
++            page_iterator = _response_lines(page, chunk_size=8192)
+             verified = next(page_iterator).strip()
+             if verified == 'yes':
+                 return next(page_iterator).strip(), None, None
+@@ -212,13 +306,9 @@
+         if self.proxy_callback:
+             params.update({'pgtUrl': self.proxy_callback})
+         base_url = urllib_parse.urljoin(self.server_url, self.url_suffix)
+-        page = self.session.get(
+-            base_url,
+-            params=params,
+-            verify=self.verify_ssl_certificate
+-        )
+-        try:
+-            return page.content
++        page = _request_get(self.session, base_url, params=params)
++        try:
++            return _response_content(page)
+         finally:
+             page.close()
+ 
+@@ -338,7 +428,7 @@
+         try:
+             user = None
+             attributes = {}
+-            response = page.content
++            response = _response_content(page)
+             tree = ElementTree.fromstring(response)
+             # Find the authentication status
+             success = tree.find('.//' + SAML_1_0_PROTOCOL_NS + 'StatusCode')
+@@ -380,7 +470,8 @@
+         saml_validate_url = urllib_parse.urljoin(
+             self.server_url, 'samlValidate',
+         )
+-        return self.session.post(
++        return _request_post(
++            self.session,
+             saml_validate_url,
+             self.get_saml_assertion(ticket),
+             params=params,

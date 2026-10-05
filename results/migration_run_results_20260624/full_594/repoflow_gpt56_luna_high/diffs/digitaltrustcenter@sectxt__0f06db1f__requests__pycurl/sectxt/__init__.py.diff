@@ -1,0 +1,163 @@
+--- a/sectxt/__init__.py
++++ b/sectxt/__init__.py
+@@ -2,6 +2,7 @@
+ # SPDX-License-Identifier: EUPL-1.2
+ #
+ import codecs
++from io import BytesIO
+ 
+ import langcodes
+ import re
+@@ -22,11 +23,75 @@
+     from typing import TypedDict
+ 
+ import dateutil.parser
+-import requests
++import pycurl
+ 
+ __version__ = "0.9.6"
+ 
+-s = requests.Session()
++_SSL_ERROR_CODES = {
++    getattr(pycurl, name)
++    for name in (
++        "CURLE_PEER_FAILED_VERIFICATION",
++        "CURLE_SSL_CONNECT_ERROR",
++        "CURLE_SSL_CACERT",
++        "CURLE_SSL_CACERT_BADFILE",
++    )
++    if hasattr(pycurl, name)
++}
++
++
++def _fetch_url(url: str, verify: bool = True):
++    body = BytesIO()
++    response_headers = {}
++
++    def capture_header(header):
++        line = header.decode("iso-8859-1") if isinstance(header, bytes) else header
++        if line.startswith("HTTP/"):
++            # A redirect starts a new response header block.
++            response_headers.clear()
++        else:
++            name, separator, value = line.rstrip("\r\n").partition(":")
++            if separator:
++                response_headers[name.lower()] = value.strip()
++        return len(header)
++
++    curl = pycurl.Curl()
++    try:
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.FOLLOWLOCATION, 1)
++        curl.setopt(
++            pycurl.HTTPHEADER,
++            [
++                "User-Agent: Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) "
++                "Gecko/20100101 Firefox/12.0"
++            ],
++        )
++        curl.setopt(pycurl.TIMEOUT, 5)
++        curl.setopt(pycurl.WRITEFUNCTION, body.write)
++        curl.setopt(pycurl.HEADERFUNCTION, capture_header)
++        if not verify:
++            curl.setopt(pycurl.SSL_VERIFYPEER, 0)
++            curl.setopt(pycurl.SSL_VERIFYHOST, 0)
++        curl.perform()
++        response_url = curl.getinfo(pycurl.EFFECTIVE_URL) or url
++        if isinstance(response_url, bytes):
++            response_url = response_url.decode("utf-8")
++        return (
++            curl.getinfo(pycurl.RESPONSE_CODE),
++            response_headers,
++            body.getvalue(),
++            response_url,
++            curl.getinfo(pycurl.REDIRECT_COUNT) > 0,
++        )
++    finally:
++        curl.close()
++
++
++def _is_ssl_error(error: Exception) -> bool:
++    return (
++        isinstance(error, pycurl.error)
++        and bool(error.args)
++        and error.args[0] in _SSL_ERROR_CODES
++    )
+ 
+ 
+ class ErrorDict(TypedDict):
+@@ -557,35 +622,26 @@
+                 for path in [".well-known/security.txt", "security.txt"]:
+                     url = urlunsplit((scheme, self._loc, path, None, None))
+                     try:
+-                        resp = requests.get(
+-                            url,
+-                            headers={
+-                                'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                              'Gecko/20100101 Firefox/12.0'},
+-                            timeout=5
+-                        )
+-                    except requests.exceptions.SSLError:
++                        status_code, headers, content, response_url, redirected = _fetch_url(url)
++                    except pycurl.error as error:
++                        if not _is_ssl_error(error):
++                            continue
+                         if not any(d["code"] == "invalid_cert" for d in self._errors):
+                             self._add_error(
+                                 "invalid_cert",
+                                 "security.txt must be served with a valid TLS certificate.",
+                             )
+                         try:
+-                            resp = requests.get(
+-                                url,
+-                                headers={
+-                                    'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                                  'Gecko/20100101 Firefox/12.0'},
+-                                timeout=5,
+-                                verify=False
++                            status_code, headers, content, response_url, redirected = _fetch_url(
++                                url, verify=False
+                             )
+-                        except:
++                        except Exception:
+                             continue
+                     except:
+                         continue
+-                    if resp.status_code == 200:
+-                        if resp.history:
+-                            if not resp.url.endswith(path):
++                    if status_code == 200:
++                        if redirected:
++                            if not response_url.endswith(path):
+                                 continue
+                         self._path = path
+                         self._url = url
+@@ -603,13 +659,13 @@
+                                 "(legacy place), but must be placed under "
+                                 "the '/.well-known/' path.",
+                             )
+-                        if "content-type" not in resp.headers:
++                        if "content-type" not in headers:
+                             self._add_error(
+                                 "no_content_type", "HTTP Content-Type header must be sent."
+                             )
+                         else:
+                             m = Message()
+-                            m['content-type'] = resp.headers["content-type"]
++                            m['content-type'] = headers["content-type"]
+                             params = dict(m.get_params())
+                             if "text/plain" not in params:
+                                 self._add_error(
+@@ -625,9 +681,9 @@
+                                     "Charset parameter in Content-Type header must be "
+                                     "'utf-8' if present.",
+                                 )
+-                        self._content = resp.content
+-                        if resp.history:
+-                            self._urls = [resp.history[0].url, resp.url]
++                        self._content = content
++                        if redirected:
++                            self._urls = [url, response_url]
+                         else:
+                             self._urls = [url]
+                         super()._process()

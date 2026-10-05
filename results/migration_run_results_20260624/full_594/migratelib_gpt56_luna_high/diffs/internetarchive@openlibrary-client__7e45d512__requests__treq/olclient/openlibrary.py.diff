@@ -1,0 +1,479 @@
+--- a/olclient/openlibrary.py
++++ b/olclient/openlibrary.py
+@@ -8,12 +8,16 @@
+ import logging
+ import os
+ import re
++from http.cookiejar import CookieJar
+ from urllib.parse import urlencode
+ from urllib.request import pathname2url
+ 
+ import backoff
+-import requests
+-from requests import Response
++import treq
++from treq.client import HTTPClient
++from twisted.internet import reactor
++from twisted.internet.defer import inlineCallbacks, returnValue
++from twisted.web.client import Agent
+ 
+ from olclient import common
+ from olclient.config import Config
+@@ -21,6 +25,15 @@
+ from olclient.utils import merge_unique_lists
+ 
+ logger = logging.getLogger('openlibrary')
++
++
++class TreqHTTPError(Exception):
++
++    def __init__(self, response):
++        self.response = response
++        super().__init__(
++            f'HTTP request failed with status code {response.code}'
++        )
+ 
+ 
+ class OpenLibrary:
+@@ -51,9 +64,9 @@
+     VALID_IDS = ['isbn_10', 'isbn_13', 'lccn', 'ocaid']
+     BACKOFF_KWARGS = {
+         'wait_gen': backoff.expo,
+-        'exception': requests.exceptions.RequestException,
+-        'giveup': lambda e: hasattr(e.response, 'status_code')
+-        and 400 <= e.response.status_code < 500,
++        'exception': Exception,
++        'giveup': lambda e: hasattr(e, 'response')
++        and 400 <= e.response.code < 500,
+         'max_tries': 5,
+     }
+ 
+@@ -62,23 +75,38 @@
+     WORKS_PAGINATION_OFFSET = 0
+ 
+     def __init__(self, credentials=None, base_url='https://openlibrary.org'):
+-        self.session = requests.Session()
++        self._cookie_jar = CookieJar()
++        self.session = HTTPClient(
++            Agent(reactor),
++            cookieJar=self._cookie_jar,
++        )
++        self._login_deferred = None
+         self.base_url = base_url
+         credentials = credentials or Config().get_config().get('s3', None)
+         if credentials:
+-            self.login(credentials)
+-
++            self._login_deferred = self.login(credentials)
++
++    @inlineCallbacks
++    def _request(self, method, url, **kwargs):
++        if self._login_deferred:
++            yield self._login_deferred
++            self._login_deferred = None
++
++        response = yield getattr(self.session, method)(url, **kwargs)
++        returnValue(response)
++
++    @inlineCallbacks
+     def login(self, credentials):
+-        """Login to Open Library with given credentials, ensures the requests
++        """Login to Open Library with given credentials, ensures the treq
+         session has valid cookies for future requests.
+         """
+ 
+         if 'username' in credentials._asdict():
+             headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+-            data = urlencode(credentials._asdict())
++            data = urlencode(credentials._asdict()).encode('utf-8')
+         else:  # s3 login
+             headers = {'Content-Type': 'application/json'}
+-            data = json.dumps(credentials._asdict())
++            data = json.dumps(credentials._asdict()).encode('utf-8')
+         url = self.base_url + '/account/login'
+ 
+         err = lambda e: logger.exception("Error at login: %s", e)
+@@ -88,9 +116,9 @@
+             """Makes best effort to perform request w/ exponential backoff"""
+             return self.session.post(url, data=data, headers=headers)
+ 
+-        _ = _login(url, headers, data)
+-
+-        if not self.session.cookies:
++        _ = yield _login(url, headers, data)
++
++        if not self._cookie_jar:
+             raise ValueError("No cookie set")
+ 
+     def validate(self, doc, schema_name):
+@@ -117,9 +145,13 @@
+         """
+         data = json.dumps({'type': {'key': '/type/delete'}, '_comment': comment})
+         url = self._generate_url_from_olid(olid)
+-        return self.session.put(url, data=data)
+-
+-    def save_many(self, docs, comment) -> Response:
++        return self._request(
++            'put',
++            url,
++            data=data.encode('utf-8'),
++        )
++
++    def save_many(self, docs, comment) -> Any:
+         """
+         Uses the Open Library save_many API endpoint to
+         write any number or combination of documents (Edition, Work, or Author)
+@@ -131,11 +163,14 @@
+             '42-comment': comment,
+         }
+         doc_json = [doc.json() for doc in docs]
+-        return self.session.post(
+-            f'{self.base_url}/api/save_many', json.dumps(doc_json), headers=headers
++        return self._request(
++            'post',
++            f'{self.base_url}/api/save_many',
++            data=json.dumps(doc_json).encode('utf-8'),
++            headers=headers,
+         )
+ 
+-    def delete_many(self, ol_ids: List[str], comment: str) -> Response:
++    def delete_many(self, ol_ids: List[str], comment: str) -> Any:
+         return self.save_many(
+             [self.Delete(ol_id) for ol_id in ol_ids],
+             comment=comment
+@@ -144,11 +179,13 @@
+     err = lambda e: logger.exception("Error retrieving OpenLibrary response: %s", e)
+ 
+     @backoff.on_exception(on_giveup=err, **BACKOFF_KWARGS)  # type: ignore
++    @inlineCallbacks
+     def get_ol_response(self, path):
+         """Makes best effort to perform request w/ exponential backoff"""
+-        response = self.session.get(self.base_url + path)
+-        response.raise_for_status()
+-        return response
++        response = yield self._request('get', self.base_url + path)
++        if response.code >= 400:
++            raise TreqHTTPError(response)
++        returnValue(response)
+ 
+     @property
+     def Work(self):
+@@ -258,10 +295,11 @@
+             def add_bookcover(self, cover_url):
+                 """Adds a cover image to this edition"""
+                 url = f'{self.OL.base_url}/books/{self.olid}/-/add-cover'
+-                r = self.OL.session.post(
+-                    url, files={'file': '', 'url': cover_url, 'upload': 'submit'}
++                return self.OL._request(
++                    'post',
++                    url,
++                    files={'file': '', 'url': cover_url, 'upload': 'submit'}
+                 )
+-                return r
+ 
+             def add_book_cover_from_file(
+                     self,
+@@ -274,7 +312,8 @@
+                     "url": (None, "https://"),
+                     "upload": (None, "Submit")
+                 }
+-                return self.OL.session.post(
++                return self.OL._request(
++                    'post',
+                     f'{self.OL.base_url}/books/{self.olid}/-/add-cover',
+                     files=form_data_body
+                 )
+@@ -284,7 +323,11 @@
+                 body = self.json()
+                 body['_comment'] = comment
+                 url = self.OL.base_url + f'/books/{self.olid}.json'
+-                return self.OL.session.put(url, json.dumps(body))
++                return self.OL._request(
++                    'put',
++                    url,
++                    data=json.dumps(body).encode('utf-8'),
++                )
+ 
+             @classmethod
+             def create(cls, book, work_olid, debug=False):
+@@ -334,6 +377,7 @@
+                 return book_args
+ 
+             @classmethod
++            @inlineCallbacks
+             def get(cls, olid=None, isbn=None, oclc=None, lccn=None, ocaid=None):
+                 """Retrieves a single book from OpenLibrary as json by isbn or olid or ocaid or lccn or oclc or olid.
+ 
+@@ -345,8 +389,8 @@
+                     the OpenLibrary fields to be converted into a format which is consistent with how we are using
+                     olclient Book to create OpenLibrary books -- i.e. authors = Author objects, publishers list
+                     instead of publisher, identifiers (instead of key and isbn). The goal is to enable service to
+-                    interoperate with the Book object and for OpenLibrary to be able to marshal the book object
+-                    into a form it can use (or marshal its internal book json into a form others can use).
++                    interoperate with the Book object and for OpenLibrary to be able to marshal the book object into a
++                    form it can use (or marshal its internal book json into a form others can use).
+ 
+                 Usage:
+                     >>> from olclient import OpenLibrary
+@@ -369,19 +413,19 @@
+                 elif not olid:
+                     bibkeys = {'ISBN': isbn, 'OCLC': oclc, 'OCAID': ocaid, 'LCCN': lccn}
+                     bibkey, value = [(k, v) for k, v in bibkeys.items() if v][0]
+-                    olid = cls.get_olid(bibkey, value)
++                    olid = yield cls.get_olid(bibkey, value)
+                     if not olid:
+                         # No edition found by bibkey
+-                        return
++                        returnValue(None)
+ 
+                 path = f'/books/{olid}.json'
+-                response = cls.OL.get_ol_response(path)
++                response = yield cls.OL.get_ol_response(path)
+ 
+                 try:
+-                    data = response.json()
++                    data = yield treq.json_content(response)
+                     data['title'] = data.get('title', None)
+                     edition = cls(**cls.ol_edition_json_to_book_args(data))
+-                    return edition
++                    returnValue(edition)
+                 except Exception as e:
+                     raise Exception(
+                         f"Unable to get Edition with olid: {olid}\nDetails: {e}"
+@@ -421,6 +465,7 @@
+                     return cls.OL._extract_olid_from_url(book_url, url_type="books")
+ 
+             @classmethod
++            @inlineCallbacks
+             def get_metadata(cls, key, value):
+                 """Looks up a key (LCCN, OCLC, ISBN10/13, OCAID) using the Open Library
+                 Books API https://openlibrary.org/dev/docs/api/books
+@@ -459,17 +504,17 @@
+                     )
+ 
+                 path = f'/api/books.json?bibkeys={key}:{value}'
+-                response = cls.OL.get_ol_response(path)
++                response = yield cls.OL.get_ol_response(path)
+ 
+                 try:
+-                    results = response.json()
++                    results = yield treq.json_content(response)
+                 except ValueError as e:
+                     logger.exception(e)
+-                    return None
++                    returnValue(None)
+                 _key = f'{key}:{value}'
+                 if _key in results:
+-                    return results[_key]
+-                return None
++                    returnValue(results[_key])
++                returnValue(None)
+ 
+         return Edition
+ 
+@@ -517,8 +562,13 @@
+                 body = self.json()
+                 body['_comment'] = comment
+                 url = self.OL.base_url + f'/authors/{self.olid}.json'
+-                return self.OL.session.put(url, json.dumps(body))
+-
++                return self.OL._request(
++                    'put',
++                    url,
++                    data=json.dumps(body).encode('utf-8'),
++                )
++
++            @inlineCallbacks
+             def works(self, limit=OL.WORKS_LIMIT, offset=OL.WORKS_PAGINATION_OFFSET):
+                 """Returns a list of OpenLibrary Works associated with an OpenLibrary Author.
+ 
+@@ -555,13 +605,14 @@
+                 path += f'/?limit={limit}&offset={offset}'
+ 
+                 try:
+-                    response = self.OL.get_ol_response(path)
+-                    return response.json()
++                    response = yield self.OL.get_ol_response(path)
++                    returnValue((yield treq.json_content(response)))
+                 except Exception as e:
+                     logger.exception(e)
+                     raise Exception("Author API failed to return json")
+ 
+             @classmethod
++            @inlineCallbacks
+             def get(cls, olid):
+                 """Retrieves an OpenLibrary Author by author_olid
+                 Args:
+@@ -578,23 +629,24 @@
+                     >>> ol.Author.get('OL39307A')
+                 """
+                 path = f'/authors/{olid}.json'
+-                r = cls.OL.get_ol_response(path)
++                r = yield cls.OL.get_ol_response(path)
+                 try:
+-                    data = r.json()
++                    data = yield treq.json_content(r)
+                     olid = cls.OL._extract_olid_from_url(
+                         data.pop('key', ''), url_type='authors'
+                     )
+                 except:
+                     raise Exception(f"Unable to get Author with olid: {olid}")
+ 
+-                return cls(
++                returnValue(cls(
+                     olid,
+                     name=data.pop('name', ''),
+                     bio=OpenLibrary.get_text_value(data.pop('bio', None)),
+                     **data,
+-                )
+-
+-            @classmethod
++                ))
++
++            @classmethod
++            @inlineCallbacks
+             def search(cls, name, limit=1):
+                 """Finds a list of OpenLibrary authors with similar names to the
+                 search query using the Author auto-complete API.
+@@ -627,14 +679,14 @@
+                     @backoff.on_exception(on_giveup=err, **cls.OL.BACKOFF_KWARGS)
+                     def _get_matching_authors_by_name(url):
+                         """Makes best effort to perform request w/ exponential backoff"""
+-                        return cls.OL.session.get(url)
+-
+-                    response = _get_matching_authors_by_name(url)
+-                    author_matches = response.json()
+-                    return author_matches
+-                return []
+-
+-            @classmethod
++                        return cls.OL._request('get', url)
++
++                    response = yield _get_matching_authors_by_name(url)
++                    returnValue((yield treq.json_content(response)))
++                returnValue([])
++
++            @classmethod
++            @inlineCallbacks
+             def get_olid_by_name(cls, name):
+                 """Uses the Authors auto-complete API to find OpenLibrary Authors with
+                 similar names. If any name is an exact match then return the
+@@ -655,12 +707,12 @@
+                     >>> ol = OpenLibrary()
+                     >>> ol.Author.get_olid_by_name('Dan Brown')
+                 """
+-                authors = cls.search(name)
++                authors = yield cls.search(name)
+                 _name = name.lower().strip()
+                 for author in authors:
+                     if _name == author['name'].lower().strip():
+-                        return author['key'].split('/')[-1]
+-                return None
++                        returnValue(author['key'].split('/')[-1])
++                returnValue(None)
+ 
+         # This returns the Author class from the ol.Author factory method
+         return Author
+@@ -691,7 +743,11 @@
+                 body = self.json()
+                 body['_comment'] = comment
+                 url = self.OL._generate_url_from_olid(self.olid)
+-                return self.OL.session.put(url, json.dumps(body))
++                return self.OL._request(
++                    'put',
++                    url,
++                    data=json.dumps(body).encode('utf-8'),
++                )
+ 
+         return Delete
+ 
+@@ -738,18 +794,23 @@
+                 body = self.json()
+                 body['_comment'] = comment
+                 url = self.OL._generate_url_from_olid(self.olid)
+-                return self.OL.session.put(url, json.dumps(body))
++                return self.OL._request(
++                    'put',
++                    url,
++                    data=json.dumps(body).encode('utf-8'),
++                )
+ 
+         return Redirect
+ 
++    @inlineCallbacks
+     def get(self, olid):
+         _olid = olid.lower()
+         if _olid.endswith('m'):
+-            return self.Edition.get(olid)
++            returnValue((yield self.Edition.get(olid)))
+         elif _olid.endswith('w'):
+-            return self.Work.get(olid)
++            returnValue((yield self.Work.get(olid)))
+         elif _olid.endswith('a'):
+-            return self.Author.get(olid)
++            returnValue((yield self.Author.get(olid)))
+ 
+     @classmethod
+     def get_primary_identifier(cls, book):
+@@ -765,6 +826,7 @@
+             raise ValueError("ISBN10/13 or LCCN required")
+         return id_name, id_value
+ 
++    @inlineCallbacks
+     def create_book(self, book, work_olid=None, debug=False):
+         """Create a new OpenLibrary Book using the /books/add endpoint
+ 
+@@ -793,9 +855,9 @@
+         if not author_name:
+             raise ValueError("Unable to create_book without valid Author name")
+ 
+-        author_olid = self.Author.get_olid_by_name(author_name)
++        author_olid = yield self.Author.get_olid_by_name(author_name)
+         author_key = ('/authors/' + author_olid) if author_olid else '__new__'
+-        return self._create_book(
++        returnValue((yield self._create_book(
+             title=book.title,
+             author_name=author_name,
+             author_key=author_key,
+@@ -805,8 +867,9 @@
+             id_value=id_value,
+             work_olid=work_olid,
+             debug=debug,
+-        )
+-
++        )))
++
++    @inlineCallbacks
+     def _create_book(
+         self,
+         title,
+@@ -843,18 +906,23 @@
+             "_save": "",
+         }
+         if debug:
+-            return data
++            returnValue(data)
+ 
+         @backoff.on_exception(on_giveup=err, **self.BACKOFF_KWARGS)
+         def _create_book_post(url, data=data):
+             """Makes best effort to perform request w/ exponential backoff"""
+-            return self.session.post(url, data=data)
+-
+-        response = _create_book_post(url, data=data)
+-        _olid = self._extract_olid_from_url(response.url, url_type="books")
++            return self._request('post', url, data=data)
++
++        response = yield _create_book_post(url, data=data)
++        response_url = getattr(response, 'url', None)
++        if not response_url:
++            response_url = response.request.absoluteURI
++            if isinstance(response_url, bytes):
++                response_url = response_url.decode('utf-8')
++        _olid = self._extract_olid_from_url(response_url, url_type="books")
+         if _olid == 'add':
+             raise ValueError('Creation failed, book may already exist!')
+-        return self.Edition.get(_olid)
++        returnValue((yield self.Edition.get(_olid)))
+ 
+     def _generate_url_from_olid(self, olid):
+         """Returns the .json url for an olid (str)"""

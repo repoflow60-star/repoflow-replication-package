@@ -1,0 +1,176 @@
+--- a/wikipediaapi/__init__.py
++++ b/wikipediaapi/__init__.py
+@@ -10,12 +10,14 @@
+ 
+ from collections import defaultdict
+ from enum import IntEnum
++from io import BytesIO
++import json
+ import logging
+ import re
+-from typing import Any, Optional, Union
++from typing import Any, cast, Optional, Union
+ from urllib import parse
+ 
+-import requests
++import pycurl  # type: ignore[import-untyped]
+ 
+ USER_AGENT = (
+     "Wikipedia-API/"
+@@ -50,6 +52,128 @@
+     # Plain: https://goo.gl/MAv2qz
+     # Doesn't allow to recognize subsections
+     # PLAIN = 3
++
++
++class _PycurlResponse:
++    """Small response object exposing the part of the HTTP response API we use."""
++
++    def __init__(self, content: bytes) -> None:
++        self.content = content
++
++    def json(self) -> Any:
++        """Decode the response body as JSON."""
++        return json.loads(self.content)
++
++
++class _PycurlSession:
++    """A persistent session backed by a single curl handle."""
++
++    def __init__(self) -> None:
++        self._curl: Optional[pycurl.Curl] = pycurl.Curl()
++        self.headers: dict[str, Any] = {}
++
++    def close(self) -> None:
++        """Release the curl handle."""
++        if self._curl is not None:
++            self._curl.close()
++            self._curl = None
++
++    @staticmethod
++    def _query_url(url: str, params: Any) -> str:
++        if not params:
++            return url
++
++        # Omit parameters whose value is None, matching common HTTP client
++        # behavior while retaining support for repeated values (for example, ``titles``).
++        if hasattr(params, "items"):
++            params = [
++                (key, value) for key, value in params.items() if value is not None
++            ]
++        else:
++            params = [(key, value) for key, value in params if value is not None]
++        query = parse.urlencode(params, doseq=True)
++        if not query:
++            return url
++        return url + ("&" if "?" in url else "?") + query
++
++    @staticmethod
++    def _proxy_for(url: str, proxies: Any) -> Optional[str]:
++        if not proxies:
++            return None
++        if isinstance(proxies, str):
++            return proxies
++        scheme = parse.urlsplit(url).scheme
++        return cast(Optional[str], proxies.get(scheme) or proxies.get("all"))
++
++    def get(self, url: str, params: Any = None, **kwargs: Any) -> _PycurlResponse:
++        """Perform a GET request and return its response body."""
++        if self._curl is None:
++            raise RuntimeError("The curl session is closed")
++
++        request_url = self._query_url(url, params)
++        body = BytesIO()
++        request_headers = dict(self.headers)
++        request_headers.update(kwargs.pop("headers", {}) or {})
++        timeout = kwargs.pop("timeout", None)
++        proxies = kwargs.pop("proxies", None)
++        verify = kwargs.pop("verify", True)
++        cert = kwargs.pop("cert", None)
++        auth = kwargs.pop("auth", None)
++        allow_redirects = kwargs.pop("allow_redirects", True)
++        cookies = kwargs.pop("cookies", None)
++
++        # reset removes per-request options while libcurl can still reuse its
++        # connection cache for the next request made by this session.
++        self._curl.reset()
++        self._curl.setopt(pycurl.URL, request_url)
++        self._curl.setopt(pycurl.WRITEFUNCTION, body.write)
++        self._curl.setopt(pycurl.FOLLOWLOCATION, int(bool(allow_redirects)))
++        self._curl.setopt(pycurl.ENCODING, "")
++
++        if request_headers:
++            self._curl.setopt(
++                pycurl.HTTPHEADER,
++                [f"{key}: {value}" for key, value in request_headers.items()],
++            )
++
++        if timeout is not None:
++            if isinstance(timeout, (tuple, list)):
++                connect_timeout, request_timeout = timeout
++                self._curl.setopt(
++                    pycurl.CONNECTTIMEOUT_MS, max(0, int(connect_timeout * 1000))
++                )
++                timeout = request_timeout
++            self._curl.setopt(pycurl.TIMEOUT_MS, max(0, int(timeout * 1000)))
++
++        proxy = self._proxy_for(request_url, proxies)
++        if proxy:
++            self._curl.setopt(pycurl.PROXY, proxy)
++
++        if verify is False:
++            self._curl.setopt(pycurl.SSL_VERIFYPEER, 0)
++            self._curl.setopt(pycurl.SSL_VERIFYHOST, 0)
++        elif isinstance(verify, str):
++            self._curl.setopt(pycurl.CAINFO, verify)
++
++        if cert:
++            if isinstance(cert, (tuple, list)):
++                self._curl.setopt(pycurl.SSLCERT, cert[0])
++                if len(cert) > 1:
++                    self._curl.setopt(pycurl.SSLKEY, cert[1])
++            else:
++                self._curl.setopt(pycurl.SSLCERT, cert)
++
++        if auth:
++            self._curl.setopt(pycurl.USERPWD, "%s:%s" % auth)
++
++        if cookies:
++            cookie_header = "; ".join(
++                f"{key}={value}" for key, value in cookies.items()
++            )
++            self._curl.setopt(pycurl.COOKIE, cookie_header)
++
++        self._curl.perform()
++        return _PycurlResponse(body.getvalue())
+ 
+ 
+ class Namespace(IntEnum):
+@@ -140,15 +264,15 @@
+         """
+         Constructs Wikipedia object for extracting information Wikipedia.
+ 
+-        :param user_agent: HTTP User-Agent used in requests
++        :param user_agent: HTTP User-Agent used in API calls
+                 https://meta.wikimedia.org/wiki/User-Agent_policy
+         :param language: Language mutation of Wikipedia -
+                 http://meta.wikimedia.org/wiki/List_of_Wikipedias
+         :param extract_format: Format used for extractions
+                 :class:`ExtractFormat` object.
+         :param headers:  Headers sent as part of HTTP request
+-        :param kwargs: Optional parameters used in -
+-                http://docs.python-requests.org/en/master/api/#requests.request
++        :param kwargs: Optional parameters used in the HTTP request. Supported
++                options include ``timeout``, ``proxies``, ``verify``, ``cert``, and ``auth``.
+ 
+         Examples:
+ 
+@@ -188,7 +312,7 @@
+             self.extract_format,
+         )
+ 
+-        self._session = requests.Session()
++        self._session = _PycurlSession()
+         self._session.headers.update(default_headers)
+         self._request_kwargs = kwargs
+ 

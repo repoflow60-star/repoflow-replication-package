@@ -1,0 +1,201 @@
+--- a/census/core.py
++++ b/census/core.py
+@@ -1,3 +1,6 @@
++import json
++import re
++import threading
+ import warnings
+ from functools import wraps, lru_cache
+ from importlib.metadata import version
+@@ -7,9 +10,144 @@
+ ALL = '*'
+ 
+ 
++_reactor_lock = threading.Lock()
++_reactor_thread = None
++_reactor_ready = threading.Event()
++
++
++def _run_reactor(reactor):
++    # treq may use Twisted's DNS thread pool.  This reactor is owned by the
++    # session adapter, so its worker threads should not keep a synchronous
++    # application alive after the caller is finished.
++    def daemon_thread(*args, **kwargs):
++        kwargs['daemon'] = True
++        return threading.Thread(*args, **kwargs)
++
++    reactor.getThreadPool().threadFactory = daemon_thread
++    reactor.callWhenRunning(_reactor_ready.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _get_reactor():
++    """Return a running Twisted reactor for the synchronous public API.
++
++    treq is asynchronous, while census has historically exposed synchronous
++    methods.  Running the reactor in a small background thread lets the
++    existing API retain that behavior without bringing the legacy HTTP
++    dependency back.
++    """
++    global _reactor_thread
++
++    from twisted.internet import reactor
++
++    with _reactor_lock:
++        if _reactor_thread is None:
++            _reactor_ready.clear()
++            _reactor_thread = threading.Thread(
++                target=_run_reactor, args=(reactor,), daemon=True)
++            _reactor_thread.start()
++
++    _reactor_ready.wait()
++    return reactor
++
++
++def _wait(deferred):
++    """Synchronously wait for a treq/Twisted Deferred."""
++    if not hasattr(deferred, 'addCallbacks'):
++        return deferred
++
++    result = []
++    error = []
++    finished = threading.Event()
++
++    def succeeded(value):
++        result.append(value)
++        finished.set()
++        return value
++
++    def failed(failure):
++        error.append(failure.value)
++        finished.set()
++        return None
++
++    deferred.addCallbacks(succeeded, failed)
++    finished.wait()
++    if error:
++        raise error[0]
++    return result[0]
++
++
++class _TreqResponse:
++    """Small synchronous response wrapper for a treq response."""
++
++    def __init__(self, response):
++        import treq
++
++        self._treq = treq
++        self._response = response
++        self.status_code = response.code
++        self._body = None
++
++    def _content(self):
++        if self._body is None:
++            self._body = _wait(self._treq.content(self._response))
++        return self._body
++
++    def json(self, **kwargs):
++        # Census API responses are UTF-8 JSON.  utf-8-sig also handles a BOM.
++        return json.loads(self._content().decode('utf-8-sig'), **kwargs)
++
++    @property
++    def text(self):
++        encoding = 'utf-8'
++        headers = getattr(self._response, 'headers', None)
++        if headers is not None:
++            values = headers.getRawHeaders(b'content-type', ())
++            if not values:
++                values = headers.getRawHeaders('content-type', ())
++            if values:
++                content_type = values[0]
++                if isinstance(content_type, bytes):
++                    content_type = content_type.decode('ascii', 'ignore')
++                match = re.search(r'charset=([\w.-]+)', content_type,
++                                  flags=re.IGNORECASE)
++                if match:
++                    encoding = match.group(1)
++        return self._content().decode(encoding, errors='replace')
++
++
+ def new_session(*args, **kwargs):
+-    import requests
+-    return requests.session(*args, **kwargs)
++    # Keep the old session-shaped interface for callers while using treq for
++    # all HTTP requests.  The arguments are accepted for compatibility with
++    # the former session factory.
++    return _TreqSession(*args, **kwargs)
++
++
++class _TreqSession:
++    def __init__(self, *args, **kwargs):
++        self.headers = {}
++
++    def get(self, url, **kwargs):
++        import treq
++
++        reactor = _get_reactor()
++        response = treq.get(url, headers=self.headers,
++                            reactor=reactor, **kwargs)
++        return _response(response)
++
++    def close(self):
++        # The shared reactor must remain available to other Census clients.
++        pass
++
++
++def _response(response):
++    """Normalize a direct treq response for custom session implementations."""
++    if hasattr(response, 'addCallbacks'):
++        _get_reactor()
++    response = _wait(response)
++    if hasattr(response, 'code') and not hasattr(response, 'status_code'):
++        return _TreqResponse(response)
++    return response
+ 
+ 
+ class APIKeyError(Exception):
+@@ -112,7 +250,7 @@
+ 
+         # Query the table metadata as raw JSON
+         tables_url = self.groups_url % (year, self.dataset)
+-        resp = self.session.get(tables_url)
++        resp = _response(self.session.get(tables_url))
+ 
+         # Pass it out
+         return resp.json()['groups']
+@@ -126,7 +264,7 @@
+ 
+         fields_url = self.definitions_url % (year, self.dataset)
+ 
+-        resp = self.session.get(fields_url)
++        resp = _response(self.session.get(fields_url))
+         obj = resp.json()
+ 
+         if flat:
+@@ -183,7 +321,7 @@
+         if 'in' in geo:
+             params['in'] = geo['in']
+ 
+-        resp = self.session.get(url, params=params)
++        resp = _response(self.session.get(url, params=params))
+ 
+         if resp.status_code == 200:
+             try:
+@@ -216,7 +354,7 @@
+     @lru_cache(maxsize=1024)
+     def _field_type(self, field, year):
+         url = self.definition_url % (year, self.dataset, field)
+-        resp = self.session.get(url)
++        resp = _response(self.session.get(url))
+ 
+         types = {"fips-for": str,
+                  "fips-in": str,
+@@ -586,6 +724,8 @@
+             session = new_session()
+ 
+         self.session = session
++        if not hasattr(self.session, 'headers'):
++            self.session.headers = {}
+         self.session.headers.update({
+             'User-Agent': ('python-census/{} '.format(__version__) +
+                            'github.com/datamade/census')

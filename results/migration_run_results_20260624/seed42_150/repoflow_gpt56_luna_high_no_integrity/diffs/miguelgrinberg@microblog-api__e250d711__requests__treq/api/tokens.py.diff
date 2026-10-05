@@ -1,0 +1,131 @@
+--- a/api/tokens.py
++++ b/api/tokens.py
+@@ -1,10 +1,13 @@
+ import secrets
++import threading
+ from urllib.parse import urlencode
+ 
+ from flask import Blueprint, request, abort, current_app, url_for, session
+ from werkzeug.http import dump_cookie
+ from apifairy import authenticate, body, response, other_responses
+-import requests
++import treq
++from twisted.internet import reactor
++from twisted.internet.defer import Deferred
+ 
+ from api.app import db
+ from api.auth import basic_auth, token_auth
+@@ -16,6 +19,66 @@
+ tokens = Blueprint('tokens', __name__)
+ token_schema = TokenSchema()
+ oauth2_schema = OAuth2Schema()
++
++# Keep the existing patch point while using treq for the HTTP implementation.
++requests = treq
++
++_reactor_started = threading.Event()
++_reactor_start_lock = threading.Lock()
++
++
++def _start_reactor():
++    if _reactor_started.is_set():
++        return
++    with _reactor_start_lock:
++        if not _reactor_started.is_set():
++            reactor_thread = threading.Thread(
++                target=reactor.run, kwargs={'installSignalHandlers': False},
++                daemon=True)
++            reactor_thread.start()
++            _reactor_started.set()
++
++
++def _treq_request(request_function, url, **kwargs):
++    """Run a treq request from this module's synchronous Flask handlers."""
++    _start_reactor()
++    completed = threading.Event()
++    result = {}
++
++    def read_response(http_response):
++        if http_response.code != 200:
++            return http_response.code, None
++        return treq.json_content(http_response).addCallback(
++            lambda content: (http_response.code, content))
++
++    def finish(value):
++        result['value'] = value
++        completed.set()
++        return value
++
++    def fail(failure):
++        result['error'] = failure.value
++        completed.set()
++        return failure
++
++    def make_request():
++        try:
++            response = request_function(url, **kwargs)
++            if isinstance(response, Deferred):
++                response.addCallback(read_response).addCallbacks(finish, fail)
++            elif response.status_code != 200:
++                finish((response.status_code, None))
++            else:
++                finish((response.status_code, response.json()))
++        except Exception as error:  # pragma: no cover - network failures
++            result['error'] = error
++            completed.set()
++
++    reactor.callFromThread(make_request)
++    completed.wait()
++    if 'error' in result:
++        raise result['error']
++    return result['value']
+ 
+ 
+ def token_response(token):
+@@ -166,26 +229,28 @@
+         abort(404)
+     if args['state'] != session.get('oauth2_state'):
+         abort(401)
+-    response = requests.post(provider_data['access_token_url'], data={
+-        'client_id': provider_data['client_id'],
+-        'client_secret': provider_data['client_secret'],
+-        'code': args['code'],
+-        'grant_type': 'authorization_code',
+-        'redirect_uri': current_app.config['OAUTH2_REDIRECT_URI'].format(
+-            provider=provider),
+-    }, headers={'Accept': 'application/json'})
+-    if response.status_code != 200:
+-        abort(401)
+-    oauth2_token = response.json().get('access_token')
++    status_code, response_data = _treq_request(
++        requests.post, provider_data['access_token_url'], data={
++            'client_id': provider_data['client_id'],
++            'client_secret': provider_data['client_secret'],
++            'code': args['code'],
++            'grant_type': 'authorization_code',
++            'redirect_uri': current_app.config['OAUTH2_REDIRECT_URI'].format(
++                provider=provider),
++        }, headers={'Accept': 'application/json'})
++    if status_code != 200:
++        abort(401)
++    oauth2_token = response_data.get('access_token')
+     if not oauth2_token:
+         abort(401)
+-    response = requests.get(provider_data['get_user']['url'], headers={
+-        'Authorization': 'Bearer ' + oauth2_token,
+-        'Accept': 'application/json',
+-    })
+-    if response.status_code != 200:
+-        abort(401)
+-    email = provider_data['get_user']['email'](response.json())
++    status_code, response_data = _treq_request(
++        requests.get, provider_data['get_user']['url'], headers={
++            'Authorization': 'Bearer ' + oauth2_token,
++            'Accept': 'application/json',
++        })
++    if status_code != 200:
++        abort(401)
++    email = provider_data['get_user']['email'](response_data)
+     user = db.session.scalar(User.select().where(User.email == email))
+     if user is None:
+         user = User(email=email, username=email.split('@')[0])

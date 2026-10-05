@@ -1,0 +1,149 @@
+--- a/ditk/tensorboard/plots/range.py
++++ b/ditk/tensorboard/plots/range.py
+@@ -3,9 +3,10 @@
+ from functools import lru_cache
+ from typing import Optional, Mapping
+ 
++import altair as alt
+ import matplotlib.pyplot as plt
+ import numpy as np
+-import seaborn as sns
++import pandas as pd
+ from hbutils.string import plural_word
+ from hbutils.testing import vpip
+ from matplotlib.ticker import FuncFormatter
+@@ -29,14 +30,37 @@
+         return f'{x / 1e6:.2f}M'
+ 
+ 
++def _tb_make_line_chart(data, xname, yname):
++    return alt.Chart(data).mark_line().encode(
++        x=alt.X('x:Q', title=xname, axis=alt.Axis(format='~s')),
++        y=alt.Y('y:Q', title=yname),
++        color=alt.Color('label:N', title=None),
++        detail='seed:N',
++    )
++
++
+ def _tb_rplot_single_group(ax, dfs, xname, yname, label, n_samples: Optional[int] = None,
+                            lower_bound: Optional[float] = None, upper_bound: Optional[float] = None):
+     datas = []
+     for d in dfs:
+-        df = d[[xname, yname]]
+-        df = df[~df[yname].isna()]
+-        func = interpolate.UnivariateSpline(df[xname], df[yname], s=0)
++        df = d[[xname, yname]].dropna().sort_values(xname)
++        if len(df) == 1:
++            value = df[yname].iloc[0]
++
++            def func(_x, value=value):
++                return value
++        elif len(df) >= 2:
++            # Cubic splines need at least four points; lower the degree for
++            # small (but perfectly valid) TensorBoard series.
++            func = interpolate.UnivariateSpline(
++                df[xname], df[yname], k=min(3, len(df) - 1), s=0)
++        else:
++            continue
+         datas.append((df[xname], df[yname], func))
++
++    if not datas:
++        empty_data = pd.DataFrame({'x': [], 'y': [], 'seed': [], 'label': []})
++        return _tb_make_line_chart(empty_data, xname, yname)
+ 
+     if lower_bound is None:
+         lower_bound = np.min([x.min() for x, _, _ in datas])
+@@ -61,16 +85,38 @@
+ 
+     fx = []
+     fy = []
+-    for xvalues, _, func in datas:
++    chart_x = []
++    chart_y = []
++    chart_seed = []
++    for seed, (xvalues, _, func) in enumerate(datas):
+         x_min, x_max = xvalues.min(), xvalues.max()
+         for x in px:
+             if x_min <= x <= x_max:
++                value = func(x)
+                 fx.append(x)
+-                fy.append(func(x))
++                fy.append(value)
++                chart_x.append(x)
++                chart_y.append(value)
++                chart_seed.append(seed)
+     fx = np.array(fx)
+     fy = np.array(fy)
+ 
+-    sns.lineplot(x=fx, y=fy, label=label, ax=ax)
++    # Keep plotting the calculated values together for callers that still pass
++    # a matplotlib axes.  The returned Altair chart below is the primary API;
++    # this small compatibility path lets existing callers migrate gradually.
++    if ax is not None:
++        ax.plot(fx, fy, label=label)
++
++    # Altair is declarative, so return a chart instead of mutating plotting
++    # state.  ``seed`` keeps each input run as an independent
++    # line while ``label`` provides the algorithm/group legend entry.
++    chart_data = pd.DataFrame({
++        'x': chart_x,
++        'y': chart_y,
++        'seed': chart_seed,
++        'label': [label] * len(chart_x),
++    })
++    return _tb_make_line_chart(chart_data, xname, yname)
+ 
+ 
+ def tb_create_range_plots(logdir, xname, yname,
+@@ -88,7 +134,8 @@
+     :param n_samples: Samples of x-axis, default is ``None`` which means just use all the samples.
+     :param lower_bound: Lower bound of x-axis. Default is the minimum value of all the experiments' x.
+     :param upper_bound: Upper bound of y-axis. Default is the maximum value of all the experiments' x.
+-    :param ax: Axes object of the matplotlib. Default is ``None`` which means use the ``plt.gca()`` as axes.
++    :param ax: Optional matplotlib axes kept for backwards compatibility. The function always returns an Altair chart.
++    :return: An Altair chart containing the range plots.
+     """
+     label_map = dict(label_map or {})
+     log_data = tb_extract_recursive_logs(logdir)
+@@ -102,16 +149,30 @@
+     if ax is None:
+         ax = plt.gca()
+ 
++    charts = []
+     for group_name, dfs in log_groups.items():
+-        _tb_rplot_single_group(
+-            ax, dfs, xname, yname,
+-            label=label_map.get(group_name, group_name),
+-            n_samples=n_samples,
+-            lower_bound=lower_bound,
+-            upper_bound=upper_bound,
+-        )
++        charts.append(
++            _tb_rplot_single_group(
++                ax, dfs, xname, yname,
++                label=label_map.get(group_name, group_name),
++                n_samples=n_samples,
++                lower_bound=lower_bound,
++                upper_bound=upper_bound,
++            ))
+ 
+-    ax.xaxis.set_major_formatter(FuncFormatter(_tb_x_format))
+-    ax.set_title(f'{xname!r} - {yname!r} plot')
+-    ax.set_xlabel(xname)
+-    ax.set_ylabel(yname)
++    # Combining the group data into one chart gives Altair one shared color
++    # scale and one legend while detail keeps individual runs separate.
++    if charts:
++        chart_data = pd.concat([chart.data for chart in charts], ignore_index=True)
++    else:
++        chart_data = pd.DataFrame({'x': [], 'y': [], 'seed': [], 'label': []})
++    chart = _tb_make_line_chart(chart_data, xname, yname)
++    chart = chart.properties(title=f'{xname!r} - {yname!r} plot')
++
++    if ax is not None:
++        ax.xaxis.set_major_formatter(FuncFormatter(_tb_x_format))
++        ax.set_title(f'{xname!r} - {yname!r} plot')
++        ax.set_xlabel(xname)
++        ax.set_ylabel(yname)
++
++    return chart

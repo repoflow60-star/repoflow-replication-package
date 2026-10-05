@@ -1,0 +1,173 @@
+--- a/pyschlage/auth.py
++++ b/pyschlage/auth.py
+@@ -3,12 +3,14 @@
+ from __future__ import annotations
+ 
+ from functools import wraps
++from io import BytesIO
++import json
+ from typing import Callable
++from urllib.parse import urlencode
+ 
+ from botocore.exceptions import ClientError
+ import pycognito
+-from pycognito import utils
+-import requests
++import pycurl
+ 
+ from .exceptions import NotAuthorizedError, UnknownError
+ 
+@@ -28,13 +30,31 @@
+ USER_POOL_ID = USER_POOL_REGION + "_2zhrVs9d4"
+ 
+ 
++class _HTTPError(Exception):
++    """Raised when an HTTP request returns an error status."""
++
++
++class _Response:
++    def __init__(self, content: bytes, status_code: int, reason: str) -> None:
++        self.content = content
++        self.status_code = status_code
++        self.reason = reason
++
++    def json(self):
++        return json.loads(self.content)
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise _HTTPError(f"{self.status_code} {self.reason}".strip())
++
++
+ def _translate_auth_errors(
+     # pylint: disable=invalid-name
+-    fn: Callable[..., requests.Response],
++    fn: Callable[..., _Response],
+     # pylint: enable=invalid-name
+-) -> Callable[..., requests.Response]:
++) -> Callable[..., _Response]:
+     @wraps(fn)
+-    def wrapper(*args, **kwargs) -> requests.Response:
++    def wrapper(*args, **kwargs) -> _Response:
+         try:
+             return fn(*args, **kwargs)
+         except ClientError as ex:
+@@ -50,19 +70,19 @@
+ 
+ def _translate_http_errors(
+     # pylint: disable=invalid-name
+-    fn: Callable[..., requests.Response],
++    fn: Callable[..., _Response],
+     # pylint: enable=invalid-name
+-) -> Callable[..., requests.Response]:
++) -> Callable[..., _Response]:
+     @wraps(fn)
+-    def wrapper(*args, **kwargs) -> requests.Response:
++    def wrapper(*args, **kwargs) -> _Response:
+         resp = fn(*args, **kwargs)
+         try:
+             resp.raise_for_status()
+             return resp
+-        except requests.HTTPError as ex:
++        except _HTTPError as ex:
+             try:
+                 message = resp.json().get("message", resp.reason)
+-            except requests.JSONDecodeError:
++            except json.JSONDecodeError:
+                 message = resp.reason
+             raise UnknownError(message) from ex
+ 
+@@ -80,16 +100,13 @@
+         :param password: The password for the account.
+         :type password: str
+         """
++        self.password = password
+         self.cognito = pycognito.Cognito(
+             username=username,
+             user_pool_region=USER_POOL_REGION,
+             user_pool_id=USER_POOL_ID,
+             client_id=CLIENT_ID,
+             client_secret=CLIENT_SECRET,
+-        )
+-        self.auth = utils.RequestsSrpAuth(
+-            password=password,
+-            cognito=self.cognito,
+         )
+         self._user_id: str | None = None
+ 
+@@ -100,7 +117,7 @@
+         :raise pyschlage.exceptions.NotAuthorizedError: When authentication fails.
+         :raise pyschlage.exceptions.UnknownError: On other errors.
+         """
+-        self.auth(requests.Request())
++        self.cognito.authenticate(password=self.password)
+ 
+     @property
+     def user_id(self) -> str:
+@@ -117,15 +134,62 @@
+     @_translate_auth_errors
+     def request(
+         self, method: str, path: str, base_url: str = BASE_URL, **kwargs
+-    ) -> requests.Response:
++    ) -> _Response:
+         """Performs a request against the Schlage WiFi cloud service.
+ 
+         :meta private:
+         """
+-        kwargs["auth"] = self.auth
++        if not self.cognito.id_token:
++            self.authenticate()
+         if "headers" not in kwargs:
+             kwargs["headers"] = {}
+         kwargs["headers"]["X-Api-Key"] = API_KEY
++        kwargs["headers"]["Authorization"] = self.cognito.id_token
+         kwargs.setdefault("timeout", _DEFAULT_TIMEOUT)
+-        # pylint: disable=missing-timeout
+-        return requests.request(method, f"{base_url}/{path.lstrip('/')}", **kwargs)
++
++        url = f"{base_url}/{path.lstrip('/')}"
++        if kwargs.get("params"):
++            query = urlencode(kwargs["params"], doseq=True)
++            url += f"&{query}" if "?" in url else f"?{query}"
++
++        body = None
++        if "json" in kwargs:
++            body = json.dumps(kwargs["json"])
++            kwargs["headers"].setdefault("Content-Type", "application/json")
++        elif "data" in kwargs:
++            body = kwargs["data"]
++            if isinstance(body, dict):
++                body = urlencode(body, doseq=True)
++
++        response_body = BytesIO()
++        response_headers = BytesIO()
++        curl = pycurl.Curl()
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.CUSTOMREQUEST, method.upper())
++        curl.setopt(pycurl.FOLLOWLOCATION, 1)
++        curl.setopt(pycurl.TIMEOUT, kwargs["timeout"])
++        curl.setopt(
++            pycurl.HTTPHEADER,
++            [
++                f"{key}: {value}"
++                for key, value in kwargs["headers"].items()
++            ],
++        )
++        curl.setopt(pycurl.WRITEDATA, response_body)
++        curl.setopt(pycurl.HEADERFUNCTION, response_headers.write)
++        if method.lower() == "post":
++            curl.setopt(pycurl.POST, 1)
++        if body is not None:
++            curl.setopt(pycurl.POSTFIELDS, body)
++        curl.perform()
++
++        status_code = int(curl.getinfo(pycurl.RESPONSE_CODE))
++        reason = ""
++        for line in response_headers.getvalue().splitlines():
++            if line.startswith(b"HTTP/"):
++                parts = line.decode("iso-8859-1").split(" ", 2)
++                if len(parts) == 3:
++                    reason = parts[2]
++        curl.close()
++
++        return _Response(response_body.getvalue(), status_code, reason)

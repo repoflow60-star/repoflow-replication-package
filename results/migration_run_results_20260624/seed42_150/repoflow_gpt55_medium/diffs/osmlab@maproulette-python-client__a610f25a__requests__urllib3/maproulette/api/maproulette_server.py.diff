@@ -1,0 +1,446 @@
+--- a/maproulette/api/maproulette_server.py
++++ b/maproulette/api/maproulette_server.py
+@@ -1,10 +1,74 @@
+-"""This module contains the basic methods that handle API calls to the MapRoulette API. It uses the requests library to
+-accomplish this."""
+-
+-import requests
++"""This module contains the basic methods that handle API calls to the MapRoulette API."""
++
+ import json
++import ssl
+ import time
++from types import SimpleNamespace
++from urllib.parse import urlencode
++
++import urllib3
++
+ from .errors import HttpError, InvalidJsonError, ConnectionUnavailableError, UnauthorizedError, NotFoundError
++
++
++class _Urllib3Session:
++    def __init__(self, headers=None, verify=True, cert=None):
++        self.headers = headers or {}
++        self.verify = verify
++        self.cert = cert
++        self.pool = self.__create_pool_manager()
++
++    def __create_pool_manager(self):
++        pool_kwargs = {}
++        if self.verify is False:
++            pool_kwargs['cert_reqs'] = ssl.CERT_NONE
++        elif isinstance(self.verify, str):
++            pool_kwargs['cert_reqs'] = ssl.CERT_REQUIRED
++            pool_kwargs['ca_certs'] = self.verify
++
++        if isinstance(self.cert, tuple):
++            pool_kwargs['cert_file'] = self.cert[0]
++            pool_kwargs['key_file'] = self.cert[1]
++        elif self.cert:
++            pool_kwargs['cert_file'] = self.cert
++
++        return urllib3.PoolManager(**pool_kwargs)
++
++    def request(self, method, url, params=None, json_body=None, files=None):
++        if params:
++            separator = '&' if '?' in url else '?'
++            url = url + separator + urlencode(params, doseq=True)
++
++        headers = dict(self.headers or {})
++        request_kwargs = {'headers': headers}
++        if json_body is not None:
++            request_kwargs['body'] = json.dumps(json_body)
++            headers['Content-Type'] = 'application/json'
++        if files is not None:
++            request_kwargs['fields'] = files
++            request_kwargs['encode_multipart'] = True
++
++        return self.pool.request(method, url, **request_kwargs)
++
++    def get(self, url, params=None):
++        return self.request('GET', url, params=params)
++
++    def post(self, url, params=None, json=None):
++        return self.request('POST', url, params=params, json_body=json)
++
++    def put(self, url, params=None, json=None, files=None):
++        return self.request('PUT', url, params=params, json_body=json, files=files)
++
++    def delete(self, url, params=None):
++        return self.request('DELETE', url, params=params)
++
++
++def _get(url, headers=None, verify=True, cert=None):
++    return _Urllib3Session(headers=headers, verify=verify, cert=cert).get(url)
++
++
++# Preserve the historical module attribute without importing the source library.
++requests = SimpleNamespace(Session=_Urllib3Session, get=_get)
+ 
+ 
+ class MapRouletteServer:
+@@ -16,10 +80,7 @@
+         self.certs = configuration.certs
+         self.verify = configuration.verify
+         if self.__check_health():
+-            self.session = requests.Session()
+-            self.session.headers = self.headers
+-            self.session.verify = self.verify
+-            self.session.cert = self.certs
++            self.session = _Urllib3Session(headers=self.headers, verify=self.verify, cert=self.certs)
+ 
+     def __check_health(self, retries=3, delay=5):
+         """Checks health of connection to host by pinging the URL set in the configuration
+@@ -30,18 +91,15 @@
+         """
+         for i in range(retries):
+             try:
+-                response = requests.get(
+-                    self.base_url + '/ping',
+-                    headers=self.headers,
+-                    verify=self.verify,
+-                    cert=self.certs
++                response = _Urllib3Session(headers=self.headers, verify=self.verify, cert=self.certs).get(
++                    self.base_url + '/ping'
+                 )
+-                if not response.ok:
++                if not self.__response_ok(response):
+                     print(f"Unsuccessful connection. Retrying in {str(delay)} seconds")
+                     time.sleep(delay)
+                 else:
+                     return True
+-            except requests.exceptions.ConnectionError:
++            except urllib3.exceptions.HTTPError:
+                 print(f"Connection not available. Attempt {str(i+1)} out of {str(retries)}")
+                 time.sleep(delay)
+ 
+@@ -62,33 +120,23 @@
+             params=params
+         )
+         try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 404:
++            self.__raise_for_status(response)
++        except HttpError as e:
++            if e.status == 404:
+                 raise NotFoundError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
++                    message=e.message,
++                    status=e.status
++                ) from None
++            else:
++                raise HttpError(
++                    message=e.message,
++                    status=e.status
++                ) from None
++        except urllib3.exceptions.HTTPError as e:
+             raise ConnectionUnavailableError(
+-                message=self.parse_response_message(e.response),
+-                status=e.response.status_code
++                message=str(e)
+             ) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
++        return self.__format_response(response)
+ 
+     def post(self, endpoint, body=None, params=None):
+         """Method that completes a POST request to the MapRoulette API
+@@ -105,35 +153,26 @@
+             json=body
+         )
+         try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 400:
++            self.__raise_for_status(response)
++        except HttpError as e:
++            if e.status == 400:
+                 raise InvalidJsonError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            elif e.response.status_code == 401:
++                    message=e.message,
++                    status=e.status
++                ) from None
++            elif e.status == 401:
+                 raise UnauthorizedError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
++                    message=e.message,
++                    status=e.status
++                ) from None
++            else:
++                raise HttpError(
++                    message=e.message,
++                    status=e.status
++                ) from None
++        except urllib3.exceptions.HTTPError as e:
+             raise ConnectionUnavailableError(e) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
++        return self.__format_response(response)
+ 
+     def put(self, endpoint, body=None, params=None):
+         """Method that completes a PUT request to the MapRoulette API
+@@ -150,35 +189,26 @@
+             json=body
+         )
+         try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 400:
++            self.__raise_for_status(response)
++        except HttpError as e:
++            if e.status == 400:
+                 raise InvalidJsonError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            elif e.response.status_code == 401:
++                    message=e.message,
++                    status=e.status
++                ) from None
++            elif e.status == 401:
+                 raise UnauthorizedError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
++                    message=e.message,
++                    status=e.status
++                ) from None
++            else:
++                raise HttpError(
++                    message=e.message,
++                    status=e.status
++                ) from None
++        except urllib3.exceptions.HTTPError as e:
+             raise ConnectionUnavailableError(e) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
++        return self.__format_response(response)
+ 
+     def put_file(self, endpoint, body=None, params=None):
+         """Method that completes a multipart PUT request to the MapRoulette API
+@@ -195,35 +225,26 @@
+             files=body
+         )
+         try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 400:
++            self.__raise_for_status(response)
++        except HttpError as e:
++            if e.status == 400:
+                 raise InvalidJsonError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            elif e.response.status_code == 401:
++                    message=e.message,
++                    status=e.status
++                ) from None
++            elif e.status == 401:
+                 raise UnauthorizedError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
++                    message=e.message,
++                    status=e.status
++                ) from None
++            else:
++                raise HttpError(
++                    message=e.message,
++                    status=e.status
++                ) from None
++        except urllib3.exceptions.HTTPError as e:
+             raise ConnectionUnavailableError(e) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
++        return self.__format_response(response)
+ 
+     def delete(self, endpoint, params=None):
+         """Method that completes a DELETE request to the MapRoulette API
+@@ -238,35 +259,83 @@
+             params=params
+         )
+         try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 401:
++            self.__raise_for_status(response)
++        except HttpError as e:
++            if e.status == 401:
+                 raise UnauthorizedError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            elif e.response.status_code == 404:
++                    message=e.message,
++                    status=e.status
++                ) from None
++            elif e.status == 404:
+                 raise NotFoundError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
++                    message=e.message,
++                    status=e.status
++                ) from None
++            else:
++                raise HttpError(
++                    message=e.message,
++                    status=e.status
++                ) from None
++        except urllib3.exceptions.HTTPError as e:
+             raise ConnectionUnavailableError(e) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
++        return self.__format_response(response)
++
++    @staticmethod
++    def __response_status(response):
++        for attribute in ('status_code', 'status'):
++            value = getattr(response, attribute, None)
++            if isinstance(value, (int, str)):
++                return value
++        return None
++
++    @staticmethod
++    def __response_text(response):
++        text = getattr(response, 'text', None)
++        if isinstance(text, str):
++            return text
++        data = getattr(response, 'data', b'')
++        if isinstance(data, bytes):
++            return data.decode('utf-8')
++        if isinstance(data, str):
++            return data
++        return ''
++
++    @classmethod
++    def __response_ok(cls, response):
++        ok = getattr(response, 'ok', None)
++        if isinstance(ok, bool):
++            return ok
++        status = cls.__response_status(response)
++        try:
++            return status is not None and int(status) < 400
++        except (TypeError, ValueError):
++            return False
++
++    @classmethod
++    def __raise_for_status(cls, response):
++        status = cls.__response_status(response)
++        try:
++            has_error_status = status is not None and int(status) >= 400
++        except (TypeError, ValueError):
++            has_error_status = False
++        if has_error_status:
++            raise HttpError(
++                message=cls.parse_response_message(response),
++                status=status
++            )
++
++    @classmethod
++    def __format_response(cls, response):
++        try:
++            json_method = getattr(response, 'json', None)
++            data = json_method() if json_method else json.loads(cls.__response_text(response))
+         except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
++            data = cls.__response_text(response)
++
++        return {
++            "data": data,
++            "status": cls.__response_status(response)
++        }
+ 
+     @staticmethod
+     def is_json(input_object):
+@@ -286,10 +355,10 @@
+     def parse_response_message(response):
+         """Method to determine the message body from a response object. Will return None if message cannot be parsed.
+ 
+-        :param response: the Requests response object
++        :param response: the HTTP response object
+         :returns: the response message if parsable, otherwise None
+         """
+         try:
+-            return json.loads(response.text)['message']
+-        except (ValueError, KeyError):
++            return json.loads(MapRouletteServer.__response_text(response))['message']
++        except (TypeError, ValueError, KeyError):
+             return None

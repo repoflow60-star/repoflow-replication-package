@@ -1,0 +1,321 @@
+--- a/qface/generator.py
++++ b/qface/generator.py
+@@ -1,15 +1,16 @@
+ 
+ # Copyright (c) Pelagicore AB 2016
+ 
+-from jinja2 import Environment, Template, Undefined, StrictUndefined
+-from jinja2 import FileSystemLoader, PackageLoader, ChoiceLoader
+-from jinja2 import TemplateSyntaxError, TemplateNotFound, TemplateError
++from mako.exceptions import CompileException, MakoException, TopLevelLookupException
++from mako.lookup import TemplateLookup
++from mako.template import Template
+ from pathlib import Path
+ from antlr4 import InputStream, FileStream, CommonTokenStream, ParseTreeWalker
+ from antlr4.error import DiagnosticErrorListener, ErrorListener
+ import shelve
+ import logging
+ import hashlib
++import re
+ import yaml
+ import click
+ import sys
+@@ -47,10 +48,113 @@
+     return a
+ 
+ 
+-class TestableUndefined(StrictUndefined):
+-    """Return an error for all undefined values, but allow testing them in if statements"""
+-    def __bool__(self):
+-        return False
++class _LegacyTemplateSyntaxError(Exception):
++    """A syntax error from a legacy Jinja-style template directive."""
++
++    def __init__(self, line, tag):
++        super().__init__(tag)
++        self.line = line
++        self.tag = tag
++
++
++class _FilterNamespace:
++    """Attribute namespace used for Mako filters with dotted names."""
++    pass
++
++
++def _split_filters(expression):
++    """Split a filter expression without splitting pipes in quoted strings."""
++    parts = []
++    start = 0
++    quote = None
++    depth = 0
++    for index, char in enumerate(expression):
++        if quote:
++            if char == quote and (index == 0 or expression[index - 1] != '\\'):
++                quote = None
++        elif char in "'\"":
++            quote = char
++        elif char in '([':
++            depth += 1
++        elif char in ')]':
++            depth -= 1
++        elif char == '|' and depth == 0:
++            parts.append(expression[start:index].strip())
++            start = index + 1
++    parts.append(expression[start:].strip())
++    return parts
++
++
++def _legacy_expression(expression):
++    """Translate the legacy Jinja filter form into ordinary Python calls."""
++    parts = _split_filters(expression.strip())
++    result = parts[0]
++    for part in parts[1:]:
++        match = re.match(r'^([\w.]+)(?:\((.*)\))?$', part, re.DOTALL)
++        if not match:
++            return expression.strip()
++        name, arguments = match.groups()
++        if arguments:
++            result = '{0}({1}, {2})'.format(name, result, arguments)
++        else:
++            result = '{0}({1})'.format(name, result)
++    return result
++
++
++_LEGACY_TOKEN = re.compile(r'({{[-+]?.*?[-+]?}}|{%[-+]?.*?[-+]?%}|{#.*?#})', re.DOTALL)
++
++
++def _legacy_preprocessor(source):
++    """Translate the small Jinja dialect used by existing QFace templates."""
++    output = []
++    position = 0
++    for match in _LEGACY_TOKEN.finditer(source):
++        output.append(source[position:match.start()])
++        token = match.group(0)
++        if token.startswith('{#'):
++            replacement = ''
++        elif token.startswith('{{'):
++            expression = token[2:-2].strip('-+ ')
++            replacement = '${' + _legacy_expression(expression) + '}'
++        else:
++            tag = token[2:-2].strip('-+ \t\r\n')
++            if tag.startswith('for '):
++                replacement = '% ' + tag + ':'
++            elif tag.startswith('if '):
++                replacement = '% ' + tag + ':'
++            elif tag.startswith('elif '):
++                replacement = '% ' + tag + ':'
++            elif tag in ('else', 'endif', 'endfor'):
++                replacement = '% ' + tag
++            elif tag.startswith('macro '):
++                replacement = '<%def name="' + tag[6:].strip() + '">'
++            elif tag == 'endmacro':
++                replacement = '</%def>'
++            elif tag.startswith('with '):
++                assignment = tag[5:].strip()
++                if '=' in assignment:
++                    name, expression = assignment.split('=', 1)
++                    replacement = '<% {0} = {1} %>'.format(
++                        name.strip(), _legacy_expression(expression))
++                else:
++                    replacement = '<% {0} %>'.format(assignment)
++            elif tag == 'endwith':
++                replacement = ''
++            elif tag.startswith('set '):
++                assignment = tag[4:].strip()
++                if '=' in assignment:
++                    name, expression = assignment.split('=', 1)
++                    replacement = '<% {0} = {1} %>'.format(
++                        name.strip(), _legacy_expression(expression))
++                else:
++                    replacement = '<% {0} %>'.format(assignment)
++            else:
++                line = source[:match.start()].count('\n') + 1
++                raise _LegacyTemplateSyntaxError(line, tag.split(None, 1)[0])
++        output.append(replacement)
++        position = match.end()
++    output.append(source[position:])
++    return ''.join(output)
+ 
+ 
+ class ReportingErrorListener(ErrorListener.ErrorListener):
+@@ -81,16 +185,14 @@
+     def __init__(self, search_path, context={}, force=False):
+         if not isinstance(search_path, (list, tuple)):
+             search_path = [search_path]
+-        loader = ChoiceLoader([
+-            FileSystemLoader(search_path),
+-            PackageLoader('qface')
+-        ])
+-        self.env = Environment(
+-            loader=loader,
+-            trim_blocks=True,
+-            lstrip_blocks=True,
++        self._template_directories = [str(path) for path in search_path]
++        self._template_directories.append(str(Path(__file__).parent / 'templates'))
++        self.env = TemplateLookup(
++            directories=self._template_directories,
++            preprocessor=_legacy_preprocessor,
++            strict_undefined=Generator.strict,
+         )
+-        self.env.filters.update(get_filters())
++        self._filters = get_filters()
+         self._destination = Path()
+         self._path = Path()
+         self._source = ''
+@@ -132,35 +234,97 @@
+ 
+     @property
+     def filters(self):
+-        return self.env.filters
++        return self._filters
+ 
+     @filters.setter
+     def filters(self, filters):
+-        self.env.filters.update(filters)
++        self._filters.update(filters)
++
++    def _render_context(self, context):
++        values = dict(context)
++        namespaces = {}
++        for name, callback in self.filters.items():
++            if '.' in name:
++                namespace_name, filter_name = name.split('.', 1)
++                namespace = namespaces.setdefault(namespace_name, _FilterNamespace())
++                setattr(namespace, filter_name, callback)
++            else:
++                values.setdefault(name, callback)
++        values.update(namespaces)
++        return values
++
++    def _configure_undefined(self):
++        """Apply the current strictness before Mako compiles a template."""
++        if self.env.template_args.get('strict_undefined') == Generator.strict:
++            return
++        self.env.template_args['strict_undefined'] = Generator.strict
++        self.env._collection.clear()
++        self.env._uri_cache.clear()
++
++    def _template_filename(self, name):
++        source = str(name).lstrip('/')
++        if self.source:
++            source = '/'.join((self.source, source))
++        for directory in self._template_directories:
++            candidate = Path(directory) / source
++            if candidate.exists():
++                return str(candidate)
++        return str(name)
++
++    def _template_line(self, name, needle=None):
++        filename = self._template_filename(name)
++        try:
++            source = Path(filename).read_text(encoding='utf-8')
++        except (OSError, UnicodeError):
++            return 1
++        if needle:
++            for line, text in enumerate(source.splitlines(), 1):
++                if needle in text:
++                    return line
++        return 1
++
++    def _undefined_name(self, exc, template):
++        match = re.search(r"name ['\"]([^'\"]+)['\"] is not defined", str(exc))
++        if match:
++            return match.group(1)
++        if isinstance(exc, KeyError) and exc.args:
++            return str(exc.args[0])
++        if str(exc) == 'Undefined':
++            filename = self._template_filename(template)
++            try:
++                source = Path(filename).read_text(encoding='utf-8')
++            except (OSError, UnicodeError):
++                return None
++            match = re.search(r'(?:\{\{|\$\{)\s*([A-Za-z_]\w*)', source)
++            return match.group(1) if match else None
++        return None
+ 
+     def get_template(self, name):
+         """Retrieves a single template file from the template loader"""
++        self._configure_undefined()
+         source = name
+         if name and name[0] == '/':
+             source = name[1:]
+-        elif self.source is not None:
++        elif self.source:
+             source = '/'.join((self.source, name))
+         return self.env.get_template(source)
+ 
+     def render(self, name, context):
+         """Returns the rendered text from a single template file from the
+         template loader using the given context data"""
+-        if Generator.strict:
+-            self.env.undefined = TestableUndefined
+-        else:
+-            self.env.undefined = Undefined
+         template = self.get_template(name)
+-        return template.render(context)
++        return template.render(**self._render_context(context))
+ 
+     def apply(self, template, context={}):
+         context.update(self.context)
+         """Return the rendered text of a template instance"""
+-        return self.env.from_string(template).render(context)
++        self._configure_undefined()
++        instance = Template(
++            text=_legacy_preprocessor(template),
++            lookup=self.env,
++            strict_undefined=Generator.strict,
++        )
++        return instance.render(**self._render_context(context))
+ 
+     def write(self, file_path, template, context={}, preserve=False, force=False):
+         """Using a template file name it renders a template
+@@ -174,19 +338,31 @@
+         error = False
+         try:
+             self._write(file_path, template, context, preserve, force)
+-        except TemplateSyntaxError as exc:
+-            message = '{0}:{1}: error: {2}'.format(exc.filename, exc.lineno, exc.message)
++        except _LegacyTemplateSyntaxError as exc:
++            message = "{0}:{1}: error: Encountered unknown tag '{2}'.".format(
++                self._template_filename(template), exc.line, exc.tag)
+             click.secho(message, fg='red', err=True)
+             error = True
+-        except TemplateNotFound as exc:
+-            message = '{0}: error: Template not found'.format(exc.name)
++        except TopLevelLookupException:
++            message = '{0}: error: Template not found'.format(template)
+             click.secho(message, fg='red', err=True)
+             error = True
+-        except TemplateError as exc:
+-            exc_tb = sys.exc_info()[2]
+-            while exc_tb.tb_next != None:
+-                exc_tb = exc_tb.tb_next
+-            message = '{0}:{1}: error: {2}'.format(exc_tb.tb_frame.f_code.co_filename, exc_tb.tb_lineno, exc.message)
++        except CompileException as exc:
++            filename = getattr(exc, 'filename', None) or self._template_filename(template)
++            lineno = getattr(exc, 'lineno', None) or self._template_line(template)
++            message = '{0}:{1}: error: {2}'.format(filename, lineno, str(exc))
++            click.secho(message, fg='red', err=True)
++            error = True
++        except (MakoException, NameError, KeyError, AttributeError, TypeError) as exc:
++            filename = self._template_filename(template)
++            undefined_name = self._undefined_name(exc, template)
++            if undefined_name:
++                lineno = self._template_line(template, undefined_name)
++                detail = "'{0}' is undefined".format(undefined_name)
++            else:
++                lineno = getattr(exc, 'lineno', None) or self._template_line(template)
++                detail = str(exc)
++            message = '{0}:{1}: error: {2}'.format(filename, lineno, detail)
+             click.secho(message, fg='red', err=True)
+             error = True
+ 
+@@ -216,7 +392,7 @@
+ 
+     def register_filter(self, name, callback):
+         """Register your custom template filter"""
+-        self.env.filters[name] = callback
++        self._filters[name] = callback
+ 
+ 
+ class RuleGenerator(Generator):

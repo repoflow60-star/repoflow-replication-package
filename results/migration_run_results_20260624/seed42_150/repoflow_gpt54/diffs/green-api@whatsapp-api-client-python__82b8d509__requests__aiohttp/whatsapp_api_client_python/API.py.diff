@@ -1,0 +1,225 @@
+--- a/whatsapp_api_client_python/API.py
++++ b/whatsapp_api_client_python/API.py
+@@ -1,9 +1,10 @@
++import asyncio
+ import json
+ import logging
+-from typing import Any, NoReturn, Optional
+-
+-from requests import Response, Session
+-from requests.adapters import HTTPAdapter, Retry
++import threading
++from typing import Any, Dict, NoReturn, Optional, Set, Union
++
++import aiohttp
+ 
+ from .response import Response as GreenAPIResponse
+ from .tools import (
+@@ -20,6 +21,180 @@
+ )
+ 
+ 
++class _Response:
++    def __init__(self, status_code: int, text: str):
++        self.status_code = status_code
++        self.text = text
++
++
++class Session:
++    def __init__(self):
++        self.headers: Dict[str, str] = {}
++        self._retry_total = 0
++        self._backoff_factor = 0.0
++        self._status_forcelist: Set[int] = set()
++        self._closed = False
++        self._started = threading.Event()
++        self._loop = asyncio.new_event_loop()
++        self._thread = threading.Thread(target=self._run_loop, daemon=True)
++        self._thread.start()
++        self._started.wait()
++
++    def __del__(self) -> None:
++        try:
++            self.close()
++        except Exception:
++            pass
++
++    def configure_retry(
++            self,
++            total: int,
++            backoff_factor: float,
++            status_forcelist: Set[int]
++    ) -> None:
++        self._retry_total = total
++        self._backoff_factor = backoff_factor
++        self._status_forcelist = set(status_forcelist)
++
++    def request(self, method: str, url: str, **arguments: Any) -> _Response:
++        if self._closed:
++            raise RuntimeError("Session is closed.")
++
++        future = asyncio.run_coroutine_threadsafe(
++            self._request(method, url, arguments), self._loop
++        )
++
++        return future.result()
++
++    def close(self) -> None:
++        if self._closed:
++            return
++
++        self._closed = True
++        self._loop.call_soon_threadsafe(self._loop.stop)
++        self._thread.join()
++
++    def _run_loop(self) -> None:
++        asyncio.set_event_loop(self._loop)
++        self._started.set()
++        self._loop.run_forever()
++        self._loop.close()
++
++    async def _request(
++            self,
++            method: str,
++            url: str,
++            arguments: Dict[str, Any]
++    ) -> _Response:
++        request_arguments = self._prepare_arguments(method, url, arguments)
++
++        for attempt in range(self._retry_total + 1):
++            try:
++                async with aiohttp.ClientSession() as session:
++                    async with session.request(**request_arguments) as response:
++                        text = await response.text()
++
++                        if (
++                                response.status in self._status_forcelist
++                                and attempt < self._retry_total
++                        ):
++                            await asyncio.sleep(self._backoff_delay(attempt + 1))
++                            continue
++
++                        return _Response(response.status, text)
++            except (aiohttp.ClientError, asyncio.TimeoutError):
++                if attempt >= self._retry_total:
++                    raise
++
++                await asyncio.sleep(self._backoff_delay(attempt + 1))
++
++        raise RuntimeError("Request retries were exhausted.")
++
++    def _prepare_arguments(
++            self,
++            method: str,
++            url: str,
++            arguments: Dict[str, Any]
++    ) -> Dict[str, Any]:
++        request_arguments = arguments.copy()
++        request_arguments["method"] = method
++        request_arguments["url"] = url
++
++        headers = self.headers.copy()
++        headers.update(request_arguments.get("headers") or {})
++        request_arguments["headers"] = headers
++
++        timeout = request_arguments.get("timeout")
++        if timeout is not None:
++            request_arguments["timeout"] = self._prepare_timeout(timeout)
++
++        verify = request_arguments.pop("verify", None)
++        if verify is False:
++            request_arguments["ssl"] = False
++
++        files = request_arguments.pop("files", None)
++        if files:
++            request_arguments["data"] = self._prepare_form_data(
++                request_arguments.pop("data", None), files
++            )
++            request_arguments.pop("json", None)
++
++        return request_arguments
++
++    @classmethod
++    def _prepare_timeout(
++            cls,
++            timeout: Union[float, int, tuple, list, aiohttp.ClientTimeout]
++    ) -> aiohttp.ClientTimeout:
++        if isinstance(timeout, aiohttp.ClientTimeout):
++            return timeout
++
++        if isinstance(timeout, (tuple, list)):
++            connect_timeout = timeout[0] if len(timeout) > 0 else None
++            read_timeout = timeout[1] if len(timeout) > 1 else None
++
++            return aiohttp.ClientTimeout(
++                sock_connect=connect_timeout,
++                sock_read=read_timeout
++            )
++
++        return aiohttp.ClientTimeout(total=timeout)
++
++    @classmethod
++    def _prepare_form_data(
++            cls,
++            data: Optional[dict],
++            files: dict
++    ) -> aiohttp.FormData:
++        form_data = aiohttp.FormData()
++
++        if data:
++            for key, value in data.items():
++                if isinstance(value, (bytes, bytearray, memoryview)):
++                    form_data.add_field(key, value)
++                else:
++                    form_data.add_field(key, str(value))
++
++        for key, value in files.items():
++            field_value = value
++            field_arguments: Dict[str, Any] = {}
++
++            if isinstance(value, tuple):
++                if len(value) > 0 and value[0] is not None:
++                    field_arguments["filename"] = value[0]
++                if len(value) > 1:
++                    field_value = value[1]
++                if len(value) > 2 and value[2] is not None:
++                    field_arguments["content_type"] = value[2]
++
++            form_data.add_field(key, field_value, **field_arguments)
++
++        return form_data
++
++    def _backoff_delay(self, attempt_number: int) -> float:
++        return self._backoff_factor * (2 ** (attempt_number - 1))
++
++
+ class GreenApi:
+     host: str
+     media: str
+@@ -116,7 +291,7 @@
+ 
+         return GreenAPIResponse(response.status_code, response.text)
+ 
+-    def __handle_response(self, response: Response) -> Optional[NoReturn]:
++    def __handle_response(self, response: _Response) -> Optional[NoReturn]:
+         status_code = response.status_code
+         if status_code != 200 or self.debug_mode:
+             try:
+@@ -161,15 +336,11 @@
+     def __prepare_session(self) -> None:
+         self.session.headers["Connection"] = "close"
+ 
+-        retry = Retry(
++        self.session.configure_retry(
+             total=3,
+             backoff_factor=1.0,
+-            allowed_methods=None,
+-            status_forcelist=[429]
++            status_forcelist={429}
+         )
+-
+-        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+ 
+ 
+ class GreenAPI(GreenApi):

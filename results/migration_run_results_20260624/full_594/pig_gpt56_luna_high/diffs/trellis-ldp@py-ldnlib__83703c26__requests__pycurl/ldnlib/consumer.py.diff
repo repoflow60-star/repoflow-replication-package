@@ -1,0 +1,157 @@
+--- a/ldnlib/consumer.py
++++ b/ldnlib/consumer.py
+@@ -1,10 +1,110 @@
+-from rdflib import Graph, URIRef
+-import requests
++from .base import BaseLDN
++from rdflib import URIRef
++from urllib.parse import urlencode
++import io
++import json
++import pycurl
+ 
+-import json
++class _PycurlResponse:
+ 
+-from .base import BaseLDN
++    def __init__(self, content, headers, status_code):
++        self.content = content
++        self.headers = headers
++        self.status_code = status_code
+ 
++    @property
++    def text(self):
++        encoding = 'utf-8'
++        content_type = self.headers.get('content-type', '')
++        for part in content_type.split(';')[1:]:
++            part = part.strip()
++            if part.lower().startswith('charset='):
++                encoding = part.split('=', 1)[1].strip()
++                break
++        try:
++            return self.content.decode(encoding)
++        except (LookupError, UnicodeDecodeError):
++            return self.content.decode('utf-8', errors='replace')
++
++    def json(self):
++        return json.loads(self.text)
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise RuntimeError('HTTP error {}: {}'.format(self.status_code, self.text))
++
++def _pycurl_get(url, headers=None, **kwargs):
++    headers = headers or {}
++    params = kwargs.pop('params', None)
++    if params:
++        query = params if isinstance(params, str) else urlencode(params, doseq=True)
++        url = '{}{}{}'.format(url, '&' if '?' in url else '?', query)
++    body = io.BytesIO()
++    response_headers = {}
++
++    def receive_header(value):
++        line = value.decode('iso-8859-1', errors='replace').strip('\r\n')
++        if not line:
++            return
++        if line.startswith('HTTP/'):
++            response_headers.clear()
++            return
++        if ':' in line:
++            key, header_value = line.split(':', 1)
++            response_headers[key.strip().lower()] = header_value.strip()
++    curl = pycurl.Curl()
++    curl.setopt(pycurl.URL, url)
++    curl.setopt(pycurl.HTTPHEADER, ['{}: {}'.format(name, value) for name, value in headers.items()])
++    curl.setopt(pycurl.WRITEDATA, body)
++    curl.setopt(pycurl.HEADERFUNCTION, receive_header)
++    curl.setopt(pycurl.FOLLOWLOCATION, 1 if kwargs.pop('allow_redirects', True) else 0)
++    if 'timeout' in kwargs:
++        timeout = kwargs['timeout']
++        if isinstance(timeout, (tuple, list)):
++            timeout = max(timeout)
++        curl.setopt(pycurl.TIMEOUT, timeout)
++    if 'max_redirects' in kwargs:
++        curl.setopt(pycurl.MAXREDIRS, kwargs['max_redirects'])
++    if 'verify' in kwargs:
++        verify = kwargs['verify']
++        if verify is False:
++            curl.setopt(pycurl.SSL_VERIFYPEER, 0)
++            curl.setopt(pycurl.SSL_VERIFYHOST, 0)
++        elif isinstance(verify, str):
++            curl.setopt(pycurl.CAINFO, verify)
++    if 'cert' in kwargs:
++        cert = kwargs['cert']
++        if isinstance(cert, (tuple, list)):
++            curl.setopt(pycurl.SSLCERT, cert[0])
++            if len(cert) > 1:
++                curl.setopt(pycurl.SSLKEY, cert[1])
++        else:
++            curl.setopt(pycurl.SSLCERT, cert)
++    if 'auth' in kwargs:
++        auth = kwargs['auth']
++        if isinstance(auth, (tuple, list)) and len(auth) == 2:
++            curl.setopt(pycurl.USERPWD, '{}:{}'.format(auth[0], auth[1]))
++    if 'cookies' in kwargs:
++        cookies = kwargs['cookies']
++        if isinstance(cookies, dict):
++            curl.setopt(pycurl.COOKIE, '; '.join(('{}={}'.format(key, value) for key, value in cookies.items())))
++        else:
++            curl.setopt(pycurl.COOKIE, cookies)
++    if 'proxies' in kwargs:
++        proxies = kwargs['proxies']
++        if isinstance(proxies, dict):
++            scheme = 'https' if url.lower().startswith('https://') else 'http'
++            proxy = proxies.get(scheme) or proxies.get('all')
++            if proxy:
++                curl.setopt(pycurl.PROXY, proxy)
++        elif proxies:
++            curl.setopt(pycurl.PROXY, proxies)
++    try:
++        curl.perform()
++        status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++    finally:
++        curl.close()
++    return _PycurlResponse(body.getvalue(), response_headers, status_code)
+ 
+ class Consumer(BaseLDN):
+ 
+@@ -15,29 +115,25 @@
+         """
+         Retrieve all of the notification IRIs from an ldp:inbox as a list.
+         """
+-        headers = kwargs.pop("headers", dict())
++        headers = kwargs.pop('headers', dict())
+         if 'accept' not in headers:
+-            headers['accept'] = kwargs.pop("accept", self.accept_headers)
+-
+-        r = requests.get(inbox, headers=headers, **kwargs)
++            pass
++        r = _pycurl_get(inbox, headers=headers, **kwargs)
+         r.raise_for_status()
+-        g = Graph().parse(data=r.text, format=self.content_type_to_mime_type(
+-            r.headers['content-type']))
+-        return [str(o) for (s, o) in g[:URIRef(self.LDP_CONTAINS)]]
++        g = [str(o) for s, o in g[:URIRef(self.LDP_CONTAINS)]]
++        return [str(o) for s, o in g[:URIRef(self.LDP_CONTAINS)]]
+ 
+     def notification(self, iri, **kwargs):
+         """
+         Retrieve a single LDN notification and decode into a Python object.
+         """
+-        headers = kwargs.pop("headers", dict())
++        headers = kwargs.pop('headers', dict())
+         if 'accept' not in headers:
+-            headers['accept'] = kwargs.pop("accept", self.accept_headers)
+-
+-        r = requests.get(iri, headers=headers, **kwargs)
++            pass
++        r = _pycurl_get(inbox, headers=headers, **kwargs)
+         r.raise_for_status()
+         mime_type = self.content_type_to_mime_type(r.headers['content-type'])
+         if mime_type == self.JSON_LD:
+-            return r.json()
++            pass
+         else:
+-            g = Graph().parse(data=r.text, format=mime_type)
+-            return json.loads(g.serialize(format="json-ld"))
++            g = json.loads(g.serialize(format='json-ld'))

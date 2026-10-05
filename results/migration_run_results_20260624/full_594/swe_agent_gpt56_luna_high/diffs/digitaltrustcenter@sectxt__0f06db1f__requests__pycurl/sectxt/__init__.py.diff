@@ -1,0 +1,137 @@
+--- a/sectxt/__init__.py
++++ b/sectxt/__init__.py
+@@ -2,6 +2,7 @@
+ # SPDX-License-Identifier: EUPL-1.2
+ #
+ import codecs
++import io
+ 
+ import langcodes
+ import re
+@@ -22,11 +23,85 @@
+     from typing import TypedDict
+ 
+ import dateutil.parser
+-import requests
++import pycurl
+ 
+ __version__ = "0.9.6"
+ 
+-s = requests.Session()
++
++class _CurlResponse:
++    """Small response object containing the parts used by :class:`SecurityTXT`."""
++
++    def __init__(self, content: bytes, status_code: int, url: str, headers: dict, history: list):
++        self.content = content
++        self.status_code = status_code
++        self.url = url
++        self.headers = headers
++        self.history = history
++
++
++def _get_with_pycurl(url: str, verify: bool = True) -> _CurlResponse:
++    """Fetch *url* using libcurl and expose the response data we need.
++
++    PycURL is deliberately used directly here rather than through a requests
++    compatibility layer.  Header callbacks are reset for every response so
++    that, when redirects are followed, ``headers`` represents the final one.
++    """
++    body = io.BytesIO()
++    response_headers = {}
++    status_code = 0
++
++    def receive_headers(header: bytes) -> None:
++        nonlocal response_headers, status_code
++        line = header.decode("latin-1").rstrip("\r\n")
++        if line.startswith("HTTP/"):
++            # A redirect (and a proxy CONNECT response) starts a new header
++            # block.  Only the final block belongs to the returned response.
++            response_headers = {}
++            try:
++                status_code = int(line.split(None, 2)[1])
++            except (IndexError, ValueError):
++                status_code = 0
++        elif ":" in line:
++            name, value = line.split(":", 1)
++            response_headers[name.lower()] = value.strip()
++
++    curl = pycurl.Curl()
++    try:
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.WRITEFUNCTION, body.write)
++        curl.setopt(pycurl.HEADERFUNCTION, receive_headers)
++        curl.setopt(pycurl.FOLLOWLOCATION, 1)
++        curl.setopt(pycurl.TIMEOUT, 5)
++        curl.setopt(pycurl.NOSIGNAL, 1)
++        curl.setopt(
++            pycurl.USERAGENT,
++            "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) "
++            "Gecko/20100101 Firefox/12.0",
++        )
++        if not verify:
++            curl.setopt(pycurl.SSL_VERIFYPEER, 0)
++            curl.setopt(pycurl.SSL_VERIFYHOST, 0)
++        curl.perform()
++        effective_url = curl.getinfo(pycurl.EFFECTIVE_URL) or url
++        redirect_count = curl.getinfo(pycurl.REDIRECT_COUNT)
++    finally:
++        curl.close()
++
++    # SecurityTXT only needs to know whether there was a redirect and the
++    # first URL in the chain.  The latter is the URL requested here.
++    history = [url] if redirect_count else []
++    return _CurlResponse(body.getvalue(), status_code, effective_url, response_headers, history)
++
++
++def _is_ssl_verification_error(error: Exception) -> bool:
++    """Return whether a pycurl error indicates an invalid TLS certificate."""
++    if not isinstance(error, pycurl.error) or not error.args:
++        return False
++    code = error.args[0]
++    return code in {
++        getattr(pycurl, "E_SSL_CACERT", -1),
++        getattr(pycurl, "E_PEER_FAILED_VERIFICATION", -1),
++    }
+ 
+ 
+ class ErrorDict(TypedDict):
+@@ -557,32 +632,19 @@
+                 for path in [".well-known/security.txt", "security.txt"]:
+                     url = urlunsplit((scheme, self._loc, path, None, None))
+                     try:
+-                        resp = requests.get(
+-                            url,
+-                            headers={
+-                                'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                              'Gecko/20100101 Firefox/12.0'},
+-                            timeout=5
+-                        )
+-                    except requests.exceptions.SSLError:
++                        resp = _get_with_pycurl(url)
++                    except Exception as error:
++                        if not _is_ssl_verification_error(error):
++                            continue
+                         if not any(d["code"] == "invalid_cert" for d in self._errors):
+                             self._add_error(
+                                 "invalid_cert",
+                                 "security.txt must be served with a valid TLS certificate.",
+                             )
+                         try:
+-                            resp = requests.get(
+-                                url,
+-                                headers={
+-                                    'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                                  'Gecko/20100101 Firefox/12.0'},
+-                                timeout=5,
+-                                verify=False
+-                            )
+-                        except:
++                            resp = _get_with_pycurl(url, verify=False)
++                        except Exception:
+                             continue
+-                    except:
+-                        continue
+                     if resp.status_code == 200:
+                         if resp.history:
+                             if not resp.url.endswith(path):

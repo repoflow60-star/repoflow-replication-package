@@ -1,0 +1,662 @@
+--- a/pdpyras.py
++++ b/pdpyras.py
+@@ -1,26 +1,71 @@
+-
+ # Copyright (c) PagerDuty.
+ # See LICENSE for details.
+ 
+ # Standard libraries
++import io
++import json
+ import logging
+ import sys
+ import time
+ from copy import deepcopy
+-from datetime import datetime
++from datetime import datetime, timedelta
+ from random import random
+ from typing import Iterator, Union
++from urllib.parse import urlencode
+ from warnings import warn
+ 
+-# Upstream components on which this client is based:
+-from requests import Response, Session
+-from requests import __version__ as REQUESTS_VERSION
+-
+-# HTTP client exceptions:
+-from urllib3.exceptions import HTTPError, PoolError
+-from requests.exceptions import RequestException
++import pycurl
+ 
+ __version__ = '5.4.0'
++
++########################
++### PYCURL COMPATIBILITY
++########################
++
++PYCURL_VERSION = pycurl.version_info()[1]
++
++
++class _Request:
++    def __init__(self, method, url):
++        self.method = method
++        self.url = url
++
++
++class _Headers(dict):
++    def get(self, key, default=None):
++        key_lower = key.lower()
++        for header, value in self.items():
++            if header.lower() == key_lower:
++                return value
++        return default
++
++    def __getitem__(self, key):
++        key_lower = key.lower()
++        for header, value in self.items():
++            if header.lower() == key_lower:
++                return value
++        raise KeyError(key)
++
++
++class Response:
++    def __init__(self, status_code, headers, content, method, url, elapsed):
++        self.status_code = status_code
++        self.headers = headers
++        self.content = content
++        self.request = _Request(method, url)
++        self.elapsed = timedelta(seconds=elapsed)
++
++    @property
++    def text(self):
++        return self.content.decode('utf-8', errors='replace')
++
++    @property
++    def ok(self):
++        return self.status_code < 400
++
++    def json(self):
++        return json.loads(self.text)
++
+ 
+ #######################
+ ### CLIENT DEFAULTS ###
+@@ -30,8 +75,8 @@
+ The maximum position of a result in classic pagination.
+ 
+ The offset plus limit parameter may not exceed this number. This is enforced
+-server-side and is not something the client may override. Rather, this value is
+-used to short-circuit pagination in order to avoid a HTTP 400 error.
++server-side and is not something the client may override. Rather, this value
++is used to short-circuit pagination in order to avoid a HTTP 400 error.
+ 
+ See: `Pagination
+ <https://developer.pagerduty.com/docs/ZG9jOjExMDI5NTU4-pagination>`_.
+@@ -374,12 +419,12 @@
+ can also be None to denote that either the request or response is unwrapped.
+ 
+ An endpoint, under the design logic of this client, is said to have entity
+-wrapping if the body (request or response) has only one property containing
+-the content requested or transmitted, apart from properties used for
+-pagination. If there are any secondary content-bearing properties (other than
+-those used for pagination), entity wrapping should be disabled to avoid
+-discarding those properties from responses or preventing the use of those
+-properties in request bodies.
++wrapping if the body (request or response) has only one property containing the
++content requested or transmitted, apart from properties used for pagination. If
++there are any secondary content-bearing properties (other than those used for
++pagination), entity wrapping should be disabled to avoid discarding those
++properties from responses or preventing the use of those properties in request
++bodies.
+ 
+ :meta hide-value:
+ """
+@@ -394,7 +439,7 @@
+     The canonical path from the API documentation corresponding to a URL
+ 
+     This is used to identify and classify URLs according to which particular API
+-    within REST API v2 it belongs to.
++    within REST API v2 it belongs.
+ 
+     Explicitly supported canonical paths are defined in the list
+     :attr:`CANONICAL_PATHS` and are the path part of any given API's URL. The
+@@ -624,7 +669,7 @@
+     Makes methods return the full response body object after decoding from JSON.
+ 
+     Intended for use on functions that take a URL positional argument followed
+-    by keyword arguments and return a `requests.Response`_ object.
++    by keyword arguments and return a Response object.
+     """
+     doc = method.__doc__
+     def call(self, url, **kw):
+@@ -680,17 +725,12 @@
+     the ``json`` keyword argument will be normalized to include the wrapper.
+ 
+     Methods using this decorator will raise a :class:`PDHTTPError` with its
+-    ``response`` property being being the `requests.Response`_ object in the
+-    case of any error (as of version 4.2 this is subclassed as
+-    :class:`PDHTTPError`), so that the implementer can access it by catching the
+-    exception, and thus design their own custom logic around different types of
+-    error responses.
++    ``response`` property being the response object in the case of any error.
+ 
+     :param method: Method being decorated. Must take one positional argument
+         after ``self`` that is the URL/path to the resource, followed by keyword
+-        any number of keyword arguments, and must return an object of class
+-        `requests.Response`_, and be named after the HTTP method but with "r"
+-        prepended.
++        any number of keyword arguments, and must return a Response object, and
++        be named after the HTTP method but with "r" prepended.
+     :returns: A callable object; the reformed method
+     """
+     http_method = method.__name__.lstrip('r')
+@@ -862,11 +902,11 @@
+ ### CLASSES ###
+ ###############
+ 
+-class PDSession(Session):
++class PDSession:
+     """
+     Base class for making HTTP requests to PagerDuty APIs
+ 
+-    This is an opinionated wrapper of `requests.Session`_, with a few additional
++    This is an opinionated wrapper of ``pycurl``, with a few additional
+     features:
+ 
+     - The client will reattempt the request with auto-increasing cooldown/retry
+@@ -911,7 +951,7 @@
+     """
+ 
+     parent = None
+-    """The ``super`` object (`requests.Session`_)"""
++    """The underlying pycurl-based session."""
+ 
+     permitted_methods = ()
+     """
+@@ -937,7 +977,7 @@
+       encountered first), and then return the final response.
+ 
+     The default behavior is to retry without limit on status 429, raise an
+-    exception on a 401, and return the `requests.Response`_ object in any other case
++    exception on a 401, and return the Response object in any other case
+     (assuming a HTTP response was received from the server).
+     """
+ 
+@@ -959,15 +999,14 @@
+ 
+     timeout = TIMEOUT
+     """
+-    This is the value sent to `Requests`_ as the ``timeout`` parameter that
+-    determines the TCP read timeout.
++    This is the value sent to pycurl as the request timeout.
+     """
+ 
+     url = ""
+ 
+     def __init__(self, api_key: str, debug=False):
+-        self.parent = super(PDSession, self)
+-        self.parent.__init__()
++        self.parent = None
++        self.headers = {}
+         self.api_key = api_key
+         self.log = logging.getLogger(__name__)
+         self.print_debug = debug
+@@ -1038,8 +1077,8 @@
+         """
+         Perform supplemental actions immediately after receiving a response.
+ 
+-        This method is called once per request not including retries, and can be
+-        extended in child classes.
++        This method is called once per request not including retries, and can
++        be extended in child classes.
+         """
+         pass
+ 
+@@ -1089,6 +1128,98 @@
+             delattr(self, '_debugHandler')
+         # else: no-op; only happens if debug is set to the same value twice
+ 
++    def _pycurl_request(self, method, url, **kwargs) -> Response:
++        """
++        Execute one HTTP request using pycurl.
++        """
++        body = io.BytesIO()
++        response_headers = []
++        curl = pycurl.Curl()
++
++        headers = kwargs.get('headers', {})
++        header_values = [
++            "%s: %s"%(name, value)
++            for name, value in headers.items()
++        ]
++
++        params = kwargs.get('params')
++        request_url = url
++        if params:
++            query = urlencode(params, doseq=True)
++            separator = '&' if '?' in request_url else '?'
++            request_url += separator + query
++
++        request_body = None
++        if 'json' in kwargs:
++            request_body = json.dumps(kwargs['json']).encode('utf-8')
++        elif 'data' in kwargs:
++            request_body = kwargs['data']
++            if isinstance(request_body, (dict, list, tuple)):
++                request_body = urlencode(request_body, doseq=True)
++            if isinstance(request_body, str):
++                request_body = request_body.encode('utf-8')
++
++        try:
++            curl.setopt(pycurl.URL, request_url)
++            curl.setopt(pycurl.CUSTOMREQUEST, method)
++            curl.setopt(pycurl.HTTPHEADER, header_values)
++            curl.setopt(pycurl.WRITEFUNCTION, body.write)
++            curl.setopt(pycurl.HEADERFUNCTION, response_headers.append)
++
++            timeout = kwargs.get('timeout')
++            if isinstance(timeout, tuple):
++                curl.setopt(pycurl.CONNECTTIMEOUT, timeout[0])
++                curl.setopt(pycurl.TIMEOUT, timeout[1])
++            elif timeout is not None:
++                curl.setopt(pycurl.TIMEOUT, timeout)
++
++            if method == 'GET':
++                curl.setopt(pycurl.HTTPGET, True)
++            elif method == 'POST':
++                curl.setopt(pycurl.POST, True)
++
++            if request_body is not None:
++                curl.setopt(pycurl.POSTFIELDS, request_body)
++
++            curl.perform()
++
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++            elapsed = curl.getinfo(pycurl.TOTAL_TIME)
++        finally:
++            curl.close()
++
++        parsed_headers = _Headers()
++        for raw_line in response_headers:
++            line = raw_line.decode('iso-8859-1').strip()
++            if not line:
++                continue
++            if line.startswith('HTTP/'):
++                parsed_headers = _Headers()
++            elif ':' in line:
++                name, value = line.split(':', 1)
++                parsed_headers[name.strip()] = value.strip()
++
++        return Response(
++            status_code,
++            parsed_headers,
++            body.getvalue(),
++            method,
++            request_url,
++            elapsed,
++        )
++
++    def get(self, url, **kwargs) -> Response:
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, **kwargs) -> Response:
++        return self.request('POST', url, **kwargs)
++
++    def put(self, url, **kwargs) -> Response:
++        return self.request('PUT', url, **kwargs)
++
++    def delete(self, url, **kwargs) -> Response:
++        return self.request('DELETE', url, **kwargs)
++
+     def request(self, method, url, **kwargs) -> Response:
+         """
+         Make a generic PagerDuty API request.
+@@ -1100,11 +1231,11 @@
+             The path/URL to request. If it does not start with the base URL, the
+             base URL will be prepended.
+         :param **kwargs:
+-            Custom keyword arguments to pass to ``requests.Session.request``.
++            Custom keyword arguments to pass to the pycurl request.
+         :type method: str
+         :type url: str
+         :returns:
+-            The `requests.Response`_ object corresponding to the HTTP response
++            The Response object corresponding to the HTTP response
+         """
+         sleep_timer = self.sleep_timer
+         network_attempts = 0
+@@ -1133,9 +1264,9 @@
+         # Make the request (and repeat w/cooldown if the rate limit is reached):
+         while True:
+             try:
+-                response = self.parent.request(method, full_url, **req_kw)
++                response = self._pycurl_request(method, full_url, **req_kw)
+                 self.postprocess(response)
+-            except (HTTPError, PoolError, RequestException) as e:
++            except pycurl.error as e:
+                 network_attempts += 1
+                 if network_attempts > self.max_network_attempts:
+                     error_msg = f"{endpoint}: Non-transient network " \
+@@ -1237,12 +1368,13 @@
+ 
+     @property
+     def user_agent(self) -> str:
+-        return 'pdpyras/%s python-requests/%s Python/%d.%d'%(
++        return 'pdpyras/%s pycurl/%s Python/%d.%d'%(
+             __version__,
+-            REQUESTS_VERSION,
++            PYCURL_VERSION,
+             sys.version_info.major,
+             sys.version_info.minor
+         )
++
+ 
+ class EventsAPISession(PDSession):
+ 
+@@ -1306,7 +1438,7 @@
+         Resolve an alert via Events API.
+ 
+         :param dedup_key:
+-            The deduplication key of the alert to resolve.
++            The deduplication key of the alert to set to the resolved state.
+         """
+         return self.send_event('resolve', dedup_key=dedup_key)
+ 
+@@ -1357,7 +1489,7 @@
+ 
+     def post(self, *args, **kw) -> Response:
+         """
+-        Override of ``requests.Session.post``
++        Override of ``PDSession.post``
+ 
+         Adds the ``routing_key`` parameter to the body before sending.
+         """
+@@ -1540,7 +1672,7 @@
+     PagerDuty REST API v2 session object class.
+ 
+     Implements the most generic and oft-implemented aspects of PagerDuty's REST
+-    API v2 as an opinionated wrapper of `requests.Session`_.
++    API v2 as an opinionated wrapper of ``pycurl``.
+ 
+     Inherits from :class:`PDSession`.
+ 
+@@ -1661,8 +1793,8 @@
+             The attribute of each object to use for the key values of the
+             dictionary. This is ``id`` by default. Please note, there is no
+             uniqueness validation, so if you use an attribute that is not
+-            distinct for the data set, this function will omit some data in the
+-            results.
++            distinct for the data set, this function will omit some data in
++            the results.
+         """
+         by = kw.pop('by', 'id')
+         iterator = self.iter_all(path, **kw)
+@@ -1689,9 +1821,9 @@
+         (all-lowercase strings) so that case doesn't need to match in the query argument
+         (which is also interpreted by the API as case-insensitive).
+ 
+-        If said behavior differs for a given API, i.e. the uniqueness constraint on a
+-        field is case-sensitive, it should still return the correct results because the
+-        search term sent to the index in the querystring is not lower-cased.
++        If said behavior differs for a given API, i.e. the uniqueness constraint on
++        a field is case-sensitive, it should still return the correct results because
++        the search term sent to the index in the querystring is not lower-cased.
+ 
+         :param resource:
+             The name of the resource endpoint to query, i.e.
+@@ -1735,7 +1867,7 @@
+         it implements classic pagination, a.k.a. numeric pagination.
+ 
+         Each yielded value is a dict object representing a result returned from
+-        the index. For example, if requesting the ``/users`` endpoint, each
++        the API. For example, if requesting the ``/users`` endpoint, each
+         yielded value will be an entry of the ``users`` array property in the
+         response.
+ 
+@@ -1768,22 +1900,14 @@
+         :type page_size: int or None
+         :type total: bool
+         """
+-        # Get entity wrapping and validate that the URL being requested is
+-        # likely to support pagination:
+         path = canonical_path(self.url, url)
+         endpoint = f"GET {path}"
+ 
+-        # Short-circuit to cursor-based pagination if appropriate:
+         if path in CURSOR_BASED_PAGINATION_PATHS:
+             return self.iter_cursor(url, params=params)
+ 
+         nodes = path.split('/')
+         if is_path_param(nodes[-1]):
+-            # NOTE: If this happens for a newer API, the path might need to be
+-            # added to the EXPAND_PATHS dictionary in
+-            # scripts/get_path_list/get_path_list.py, after which
+-            # CANONICAL_PATHS will then need to be updated accordingly based on
+-            # the new output of the script.
+             raise URLError(f"Path {path} (URL={url}) is formatted like an " \
+                 "individual resource versus a resource collection. It is " \
+                 "therefore assumed to not support pagination.")
+@@ -1792,7 +1916,6 @@
+         if wrapper is None:
+             raise URLError(f"Pagination is not supported for {endpoint}.")
+ 
+-        # Parameters to send:
+         data = {}
+         if page_size is None:
+             data['limit'] = self.default_page_size
+@@ -1801,7 +1924,6 @@
+         if total:
+             data['total'] = 1
+         if isinstance(params, (dict, list)):
+-            # Override defaults with values given:
+             data.update(dict(params))
+ 
+         more = True
+@@ -1810,7 +1932,6 @@
+             offset = int(params.get('offset', 0))
+         n = 0
+         while more:
+-            # Check the offset and limit:
+             data['offset'] = offset
+             highest_record_index = int(data['offset']) + int(data['limit'])
+             if highest_record_index > ITERATION_LIMIT:
+@@ -1823,7 +1944,6 @@
+                 )
+                 return
+ 
+-            # Make the request and validate/unpack the response:
+             r = successful_response(
+                 self.get(url, params=data.copy()),
+                 context='classic pagination'
+@@ -1831,19 +1951,6 @@
+             body = try_decoding(r)
+             results = unwrap(r, wrapper)
+ 
+-            # Validate and update pagination parameters
+-            #
+-            # Note, the number of the results in the actual response is always
+-            # the most appropriate amount to increment the offset by after
+-            # receiving each page. If this is the last page, agination should
+-            # stop anyways because the ``more`` parameter should evaluate to
+-            # false.
+-            #
+-            # In short, the reasons why we don't trust the echoed ``limit``
+-            # value or stick to the limit requested and hope the server honors
+-            # it is that it could potentially result in skipping results or
+-            # yielding duplicates if there's a mismatch, or potentially issues
+-            # like #61
+             data['limit'] = len(results)
+             offset += data['limit']
+             more = False
+@@ -1861,10 +1968,8 @@
+             if 'total' in body:
+                 total_count = body['total']
+ 
+-            # Perform per-page actions on the response data
+             for result in results:
+                 n += 1
+-                # Call a callable object for each item, i.e. to print progress:
+                 if hasattr(item_hook, '__call__'):
+                     item_hook(result, n, total_count)
+                 yield result
+@@ -1886,7 +1991,6 @@
+         _, wrapper = entity_wrappers('GET', path)
+         user_params = {}
+         if isinstance(params, (dict, list)):
+-            # Override defaults with values given:
+             user_params.update(dict(params))
+ 
+         more = True
+@@ -1894,7 +1998,6 @@
+         total = 0
+ 
+         while more:
+-            # Update parameters and request a new page:
+             if next_cursor:
+                 user_params.update({'cursor': next_cursor})
+             r = successful_response(
+@@ -1902,7 +2005,6 @@
+                 context='cursor-based pagination',
+             )
+ 
+-            # Unpack and yield results
+             body = try_decoding(r)
+             results = unwrap(r, wrapper)
+             for result in results:
+@@ -1910,7 +2012,6 @@
+                 if hasattr(item_hook, '__call__'):
+                     item_hook(result, total, '?')
+                 yield result
+-            # Advance to the next page
+             next_cursor = body.get('next_cursor', None)
+             more = bool(next_cursor)
+ 
+@@ -1961,10 +2062,10 @@
+ 
+         :param resource:
+             The URL to use when creating the new resource or searching for an
+-            existing one. The underlying AP must support entity wrapping to use
++            existing one. The underlying API must support entity wrapping to use
+             this method with it.
+         :param attr:
+-            Name of the attribute to use as the idempotency key. For instance,
++            Name of the attribute to use as an idempotency key. For instance,
+             "email" when the resource is "users" will not create the user if a
+             user with the email address given in ``values`` already exists.
+         :param values:
+@@ -2000,11 +2101,11 @@
+         Records performance information / request metadata about the API call.
+ 
+         :param response:
+-            The `requests.Response`_ object returned by the request method
++            The Response object returned by the request method
+         :param suffix:
+             Optional suffix to append to the key
+         :type method: str
+-        :type response: `requests.Response`_
++        :type response: Response
+         :type suffix: str or None
+         """
+         method = response.request.method.upper()
+@@ -2017,16 +2118,12 @@
+         try:
+             endpoint = "%s %s"%(method, canonical_path(self.url, url))
+         except URLError:
+-            # This is necessary so that profiling can also support using the
+-            # basic get / post / put / delete methods with APIs that are not yet
+-            # explicitly supported by inclusion in CANONICAL_PATHS.
+             endpoint = "%s %s"%(method, url)
+         self.api_call_counts.setdefault(endpoint, 0)
+         self.api_time.setdefault(endpoint, 0.0)
+         self.api_call_counts[endpoint] += 1
+         self.api_time[endpoint] += request_time
+ 
+-        # Request ID / timestamp logging
+         self.log.debug("Request completed: #method=%s|#url=%s|#status=%d|"
+             "#x_request_id=%s|#date=%s|#wall_time_s=%g", method, url, status,
+             request_id, request_date, request_time)
+@@ -2058,7 +2155,7 @@
+             representing an API resource that contains an item with key ``self``
+             whose value is the URL of the resource.
+         :param **kw:
+-            Custom keyword arguments to pass to ``requests.Session.delete``
++            Custom keyword arguments to pass to ``PDSession.delete``
+         :type resource: str or dict
+         """
+         return self.delete(resource, **kw)
+@@ -2077,7 +2174,7 @@
+             representing an API resource that contains an item with key ``self``
+             whose value is the URL of the resource.
+         :param **kw:
+-            Custom keyword arguments to pass to ``requests.Session.get``
++            Custom keyword arguments to pass to ``PDSession.get``
+         :returns:
+             Dictionary representation of the requested object
+         :type resource: str or dict
+@@ -2095,7 +2192,7 @@
+             The path/URL to which to send the POST request, which should be an
+             index endpoint.
+         :param **kw:
+-            Custom keyword arguments to pass to ``requests.Session.post``
++            Custom keyword arguments to pass to ``PDSession.post``
+         :returns:
+             Dictionary representation of the created object
+         :type path: str
+@@ -2115,7 +2212,7 @@
+             representing an API resource that contains an item with key ``self``
+             whose value is the URL of the resource.
+         :param **kw:
+-            Custom keyword arguments to pass to ``requests.Session.put``
++            Custom keyword arguments to pass to ``PDSession.put``
+         :returns:
+             Dictionary representation of the updated object
+         """
+@@ -2153,11 +2250,13 @@
+         """Truncated token for secure display/identification purposes."""
+         return last_4(self.api_key)
+ 
++
+ class URLError(Exception):
+     """
+     Exception class for unsupported URLs or malformed input.
+     """
+     pass
++
+ 
+ class PDClientError(Exception):
+     """
+@@ -2180,17 +2279,18 @@
+         self.response = response
+         super(PDClientError, self).__init__(message)
+ 
++
+ class PDHTTPError(PDClientError):
+     """
+     Error class representing errors strictly associated with HTTP responses.
+ 
+     This class was created to make it easier to more cleanly handle errors by
+     way of a class that is guaranteed to have its ``response`` be a valid
+-    `requests.Response`_ object.
++    Response object.
+ 
+     Whereas, the more generic :class:`PDClientError` could also be used
+     to denote such things as non-transient network errors wherein no response
+-    was recevied from the API.
++    was received from the API.
+ 
+     For instance, instead of this:
+ 
+@@ -2217,6 +2317,7 @@
+     def __init__(self, message, response: Response):
+         super(PDHTTPError, self).__init__(message, response=response)
+ 
++
+ class PDServerError(PDHTTPError):
+     """
+     Error class representing failed expectations made of the server
+@@ -2226,4 +2327,4 @@
+     changes before GA, or in cases of HTTP status 5xx where a successful
+     response is required.
+     """
+-    pass
++    pass

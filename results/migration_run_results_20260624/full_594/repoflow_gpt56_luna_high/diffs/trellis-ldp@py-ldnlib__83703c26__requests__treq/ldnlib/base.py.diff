@@ -1,0 +1,142 @@
+--- a/ldnlib/base.py
++++ b/ldnlib/base.py
+@@ -1,5 +1,10 @@
+ from rdflib import Graph, URIRef
+-import requests
++import base64
++
++from twisted.internet import defer
++from twisted.internet.selectreactor import SelectReactor
++from twisted.python.failure import Failure
++import treq
+ 
+ 
+ class BaseLDN(object):
+@@ -14,18 +19,119 @@
+     def __init__(self, **kwargs):
+         self.accept_headers = kwargs.get('accept_headers', self.ACCEPT_HEADERS)
+ 
++    def _request(self, method, target, **kwargs):
++        """Run a treq request synchronously for the existing public API."""
++        reactor = SelectReactor()
++        request_kwargs = dict(kwargs)
++        request_kwargs.setdefault('browser_like_redirects', True)
++        if 'allow_redirects' in request_kwargs:
++            request_kwargs['browser_like_redirects'] = request_kwargs.pop(
++                'allow_redirects')
++
++        data = request_kwargs.get('data')
++        if isinstance(data, str):
++            request_kwargs['data'] = data.encode('utf-8')
++
++        auth = request_kwargs.pop('auth', None)
++        if auth is not None:
++            if not isinstance(auth, tuple) or len(auth) != 2:
++                raise TypeError('treq supports only username/password auth')
++            credentials = '{}:{}'.format(auth[0], auth[1]).encode('utf-8')
++            encoded = base64.b64encode(credentials).decode('ascii')
++            headers = dict(request_kwargs.get('headers') or {})
++            headers.setdefault('authorization', 'Basic {}'.format(encoded))
++            request_kwargs['headers'] = headers
++
++        result = []
++        error = []
++
++        def read_body(response):
++            return defer.maybeDeferred(treq.content, response).addCallback(
++                lambda body: (response, body))
++
++        def finish(value):
++            if isinstance(value, Failure):
++                error.append(value)
++            else:
++                result.append(value)
++            if reactor.running:
++                reactor.stop()
++            else:
++                reactor.callWhenRunning(reactor.stop)
++            return value
++
++        request = defer.maybeDeferred(
++            treq.request, method.upper(), target, reactor=reactor,
++            **request_kwargs)
++        request.addCallback(read_body).addBoth(finish)
++        reactor.run(installSignalHandlers=False)
++        if error:
++            error[0].raiseException()
++        return result[0]
++
++    def _raise_for_status(self, response):
++        if response.code >= 400:
++            raise RuntimeError("HTTP request failed with status {}".format(
++                response.code))
++
++    def _header(self, response, name):
++        headers = response.headers
++        if hasattr(headers, 'getRawHeaders'):
++            values = None
++            for header_name in (name, name.encode('ascii')):
++                try:
++                    values = headers.getRawHeaders(header_name)
++                except (AttributeError, TypeError):
++                    continue
++                if values:
++                    break
++        else:
++            values = headers.get(name)
++            if not values:
++                values = headers.get(name.lower())
++            if not values:
++                values = headers.get(name.encode('ascii'))
++        if not values:
++            return None
++        value = values[0] if isinstance(values, (list, tuple)) else values
++        return value.decode('utf-8') if isinstance(value, bytes) else value
++
++    def _content_type(self, response):
++        content_type = self._header(response, 'content-type')
++        if content_type is None:
++            raise KeyError('content-type')
++        return content_type
++
++    def _response_text(self, body):
++        return body.decode('utf-8') if isinstance(body, bytes) else body
++
++    def _link_inbox(self, response):
++        link_header = self._header(response, 'link')
++        if not link_header:
++            return None
++        for link in link_header.split(','):
++            target, separator, parameters = link.partition(';')
++            if not separator or not target.strip().startswith('<'):
++                continue
++            target = target.strip()[1:-1]
++            for parameter in parameters.split(';'):
++                key, separator, value = parameter.strip().partition('=')
++                if (key.lower() == 'rel' and separator and
++                        self.LDP_INBOX in value.strip('"\'').split()):
++                    return target
++
+     def __discover_head(self, target, **kwargs):
+-        r = requests.head(target, **kwargs)
+-        r.raise_for_status()
+-        if self.LDP_INBOX in r.links:
+-            return r.links[self.LDP_INBOX].get('url')
++        r, _ = self._request('head', target, **kwargs)
++        self._raise_for_status(r)
++        return self._link_inbox(r)
+ 
+     def __discover_get(self, target, **kwargs):
+-        r = requests.get(target, **kwargs)
+-        r.raise_for_status()
++        r, body = self._request('get', target, **kwargs)
++        self._raise_for_status(r)
+         # TODO -- check for HTML
+-        g = Graph().parse(data=r.text, format=self.content_type_to_mime_type(
+-            r.headers['content-type']))
++        g = Graph().parse(data=self._response_text(body),
++                           format=self.content_type_to_mime_type(
++                               self._content_type(r)))
+ 
+         for (subject, inbox) in g[:URIRef(self.LDP_INBOX)]:
+             return str(inbox)

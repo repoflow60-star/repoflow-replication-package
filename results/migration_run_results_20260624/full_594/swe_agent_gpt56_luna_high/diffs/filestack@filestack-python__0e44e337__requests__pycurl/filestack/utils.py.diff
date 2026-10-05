@@ -1,0 +1,272 @@
+--- a/filestack/utils.py
++++ b/filestack/utils.py
+@@ -1,9 +1,13 @@
++import json
++import os
++import random
++import string
++import tempfile
+ import time
+-import string
+-import random
+ from functools import partial
+-import requests as original_requests
+-from requests.exceptions import HTTPError
++from urllib.parse import urlencode
++
++import pycurl
+ 
+ from filestack import config
+ from filestack.exceptions import FilestackHTTPError
+@@ -13,34 +17,232 @@
+     return ''.join(random.choice(string.ascii_letters + string.digits) for i in range(length))
+ 
+ 
+-class RequestsWrapper:
+-    """
+-    This class wraps selected methods from requests package and adds
+-    default headers if no headers were specified.
++class _Headers(dict):
++    """A small case-insensitive mapping used for response headers."""
++    def __getitem__(self, key):
++        for existing_key, value in self.items():
++            if existing_key.lower() == key.lower():
++                return value
++        raise KeyError(key)
++
++    def get(self, key, default=None):
++        try:
++            return self[key]
++        except KeyError:
++            return default
++
++
++class PycurlResponse:
++    """The response features used by the SDK, backed by a pycurl transfer."""
++    def __init__(self, content, status_code, headers):
++        self.content = content
++        self.status_code = status_code
++        self.headers = headers
++
++    @property
++    def text(self):
++        return self.content.decode('utf-8', errors='replace')
++
++    @property
++    def ok(self):
++        return self.status_code < 400
++
++    def json(self):
++        return json.loads(self.text)
++
++    def iter_content(self, chunk_size=1):
++        for offset in range(0, len(self.content), chunk_size):
++            yield self.content[offset:offset + chunk_size]
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise FilestackHTTPError(self.text)
++
++
++class PycurlSession:
++    """A minimal session facade retained for callers that use ``Session``."""
++    def __init__(self, client):
++        self.client = client
++
++    def post(self, *args, **kwargs):
++        return self.client.post(*args, **kwargs)
++
++    def close(self):
++        pass
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *exc_info):
++        self.close()
++
++
++class PycurlWrapper:
++    """HTTP client exposing the subset of the requests API used by Filestack.
++
++    PycURL is intentionally used directly here rather than through a requests
++    compatibility layer. Keeping this small facade means the rest of the SDK
++    can continue to work with response objects while all network I/O is done
++    by libcurl.
+     """
+     def __getattr__(self, name):
+         if name in ('get', 'post', 'put', 'delete'):
+             return partial(self.handle_request, name)
+-        return original_requests.__getattribute__(name)
+-
+-    def handle_request(self, name, *args, **kwargs):
+-        if 'headers' not in kwargs:
+-            kwargs['headers'] = config.HEADERS
+-            kwargs['headers']['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
+-            kwargs['headers']['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
+-
+-        requests_method = getattr(original_requests, name)
+-        response = requests_method(*args, **kwargs)
++        if name == 'Session':
++            return partial(PycurlSession, self)
++        raise AttributeError(name)
++
++    @staticmethod
++    def _url_with_params(url, params):
++        if not params:
++            return url
++        encoded = urlencode(params, doseq=True)
++        return '{}{}{}'.format(url, '&' if '?' in url else '?', encoded)
++
++    @staticmethod
++    def _header_values(headers):
++        return ['{}: {}'.format(key, value) for key, value in headers.items()]
++
++    @staticmethod
++    def _has_header(headers, name):
++        return any(key.lower() == name.lower() for key in headers)
++
++    @staticmethod
++    def _form_fields(files, data):
++        """Create HTTPPOST fields and temporary files for file-like uploads."""
++        fields = []
++        temporary_files = []
++
++        if data:
++            items = data.items() if hasattr(data, 'items') else data
++            for key, value in items:
++                values = value if isinstance(value, (list, tuple)) else (value,)
++                for item in values:
++                    fields.append((key, str(item)))
++
++        for key, value in (files or {}).items():
++            filename = 'filename'
++            content_type = None
++            file_obj = value
++            if isinstance(value, tuple):
++                if len(value) > 0:
++                    filename = value[0]
++                if len(value) > 1:
++                    file_obj = value[1]
++                if len(value) > 2:
++                    content_type = value[2]
++
++            # HTTPPOST's FORM_FILE takes a path. Reading into a temporary
++            # file also supports BytesIO and other file-like objects.
++            data_bytes = file_obj.read()
++            if isinstance(data_bytes, str):
++                data_bytes = data_bytes.encode()
++            temporary_file = tempfile.NamedTemporaryFile(delete=False)
++            temporary_file.write(data_bytes)
++            temporary_file.close()
++            temporary_files.append(temporary_file.name)
++
++            field = (pycurl.FORM_FILE, temporary_file.name,
++                     pycurl.FORM_FILENAME, filename)
++            if content_type:
++                field += (pycurl.FORM_CONTENTTYPE, content_type)
++            fields.append((key, field))
++
++        return fields, temporary_files
++
++    def handle_request(self, name, url, *args, **kwargs):
++        params = kwargs.pop('params', None)
++        headers = kwargs.pop('headers', None)
++        body_json = kwargs.pop('json', None)
++        data = kwargs.pop('data', None)
++        files = kwargs.pop('files', None)
++        # ``stream`` only controls buffering in requests. PycURL writes to
++        # memory here, and iter_content provides the same consumer interface.
++        kwargs.pop('stream', None)
++        if kwargs:
++            unexpected = next(iter(kwargs))
++            raise TypeError("unexpected keyword argument '{}'".format(unexpected))
++
++        if args:
++            raise TypeError('positional request arguments are not supported')
++
++        if headers is None:
++            headers = dict(config.HEADERS)
++            headers['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
++            headers['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
++        else:
++            headers = dict(headers)
++
++        url = self._url_with_params(url, params)
++        method = name.upper()
++        response_body = bytearray()
++        response_headers = _Headers()
++        status_code = [0]
++        temporary_files = []
++        curl = pycurl.Curl()
++
++        def receive_headers(line):
++            # A redirect or a 100-continue response starts a new header block.
++            decoded = line.decode('iso-8859-1').strip()
++            if decoded.startswith('HTTP/'):
++                response_headers.clear()
++                return
++            if ':' in decoded:
++                key, value = decoded.split(':', 1)
++                response_headers[key.strip()] = value.strip()
+ 
+         try:
+-            response.raise_for_status()
+-        except HTTPError as e:
+-            raise FilestackHTTPError(response.text) from e
+-
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.HTTPHEADER, self._header_values(headers))
++            curl.setopt(pycurl.HEADERFUNCTION, receive_headers)
++            curl.setopt(pycurl.WRITEFUNCTION, response_body.extend)
++            curl.setopt(pycurl.FOLLOWLOCATION, 1)
++            # The SDK performs uploads from worker threads.
++            curl.setopt(pycurl.NOSIGNAL, 1)
++
++            if method == 'GET':
++                curl.setopt(pycurl.HTTPGET, 1)
++            elif method == 'POST':
++                curl.setopt(pycurl.POST, 1)
++            else:
++                curl.setopt(pycurl.CUSTOMREQUEST, method)
++
++            if body_json is not None:
++                body = json.dumps(body_json).encode('utf-8')
++                curl.setopt(pycurl.POSTFIELDS, body)
++                if not self._has_header(headers, 'Content-Type'):
++                    request_headers = dict(headers)
++                    request_headers['Content-Type'] = 'application/json'
++                    curl.setopt(pycurl.HTTPHEADER, self._header_values(request_headers))
++            elif files:
++                fields, temporary_files = self._form_fields(files, data)
++                curl.setopt(pycurl.HTTPPOST, fields)
++            elif data is not None:
++                if isinstance(data, str):
++                    data = data.encode('utf-8')
++                elif isinstance(data, dict):
++                    data = urlencode(data, doseq=True).encode('utf-8')
++                curl.setopt(pycurl.POSTFIELDS, data)
++
++            curl.perform()
++            status_code[0] = curl.getinfo(pycurl.RESPONSE_CODE)
++        finally:
++            curl.close()
++            for path in temporary_files:
++                try:
++                    os.unlink(path)
++                except OSError:
++                    pass
++
++        response = PycurlResponse(bytes(response_body), status_code[0], response_headers)
++        response.raise_for_status()
+         return response
+ 
+ 
+-requests = RequestsWrapper()
++# Keep the historical SDK-level name so this remains a drop-in replacement
++# for code importing ``filestack.utils.requests``. It is not the requests
++# package; all transfers above use pycurl.
++requests = PycurlWrapper()
+ 
+ 
+ def return_transform_task(transformation, params):

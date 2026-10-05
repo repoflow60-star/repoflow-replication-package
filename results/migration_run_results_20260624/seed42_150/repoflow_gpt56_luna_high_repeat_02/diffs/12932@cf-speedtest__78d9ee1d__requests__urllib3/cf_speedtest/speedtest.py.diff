@@ -1,0 +1,151 @@
+--- a/cf_speedtest/speedtest.py
++++ b/cf_speedtest/speedtest.py
+@@ -7,13 +7,12 @@
+ import time
+ from timeit import default_timer as timer
+ 
+-import requests
+ import urllib3
+ 
+ import cf_speedtest.locations as locations
+ import cf_speedtest.options as options
+ 
+-REQ_SESSION = requests.Session()
++REQ_SESSION = urllib3.PoolManager(cert_reqs='CERT_REQUIRED')
+ 
+ CGI_ENDPOINT = 'https://speed.cloudflare.com/cdn-cgi/trace'
+ DOWNLOAD_ENDPOINT = 'https://speed.cloudflare.com/__down?measId=0&bytes={}'
+@@ -29,6 +28,44 @@
+ PROXY_DICT = None
+ VERIFY_SSL = True
+ OUTPUT_FILE = None
++_SESSION_CONFIG = (None, True)
++
++
++def _get_session():
++    global REQ_SESSION, _SESSION_CONFIG
++
++    proxy_url = None
++    if PROXY_DICT:
++        proxy_url = PROXY_DICT.get('https') or PROXY_DICT.get('http')
++
++    session_config = (proxy_url, VERIFY_SSL)
++    if session_config != _SESSION_CONFIG:
++        cert_reqs = 'CERT_REQUIRED' if VERIFY_SSL else 'CERT_NONE'
++        if proxy_url and proxy_url.startswith('socks'):
++            from urllib3.contrib.socks import SOCKSProxyManager
++
++            REQ_SESSION = SOCKSProxyManager(proxy_url, cert_reqs=cert_reqs)
++        elif proxy_url:
++            REQ_SESSION = urllib3.ProxyManager(proxy_url, cert_reqs=cert_reqs)
++        else:
++            REQ_SESSION = urllib3.PoolManager(cert_reqs=cert_reqs)
++        _SESSION_CONFIG = session_config
++
++    return REQ_SESSION
++
++
++def _request(method: str, url: str, **kwargs):
++    session = _get_session()
++    session_method = getattr(session, method.lower(), None)
++    if session_method is not None:
++        response = session_method(url, **kwargs)
++    else:
++        response = session.request(method, url, **kwargs)
++
++    status = getattr(response, 'status', None)
++    if isinstance(status, int) and status >= 400:
++        raise urllib3.exceptions.HTTPError(f'HTTP status {status}')
++    return response
+ 
+ # Could use python's statistics library, but quantiles are only available
+ # in version 3.8 and above
+@@ -61,12 +98,11 @@
+ def upload_test(total_bytes: int) -> int | float:
+     start = timer()
+ 
+-    r = REQ_SESSION.post(
+-        UPLOAD_ENDPOINT, data=bytearray(
++    r = _request(
++        'POST', UPLOAD_ENDPOINT, body=bytearray(
+             total_bytes,
+-        ), headers=UPLOAD_HEADERS, verify=VERIFY_SSL, proxies=PROXY_DICT,
++        ), headers=UPLOAD_HEADERS,
+     )
+-    r.raise_for_status()
+     total_time_taken = timer() - start
+ 
+     # trust what the server says as time taken
+@@ -87,12 +123,11 @@
+     endpoint = DOWNLOAD_ENDPOINT.format(total_bytes)
+     start = timer()
+ 
+-    r = REQ_SESSION.get(endpoint, verify=VERIFY_SSL, proxies=PROXY_DICT)
+-    r.raise_for_status()
++    r = _request('GET', endpoint)
+ 
+     total_time_taken = timer() - start
+ 
+-    content_size = len(r.content)
++    content_size = len(r.data)
+     server_time_taken = get_server_timing(r.headers['Server-Timing'])
+ 
+     if OUTPUT_FILE:
+@@ -110,8 +145,7 @@
+     endpoint = DOWNLOAD_ENDPOINT.format(0)
+ 
+     start = timer()
+-    r = REQ_SESSION.get(endpoint, verify=VERIFY_SSL,  proxies=PROXY_DICT)
+-    r.raise_for_status()
++    r = _request('GET', endpoint)
+ 
+     total_time_taken = timer() - start
+     server_time_taken = get_server_timing(r.headers['Server-Timing'])
+@@ -119,7 +153,7 @@
+     if OUTPUT_FILE:
+         with open(OUTPUT_FILE, 'a', encoding='utf-8') as datafile:
+             datafile.write(
+-                f'{time.time()},down,{len(r.content)},{total_time_taken},{server_time_taken}\n',
++                f'{time.time()},down,{len(r.data)},{total_time_taken},{server_time_taken}\n',
+             )
+ 
+     return total_time_taken - server_time_taken
+@@ -128,10 +162,9 @@
+ 
+ 
+ def get_our_country() -> str:
+-    r = REQ_SESSION.get(CGI_ENDPOINT, verify=VERIFY_SSL,  proxies=PROXY_DICT)
+-    r.raise_for_status()
+-
+-    cgi_data = r.text
++    r = _request('GET', CGI_ENDPOINT)
++
++    cgi_data = r.data.decode('utf-8') if isinstance(r.data, bytes) else r.text
+     cgi_dict = {
+         k: v for k, v in [
+             line.split(
+@@ -144,12 +177,11 @@
+ 
+ 
+ def preamble() -> str:
+-    r = REQ_SESSION.get(
+-        DOWNLOAD_ENDPOINT.format(
++    r = _request(
++        'GET', DOWNLOAD_ENDPOINT.format(
+             0,
+-        ), verify=VERIFY_SSL,  proxies=PROXY_DICT,
++        ),
+     )
+-    r.raise_for_status()
+ 
+     our_ip = r.headers.get('cf-meta-ip')
+     colo = r.headers.get('cf-meta-colo')
+@@ -290,7 +322,7 @@
+ 
+ def main(argv=None) -> int:
+     global PROXY_DICT, VERIFY_SSL, OUTPUT_FILE
+-    # disable annoying warning when using verify=False in requests.get("x", verify=False)
++    # disable the warning emitted when TLS certificate verification is disabled
+     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+ 
+     parser = argparse.ArgumentParser()

@@ -1,0 +1,399 @@
+--- a/hxl/input.py
++++ b/hxl/input.py
+@@ -33,8 +33,12 @@
+ 
+ import abc, collections, csv, datetime, dateutil.parser, hashlib, \
+     io, io_wrapper, json, jsonpath_ng.ext, logging, \
+-    os.path, re, requests, shutil, six, sys, \
+-    tempfile, time, urllib.parse, xlrd3 as xlrd, zipfile
++    os.path, re, shutil, six, sys, \
++    tempfile, threading, time, urllib.parse, xlrd3 as xlrd, zipfile
++
++import treq
++from twisted.internet import defer, reactor, ssl
++from twisted.web.client import Agent
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -167,6 +171,143 @@
+ 
+ 
+ ########################################################################
++# treq compatibility helpers
++########################################################################
++
++_treq_reactor_started = threading.Event()
++_treq_reactor_lock = threading.Lock()
++_treq_reactor_thread = None
++
++
++class _TreqHeaders(dict):
++    """Case-insensitive response headers compatible with requests headers."""
++
++    def get(self, key, default=None):
++        key = key.lower()
++        for header, value in self.items():
++            if header.lower() == key:
++                return value
++        return default
++
++
++class _TreqResponse:
++    """Small synchronous response wrapper for a treq response."""
++
++    def __init__(self, response, content):
++        self.status_code = response.code
++        self.reason = response.phrase.decode('utf-8', errors='replace') if response.phrase else ''
++        self.content = content
++        self.headers = _TreqHeaders()
++
++        for name in response.headers.getAllRawHeaders():
++            header_name = name.decode('utf-8') if isinstance(name, bytes) else name
++            values = response.headers.getRawHeaders(name)
++            values = [
++                value.decode('utf-8') if isinstance(value, bytes) else value
++                for value in values
++            ]
++            self.headers[header_name] = ', '.join(values)
++
++        self.is_redirect = (
++            self.status_code in (301, 302, 303, 307, 308)
++            and self.headers.get('location') is not None
++        )
++        self.raw = self
++
++    def json(self):
++        return json.loads(self.content.decode('utf-8'))
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise IOError(
++                "HTTP error {} {}".format(self.status_code, self.reason)
++            )
++
++    def iter_content(self, chunk_size=0x1000):
++        for offset in range(0, len(self.content), chunk_size):
++            yield self.content[offset:offset + chunk_size]
++
++    def readable(self):
++        return True
++
++    def close(self):
++        pass
++
++
++def _start_treq_reactor():
++    global _treq_reactor_thread
++
++    with _treq_reactor_lock:
++        if reactor.running:
++            return
++
++        if _treq_reactor_thread is None:
++            _treq_reactor_thread = threading.Thread(
++                target=_run_treq_reactor,
++                daemon=True
++            )
++            _treq_reactor_thread.start()
++
++    _treq_reactor_started.wait()
++
++
++def _run_treq_reactor():
++    _treq_reactor_started.set()
++    reactor.run(installSignalHandlers=False)
++
++
++def _treq_request(method, url, verify=True, timeout=None, headers=None, params=None, data=None):
++    """Perform a treq request while preserving the module's synchronous API."""
++
++    if not reactor.running:
++        _start_treq_reactor()
++
++    result = {}
++    finished = threading.Event()
++
++    def perform_request():
++        @defer.inlineCallbacks
++        def request():
++            try:
++                context_factory = (
++                    ssl.CertificateOptions()
++                    if verify
++                    else ssl.ClientContextFactory()
++                )
++                agent = Agent(reactor, contextFactory=context_factory)
++
++                request_args = {
++                    "headers": headers,
++                    "agent": agent,
++                }
++
++                if timeout is not None:
++                    request_args["timeout"] = timeout
++                if params is not None:
++                    request_args["params"] = params
++                if data is not None:
++                    request_args["data"] = data
++
++                response = yield treq.request(method, url, **request_args)
++                content = yield treq.content(response)
++                result["response"] = _TreqResponse(response, content)
++            except Exception as error:
++                result["error"] = error
++            finally:
++                finished.set()
++
++        request()
++
++    reactor.callFromThread(perform_request)
++    finished.wait()
++
++    if "error" in result:
++        raise result["error"]
++
++    return result["response"]
++
++
++########################################################################
+ # Exported functions
+ ########################################################################
+ 
+@@ -244,7 +385,7 @@
+         input_options (InputOptions): options for reading a dataset.
+ 
+     Returns:
+-        A dict containing info about the object.
++        A dict containing info about the data source.
+ 
+     Raises:
+         IOError: if there's an error loading the data.
+@@ -621,9 +762,9 @@
+         try:
+             url = munge_url(url_or_filename, input_options)
+             logup("Trying to open remote resource", {"url": url_or_filename})
+-            response = requests.get(
++            response = _treq_request(
++                "GET",
+                 url,
+-                stream=True,
+                 verify=input_options.verify_ssl,
+                 timeout=input_options.timeout,
+                 headers=input_options.http_headers
+@@ -677,7 +818,7 @@
+         )
+ 
+ 
+-+
+ 
+ ########################################################################
+ # Exported classes
+@@ -820,17 +961,14 @@
+ 
+ # Deprecated - will remove in future release
+ class RequestResponseIOWrapper(io.RawIOBase):
+-    """Wrapper for a Response object from the requests library.  Streaming
+-    in requests is a bit broken: for example, if you're streaming, the
+-    stream from the raw property doesn't unzip the payload.
+-    """
++    """Wrapper for a response object from the treq library."""
+ 
+     BUFFER_SIZE = 0x1000
+-    """Size of input chunk buffer from requests.raw.iter_content"""
++    """Size of input chunk buffer from treq response content"""
+ 
+     def __init__(self, response):
+-        """Construct a wrapper around a requests response object
+-        @param response: the HTTP response from the requests library
++        """Construct a wrapper around a treq response object
++        @param response: the HTTP response from the treq library
+         """
+         self.response = response
+         self.buffer = None
+@@ -838,8 +976,7 @@
+         self.iter = response.iter_content(self.BUFFER_SIZE) # iterator through the input
+ 
+     def read(self, size=-1):
+-        """Read raw byte input from the requests raw.iter_content iterator
+-        The function will unzip zipped content.
++        """Read raw byte input from the response content iterator
+         @param size: the maximum number of bytes to read, or -1 for all available.
+         """
+         result = bytearray()
+@@ -973,7 +1110,7 @@
+         that appeared most often in the sample.
+         @param input: the input byte stream (with a peek() method)
+         @param encoding: the character encoding to use
+-        @returns a csv.Dialect object or string.
++        @returns: a csv.Dialect object or string.
+         """
+ 
+         raw = input.peek(16384)
+@@ -1187,7 +1324,7 @@
+ 
+         Args:
+             contents: contents of the Excel file
+-            input_options (InputOptions): options for reading a dataset.
++            input_options (InputOptions): options for reading the data.
+             url_or_filename (string): the original URL or filename or None
+         """
+         super().__init__(input_options, url_or_filename)
+@@ -1209,7 +1346,7 @@
+     def get_sheet_info (self):
+         """ Return sheet metadata for the top-level info() function """
+ 
+-        result = [] # list of dicts containing info for each sheet in the workbook
++        result = [] # list of dicts containing info for each sheet
+ 
+         for sheet_index in range(0, self._workbook.nsheets):
+             sheet = self._get_sheet(sheet_index)
+@@ -1392,7 +1529,7 @@
+         return iter(self.data)
+ 
+ 
+-+
+ 
+ ########################################################################
+ # HXL semantic parsing
+@@ -1609,17 +1746,15 @@
+     )
+ 
+ 
+-+
+ 
+ ########################################################################
+ # URL-munging code
+-#
+-# This is where a lot of the magic happens, figuring out how to download
+-# machine readable data from difference specialised URLs.
+ ########################################################################
+ 
+ 
+ def munge_url(url, input_options):
++    """Munge a URL to get at underlying data for well-known types."""
+     """Munge a URL to get at underlying data for well-known types.
+ 
+     For example, if it's an HDX dataset, figure out the download
+@@ -1657,7 +1792,7 @@
+     result = re.match(GOOGLE_DRIVE_URL, url)
+     if result:
+         logup("HEAD request for Google Drive URL", {"url": url})
+-        response = requests.head(url)
++        response = _treq_request("HEAD", url)
+         if response.is_redirect:
+             new_url = response.headers['Location']
+             logup("Google Drive redirect", {"url": url, "redirect": new_url})
+@@ -1728,23 +1863,7 @@
+ 
+ 
+ def _get_ckan_urls(site_url, dataset_id, resource_id, input_options):
+-    """Look up a CKAN download URL starting from a dataset or resource page
+-
+-    If the link is to a dataset page, try the first resource. If it's
+-    to a resource page, look up the resource's download link. Either
+-    dataset_id or resource_id is required (will prefer resource_id
+-    over dataset_id).
+-
+-    Args:
+-        site_url (str): the CKAN site URL (e.g. https://data.humdata.org)
+-        dataset_id (str): the CKAN dataset ID, or None if unavailable
+-        resource_id (str): the CKAN resource ID, or None if unavailable
+-        input_options (InputOptions): options for reading a dataset.
+-
+-    Returns:
+-        list of str: the direct-download URL for the CKAN dataset
+-
+-    """
++    """Look up a CKAN download URL starting from a dataset or resource page."""
+ 
+     result_urls = []
+ 
+@@ -1752,7 +1871,12 @@
+         # CKAN resource URL
+         ckan_api_query = '{}/api/3/action/resource_show?id={}'.format(site_url, resource_id)
+         logup("Trying CKAN API call", {"url": ckan_api_query})
+-        ckan_api_result = requests.get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
++        ckan_api_result = _treq_request(
++            "GET",
++            ckan_api_query,
++            verify=input_options.verify_ssl,
++            headers=input_options.http_headers
++        ).json()
+         if ckan_api_result['success']:
+             url = ckan_api_result['result']['url']
+             logup("Found candidate URL for CKAN dataset", {"url": url})
+@@ -1775,7 +1899,12 @@
+     else:
+         # CKAN dataset (package) URL
+         ckan_api_query = '{}/api/3/action/package_show?id={}'.format(site_url, dataset_id)
+-        ckan_api_result = requests.get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
++        ckan_api_result = _treq_request(
++            "GET",
++            ckan_api_query,
++            verify=input_options.verify_ssl,
++            headers=input_options.http_headers
++        ).json()
+         if ckan_api_result['success']:
+             for resource in ckan_api_result['result']['resources']:
+                 url = resource['url']
+@@ -1801,31 +1930,15 @@
+ 
+ 
+ def _get_kobo_url(asset_id, url, input_options, max_export_age_seconds=14400):
+-    """ Create an export for a Kobo survey, then return the download link.
+-
+-    This will fail unless there's an Authorization: header including a Kobo
+-    API token.
+-
+-    Args:
+-        asset_id (str): the Kobo asset ID for the survey (extracted from the URL)
+-        max_export_age_seconds (int): maximum age to reuse an existing export (defaults to 14,400 seconds, or 4 hours)
+-        input_options (InputOptions): options for reading a dataset.
+-
+-
+-    Returns:
+-        str: the direct-download URL for the Kobo survey data export
+-
+-    Raises:
+-        hxl.input.HXLAuthorizationException: if http_headers does not include a valid Authorization: header
+-
+-    """
++    """ Create an export for a Kobo survey, then return the download link."""
+ 
+     # 1. Check current exports
+     params = {
+         "q": "source:{}".format(asset_id)
+     }
+     logup("Trying Kobo dataset", {"url": asset_id})
+-    response = requests.get(
++    response = _treq_request(
++        "GET",
+         "https://kobo.humanitarianresponse.info/exports/",
+         verify=input_options.verify_ssl,
+         headers=input_options.http_headers,
+@@ -1861,7 +1974,8 @@
+         "hierarchy_in_labels": False,
+         "group_sep": ",",
+     }
+-    response = requests.post(
++    response = _treq_request(
++        "POST",
+         "https://kobo.humanitarianresponse.info/exports/",
+         verify=input_options.verify_ssl,
+         headers=http_headers,
+@@ -1881,7 +1995,8 @@
+     fail_counter = 0
+     while True:
+         logup("Getting info for Kobo export", {"url": info_url})
+-        response = requests.get(
++        response = _treq_request(
++            "GET",
+             info_url,
+             verify=input_options.verify_ssl,
+             headers=http_headers
+@@ -1917,4 +2032,4 @@
+     return md5.hexdigest()
+ 
+ 
+-# end
++# end

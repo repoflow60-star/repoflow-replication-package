@@ -1,0 +1,512 @@
+--- a/maproulette/api/maproulette_server.py
++++ b/maproulette/api/maproulette_server.py
+@@ -1,9 +1,10 @@
+-"""This module contains the basic methods that handle API calls to the MapRoulette API. It uses the requests library to
++"""This module contains the basic methods that handle API calls to the MapRoulette API. It uses the aiohttp library to
+ accomplish this."""
+ 
+-import requests
++import aiohttp
++import asyncio
+ import json
+-import time
++import ssl
+ from .errors import HttpError, InvalidJsonError, ConnectionUnavailableError, UnauthorizedError, NotFoundError
+ 
+ 
+@@ -15,13 +16,31 @@
+         self.headers = configuration.headers
+         self.certs = configuration.certs
+         self.verify = configuration.verify
+-        if self.__check_health():
+-            self.session = requests.Session()
+-            self.session.headers = self.headers
+-            self.session.verify = self.verify
+-            self.session.cert = self.certs
+-
+-    def __check_health(self, retries=3, delay=5):
++        if self.verify is False:
++            self.ssl = ssl.create_default_context()
++            self.ssl.check_hostname = False
++            self.ssl.verify_mode = ssl.CERT_NONE
++        else:
++            self.ssl = ssl.create_default_context(
++                cafile=self.verify if isinstance(self.verify, str) else None
++            )
++        if self.certs:
++            if isinstance(self.certs, tuple):
++                self.ssl.load_cert_chain(self.certs[0], self.certs[1])
++            else:
++                self.ssl.load_cert_chain(self.certs)
++
++    @classmethod
++    async def create(cls, configuration):
++        self = cls(configuration)
++        if await self.__check_health():
++            self.session = aiohttp.ClientSession(
++                headers=self.headers,
++                connector=aiohttp.TCPConnector(ssl=self.ssl)
++            )
++        return self
++
++    async def __check_health(self, retries=3, delay=5):
+         """Checks health of connection to host by pinging the URL set in the configuration
+ 
+         :param retries: the number of reties to use to successfully ping the URL. Default is 3
+@@ -30,26 +49,26 @@
+         """
+         for i in range(retries):
+             try:
+-                response = requests.get(
++                async with aiohttp.request(
++                    'GET',
+                     self.base_url + '/ping',
+                     headers=self.headers,
+-                    verify=self.verify,
+-                    cert=self.certs
+-                )
+-                if not response.ok:
+-                    print(f"Unsuccessful connection. Retrying in {str(delay)} seconds")
+-                    time.sleep(delay)
+-                else:
+-                    return True
+-            except requests.exceptions.ConnectionError:
++                    ssl=self.ssl
++                ) as response:
++                    if response.status >= 400:
++                        print(f"Unsuccessful connection. Retrying in {str(delay)} seconds")
++                        await asyncio.sleep(delay)
++                    else:
++                        return True
++            except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
+                 print(f"Connection not available. Attempt {str(i+1)} out of {str(retries)}")
+-                time.sleep(delay)
++                await asyncio.sleep(delay)
+ 
+         raise ConnectionUnavailableError(
+             message='Specified server unavailable'
+         )
+ 
+-    def get(self, endpoint, params=None):
++    async def get(self, endpoint, params=None):
+         """Method that completes a GET request to the MapRoulette API
+ 
+         :param endpoint: the server endpoint to use for the GET request
+@@ -57,40 +76,39 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.get(
+-            self.url + endpoint,
+-            params=params
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 404:
+-                raise NotFoundError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(
+-                message=self.parse_response_message(e.response),
+-                status=e.response.status_code
+-            ) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
+-
+-    def post(self, endpoint, body=None, params=None):
++        try:
++            async with self.session.get(
++                self.url + endpoint,
++                params=params
++            ) as response:
++                response_text = await response.text()
++                try:
++                    response.raise_for_status()
++                except aiohttp.ClientResponseError as e:
++                    if response.status == 404:
++                        raise NotFoundError(
++                            message=await self.parse_response_message(response),
++                            status=response.status
++                        ) from None
++                    else:
++                        raise HttpError(
++                            message=await self.parse_response_message(response),
++                            status=response.status
++                        ) from None
++                try:
++                    return {
++                        "data": json.loads(response_text),
++                        "status": response.status
++                    }
++                except ValueError:
++                    return {
++                        "data": response_text,
++                        "status": response.status
++                    }
++        except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
++            raise ConnectionUnavailableError(e) from None
++
++    async def post(self, endpoint, body=None, params=None):
+         """Method that completes a POST request to the MapRoulette API
+ 
+         :param endpoint: the server endpoint to use for the POST request
+@@ -99,43 +117,45 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.post(
+-            self.url + endpoint,
+-            params=params,
+-            json=body
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 400:
+-                raise InvalidJsonError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            elif e.response.status_code == 401:
+-                raise UnauthorizedError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(e) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
+-
+-    def put(self, endpoint, body=None, params=None):
++        try:
++            async with self.session.post(
++                self.url + endpoint,
++                params=params,
++                json=body
++            ) as response:
++                response_text = await response.text()
++                try:
++                    response.raise_for_status()
++                except aiohttp.ClientResponseError as e:
++                    if response.status == 400:
++                        raise InvalidJsonError(
++                            message=await self.parse_response_message(response),
++                            status=response.status
++                        ) from None
++                    elif response.status == 401:
++                        raise UnauthorizedError(
++                            message=await self.parse_response_message(response),
++                            status=response.status
++                        ) from None
++                    else:
++                        raise HttpError(
++                            message=await self.parse_response_message(response),
++                            status=response.status
++                        ) from None
++                try:
++                    return {
++                        "data": json.loads(response_text),
++                        "status": response.status
++                    }
++                except ValueError:
++                    return {
++                        "data": response_text,
++                        "status": response.status
++                    }
++        except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
++            raise ConnectionUnavailableError(e) from None
++
++    async def put(self, endpoint, body=None, params=None):
+         """Method that completes a PUT request to the MapRoulette API
+ 
+         :param endpoint: the server endpoint to use for the PUT request
+@@ -144,43 +164,45 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.put(
+-            self.url + endpoint,
+-            params=params,
+-            json=body
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 400:
+-                raise InvalidJsonError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            elif e.response.status_code == 401:
+-                raise UnauthorizedError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(e) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
+-
+-    def put_file(self, endpoint, body=None, params=None):
++        try:
++            async with self.session.put(
++                self.url + endpoint,
++                params=params,
++                json=body
++            ) as response:
++                response_text = await response.text()
++                try:
++                    response.raise_for_status()
++                except aiohttp.ClientResponseError as e:
++                    if response.status == 400:
++                        raise InvalidJsonError(
++                            message=await self.parse_response_message(response),
++                            status=response.status
++                        ) from None
++                    elif response.status == 401:
++                        raise UnauthorizedError(
++                            message=await self.parse_response_message(response),
++                            status=response.status
++                        ) from None
++                    else:
++                        raise HttpError(
++                            message=await self.parse_response_message(response),
++                            status=response.status
++                        ) from None
++                try:
++                    return {
++                        "data": json.loads(response_text),
++                        "status": response.status
++                    }
++                except ValueError:
++                    return {
++                        "data": response_text,
++                        "status": response.status
++                    }
++        except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
++            raise ConnectionUnavailableError(e) from None
++
++    async def put_file(self, endpoint, body=None, params=None):
+         """Method that completes a multipart PUT request to the MapRoulette API
+ 
+         :param endpoint: the server endpoint to use for the PUT request
+@@ -189,43 +211,45 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.put(
+-            self.url + endpoint,
+-            params=params,
+-            files=body
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 400:
+-                raise InvalidJsonError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            elif e.response.status_code == 401:
+-                raise UnauthorizedError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(e) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
+-
+-    def delete(self, endpoint, params=None):
++        try:
++            async with self.session.put(
++                self.url + endpoint,
++                params=params,
++                data=body
++            ) as response:
++                response_text = await response.text()
++                try:
++                    response.raise_for_status()
++                except aiohttp.ClientResponseError as e:
++                    if response.status == 400:
++                        raise InvalidJsonError(
++                            message=await self.parse_response_message(response),
++                            status=response.status
++                        ) from None
++                    elif response.status == 401:
++                        raise UnauthorizedError(
++                            message=await self.parse_response_message(response),
++                            status=response.status
++                        ) from None
++                    else:
++                        raise HttpError(
++                            message=await self.parse_response_message(response),
++                            status=response.status
++                        ) from None
++                try:
++                    return {
++                        "data": json.loads(response_text),
++                        "status": response.status
++                    }
++                except ValueError:
++                    return {
++                        "data": response_text,
++                        "status": response.status
++                    }
++        except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
++            raise ConnectionUnavailableError(e) from None
++
++    async def delete(self, endpoint, params=None):
+         """Method that completes a DELETE request to the MapRoulette API
+ 
+         :param endpoint: the server endpoint to use for the DELETE request
+@@ -233,40 +257,42 @@
+         :returns: a dictionary containing the API response status code as well as the decoded JSON response if decoding
+             was successful. If not, the response text is returned.
+         """
+-        response = self.session.delete(
+-            self.url + endpoint,
+-            params=params
+-        )
+-        try:
+-            response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
+-            if e.response.status_code == 401:
+-                raise UnauthorizedError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            elif e.response.status_code == 404:
+-                raise NotFoundError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-            else:
+-                raise HttpError(
+-                    message=self.parse_response_message(e.response),
+-                    status=e.response.status_code
+-                ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(e) from None
+-        try:
+-            return {
+-                "data": response.json(),
+-                "status": response.status_code
+-            }
+-        except ValueError:
+-            return {
+-                "data": response.text,
+-                "status": response.status_code
+-            }
++        try:
++            async with self.session.delete(
++                self.url + endpoint,
++                params=params
++            ) as response:
++                response_text = await response.text()
++                try:
++                    response.raise_for_status()
++                except aiohttp.ClientResponseError as e:
++                    if response.status == 401:
++                        raise UnauthorizedError(
++                            message=await self.parse_response_message(response),
++                            status=response.status
++                        ) from None
++                    elif response.status == 404:
++                        raise NotFoundError(
++                            message=await self.parse_response_message(response),
++                            status=response.status
++                        ) from None
++                    else:
++                        raise HttpError(
++                            message=await self.parse_response_message(response),
++                            status=response.status
++                        ) from None
++                try:
++                    return {
++                        "data": json.loads(response_text),
++                        "status": response.status
++                    }
++                except ValueError:
++                    return {
++                        "data": response_text,
++                        "status": response.status
++                    }
++        except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
++            raise ConnectionUnavailableError(e) from None
+ 
+     @staticmethod
+     def is_json(input_object):
+@@ -283,13 +309,13 @@
+             return False
+ 
+     @staticmethod
+-    def parse_response_message(response):
++    async def parse_response_message(response):
+         """Method to determine the message body from a response object. Will return None if message cannot be parsed.
+ 
+-        :param response: the Requests response object
++        :param response: the aiohttp response object
+         :returns: the response message if parsable, otherwise None
+         """
+         try:
+-            return json.loads(response.text)['message']
++            return json.loads(await response.text())['message']
+         except (ValueError, KeyError):
+-            return None
++            return None

@@ -1,0 +1,239 @@
+--- a/hxl/input.py
++++ b/hxl/input.py
+@@ -33,7 +33,7 @@
+ 
+ import abc, collections, csv, datetime, dateutil.parser, hashlib, \
+     io, io_wrapper, json, jsonpath_ng.ext, logging, \
+-    os.path, re, requests, shutil, six, sys, \
++    os.path, pycurl, re, shutil, six, sys, \
+     tempfile, time, urllib.parse, xlrd3 as xlrd, zipfile
+ 
+ logger = logging.getLogger(__name__)
+@@ -164,6 +164,110 @@
+     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+     'application/vnd.ms-excel',
+ )
++
++
++########################################################################
++# HTTP helpers
++########################################################################
++
++class _HTTPResponse(object):
++    """Small pycurl-backed response object for the attributes used here."""
++
++    def __init__(self, url, status_code, headers, content):
++        self.url = url
++        self.status_code = status_code
++        self.headers = headers
++        self.content = content
++
++    @property
++    def is_redirect(self):
++        return self.status_code in range(300, 400) and self.headers.get('location') is not None
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise HXLIOException("HTTP error {} for {}".format(self.status_code, self.url), url=self.url)
++
++    def json(self):
++        return json.loads(self.content.decode('utf-8'))
++
++
++def _parse_http_headers(raw_headers):
++    headers = {}
++    blocks = [block for block in raw_headers.split(b'\r\n\r\n') if block.strip()]
++    if not blocks:
++        return headers
++    for line in blocks[-1].splitlines()[1:]:
++        try:
++            name, value = line.decode('iso-8859-1').split(':', 1)
++            headers[name.strip().lower()] = value.strip()
++        except ValueError:
++            pass
++    return headers
++
++
++def _encode_http_data(data):
++    if data is None:
++        return b''
++    if isinstance(data, bytes):
++        return data
++    if isinstance(data, str):
++        return data.encode('utf-8')
++    return urllib.parse.urlencode(data, doseq=True).encode('utf-8')
++
++
++def _http_request(method, url, verify=True, timeout=None, headers=None, params=None, data=None, follow_redirects=True):
++    if params:
++        separator = '&' if urllib.parse.urlparse(url).query else '?'
++        url = url + separator + urllib.parse.urlencode(params, doseq=True)
++
++    body = io.BytesIO()
++    raw_headers = io.BytesIO()
++    curl = pycurl.Curl()
++    try:
++        curl.setopt(pycurl.URL, url.encode('utf-8'))
++        curl.setopt(pycurl.WRITEDATA, body)
++        curl.setopt(pycurl.HEADERFUNCTION, raw_headers.write)
++        curl.setopt(pycurl.FOLLOWLOCATION, 1 if follow_redirects else 0)
++        curl.setopt(pycurl.SSL_VERIFYPEER, 1 if verify else 0)
++        curl.setopt(pycurl.SSL_VERIFYHOST, 2 if verify else 0)
++        encoding_option = getattr(pycurl, 'ACCEPT_ENCODING', None) or getattr(pycurl, 'ENCODING', None)
++        if encoding_option is not None:
++            curl.setopt(encoding_option, '')
++        if timeout is not None:
++            curl.setopt(pycurl.TIMEOUT_MS, int(float(timeout) * 1000))
++        if headers:
++            curl.setopt(pycurl.HTTPHEADER, ["{}: {}".format(name, value) for name, value in headers.items()])
++        if method == 'HEAD':
++            curl.setopt(pycurl.NOBODY, 1)
++        elif method == 'POST':
++            curl.setopt(pycurl.POST, 1)
++            curl.setopt(pycurl.POSTFIELDS, _encode_http_data(data))
++        else:
++            curl.setopt(pycurl.HTTPGET, 1)
++        curl.perform()
++        effective_url = curl.getinfo(pycurl.EFFECTIVE_URL) or url
++        return _HTTPResponse(
++            effective_url,
++            curl.getinfo(pycurl.RESPONSE_CODE),
++            _parse_http_headers(raw_headers.getvalue()),
++            body.getvalue()
++        )
++    except pycurl.error as e:
++        raise HXLIOException(str(e), url=url)
++    finally:
++        curl.close()
++
++
++def _http_get(url, verify=True, timeout=None, headers=None, params=None):
++    return _http_request('GET', url, verify=verify, timeout=timeout, headers=headers, params=params)
++
++
++def _http_head(url, verify=True, timeout=None, headers=None):
++    return _http_request('HEAD', url, verify=verify, timeout=timeout, headers=headers, follow_redirects=False)
++
++
++def _http_post(url, verify=True, timeout=None, headers=None, data=None):
++    return _http_request('POST', url, verify=verify, timeout=timeout, headers=headers, data=data)
+ 
+ 
+ ########################################################################
+@@ -621,9 +725,8 @@
+         try:
+             url = munge_url(url_or_filename, input_options)
+             logup("Trying to open remote resource", {"url": url_or_filename})
+-            response = requests.get(
++            response = _http_get(
+                 url,
+-                stream=True,
+                 verify=input_options.verify_ssl,
+                 timeout=input_options.timeout,
+                 headers=input_options.http_headers
+@@ -820,17 +923,17 @@
+ 
+ # Deprecated - will remove in future release
+ class RequestResponseIOWrapper(io.RawIOBase):
+-    """Wrapper for a Response object from the requests library.  Streaming
+-    in requests is a bit broken: for example, if you're streaming, the
++    """Wrapper for a streaming HTTP response object.  Streaming
++    can be problematic: for example, if you're streaming, the
+     stream from the raw property doesn't unzip the payload.
+     """
+ 
+     BUFFER_SIZE = 0x1000
+-    """Size of input chunk buffer from requests.raw.iter_content"""
++    """Size of input chunk buffer from response.raw.iter_content"""
+ 
+     def __init__(self, response):
+-        """Construct a wrapper around a requests response object
+-        @param response: the HTTP response from the requests library
++        """Construct a wrapper around an HTTP response object
++        @param response: the HTTP response
+         """
+         self.response = response
+         self.buffer = None
+@@ -838,7 +941,7 @@
+         self.iter = response.iter_content(self.BUFFER_SIZE) # iterator through the input
+ 
+     def read(self, size=-1):
+-        """Read raw byte input from the requests raw.iter_content iterator
++        """Read raw byte input from the raw.iter_content iterator
+         The function will unzip zipped content.
+         @param size: the maximum number of bytes to read, or -1 for all available.
+         """
+@@ -1644,7 +1747,7 @@
+     """
+ 
+     #
+-    # Stage 1: unpack indirect links (requires extra HTTP requests)
++    # Stage 1: unpack indirect links (requires extra HTTP calls)
+     #
+ 
+     # Is it a CKAN resource? (Assumes the v.3 API for now)
+@@ -1657,9 +1760,9 @@
+     result = re.match(GOOGLE_DRIVE_URL, url)
+     if result:
+         logup("HEAD request for Google Drive URL", {"url": url})
+-        response = requests.head(url)
++        response = _http_head(url, verify=input_options.verify_ssl, headers=input_options.http_headers)
+         if response.is_redirect:
+-            new_url = response.headers['Location']
++            new_url = response.headers['location']
+             logup("Google Drive redirect", {"url": url, "redirect": new_url})
+             logger.info("Following Google Drive redirect to %s", new_url)
+             url = new_url
+@@ -1752,7 +1855,7 @@
+         # CKAN resource URL
+         ckan_api_query = '{}/api/3/action/resource_show?id={}'.format(site_url, resource_id)
+         logup("Trying CKAN API call", {"url": ckan_api_query})
+-        ckan_api_result = requests.get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
++        ckan_api_result = _http_get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
+         if ckan_api_result['success']:
+             url = ckan_api_result['result']['url']
+             logup("Found candidate URL for CKAN dataset", {"url": url})
+@@ -1775,7 +1878,7 @@
+     else:
+         # CKAN dataset (package) URL
+         ckan_api_query = '{}/api/3/action/package_show?id={}'.format(site_url, dataset_id)
+-        ckan_api_result = requests.get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
++        ckan_api_result = _http_get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
+         if ckan_api_result['success']:
+             for resource in ckan_api_result['result']['resources']:
+                 url = resource['url']
+@@ -1825,7 +1928,7 @@
+         "q": "source:{}".format(asset_id)
+     }
+     logup("Trying Kobo dataset", {"url": asset_id})
+-    response = requests.get(
++    response = _http_get(
+         "https://kobo.humanitarianresponse.info/exports/",
+         verify=input_options.verify_ssl,
+         headers=input_options.http_headers,
+@@ -1861,10 +1964,10 @@
+         "hierarchy_in_labels": False,
+         "group_sep": ",",
+     }
+-    response = requests.post(
++    response = _http_post(
+         "https://kobo.humanitarianresponse.info/exports/",
+         verify=input_options.verify_ssl,
+-        headers=http_headers,
++        headers=input_options.http_headers,
+         data=params
+     )
+     logup("Generated Kobo export", {"asset_id": asset_id, "status": response.status_code})
+@@ -1881,10 +1984,10 @@
+     fail_counter = 0
+     while True:
+         logup("Getting info for Kobo export", {"url": info_url})
+-        response = requests.get(
++        response = _http_get(
+             info_url,
+             verify=input_options.verify_ssl,
+-            headers=http_headers
++            headers=input_options.http_headers
+         )
+         logup("Response for Kobo info", {"url": info_url, "status": response.status_code})
+ 

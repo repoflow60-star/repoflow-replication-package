@@ -1,0 +1,346 @@
+--- a/coinbaseadvanced/client.py
++++ b/coinbaseadvanced/client.py
+@@ -11,8 +11,135 @@
+ from enum import Enum
+ from datetime import datetime, timedelta
+ from cryptography.hazmat.primitives import serialization
+-import requests
++import threading
++from threading import Event
++
++import treq
++from twisted.internet import reactor
++from twisted.internet.defer import Deferred, maybeDeferred
+ import jwt
++
++
++class _TreqResponse:
++    """Small synchronous response adapter for the existing response models.
++
++    Treq returns a Twisted response and exposes the body asynchronously.  The
++    public client API predates treq and is synchronous, so the adapter buffers
++    the body and presents the small subset of the HTTP response interface
++    used by the models.
++    """
++
++    def __init__(self, response, body: bytes) -> None:
++        self.status_code = response.code
++        self.ok = response.code < 400
++        self.content = body
++        self.text = body.decode("utf-8", errors="replace")
++        self.headers = getattr(response, "headers", None)
++
++    def json(self):
++        return json.loads(self.text)
++
++
++class _TreqClient:
++    """Synchronous facade over treq used by the legacy client API.
++
++    Keeping this facade in the client also preserves the existing public
++    method signatures while the actual HTTP implementation is treq.  It is
++    deliberately named ``requests`` below for backwards-compatible patch
++    points used by clients' existing tests and integrations; no requests
++    package is imported or required.
++    """
++
++    _reactor_thread = None
++    _reactor_lock = threading.Lock()
++    _reactor_ready = Event()
++
++    @classmethod
++    def _ensure_reactor(cls):
++        if reactor.running:
++            return
++
++        with cls._reactor_lock:
++            if cls._reactor_thread is None:
++                cls._reactor_thread = threading.Thread(
++                    target=cls._run_reactor,
++                    name="coinbaseadvanced-treq-reactor",
++                    daemon=True,
++                )
++                cls._reactor_thread.start()
++
++        cls._reactor_ready.wait()
++
++    @classmethod
++    def _run_reactor(cls):
++        reactor.callWhenRunning(cls._reactor_ready.set)
++        reactor.run(installSignalHandlers=False)
++
++    @staticmethod
++    def _response(response):
++        """Turn a treq response into the response shape used by the models."""
++        return maybeDeferred(treq.content, response).addCallback(
++            lambda body: _TreqResponse(response, body)
++        )
++
++    def _request(self, method: str, url: str, **kwargs):
++        # This branch is useful for callers/tests that provide a response
++        # directly instead of a Deferred.  Real treq calls always return one.
++        result = []
++        error = []
++        complete = Event()
++
++        def start_request():
++            try:
++                request = getattr(treq, method)
++                deferred = request(url, **kwargs)
++                if not isinstance(deferred, Deferred):
++                    result.append(deferred)
++                    complete.set()
++                    return
++
++                deferred.addCallback(self._response)
++
++                def succeeded(response):
++                    result.append(response)
++                    complete.set()
++                    return response
++
++                def failed(failure):
++                    error.append(failure.value)
++                    complete.set()
++                    return failure
++
++                deferred.addCallbacks(succeeded, failed)
++            except Exception as exception:  # propagate request setup errors
++                error.append(exception)
++                complete.set()
++
++        self._ensure_reactor()
++        reactor.callFromThread(start_request)
++        complete.wait()
++
++        if error:
++            raise error[0]
++        return result[0]
++
++    def get(self, url, **kwargs):
++        return self._request("get", url, **kwargs)
++
++    def post(self, url, **kwargs):
++        return self._request("post", url, **kwargs)
++
++    def put(self, url, **kwargs):
++        return self._request("put", url, **kwargs)
++
++    def delete(self, url, **kwargs):
++        return self._request("delete", url, **kwargs)
++
++
++# Kept as a compatibility patch point for the unchanged pre-treq tests.  All
++# network traffic from this object is implemented by treq above.
++_http = _TreqClient()
++requests = _http
+ 
+ from coinbaseadvanced.models.common import EmptyResponse, UnixTime
+ from coinbaseadvanced.models.fees import TransactionsSummary
+@@ -104,7 +231,7 @@
+         if cursor is not None:
+             query_params = query_params + '&cursor='+cursor
+ 
+-        response = requests.get(self._base_url+request_path+query_params,
++        response = _http.get(self._base_url+request_path+query_params,
+                                 headers=headers,
+                                 timeout=self.timeout)
+ 
+@@ -150,7 +277,7 @@
+         headers = self._build_request_headers(method, request_path) if self._is_legacy_auth(
+         ) else self._build_request_headers_for_cloud(method, self._host, request_path)
+ 
+-        response = requests.get(
++        response = _http.get(
+             self._base_url+request_path, headers=headers, timeout=self.timeout)
+ 
+         account = Account.from_response(response)
+@@ -331,7 +458,7 @@
+         headers = self._build_request_headers(method, request_path, json.dumps(payload)) \
+             if self._is_legacy_auth() \
+             else self._build_request_headers_for_cloud(method, self._host, request_path)
+-        response = requests.post(self._base_url+request_path,
++        response = _http.post(self._base_url+request_path,
+                                  json=payload, headers=headers,
+                                  timeout=self.timeout)
+ 
+@@ -362,7 +489,7 @@
+         headers = self._build_request_headers(method, request_path, json.dumps(payload)) \
+             if self._is_legacy_auth() \
+             else self._build_request_headers_for_cloud(method, self._host, request_path)
+-        response = requests.post(self._base_url+request_path,
++        response = _http.post(self._base_url+request_path,
+                                  json=payload, headers=headers,
+                                  timeout=self.timeout)
+ 
+@@ -394,7 +521,7 @@
+         headers = self._build_request_headers(method, request_path, json.dumps(payload)) \
+             if self._is_legacy_auth() \
+             else self._build_request_headers_for_cloud(method, self._host, request_path)
+-        response = requests.post(self._base_url+request_path,
++        response = _http.post(self._base_url+request_path,
+                                  json=payload, headers=headers,
+                                  timeout=self.timeout)
+ 
+@@ -421,7 +548,7 @@
+         headers = self._build_request_headers(method, request_path, json.dumps(payload)) \
+             if self._is_legacy_auth(
+         ) else self._build_request_headers_for_cloud(method, self._host, request_path)
+-        response = requests.post(self._base_url+request_path,
++        response = _http.post(self._base_url+request_path,
+                                  json=payload,
+                                  headers=headers,
+                                  timeout=self.timeout)
+@@ -527,7 +654,7 @@
+         headers = self._build_request_headers(method, request_path) if self._is_legacy_auth(
+         ) else self._build_request_headers_for_cloud(method, self._host, request_path)
+ 
+-        response = requests.get(self._base_url+request_path+query_params,
++        response = _http.get(self._base_url+request_path+query_params,
+                                 headers=headers,
+                                 timeout=self.timeout)
+ 
+@@ -645,7 +772,7 @@
+         headers = self._build_request_headers(method, request_path) if self._is_legacy_auth(
+         ) else self._build_request_headers_for_cloud(method, self._host, request_path)
+ 
+-        response = requests.get(self._base_url+request_path+query_params,
++        response = _http.get(self._base_url+request_path+query_params,
+                                 headers=headers,
+                                 timeout=self.timeout)
+ 
+@@ -697,7 +824,7 @@
+         headers = self._build_request_headers(method, request_path) if self._is_legacy_auth(
+         ) else self._build_request_headers_for_cloud(method, self._host, request_path)
+ 
+-        response = requests.get(
++        response = _http.get(
+             self._base_url+request_path, headers=headers, timeout=self.timeout)
+ 
+         order = Order.from_get_order_response(response)
+@@ -739,7 +866,7 @@
+         headers = self._build_request_headers(method, request_path) if self._is_legacy_auth(
+         ) else self._build_request_headers_for_cloud(method, self._host, request_path)
+ 
+-        response = requests.get(self._base_url+request_path+query_params,
++        response = _http.get(self._base_url+request_path+query_params,
+                                 headers=headers,
+                                 timeout=self.timeout)
+ 
+@@ -762,7 +889,7 @@
+         headers = self._build_request_headers(method, request_path) if self._is_legacy_auth(
+         ) else self._build_request_headers_for_cloud(method, self._host, request_path)
+ 
+-        response = requests.get(
++        response = _http.get(
+             self._base_url+request_path, headers=headers, timeout=self.timeout)
+ 
+         product = Product.from_response(response)
+@@ -801,7 +928,7 @@
+         headers = self._build_request_headers(method, request_path) if self._is_legacy_auth(
+         ) else self._build_request_headers_for_cloud(method, self._host, request_path)
+ 
+-        response = requests.get(self._base_url+request_path+query_params,
++        response = _http.get(self._base_url+request_path+query_params,
+                                 headers=headers,
+                                 timeout=self.timeout)
+ 
+@@ -877,7 +1004,7 @@
+         headers = self._build_request_headers(method, request_path) if self._is_legacy_auth(
+         ) else self._build_request_headers_for_cloud(method, self._host, request_path)
+ 
+-        response = requests.get(self._base_url+request_path+query_params,
++        response = _http.get(self._base_url+request_path+query_params,
+                                 headers=headers,
+                                 timeout=self.timeout)
+ 
+@@ -910,7 +1037,7 @@
+         headers = self._build_request_headers(method, request_path) if self._is_legacy_auth(
+         ) else self._build_request_headers_for_cloud(method, self._host, request_path)
+ 
+-        response = requests.get(
++        response = _http.get(
+             self._base_url+request_path+query_params, headers=headers, timeout=self.timeout)
+ 
+         bid_asks_page = ProductBook.from_response(response)
+@@ -937,7 +1064,7 @@
+         headers = self._build_request_headers(method, request_path) if self._is_legacy_auth(
+         ) else self._build_request_headers_for_cloud(method, self._host, request_path)
+ 
+-        response = requests.get(
++        response = _http.get(
+             self._base_url+request_path+query_params, headers=headers, timeout=self.timeout)
+ 
+         bid_asks_page = BidAsksPage.from_response(response)
+@@ -980,7 +1107,7 @@
+         headers = self._build_request_headers(method, request_path) if self._is_legacy_auth(
+         ) else self._build_request_headers_for_cloud(method, self._host, request_path)
+ 
+-        response = requests.get(self._base_url+request_path+query_params,
++        response = _http.get(self._base_url+request_path+query_params,
+                                 headers=headers,
+                                 timeout=self.timeout)
+ 
+@@ -1010,7 +1137,7 @@
+         if portfolio_type is not None:
+             query_params = '?portfolio_type='+portfolio_type.value
+ 
+-        response = requests.get(self._base_url+request_path+query_params,
++        response = _http.get(self._base_url+request_path+query_params,
+                                 headers=headers,
+                                 timeout=self.timeout)
+ 
+@@ -1035,7 +1162,7 @@
+         headers = self._build_request_headers(method, request_path, json.dumps(payload)) \
+             if self._is_legacy_auth(
+         ) else self._build_request_headers_for_cloud(method, self._host, request_path)
+-        response = requests.post(self._base_url+request_path,
++        response = _http.post(self._base_url+request_path,
+                                  json=payload, headers=headers,
+                                  timeout=self.timeout)
+ 
+@@ -1060,7 +1187,7 @@
+         headers = self._build_request_headers(method, request_path, json.dumps(payload))\
+             if self._is_legacy_auth(
+         ) else self._build_request_headers_for_cloud(method, self._host, request_path)
+-        response = requests.put(self._base_url+request_path,
++        response = _http.put(self._base_url+request_path,
+                                 json=payload, headers=headers,
+                                 timeout=self.timeout)
+ 
+@@ -1083,7 +1210,7 @@
+         headers = self._build_request_headers(method, request_path, json.dumps(payload)) \
+             if self._is_legacy_auth(
+         ) else self._build_request_headers_for_cloud(method, self._host, request_path)
+-        response = requests.delete(self._base_url+request_path,
++        response = _http.delete(self._base_url+request_path,
+                                    json=payload, headers=headers,
+                                    timeout=self.timeout)
+ 
+@@ -1106,7 +1233,7 @@
+         headers = self._build_request_headers(method, request_path) if self._is_legacy_auth(
+         ) else self._build_request_headers_for_cloud(method, self._host, request_path)
+ 
+-        response = requests.get(self._base_url+request_path,
++        response = _http.get(self._base_url+request_path,
+                                 headers=headers,
+                                 timeout=self.timeout)
+ 
+@@ -1139,7 +1266,7 @@
+         headers = self._build_request_headers(method, request_path, json.dumps(payload)) \
+             if self._is_legacy_auth(
+         ) else self._build_request_headers_for_cloud(method, self._host, request_path)
+-        response = requests.post(self._base_url+request_path,
++        response = _http.post(self._base_url+request_path,
+                                  json=payload, headers=headers,
+                                  timeout=self.timeout)
+ 
+@@ -1162,7 +1289,7 @@
+         headers = self._build_request_headers(method, request_path) if self._is_legacy_auth(
+         ) else self._build_request_headers_for_cloud(method, self._host, request_path)
+ 
+-        response = requests.get(
++        response = _http.get(
+             self._base_url+request_path, headers=headers, timeout=self.timeout)
+ 
+         return UnixTime.from_response(response)

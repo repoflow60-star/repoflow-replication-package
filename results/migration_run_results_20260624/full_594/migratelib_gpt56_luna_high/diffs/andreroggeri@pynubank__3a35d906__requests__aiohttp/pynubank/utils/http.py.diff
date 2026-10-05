@@ -1,0 +1,114 @@
+--- a/pynubank/utils/http.py
++++ b/pynubank/utils/http.py
+@@ -1,5 +1,11 @@
+-from requests import Response
+-from requests_pkcs12 import get, post
++import os
++import ssl
++import tempfile
++
++import aiohttp
++from aiohttp import ClientResponse
++from cryptography.hazmat.primitives import serialization
++from cryptography.hazmat.primitives.serialization import pkcs12
+ 
+ from pynubank import NuRequestException
+ 
+@@ -8,6 +14,7 @@
+ 
+     def __init__(self):
+         self._cert = None
++        self._session = None
+         self._headers = {
+             'Content-Type': 'application/json',
+             'X-Correlation-Id': 'and-7-86-2-1000005524.9twu3pgr',
+@@ -28,22 +35,77 @@
+ 
+     @property
+     def _cert_args(self):
+-        return {'pkcs12_data': self._cert, 'pkcs12_password': ''} if self._cert else {}
++        if not self._cert:
++            return {}
+ 
+-    def _handle_response(self, response: Response) -> dict:
+-        if response.status_code != 200:
++        private_key, certificate, additional_certificates = pkcs12.load_key_and_certificates(
++            self._cert,
++            b'',
++        )
++
++        ssl_context = ssl.create_default_context()
++
++        with tempfile.TemporaryDirectory() as directory:
++            cert_path = os.path.join(directory, 'certificate.pem')
++            key_path = os.path.join(directory, 'private_key.pem')
++
++            with open(cert_path, 'wb') as cert_file:
++                cert_file.write(certificate.public_bytes(serialization.Encoding.PEM))
++
++                for additional_certificate in additional_certificates or ():
++                    cert_file.write(
++                        additional_certificate.public_bytes(serialization.Encoding.PEM)
++                    )
++
++            with open(key_path, 'wb') as key_file:
++                key_file.write(
++                    private_key.private_bytes(
++                        encoding=serialization.Encoding.PEM,
++                        format=serialization.PrivateFormat.PKCS8,
++                        encryption_algorithm=serialization.NoEncryption(),
++                    )
++                )
++
++            ssl_context.load_cert_chain(certfile=cert_path, keyfile=key_path)
++
++        return {'ssl': ssl_context}
++
++    async def _handle_response(self, response: ClientResponse) -> dict:
++        if response.status != 200:
+             raise NuRequestException(response)
+ 
+-        return response.json()
++        return await response.json(content_type=None)
+ 
+-    def raw_get(self, url: str) -> Response:
+-        return get(url, headers=self._headers, **self._cert_args)
++    async def raw_get(self, url: str) -> ClientResponse:
++        if self._session is None or self._session.closed:
++            self._session = aiohttp.ClientSession()
+ 
+-    def raw_post(self, url: str, json: dict) -> Response:
+-        return post(url, json=json, headers=self._headers, **self._cert_args)
++        response = await self._session.get(url, headers=self._headers, **self._cert_args)
++        await response.read()
+ 
+-    def get(self, url: str) -> dict:
+-        return self._handle_response(self.raw_get(url))
++        return response
+ 
+-    def post(self, url: str, json: dict) -> dict:
+-        return self._handle_response(post(url, json=json, headers=self._headers, **self._cert_args))
++    async def raw_post(self, url: str, json: dict) -> ClientResponse:
++        if self._session is None or self._session.closed:
++            self._session = aiohttp.ClientSession()
++
++        response = await self._session.post(
++            url,
++            json=json,
++            headers=self._headers,
++            **self._cert_args
++        )
++        await response.read()
++
++        return response
++
++    async def get(self, url: str) -> dict:
++        return await self._handle_response(await self.raw_get(url))
++
++    async def post(self, url: str, json: dict) -> dict:
++        return await self._handle_response(await self.raw_post(url, json))
++
++    async def close(self):
++        if self._session is not None:
++            await self._session.close()
++            self._session = None

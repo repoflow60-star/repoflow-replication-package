@@ -1,0 +1,170 @@
+--- a/ldnlib/base.py
++++ b/ldnlib/base.py
+@@ -1,5 +1,13 @@
+ from rdflib import Graph, URIRef
+-import requests
++import base64
++import json
++import ssl
++from urllib.parse import urlencode, urlsplit, urlunsplit
++
++import urllib3
++
++
++HTTP = urllib3.PoolManager(retries=False)
+ 
+ 
+ class BaseLDN(object):
+@@ -14,18 +22,144 @@
+     def __init__(self, **kwargs):
+         self.accept_headers = kwargs.get('accept_headers', self.ACCEPT_HEADERS)
+ 
++    def _request(self, method, url, **kwargs):
++        """Issue a request through urllib3 with the public API's options."""
++        allow_redirects = kwargs.pop('allow_redirects', True)
++        headers = kwargs.pop('headers', None)
++        headers = dict(headers or {})
++
++        params = kwargs.pop('params', None)
++        if params:
++            parts = urlsplit(url)
++            if isinstance(params, (dict, list, tuple)):
++                query = urlencode(params, doseq=True)
++            else:
++                query = params.decode('ascii') if isinstance(params, bytes) \
++                    else str(params)
++            if parts.query:
++                query = '{}&{}'.format(parts.query, query)
++            url = urlunsplit((parts.scheme, parts.netloc, parts.path,
++                              query, parts.fragment))
++
++        body = kwargs.pop('body', None)
++        if body is None and 'data' in kwargs:
++            body = kwargs.pop('data')
++            if isinstance(body, (dict, list, tuple)):
++                body = urlencode(body, doseq=True)
++                if not any(key.lower() == 'content-type'
++                           for key in headers):
++                    headers['content-type'] = \
++                        'application/x-www-form-urlencoded'
++
++        if 'json' in kwargs:
++            body = json.dumps(kwargs.pop('json'))
++            if not any(key.lower() == 'content-type' for key in headers):
++                headers['content-type'] = 'application/json'
++
++        auth = kwargs.pop('auth', None)
++        if auth:
++            username, password = auth
++            credentials = '{}:{}'.format(username, password).encode('utf-8')
++            if not any(key.lower() == 'authorization' for key in headers):
++                headers['authorization'] = 'Basic {}'.format(
++                    base64.b64encode(credentials).decode('ascii'))
++
++        cookies = kwargs.pop('cookies', None)
++        if cookies and not any(key.lower() == 'cookie' for key in headers):
++            headers['cookie'] = '; '.join(
++                '{}={}'.format(name, value)
++                for name, value in cookies.items())
++
++        request_kwargs = dict(kwargs)
++        request_kwargs['headers'] = headers
++        request_kwargs['redirect'] = allow_redirects
++        if body is not None:
++            request_kwargs['body'] = body
++
++        timeout = request_kwargs.pop('timeout', None)
++        if isinstance(timeout, tuple):
++            timeout = urllib3.util.Timeout(connect=timeout[0],
++                                           read=timeout[1])
++        if timeout is not None:
++            request_kwargs['timeout'] = timeout
++
++        verify = request_kwargs.pop('verify', True)
++        request_kwargs['cert_reqs'] = (ssl.CERT_REQUIRED if verify
++                                       else ssl.CERT_NONE)
++        if isinstance(verify, str):
++            request_kwargs['ca_certs'] = verify
++
++        cert = request_kwargs.pop('cert', None)
++        if cert:
++            if isinstance(cert, tuple):
++                request_kwargs['cert_file'], request_kwargs['key_file'] = cert
++            else:
++                request_kwargs['cert_file'] = cert
++
++        if request_kwargs.pop('stream', False):
++            request_kwargs['preload_content'] = False
++
++        proxies = request_kwargs.pop('proxies', None)
++        manager = HTTP
++        if proxies:
++            proxy = proxies.get(urlsplit(url).scheme) or proxies.get('http')
++            if proxy:
++                manager = urllib3.ProxyManager(proxy)
++
++        return manager.request(method, url, **request_kwargs)
++
++    def _raise_for_status(self, response):
++        if response.status >= 400:
++            raise urllib3.exceptions.HTTPError(
++                'HTTP Error {}'.format(response.status))
++
++    def _response_text(self, response):
++        data = response.data
++        if not isinstance(data, bytes):
++            return data
++
++        content_type = response.headers.get('content-type', '')
++        encoding = 'utf-8'
++        for parameter in content_type.split(';')[1:]:
++            name, separator, value = parameter.partition('=')
++            if separator and name.strip().lower() == 'charset':
++                encoding = value.strip().strip('"')
++                break
++        try:
++            return data.decode(encoding)
++        except (LookupError, UnicodeDecodeError):
++            return data.decode('utf-8', errors='replace')
++
++    def _response_json(self, response):
++        return json.loads(self._response_text(response))
++
++    def _response_inbox(self, response):
++        link_header = response.headers.get('link', '')
++        for link in link_header.split(','):
++            parts = [part.strip() for part in link.split(';')]
++            if not parts or not parts[0].startswith('<'):
++                continue
++            rel = ''
++            for parameter in parts[1:]:
++                name, separator, value = parameter.partition('=')
++                if separator and name.strip().lower() == 'rel':
++                    rel = value.strip().strip('"')
++                    break
++            if self.LDP_INBOX in rel.split():
++                return parts[0][1:-1]
++
+     def __discover_head(self, target, **kwargs):
+-        r = requests.head(target, **kwargs)
+-        r.raise_for_status()
+-        if self.LDP_INBOX in r.links:
+-            return r.links[self.LDP_INBOX].get('url')
++        r = self._request('HEAD', target, **kwargs)
++        self._raise_for_status(r)
++        return self._response_inbox(r)
+ 
+     def __discover_get(self, target, **kwargs):
+-        r = requests.get(target, **kwargs)
+-        r.raise_for_status()
++        r = self._request('GET', target, **kwargs)
++        self._raise_for_status(r)
+         # TODO -- check for HTML
+-        g = Graph().parse(data=r.text, format=self.content_type_to_mime_type(
+-            r.headers['content-type']))
++        g = Graph().parse(data=self._response_text(r),
++                          format=self.content_type_to_mime_type(
++                              r.headers['content-type']))
+ 
+         for (subject, inbox) in g[:URIRef(self.LDP_INBOX)]:
+             return str(inbox)

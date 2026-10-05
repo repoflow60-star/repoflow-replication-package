@@ -1,0 +1,124 @@
+--- a/bpemb/util.py
++++ b/bpemb/util.py
+@@ -12,32 +12,83 @@
+ 
+ # source: https://github.com/allenai/allennlp/blob/master/allennlp/common/file_utils.py#L147  # NOQA
+ def http_get_temp(url: str, temp_file: IO) -> None:
+-    import requests
+-    import warnings
+-    from urllib3.exceptions import InsecureRequestWarning
++    """Download *url* into an open temporary file using treq.
+ 
+-    # temporary fix for dealing with this SSL certificate issue:
+-    # https://github.com/bheinzerling/bpemb/issues/63
+-    with warnings.catch_warnings():
+-        warnings.simplefilter("ignore", InsecureRequestWarning)
+-        req = requests.get(url, stream=True, verify=False)
++    treq is built on Twisted and therefore returns Deferreds rather than
++    blocking responses.  The rest of this module has a synchronous API, so a
++    short-lived reactor is used here to preserve that API while the response
++    body is streamed to ``temp_file``.
++    """
++    import treq
++    from twisted.internet.selectreactor import SelectReactor
++    from twisted.internet.ssl import CertificateOptions
++    from twisted.web.client import Agent
++    from twisted.web.iweb import IPolicyForHTTPS
++    from twisted.python.failure import Failure
++    from zope.interface import implementer
+ 
+-    req.raise_for_status()
+-    content_length = req.headers.get('Content-Length')
+-    total = int(content_length) if content_length is not None else None
+-    try:
+-        from tqdm import tqdm
+-        progress = tqdm(unit="B", total=total)
+-    except ImportError:
+-        progress = None
+-    for chunk in req.iter_content(chunk_size=1024):
+-        if chunk:  # filter out keep-alive new chunks
++    @implementer(IPolicyForHTTPS)
++    class InsecurePolicy:
++        def creatorForNetloc(self, hostname, port):
++            # CertificateOptions(verify=False) retains the behaviour of the
++            # old requests call for the certificate problem in issue #63.
++            return CertificateOptions(verify=False)
++
++    reactor = SelectReactor()
++    agent = Agent(reactor, contextFactory=InsecurePolicy())
++    result = []
++
++    def write_response(response):
++        if response.code >= 400:
++            raise RuntimeError(
++                "HTTP error {} while downloading {}".format(
++                    response.code, url))
++
++        content_length = response.headers.getRawHeaders(b"Content-Length")
++        total = int(content_length[0]) if content_length else None
++        try:
++            from tqdm import tqdm
++            progress = tqdm(unit="B", total=total)
++        except ImportError:
++            progress = None
++
++        def write_chunk(chunk):
++            if chunk:
++                if progress is not None:
++                    progress.update(len(chunk))
++                temp_file.write(chunk)
++
++        def finished(_):
+             if progress is not None:
+-                progress.update(len(chunk))
+-            temp_file.write(chunk)
+-    if progress is not None:
+-        progress.close()
+-    return req.headers
++                progress.close()
++            return response.headers
++
++        return response.collect(write_chunk).addCallback(finished)
++
++    def complete(value):
++        result.append(value)
++        if reactor.running:
++            reactor.stop()
++        else:
++            reactor.callWhenRunning(reactor.stop)
++        # Store failures for the synchronous caller instead of leaving an
++        # unhandled Deferred behind after the reactor has stopped.
++        return None
++
++    deferred = treq.get(
++        url,
++        agent=agent,
++        reactor=reactor,
++        persistent=False,
++    )
++    deferred.addCallback(write_response)
++    deferred.addBoth(complete)
++    reactor.run()
++
++    value = result[0]
++    if isinstance(value, Failure):
++        value.raiseException()
++    return value
+ 
+ 
+ # source: https://github.com/allenai/allennlp/blob/master/allennlp/common/file_utils.py#L147  # NOQA
+@@ -51,7 +102,13 @@
+         # shutil.copyfileobj() starts at current position, so go to the start
+         temp_file.seek(0)
+         outfile.parent.mkdir(exist_ok=True, parents=True)
+-        content_header = headers.get("Content-Type")
++        if hasattr(headers, "getRawHeaders"):
++            content_values = headers.getRawHeaders(b"Content-Type")
++            content_header = (
++                content_values[0].decode("latin1")
++                if content_values else None)
++        else:
++            content_header = headers.get("Content-Type")
+         if content_header and "gzip" in content_header:
+             import tarfile
+             tf = tarfile.open(fileobj=temp_file)

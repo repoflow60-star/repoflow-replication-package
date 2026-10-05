@@ -1,0 +1,226 @@
+--- a/certbot_dns_infomaniak/dns_infomaniak.py
++++ b/certbot_dns_infomaniak/dns_infomaniak.py
+@@ -5,9 +5,11 @@
+ """DNS Authenticator for Infomaniak"""
+ import json
+ import logging
++import threading
+ import idna
+ 
+-import requests
++import treq
++from twisted.internet import defer, reactor
+ 
+ from certbot import errors
+ from certbot.plugins import dns_common
+@@ -17,6 +19,83 @@
+     import os
+ 
+ logger = logging.getLogger(__name__)
++
++
++class _SyncTreq:
++    """Run treq calls synchronously for Certbot's synchronous plugin API."""
++
++    _lock = threading.Lock()
++    _reactor_started = False
++    _reactor_ready = threading.Event()
++
++    @classmethod
++    def _ensure_reactor(cls):
++        if reactor.running:
++            return
++
++        with cls._lock:
++            if not cls._reactor_started:
++                cls._reactor_started = True
++
++                def run_reactor():
++                    cls._reactor_ready.set()
++                    reactor.run(installSignalHandlers=False)
++
++                thread = threading.Thread(
++                    target=run_reactor,
++                    name="infomaniak-treq-reactor",
++                )
++                thread.daemon = True
++                thread.start()
++
++        cls._reactor_ready.wait()
++
++    @classmethod
++    def call(cls, operation):
++        cls._ensure_reactor()
++        completed = threading.Event()
++        result = []
++
++        def succeeded(value):
++            result.append((True, value))
++            completed.set()
++            return value
++
++        def failed(failure):
++            result.append((False, failure))
++            completed.set()
++            return failure
++
++        def start_operation():
++            request = defer.maybeDeferred(operation)
++            request.addCallbacks(succeeded, failed)
++
++        reactor.callFromThread(start_operation)
++        completed.wait()
++        if result[0][0]:
++            return result[0][1]
++        result[0][1].raiseException()
++
++
++class _TreqSession:
++    """Keep common headers while issuing requests through treq."""
++
++    def __init__(self, headers=None):
++        self.headers = headers or {}
++
++    def request(self, method, url, **kwargs):
++        headers = dict(self.headers)
++        headers.update(kwargs.pop("headers", {}))
++        return treq.request(method, url, headers=headers, **kwargs)
++
++    def get(self, url, **kwargs):
++        return self.request("GET", url, **kwargs)
++
++    def post(self, url, **kwargs):
++        return self.request("POST", url, **kwargs)
++
++    def delete(self, url, **kwargs):
++        return self.request("DELETE", url, **kwargs)
+ 
+ 
+ class Authenticator(dns_common.DNSAuthenticator):
+@@ -86,8 +165,19 @@
+         :param str token: oauth2 token to consume Infomaniak API
+         """
+         self.token = token
+-        self.session = requests.Session()
+-        self.session.headers.update({"Authorization": "Bearer {token}".format(token=self.token)})
++        self.session = _TreqSession(
++            {
++                b"Authorization": [
++                    "Bearer {token}".format(token=self.token).encode("utf-8")
++                ]
++            }
++        )
++
++    def _request_json(self, method, url, **kwargs):
++        request = getattr(self.session, method.lower())(url, **kwargs)
++        request.addCallback(treq.content)
++        request.addCallback(json.loads)
++        return request
+ 
+     def _get_request(self, url, payload=None):
+         """Performs a GET request against API
+@@ -97,20 +187,21 @@
+         """
+         url = self.baseUrl + url
+         logger.debug("GET %s", url)
+-        with self.session.get(url, params=payload) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            if result["error"]["code"] == "not_authorized":
+-                raise errors.PluginError("cannot authenticate")
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++        try:
++            result = _SyncTreq.call(
++                lambda: self._request_json("GET", url, params=payload)
++            )
++        except json.decoder.JSONDecodeError as exc:
++            raise errors.PluginError("no JSON in API response") from exc
++        if result["result"] == "success":
++            return result["data"]
++        if result["error"]["code"] == "not_authorized":
++            raise errors.PluginError("cannot authenticate")
++        raise errors.PluginError(
++            "error in API request: {} / {}".format(
++                result["error"]["code"], result["error"]["description"]
++            )
++        )
+ 
+     def _post_request(self, url, payload):
+         """Performs a POST request
+@@ -119,21 +210,24 @@
+         :param dict payload : body of request
+         """
+         url = self.baseUrl + url
+-        headers = {"Content-Type": "application/json"}
+-        json_data = json.dumps(payload)
++        headers = {b"Content-Type": [b"application/json"]}
++        json_data = json.dumps(payload).encode("utf-8")
+         logger.debug("POST %s", url)
+-        with self.session.post(url, data=json_data, headers=headers) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
++        try:
++            result = _SyncTreq.call(
++                lambda: self._request_json(
++                    "POST", url, data=json_data, headers=headers
+                 )
+             )
++        except json.decoder.JSONDecodeError as exc:
++            raise errors.PluginError("no JSON in API response") from exc
++        if result["result"] == "success":
++            return result["data"]
++        raise errors.PluginError(
++            "error in API request: {} / {}".format(
++                result["error"]["code"], result["error"]["description"]
++            )
++        )
+ 
+     def _delete_request(self, url):
+         """Performs a POST request
+@@ -142,18 +236,19 @@
+         """
+         url = self.baseUrl + url
+         logger.debug("DELETE %s", url)
+-        with self.session.delete(url) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++        try:
++            result = _SyncTreq.call(
++                lambda: self._request_json("DELETE", url)
++            )
++        except json.decoder.JSONDecodeError as exc:
++            raise errors.PluginError("no JSON in API response") from exc
++        if result["result"] == "success":
++            return result["data"]
++        raise errors.PluginError(
++            "error in API request: {} / {}".format(
++                result["error"]["code"], result["error"]["description"]
++            )
++        )
+ 
+     def _get_records(self, domain, domain_id, record):
+         """Find record matching arguments

@@ -1,0 +1,214 @@
+--- a/pdpyras.py
++++ b/pdpyras.py
+@@ -3,24 +3,194 @@
+ # See LICENSE for details.
+ 
+ # Standard libraries
++import json
+ import logging
+ import sys
++import threading
+ import time
+ from copy import deepcopy
+-from datetime import datetime
++from datetime import datetime, timedelta
+ from random import random
+ from typing import Iterator, Union
+ from warnings import warn
+ 
+-# Upstream components on which this client is based:
+-from requests import Response, Session
+-from requests import __version__ as REQUESTS_VERSION
+-
+-# HTTP client exceptions:
+-from urllib3.exceptions import HTTPError, PoolError
+-from requests.exceptions import RequestException
++# Upstream component on which this client is based:
++import treq
++from treq import __version__ as TREQ_VERSION
++from twisted.internet import reactor
++from twisted.python.failure import Failure
++
++# These exception names are retained as part of pdpyras' public surface.  treq
++# reports transport failures through Twisted Deferreds rather than exposing the
++# requests/urllib3 exception hierarchy.
++class RequestException(Exception):
++    """Base exception for errors raised while making a treq request."""
++
++
++HTTPError = RequestException
++PoolError = RequestException
++
++# Keep the historical user-agent component for callers that rely on it.  This
++# is only an identifier; all HTTP transport is provided by treq below.
++REQUESTS_VERSION = '2.34.2'
+ 
+ __version__ = '5.4.0'
++
++
++class _TreqResponse:
++    """Small synchronous response facade over treq's asynchronous response.
++
++    pdpyras intentionally has a synchronous API.  treq returns a Deferred and
++    its response body methods are asynchronous, so the adapter buffers the
++    body before returning and exposes the response attributes used by the
++    existing pdpyras API.
++    """
++
++    def __init__(self, response, body, method, url, elapsed):
++        self._response = response
++        self._body = body
++        self.status_code = response.code
++        self.ok = self.status_code < 400
++        self.url = url
++        self.headers = {
++            key.decode('latin-1') if isinstance(key, bytes) else key:
++            (values[0].decode('latin-1') if values and isinstance(values[0], bytes)
++             else (values[0] if values else ''))
++            for key, values in response.headers.getAllRawHeaders()
++        }
++        self.request = type('Request', (), {'method': method, 'url': url})()
++        self.elapsed = elapsed
++
++    @property
++    def content(self):
++        return self._body
++
++    @property
++    def text(self):
++        content_type = self.headers.get('content-type', '')
++        encoding = 'utf-8'
++        if 'charset=' in content_type.lower():
++            encoding = content_type.lower().split('charset=', 1)[1].split(';', 1)[0].strip()
++        return self._body.decode(encoding, errors='replace')
++
++    def json(self):
++        return json.loads(self.text)
++
++
++_reactor_started = threading.Event()
++_reactor_lock = threading.Lock()
++_reactor_thread = None
++
++
++def _start_treq_reactor():
++    """Start one background reactor for synchronous treq calls."""
++    global _reactor_thread
++    with _reactor_lock:
++        if reactor.running:
++            return
++        if _reactor_thread is None:
++            def run_reactor():
++                reactor.callWhenRunning(_reactor_started.set)
++                reactor.run(installSignalHandlers=False)
++            _reactor_thread = threading.Thread(
++                target=run_reactor, name='pdpyras-treq-reactor', daemon=True)
++            _reactor_thread.start()
++    _reactor_started.wait()
++
++
++def _treq_request(method, url, **kwargs):
++    """Make one treq request and synchronously return its buffered response."""
++    if reactor.running and (_reactor_thread is None or
++                            threading.current_thread() is _reactor_thread):
++        raise RequestException(
++            'Cannot make a synchronous treq request from a running reactor.')
++    _start_treq_reactor()
++    completed = threading.Event()
++    result = []
++    started = time.monotonic()
++
++    def begin():
++        try:
++            # ``stream`` is a requests-only option.  treq buffers responses by
++            # default, which is the behavior this synchronous API requires.
++            treq_kwargs = dict(kwargs)
++            treq_kwargs.pop('stream', None)
++            deferred = treq.request(method, url, **treq_kwargs)
++
++            def got_response(response):
++                def got_body(body):
++                    result.append(_TreqResponse(
++                        response, body, method, url,
++                        timedelta(seconds=time.monotonic() - started)))
++                    completed.set()
++                    return body
++                deferred_body = response.content()
++                deferred_body.addCallback(got_body)
++                return deferred_body
++
++            def failed(failure):
++                result.append(failure.value if isinstance(failure, Failure)
++                              else failure)
++                completed.set()
++                return failure
++
++            deferred.addCallback(got_response)
++            deferred.addErrback(failed)
++        except Exception as error:
++            result.append(error)
++            completed.set()
++
++    reactor.callFromThread(begin)
++    completed.wait()
++    error = result[0]
++    if isinstance(error, BaseException):
++        raise RequestException(str(error)) from error
++    return error
++
++
++class _TreqSession:
++    """Session-shaped adapter used to preserve pdpyras' synchronous API."""
++
++    def __init__(self):
++        self.headers = {}
++
++    def request(self, method, url, **kwargs):
++        return _treq_request(method, url, **kwargs)
++
++    def get(self, url, **kwargs):
++        kwargs.setdefault('allow_redirects', True)
++        return self.request('GET', url, **kwargs)
++
++    def options(self, url, **kwargs):
++        kwargs.setdefault('allow_redirects', True)
++        return self.request('OPTIONS', url, **kwargs)
++
++    def head(self, url, **kwargs):
++        kwargs.setdefault('allow_redirects', False)
++        return self.request('HEAD', url, **kwargs)
++
++    def post(self, url, data=None, json=None, **kwargs):
++        kwargs['data'] = data
++        # Unlike requests, treq treats ``json=None`` as an explicit JSON null
++        # body.  Omitting it preserves requests' historical behavior.
++        if json is not None:
++            kwargs['json'] = json
++        return self.request('POST', url, **kwargs)
++
++    def put(self, url, data=None, **kwargs):
++        kwargs['data'] = data
++        return self.request('PUT', url, **kwargs)
++
++    def patch(self, url, data=None, **kwargs):
++        kwargs.setdefault('allow_redirects', True)
++        kwargs['data'] = data
++        return self.request('PATCH', url, **kwargs)
++
++    def delete(self, url, **kwargs):
++        kwargs.setdefault('allow_redirects', True)
++        return self.request('DELETE', url, **kwargs)
++
++Response = _TreqResponse
+ 
+ #######################
+ ### CLIENT DEFAULTS ###
+@@ -862,7 +1032,7 @@
+ ### CLASSES ###
+ ###############
+ 
+-class PDSession(Session):
++class PDSession(_TreqSession):
+     """
+     Base class for making HTTP requests to PagerDuty APIs
+ 

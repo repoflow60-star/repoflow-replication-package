@@ -1,0 +1,189 @@
+--- a/kling/kling.py
++++ b/kling/kling.py
+@@ -1,15 +1,19 @@
+ import argparse
++import json
+ import os
+ import time
+ import contextlib
+ from typing import Optional
+ from enum import Enum
+ from http.cookies import SimpleCookie
++from threading import Event, Lock, Thread
+ 
+ from fake_useragent import UserAgent
+-import requests
+-from requests.utils import cookiejar_from_dict
+ from rich import print
++import treq
++from twisted.internet import reactor
++from twisted.internet.threads import blockingCallFromThread
++from twisted.web.http_headers import Headers
+ import threading
+ 
+ browser_version = "edge101"
+@@ -18,7 +22,136 @@
+ base_url_not_cn = "https://klingai.com/"
+ 
+ 
+-def call_for_daily_check(session: requests.Session, is_cn: bool) -> bool:
++_reactor_ready = Event()
++_reactor_lock = Lock()
++_reactor_thread = None
++
++
++def _ensure_reactor() -> None:
++    global _reactor_thread
++    if reactor.running:
++        return
++    with _reactor_lock:
++        if not reactor.running and _reactor_thread is None:
++            reactor.callWhenRunning(_reactor_ready.set)
++            _reactor_thread = Thread(
++                target=reactor.run,
++                kwargs={"installSignalHandlers": False},
++                daemon=True,
++            )
++            _reactor_thread.start()
++    _reactor_ready.wait()
++
++
++def _as_header_bytes(value):
++    if isinstance(value, bytes):
++        return value
++    return str(value).encode("utf-8")
++
++
++class _CookieJar(dict):
++    def get_dict(self):
++        return dict(self)
++
++
++def _request_with_treq(
++    method: str,
++    url: str,
++    headers: dict,
++    params=None,
++    data=None,
++    json_data=None,
++):
++    request_headers = Headers()
++    for name, value in headers.items():
++        values = value if isinstance(value, (list, tuple)) else [value]
++        for header_value in values:
++            request_headers.addRawHeader(
++                _as_header_bytes(name), _as_header_bytes(header_value)
++            )
++
++    request_kwargs = {"headers": request_headers}
++    if params is not None:
++        request_kwargs["params"] = params
++    if data is not None:
++        request_kwargs["data"] = data
++    if json_data is not None:
++        request_kwargs["json"] = json_data
++
++    response_deferred = treq.request(method, url, **request_kwargs)
++
++    def read_response(response):
++        return treq.content(response).addCallback(
++            lambda body: (response, body)
++        )
++
++    return response_deferred.addCallback(read_response)
++
++
++class _TreqResponse:
++    def __init__(self, response, content: bytes) -> None:
++        self.status_code = response.code
++        self.content = content
++        self.text = content.decode("utf-8", errors="replace")
++        self.ok = self.status_code < 400
++
++    def json(self):
++        return json.loads(self.content)
++
++
++class _TreqSession:
++    def __init__(self) -> None:
++        self.cookies = None
++        self.headers = {}
++
++    def _request(self, method: str, url: str, **kwargs) -> _TreqResponse:
++        headers = dict(self.headers)
++        headers.update(kwargs.get("headers") or {})
++        if self.cookies:
++            headers.setdefault(
++                "Cookie",
++                "; ".join(
++                    f"{name}={value}" for name, value in self.cookies.items()
++                ),
++            )
++
++        _ensure_reactor()
++        response, content = blockingCallFromThread(
++            reactor,
++            _request_with_treq,
++            method,
++            url,
++            headers,
++            kwargs.get("params"),
++            kwargs.get("data"),
++            kwargs.get("json"),
++        )
++        response_headers = getattr(response, "headers", None)
++        if response_headers is not None:
++            set_cookies = response_headers.getRawHeaders(b"Set-Cookie") or []
++            if set_cookies and self.cookies is None:
++                self.cookies = _CookieJar()
++            for set_cookie in set_cookies:
++                if isinstance(set_cookie, bytes):
++                    set_cookie = set_cookie.decode("utf-8", errors="replace")
++                parsed_cookie = SimpleCookie()
++                parsed_cookie.load(set_cookie)
++                self.cookies.update(
++                    {
++                        name: morsel.value
++                        for name, morsel in parsed_cookie.items()
++                    }
++                )
++        return _TreqResponse(response, content)
++
++    def get(self, url: str, **kwargs) -> _TreqResponse:
++        return self._request("GET", url, **kwargs)
++
++    def post(self, url: str, **kwargs) -> _TreqResponse:
++        return self._request("POST", url, **kwargs)
++
++
++def call_for_daily_check(session: _TreqSession, is_cn: bool) -> bool:
+     if is_cn:
+         r = session.get(f"{base_url}api/pay/reward?activity=login_bonus_daily")
+     else:
+@@ -40,7 +173,7 @@
+ 
+ class BaseGen:
+     def __init__(self, cookie: str) -> None:
+-        self.session: requests.Session = requests.Session()
++        self.session = _TreqSession()
+         self.cookie = cookie
+         self.session.cookies, is_cn = self.parse_cookie_string(self.cookie)
+         self.session.headers["user-agent"] = ua.random
+@@ -72,16 +205,12 @@
+         cookie = SimpleCookie()
+         cookie.load(cookie_string)
+         cookies_dict = {}
+-        cookiejar = None
+         is_cn = False
+         for key, morsel in cookie.items():
+             if key.startswith("kuaishou"):
+                 is_cn = True
+             cookies_dict[key] = morsel.value
+-            cookiejar = cookiejar_from_dict(
+-                cookies_dict, cookiejar=None, overwrite=True
+-            )
+-        return cookiejar, is_cn
++        return (_CookieJar(cookies_dict) if cookies_dict else None), is_cn
+ 
+     def get_account_point(self) -> float:
+         bonus_req = self.session.get(self.daily_url)

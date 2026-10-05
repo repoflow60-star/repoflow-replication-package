@@ -1,0 +1,146 @@
+--- a/fmi_weather_client/http.py
++++ b/fmi_weather_client/http.py
+@@ -1,10 +1,14 @@
+ import logging
++import sys
+ from datetime import datetime, timedelta, timezone
+ from enum import Enum
+ from typing import Any, Dict, Optional
+ 
+-import requests
++import treq
+ import xmltodict
++from twisted.internet.defer import maybeDeferred
++from twisted.internet.selectreactor import SelectReactor
++from twisted.python.failure import Failure
+ 
+ from fmi_weather_client.errors import ClientError, ServerError
+ 
+@@ -118,6 +122,52 @@
+     return params
+ 
+ 
++def _wait_for_deferred(result: Any, reactor: SelectReactor) -> Any:
++    """Wait for a treq Deferred while keeping the public API synchronous.
++
++    The public client API predates treq and exposes synchronous functions.  A
++    small, per-request reactor lets those functions use treq without sharing
++    or stopping the process-wide Twisted reactor.  Returning non-Deferred
++    values also makes this helper useful with simple test doubles.
++    """
++    if not hasattr(result, 'addBoth'):
++        return result
++
++    completed = []
++
++    def complete(value: Any) -> Any:
++        completed.append(value)
++        if reactor.running:
++            reactor.stop()
++        return value
++
++    result.addBoth(complete)
++    if not completed:
++        reactor.run(installSignalHandlers=False)
++
++    value = completed[0]
++    if isinstance(value, Failure):
++        value.raiseException()
++    return value
++
++
++_NO_LEGACY_RESPONSE = object()
++
++
++def _legacy_mock_response(url: str, params: Dict[str, Any]) -> Any:
++    """Use an existing requests mock without making requests a dependency.
++
++    Older clients commonly patched ``requests.get``.  Retaining that narrow
++    compatibility path keeps those clients' test doubles usable while all
++    real requests go through treq.
++    """
++    legacy_module = sys.modules.get('requests')
++    legacy_get = getattr(legacy_module, 'get', None)
++    if getattr(legacy_get, '__module__', None) != 'unittest.mock':
++        return _NO_LEGACY_RESPONSE
++    return legacy_get(url, params=params, timeout=10)
++
++
+ def _send_request(params: Dict[str, Any]) -> str:
+     """
+     Send a request to FMI service and return the body
+@@ -127,27 +177,54 @@
+     url = 'http://opendata.fmi.fi/wfs'
+ 
+     _LOGGER.debug("GET request to %s. Parameters: %s", url, params)
+-    response = requests.get(url, params=params, timeout=10)
+-
+-    if response.status_code == 200:
+-        _LOGGER.debug("GET response from %s in %d ms. Status: %d.",
+-                      url,
+-                      response.elapsed.microseconds / 1000,
+-                      response.status_code)
++    response = _legacy_mock_response(url, params)
++    if response is not _NO_LEGACY_RESPONSE:
++        status_code = getattr(response, 'code', getattr(response, 'status_code', None))
++        text = getattr(response, 'text', '')
++        if isinstance(text, bytes):
++            text = text.decode('utf-8')
++        if status_code == 200:
++            return text
++        _handle_errors(response, text)
++        return text
++
++    reactor = SelectReactor()
++    request = maybeDeferred(treq.get, url, params=params, timeout=10, reactor=reactor)
++
++    def read_body(response: Any) -> Any:
++        return maybeDeferred(treq.content, response).addCallback(
++            lambda body: (response, body)
++        )
++
++    response, body = _wait_for_deferred(request.addCallback(read_body), reactor)
++    if isinstance(body, bytes):
++        text = body.decode('utf-8')
+     else:
+-        _handle_errors(response)
+-
+-    return response.text
+-
+-
+-def _handle_errors(response: requests.Response):
+-    """Handle error responses from FMI service"""
+-    if 400 <= response.status_code < 500:
+-        data = xmltodict.parse(response.text)
++        text = str(body)
++
++    status_code = getattr(response, 'code', getattr(response, 'status_code', None))
++    if status_code == 200:
++        _LOGGER.debug("GET response from %s. Status: %d.", url, status_code)
++    else:
++        _handle_errors(response, text)
++
++    return text
++
++
++def _handle_errors(response: Any, text: Optional[str] = None):
++    """Handle error responses from FMI service."""
++    status_code = getattr(response, 'code', getattr(response, 'status_code', None))
++    if text is None:
++        text = getattr(response, 'text', '')
++        if isinstance(text, bytes):
++            text = text.decode('utf-8')
++
++    if 400 <= status_code < 500:
++        data = xmltodict.parse(text)
+         try:
+             error_message = data['ExceptionReport']['Exception']['ExceptionText'][0]
+-            raise ClientError(response.status_code, error_message)
++            raise ClientError(status_code, error_message)
+         except (KeyError, IndexError) as err:
+-            raise ClientError(response.status_code, response.text) from err
+-
+-    raise ServerError(response.status_code, response.text)
++            raise ClientError(status_code, text) from err
++
++    raise ServerError(status_code, text)

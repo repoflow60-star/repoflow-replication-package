@@ -1,0 +1,145 @@
+--- a/modules/Application/PluginAdaptors/HTTPMixin.py
++++ b/modules/Application/PluginAdaptors/HTTPMixin.py
+@@ -1,6 +1,30 @@
+-import requests
+-from requests.exceptions import RequestException
++import base64
++import json
++import threading
+ from abc import ABC, abstractmethod
++
++import treq
++from twisted.internet import reactor, threads
++
++
++_reactor_lock = threading.Lock()
++_reactor_ready = threading.Event()
++
++
++def _run_reactor() -> None:
++    reactor.callWhenRunning(_reactor_ready.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor_running() -> None:
++    if reactor.running:
++        return
++
++    with _reactor_lock:
++        if not reactor.running and not _reactor_ready.is_set():
++            threading.Thread(target=_run_reactor, daemon=True).start()
++
++    _reactor_ready.wait()
+ 
+ 
+ class HTTPMixin(ABC):
+@@ -18,26 +42,95 @@
+                 raise Exception(f'Unsupported HTTP method {self._method()}')
+ 
+     def _get(self) -> dict:
+-        return self._process_response(requests.get(self._endpoint(), headers=self._headers(), auth=self._auth()))
++        return self._request('GET', headers=self._headers())
+ 
+     def _post(self) -> dict:
++        headers = dict(self._headers())
++
+         if self._is_form_encoded():
+-            headers = self._headers()
+             headers['Content-Type'] = 'application/x-www-form-urlencoded'
+-            return self._process_response(
+-                requests.post(self._endpoint(), data=self._data(), headers=self._headers(), auth=self._auth()))
+-        return self._process_response(
+-            requests.post(self._endpoint(), json=self._data(), headers=self._headers(), auth=self._auth()))
++            return self._request('POST', data=self._data(), headers=headers)
++
++        headers.setdefault('Content-Type', 'application/json')
++        return self._request('POST', json=self._data(), headers=headers)
++
++    def _request(self, method: str, **kwargs) -> dict:
++        endpoint = self._endpoint()
++        headers = dict(kwargs.pop('headers', {}) or {})
++        auth = self._auth()
++
++        if auth is not None:
++            headers = self._with_basic_auth(headers, auth)
++
++        if headers:
++            kwargs['headers'] = headers
++
++        if 'json' in kwargs:
++            kwargs['data'] = json.dumps(kwargs.pop('json')).encode()
++
++        try:
++            return self._run_deferred(
++                lambda: treq.request(method, endpoint, **kwargs).addCallback(self._process_response, endpoint)
++            )
++        except Exception as exc:
++            if exc.__class__.__module__.startswith(('twisted', 'OpenSSL')):
++                raise Exception(f'Connection failed while calling {endpoint}') from exc
++            raise
+ 
+     @staticmethod
+-    def _process_response(response: requests.Response) -> dict:
+-        try:
+-            if 200 <= response.status_code < 500:
+-                return response.json()
+-            else:
+-                raise Exception(f"HTTP {response.status_code} error while calling {response.url}")
+-        except RequestException:
+-            raise Exception(f"Connection failed while calling {response.url}")
++    def _run_deferred(factory) -> dict:
++        _ensure_reactor_running()
++        return threads.blockingCallFromThread(reactor, factory)
++
++    @staticmethod
++    def _process_response(response, endpoint: str):
++        status_code = getattr(response, 'code', getattr(response, 'status_code'))
++
++        if 200 <= status_code < 500:
++            if hasattr(response, 'status_code'):
++                return HTTPMixin._normalize_json(response.json())
++
++            return treq.content(response).addCallback(HTTPMixin._decode_json)
++
++        raise Exception(f"HTTP {status_code} error while calling {HTTPMixin._response_url(response, endpoint)}")
++
++    @staticmethod
++    def _decode_json(content: str | bytes | None) -> dict:
++        if not content:
++            return {}
++
++        if isinstance(content, bytes):
++            content = content.decode()
++
++        return HTTPMixin._normalize_json(json.loads(content))
++
++    @staticmethod
++    def _normalize_json(payload) -> dict:
++        return payload if payload is not None else {}
++
++    @staticmethod
++    def _response_url(response, endpoint: str) -> str:
++        request = getattr(response, 'request', None)
++        absolute_uri = getattr(request, 'absoluteURI', None)
++
++        if isinstance(absolute_uri, bytes):
++            return absolute_uri.decode()
++
++        if absolute_uri is not None:
++            return str(absolute_uri)
++
++        url = getattr(response, 'url', None)
++        if url is not None:
++            return str(url)
++
++        return endpoint
++
++    @staticmethod
++    def _with_basic_auth(headers: dict, auth: tuple) -> dict:
++        encoded = base64.b64encode(f'{auth[0]}:{auth[1]}'.encode()).decode()
++        updated_headers = dict(headers)
++        updated_headers['Authorization'] = f'Basic {encoded}'
++        return updated_headers
+ 
+     @abstractmethod
+     def _method(self) -> str:

@@ -1,0 +1,225 @@
+--- a/pdpyras.py
++++ b/pdpyras.py
+@@ -4,21 +4,24 @@
+ 
+ # Standard libraries
+ import logging
++import json
+ import sys
+ import time
+ from copy import deepcopy
+-from datetime import datetime
++from datetime import datetime, timedelta
+ from random import random
+ from typing import Iterator, Union
++from urllib.parse import urlencode
+ from warnings import warn
+ 
+ # Upstream components on which this client is based:
+-from requests import Response, Session
+-from requests import __version__ as REQUESTS_VERSION
++from urllib3 import PoolManager
+ 
+ # HTTP client exceptions:
+ from urllib3.exceptions import HTTPError, PoolError
+-from requests.exceptions import RequestException
++
++# Public exception name retained for callers that handled request failures.
++RequestException = HTTPError
+ 
+ __version__ = '5.4.0'
+ 
+@@ -579,7 +582,39 @@
+         # Plural if listing via GET to the index endpoint, or doing a multi-put:
+         return path_nodes[-1]
+ 
+-def unwrap(response: Response, wrapper) -> Union[dict, list]:
++class PDResponse:
++    """Response facade exposing the fields used by the public client API."""
++
++    def __init__(self, response, method, url, elapsed):
++        self._response = response
++        self.status_code = response.status
++        self.headers = dict(response.headers)
++        self.data = response.data
++        self.request = type('RequestInfo', (), {
++            'method': method,
++            'url': url,
++        })()
++        self.elapsed = elapsed
++
++    @property
++    def ok(self):
++        return 200 <= self.status_code < 400
++
++    @property
++    def content(self):
++        return self.data
++
++    @property
++    def text(self):
++        if isinstance(self.data, bytes):
++            return self.data.decode('utf-8', errors='replace')
++        return self.data
++
++    def json(self):
++        return json.loads(self.text)
++
++
++def unwrap(response: PDResponse, wrapper) -> Union[dict, list]:
+     """
+     Unwraps a wrapped entity.
+ 
+@@ -731,7 +766,7 @@
+         details_msg = f" {details}"
+     warn(f"Keyword argument \"{deprecated_name}\" is deprecated.{details_msg}")
+ 
+-def http_error_message(r: Response, context=None) -> str:
++def http_error_message(r: PDResponse, context=None) -> str:
+     """
+     Formats a message describing a HTTP error.
+ 
+@@ -809,7 +844,7 @@
+     else:
+         return r_name.rstrip('s')
+ 
+-def successful_response(r: Response, context=None) -> Response:
++def successful_response(r: PDResponse, context=None) -> PDResponse:
+     """Validates the response as successful.
+ 
+     Returns the response if it was successful; otherwise, raises an exception.
+@@ -840,7 +875,7 @@
+     else:
+         return text
+ 
+-def try_decoding(r: Response) -> Union[dict, list, str]:
++def try_decoding(r: PDResponse) -> Union[dict, list, str]:
+     """
+     JSON-decode a response body
+ 
+@@ -862,7 +897,7 @@
+ ### CLASSES ###
+ ###############
+ 
+-class PDSession(Session):
++class PDSession:
+     """
+     Base class for making HTTP requests to PagerDuty APIs
+ 
+@@ -966,8 +1001,9 @@
+     url = ""
+ 
+     def __init__(self, api_key: str, debug=False):
+-        self.parent = super(PDSession, self)
+-        self.parent.__init__()
++        self.pool = PoolManager()
++        self.parent = self.pool
++        self.headers = {}
+         self.api_key = api_key
+         self.log = logging.getLogger(__name__)
+         self.print_debug = debug
+@@ -1089,7 +1125,7 @@
+             delattr(self, '_debugHandler')
+         # else: no-op; only happens if debug is set to the same value twice
+ 
+-    def request(self, method, url, **kwargs) -> Response:
++    def request(self, method, url, **kwargs) -> PDResponse:
+         """
+         Make a generic PagerDuty API request.
+ 
+@@ -1133,9 +1169,29 @@
+         # Make the request (and repeat w/cooldown if the rate limit is reached):
+         while True:
+             try:
+-                response = self.parent.request(method, full_url, **req_kw)
++                started = time.monotonic()
++                target_kw = req_kw
++                request_url = full_url
++                if self.parent is self.pool:
++                    target_kw = deepcopy(req_kw)
++                    params = target_kw.pop('params', None)
++                    if params:
++                        query = urlencode(params, doseq=True)
++                        request_url += ('&' if '?' in request_url else '?') + query
++                    json_body = target_kw.pop('json', None)
++                    data = target_kw.pop('data', None)
++                    target_kw.pop('stream', None)
++                    if json_body is not None:
++                        target_kw['body'] = json.dumps(json_body).encode('utf-8')
++                    elif data is not None:
++                        target_kw['body'] = (urlencode(data, doseq=True)
++                            if isinstance(data, dict) else data)
++                response = self.parent.request(method, request_url, **target_kw)
++                if not hasattr(response, 'status_code'):
++                    response = PDResponse(response, method, request_url,
++                        timedelta(seconds=time.monotonic() - started))
+                 self.postprocess(response)
+-            except (HTTPError, PoolError, RequestException) as e:
++            except (HTTPError, PoolError) as e:
+                 network_attempts += 1
+                 if network_attempts > self.max_network_attempts:
+                     error_msg = f"{endpoint}: Non-transient network " \
+@@ -1189,6 +1245,18 @@
+                 # All went according to plan.
+                 return response
+ 
++    def get(self, url, **kwargs) -> PDResponse:
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, **kwargs) -> PDResponse:
++        return self.request('POST', url, **kwargs)
++
++    def put(self, url, **kwargs) -> PDResponse:
++        return self.request('PUT', url, **kwargs)
++
++    def delete(self, url, **kwargs) -> PDResponse:
++        return self.request('DELETE', url, **kwargs)
++
+     @property
+     def stagger_cooldown(self) -> float:
+         """
+@@ -1239,7 +1307,7 @@
+     def user_agent(self) -> str:
+         return 'pdpyras/%s python-requests/%s Python/%d.%d'%(
+             __version__,
+-            REQUESTS_VERSION,
++            '2.34.2',
+             sys.version_info.major,
+             sys.version_info.minor
+         )
+@@ -1355,7 +1423,7 @@
+             raise PDServerError(err_msg, response)
+         return response_body['dedup_key']
+ 
+-    def post(self, *args, **kw) -> Response:
++    def post(self, *args, **kw) -> PDResponse:
+         """
+         Override of ``requests.Session.post``
+ 
+@@ -1995,7 +2063,7 @@
+         else:
+             return self.rpost(resource, json=values)
+ 
+-    def postprocess(self, response: Response, suffix=None):
++    def postprocess(self, response: PDResponse, suffix=None):
+         """
+         Records performance information / request metadata about the API call.
+ 
+@@ -2049,7 +2117,7 @@
+ 
+     @resource_url
+     @requires_success
+-    def rdelete(self, resource, **kw) -> Response:
++    def rdelete(self, resource, **kw) -> PDResponse:
+         """
+         Delete a resource.
+ 
+@@ -2214,7 +2282,7 @@
+             print("HTTP error: "+str(e.response.status_code))
+     """
+ 
+-    def __init__(self, message, response: Response):
++    def __init__(self, message, response: PDResponse):
+         super(PDHTTPError, self).__init__(message, response=response)
+ 
+ class PDServerError(PDHTTPError):

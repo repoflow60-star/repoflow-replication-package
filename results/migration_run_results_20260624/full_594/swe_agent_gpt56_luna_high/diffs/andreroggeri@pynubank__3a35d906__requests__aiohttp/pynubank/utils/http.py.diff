@@ -1,0 +1,129 @@
+--- a/pynubank/utils/http.py
++++ b/pynubank/utils/http.py
+@@ -1,7 +1,114 @@
+-from requests import Response
+-from requests_pkcs12 import get, post
++import asyncio
++import json as json_lib
++import ssl
++import tempfile
++from typing import Optional
+ 
+-from pynubank import NuRequestException
++import aiohttp
++import OpenSSL
++
++from pynubank.exception import NuRequestException
++
++
++class Response:
++    """Synchronous response data collected from an aiohttp response."""
++
++    def __init__(self, status_code: int = None, url: str = None, headers=None, content: bytes = b''):
++        self.status_code = status_code
++        self.url = url
++        self.headers = dict(headers or {})
++        self._content = content
++
++    def json(self):
++        return json_lib.loads(self._content.decode('utf-8'))
++
++    @property
++    def content(self) -> bytes:
++        return self._content
++
++
++async def _request(method: str, url: str, headers=None, json=None, ssl_context=None) -> Response:
++    async with aiohttp.ClientSession() as session:
++        async with session.request(method, url, headers=headers, json=json, ssl=ssl_context) as response:
++            return Response(
++                status_code=response.status,
++                url=str(response.url),
++                headers=response.headers,
++                content=await response.read(),
++            )
++
++
++def _run(coroutine):
++    """Run one aiohttp request for the library's synchronous API."""
++    try:
++        asyncio.get_running_loop()
++    except RuntimeError:
++        return asyncio.run(coroutine)
++
++    coroutine.close()
++    raise RuntimeError('HttpClient cannot be used from a running asyncio event loop')
++
++
++def _pkcs12_ssl_context(pkcs12_data, password: str) -> Optional[ssl.SSLContext]:
++    if not pkcs12_data:
++        return None
++
++    if isinstance(pkcs12_data, OpenSSL.crypto.PKCS12):
++        pkcs12 = pkcs12_data
++    else:
++        pkcs12 = OpenSSL.crypto.load_pkcs12(
++            pkcs12_data,
++            password.encode('utf-8'),
++        )
++
++    certificate = pkcs12.get_certificate()
++    private_key = pkcs12.get_privatekey()
++    if certificate is None or private_key is None:
++        raise ValueError('The PKCS#12 data must contain a certificate and private key')
++
++    # ssl.SSLContext accepts PEM files, while the Nubank certificate is
++    # delivered as PKCS#12.  The temporary files are removed after the
++    # context has loaded the certificate and key.
++    certificate_pem = OpenSSL.crypto.dump_certificate(OpenSSL.crypto.FILETYPE_PEM, certificate)
++    private_key_pem = OpenSSL.crypto.dump_privatekey(OpenSSL.crypto.FILETYPE_PEM, private_key)
++    ca_certificates = pkcs12.get_ca_certificates() or ()
++    ca_pem = b''.join(
++        OpenSSL.crypto.dump_certificate(OpenSSL.crypto.FILETYPE_PEM, ca)
++        for ca in ca_certificates
++    )
++
++    context = ssl.create_default_context()
++    with tempfile.NamedTemporaryFile() as certificate_file, tempfile.NamedTemporaryFile() as key_file:
++        certificate_file.write(certificate_pem + ca_pem)
++        certificate_file.flush()
++        key_file.write(private_key_pem)
++        key_file.flush()
++        context.load_cert_chain(certificate_file.name, key_file.name)
++
++    return context
++
++
++def get(url: str, headers=None, **kwargs) -> Response:
++    return _run(_request(
++        'GET',
++        url,
++        headers=headers,
++        ssl_context=_pkcs12_ssl_context(
++            kwargs.get('pkcs12_data'), kwargs.get('pkcs12_password', '')
++        ),
++    ))
++
++
++def post(url: str, json: dict, headers=None, **kwargs) -> Response:
++    return _run(_request(
++        'POST',
++        url,
++        headers=headers,
++        json=json,
++        ssl_context=_pkcs12_ssl_context(
++            kwargs.get('pkcs12_data'), kwargs.get('pkcs12_password', '')
++        ),
++    ))
+ 
+ 
+ class HttpClient:
+@@ -46,4 +153,7 @@
+         return self._handle_response(self.raw_get(url))
+ 
+     def post(self, url: str, json: dict) -> dict:
+-        return self._handle_response(post(url, json=json, headers=self._headers, **self._cert_args))
++        return self._handle_response(self.raw_post(url, json=json))
++
++
++__all__ = ['HttpClient', 'Response']

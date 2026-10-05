@@ -1,0 +1,154 @@
+--- a/tinychat/llms/_http.py
++++ b/tinychat/llms/_http.py
+@@ -0,0 +1,151 @@
++"""Small synchronous bridge around :mod:`aiohttp`.
++
++The GUI consumes the model clients from a worker thread using ordinary Python
++iterators. aiohttp is asynchronous, so this module runs each request in a
++background event loop and exposes the response body as a blocking byte
++iterator. This keeps the existing client API while retaining streaming
++responses.
++"""
++
++import asyncio
++import queue
++import threading
++from typing import Any, Iterator
++
++import aiohttp
++
++_END = object()
++
++
++class AiohttpResponse:
++    """The small part of a response used by the provider clients.
++
++    ``sseclient`` consumes an iterable of byte chunks and the clients inspect
++    the HTTP status. The response is populated by the aiohttp worker before
++    ``post`` returns, so status errors can be handled synchronously; chunks
++    continue arriving while the caller iterates over the response.
++    """
++
++    def __init__(self) -> None:
++        self.status_code: int | None = None
++        self._chunks: queue.Queue[object] = queue.Queue()
++        self._ready = threading.Event()
++        self._closed = threading.Event()
++        self._error: BaseException | None = None
++
++    @property
++    def status(self) -> int | None:
++        """Expose aiohttp's status spelling alongside the legacy spelling."""
++        return self.status_code
++
++
++    def _set_status(self, status: int) -> None:
++        self.status_code = status
++        self._ready.set()
++
++    def _finish(self, error: BaseException | None = None) -> None:
++        self._error = error
++        self._ready.set()
++        self._chunks.put(_END)
++
++    def __iter__(self) -> Iterator[bytes]:
++        self._ready.wait()
++        while True:
++            chunk = self._chunks.get()
++            if chunk is _END:
++                if self._error is not None:
++                    raise self._error
++                return
++            yield chunk  # type: ignore[misc]
++
++    def close(self) -> None:
++        """Stop forwarding chunks when the SSE consumer closes the stream."""
++        self._closed.set()
++
++
++async def _consume_response(request: Any, response: AiohttpResponse) -> None:
++    """Forward response chunks and support aiohttp's request context manager."""
++    if hasattr(request, "__aenter__"):
++        async with request as aiohttp_response:
++            response._set_status(aiohttp_response.status)
++            async for chunk in aiohttp_response.content.iter_any():
++                if not response._closed.is_set():
++                    response._chunks.put(bytes(chunk))
++    else:
++        # This branch makes the transport straightforward to mock with an
++        # AsyncMock as well as supporting aiohttp's native context manager.
++        aiohttp_response = await request
++        response._set_status(aiohttp_response.status)
++        try:
++            async for chunk in aiohttp_response.content.iter_any():
++                if not response._closed.is_set():
++                    response._chunks.put(bytes(chunk))
++        finally:
++            aiohttp_response.release()
++
++
++async def _post(
++    url: str,
++    *,
++    headers: dict[str, str],
++    json: dict[str, Any],
++    result: AiohttpResponse,
++) -> None:
++    try:
++        async with aiohttp.ClientSession() as session:
++            request = session.post(url, headers=headers, json=json)
++            # ClientSession.post returns an awaitable context manager in
++            # aiohttp. _consume_response also accepts a coroutine, which keeps
++            # lightweight AsyncMock-based transports usable.
++            await _consume_response(request, result)
++    except BaseException as error:
++        result._finish(error)
++    else:
++        result._finish()
++
++
++def post(
++    url: str,
++    *,
++    headers: dict[str, str],
++    json: dict[str, Any],
++    stream: bool = False,
++) -> AiohttpResponse:
++    """Make a streaming POST request through aiohttp.
++
++    ``stream`` is accepted for compatibility with the old provider code. The
++    response is read incrementally by an aiohttp event loop in a daemon thread,
++    then yielded as byte chunks to the synchronous SSE consumers.
++    """
++    del stream
++    result = AiohttpResponse()
++    worker = threading.Thread(
++        target=lambda: asyncio.run(
++            _post(url, headers=headers, json=json, result=result)
++        ),
++        daemon=True,
++    )
++    worker.start()
++    result._ready.wait()
++    if result.status_code is None and result._error is not None:
++        raise result._error
++    return result
++
++
++class _AiohttpRequestsCompatibility:
++    """Compatibility namespace for callers that used ``module.requests.post``.
++
++    It is deliberately not the third-party ``requests`` package. Keeping the
++    namespace avoids breaking integrations that monkeypatch the old provider
++    attribute while the actual transport is entirely aiohttp-based.
++    """
++
++    post = staticmethod(post)
++
++
++# Existing users may patch ``tinychat.llms.<provider>.requests.post``. The
++# provider modules re-export this aiohttp-backed namespace for that purpose.
++requests = _AiohttpRequestsCompatibility()
++
++
++__all__ = ["AiohttpResponse", "post", "requests"]

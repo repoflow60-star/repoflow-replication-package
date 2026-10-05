@@ -1,0 +1,197 @@
+--- a/whatsapp_api_client_python/API.py
++++ b/whatsapp_api_client_python/API.py
+@@ -1,9 +1,10 @@
++import asyncio
+ import json
+ import logging
++import threading
+ from typing import Any, NoReturn, Optional
+ 
+-from requests import Response, Session
+-from requests.adapters import HTTPAdapter, Retry
++import aiohttp
+ 
+ from .response import Response as GreenAPIResponse
+ from .tools import (
+@@ -18,6 +19,155 @@
+     serviceMethods,
+     webhooks
+ )
++
++
++class _HTTPResponse:
++    """Small synchronous response view used by the public API.
++
++    The client historically exposed synchronous methods.  aiohttp is
++    asynchronous, so the adapter below consumes the aiohttp response before
++    returning and keeps that public API intact.
++    """
++
++    def __init__(self, status: int, text: str):
++        self.status_code = status
++        self.text = text
++
++
++class Session:
++    """Synchronous facade over :class:`aiohttp.ClientSession`.
++
++    ``Session`` remains a module-level name for compatibility with callers
++    that customize or mock the client's session.  All network I/O is carried
++    out by aiohttp; this facade only bridges it to the library's existing
++    synchronous methods.
++    """
++
++    def __init__(self) -> None:
++        self.headers = {}
++
++    def request(self, method: str, url: str, **arguments: Any) -> _HTTPResponse:
++        return _run_sync(self._request(method, url, **arguments))
++
++    async def _request(
++            self, method: str, url: str, **arguments: Any
++    ) -> _HTTPResponse:
++        timeout = arguments.pop("timeout", None)
++        files = arguments.pop("files", None)
++        headers = dict(self.headers)
++        headers.update(arguments.pop("headers", {}) or {})
++
++        request_arguments = dict(arguments)
++        form_fields = request_arguments.pop("data", None) if files else None
++        file_positions = []
++        if files:
++            request_arguments.pop("json", None)
++            for file_info in files.values():
++                file_object = file_info[1] if isinstance(file_info, tuple) else file_info
++                try:
++                    file_positions.append((file_object, file_object.tell()))
++                except (AttributeError, OSError):
++                    pass
++
++        if timeout is not None and not isinstance(timeout, aiohttp.ClientTimeout):
++            timeout = aiohttp.ClientTimeout(total=timeout)
++
++        # Retry three times after the initial request for HTTP 429 and
++        # transient network failures, as the previous HTTP adapter did.
++        last_error: Optional[BaseException] = None
++        for attempt in range(4):
++            try:
++                if attempt:
++                    for file_object, position in file_positions:
++                        file_object.seek(position)
++
++                async with aiohttp.ClientSession(
++                        headers=headers, timeout=timeout
++                ) as client:
++                    current_arguments = dict(request_arguments)
++                    if files:
++                        current_arguments["data"] = self._form_data(
++                            form_fields, files
++                        )
++                    response = await client.request(
++                        method=method, url=url, **current_arguments
++                    )
++                    try:
++                        text = await response.text()
++                        status = response.status
++                    finally:
++                        response.release()
++                        wait_for_close = getattr(response, "wait_for_close", None)
++                        if wait_for_close is not None:
++                            await wait_for_close()
++
++                if status != 429 or attempt == 3:
++                    return _HTTPResponse(status, text)
++
++                await asyncio.sleep(2 ** attempt)
++            except (aiohttp.ClientError, asyncio.TimeoutError) as error:
++                last_error = error
++                if attempt == 3:
++                    raise
++                await asyncio.sleep(2 ** attempt)
++
++        # The loop always returns or raises, but this keeps type checkers
++        # aware that a failed retry cannot silently produce a response.
++        if last_error is not None:
++            raise last_error
++        raise RuntimeError("HTTP request did not produce a response")
++
++    @staticmethod
++    def _form_data(data: Any, files: dict) -> aiohttp.FormData:
++        form = aiohttp.FormData()
++        if data:
++            for name, value in data.items():
++                form.add_field(name, str(value))
++
++        for name, file_info in files.items():
++            if isinstance(file_info, tuple):
++                file_object = file_info[1]
++                filename = file_info[0]
++                content_type = file_info[2] if len(file_info) > 2 else None
++            else:
++                file_object = file_info
++                filename = getattr(file_object, "name", name)
++                content_type = None
++
++            field_arguments = {"filename": filename}
++            if content_type:
++                field_arguments["content_type"] = content_type
++            form.add_field(name, file_object, **field_arguments)
++
++        return form
++
++
++def _run_sync(coroutine: Any) -> Any:
++    """Run an aiohttp coroutine from both sync and async caller contexts."""
++
++    try:
++        asyncio.get_running_loop()
++    except RuntimeError:
++        return asyncio.run(coroutine)
++
++    # asyncio.run cannot be called while the current thread already owns an
++    # event loop.  Running the short-lived aiohttp operation in a worker
++    # thread preserves the synchronous API in that situation too.
++    result = []
++    error = []
++
++    def run() -> None:
++        try:
++            result.append(asyncio.run(coroutine))
++        except BaseException as exception:  # propagate the original error
++            error.append(exception)
++
++    thread = threading.Thread(target=run)
++    thread.start()
++    thread.join()
++    if error:
++        raise error[0]
++    return result[0]
+ 
+ 
+ class GreenApi:
+@@ -116,7 +266,7 @@
+ 
+         return GreenAPIResponse(response.status_code, response.text)
+ 
+-    def __handle_response(self, response: Response) -> Optional[NoReturn]:
++    def __handle_response(self, response: _HTTPResponse) -> Optional[NoReturn]:
+         status_code = response.status_code
+         if status_code != 200 or self.debug_mode:
+             try:
+@@ -161,16 +311,6 @@
+     def __prepare_session(self) -> None:
+         self.session.headers["Connection"] = "close"
+ 
+-        retry = Retry(
+-            total=3,
+-            backoff_factor=1.0,
+-            allowed_methods=None,
+-            status_forcelist=[429]
+-        )
+-
+-        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+-
+ 
+ class GreenAPI(GreenApi):
+     pass

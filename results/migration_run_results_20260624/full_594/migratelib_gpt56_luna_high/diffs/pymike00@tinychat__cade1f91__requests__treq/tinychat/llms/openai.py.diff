@@ -1,0 +1,139 @@
+--- a/tinychat/llms/openai.py
++++ b/tinychat/llms/openai.py
+@@ -1,11 +1,49 @@
+ import json
+-from typing import Generator
++from typing import AsyncGenerator
+ 
+-import requests
+-from sseclient import SSEClient
++import treq
++from twisted.internet.defer import Deferred, DeferredQueue
++from twisted.internet.protocol import Protocol
+ 
+ from tinychat.llms.base import BaseLLMClient
+ from tinychat.settings import OPENAI_API_KEY_NAME
++
++
++class _SSEEvent:
++    def __init__(self, data: str) -> None:
++        self.data = data
++
++
++class _SSEProtocol(Protocol):
++    def __init__(self) -> None:
++        self._buffer = b""
++        self.event_queue = DeferredQueue()
++
++    def dataReceived(self, data: bytes) -> None:
++        self._buffer += data
++        self._buffer = self._buffer.replace(b"\r\n", b"\n")
++
++        while b"\n\n" in self._buffer:
++            event_data, self._buffer = self._buffer.split(b"\n\n", 1)
++            self._queue_event(event_data)
++
++    def connectionLost(self, reason) -> None:
++        if self._buffer:
++            self._queue_event(self._buffer)
++        self.event_queue.put(None)
++
++    def _queue_event(self, event_data: bytes) -> None:
++        data_lines = []
++
++        for line in event_data.decode("utf-8").split("\n"):
++            if line.startswith("data:"):
++                value = line[5:]
++                if value.startswith(" "):
++                    value = value[1:]
++                data_lines.append(value)
++
++        if data_lines:
++            self.event_queue.put(_SSEEvent("\n".join(data_lines)))
+ 
+ 
+ class OpenAIClient(BaseLLMClient):
+@@ -23,7 +61,7 @@
+         self.model_name = model_name
+         self.temperature = temperature
+ 
+-    def perform_stream_request(self, messages: list[dict]) -> SSEClient:
++    def perform_stream_request(self, messages: list[dict]) -> Deferred:
+         # info: https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events
+         data = {
+             "model": self.model_name,
+@@ -31,17 +69,23 @@
+             "temperature": self.temperature,
+             "stream": True,
+         }
+-        response = requests.post(
++
++        def handle_response(response):
++            if response.code != 200:
++                raise ValueError(
++                    f"Server responded with an error. Status Code: {response.code}"
++                )
++
++            event_source = _SSEProtocol()
++            response.deliverBody(event_source)
++            return event_source
++
++        return treq.post(
+             self.OPENAI_COMPLETION_API_URL,
+             headers=self.default_headers(),  # type: ignore
+             json=data,
+-            stream=True,
+-        )
+-        if response.status_code != 200:
+-            raise ValueError(
+-                f"Server responded with an error. Status Code: {response.status_code}"
+-            )
+-        return SSEClient(event_source=response)  # type: ignore
++            unbuffered=True,
++        ).addCallback(handle_response)
+ 
+ 
+ class OpenAIHandler:
+@@ -66,26 +110,35 @@
+                 string_conversation += f"LLM: {message['content']}"
+         return string_conversation
+ 
+-    def stream_response(self, user_input: str) -> Generator[str, None, None]:
++    async def stream_response(
++        self, user_input: str
++    ) -> AsyncGenerator[str, None]:
+         """
+         Yield stream responses from the client as they are received.
+ 
+         This method sends the user input to the client and then yields each piece
+-        of the language model's response as it is received in real-time. After the
+-        streaming is complete, it updates the message list with the user input and
+-        the full language model response.
++        of the language model's response as it is received in real-time. After
++        the streaming is complete, it updates the message list with the user input
++        and the full language model response.
+ 
+         :param user_input: The input string from the user to be sent to the model.
+-        :return: A generator yielding the model's response in streamed parts.
++        :return: An asynchronous generator yielding the model's response in
++            streamed parts.
+         """
+         self._messages.append({"role": "user", "content": user_input})
+-        stream = self._client.perform_stream_request(self._messages)
++        stream = await self._client.perform_stream_request(self._messages)
+         lm_response = ""
+-        for event in stream.events():  # type: ignore
++
++        while True:
++            event = await stream.event_queue.get()
++            if event is None:
++                break
++
+             if event.data != "[DONE]":
+                 json_load = json.loads(event.data)["choices"][0]["delta"]
+                 if "content" in json_load.keys():
+                     response_piece = json_load["content"]
+                     lm_response += response_piece
+                     yield response_piece
++
+         self._messages.append({"role": "assistant", "content": lm_response})

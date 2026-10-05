@@ -1,0 +1,229 @@
+--- a/smartystreets_python_sdk/requests_sender.py
++++ b/smartystreets_python_sdk/requests_sender.py
+@@ -1,12 +1,120 @@
+-from requests import Session, Request
++from argparse import Namespace
++from threading import Event, Lock, Thread
++try:
++    from urllib.parse import urlencode, urlparse
++except ImportError:
++    from urllib import urlencode
++    from urlparse import urlparse
++
++import treq
++from twisted.internet import defer, reactor
++from twisted.internet.endpoints import TCP4ClientEndpoint
++from twisted.internet.threads import blockingCallFromThread
++from twisted.web.client import ProxyAgent
++from twisted.web.http_headers import Headers
++
+ from .response import Response
+ import smartystreets_python_sdk as smarty
+ import smartystreets_python_sdk_version as version
+ 
+ 
++_reactor_lock = Lock()
++_reactor_thread = None
++
++
++def _ensure_reactor_running():
++    global _reactor_thread
++
++    with _reactor_lock:
++        if reactor.running:
++            return
++        if _reactor_thread is not None:
++            raise RuntimeError('The Twisted reactor has stopped and cannot be restarted')
++
++        started = Event()
++
++        def run_reactor():
++            reactor.callWhenRunning(started.set)
++            reactor.run(installSignalHandlers=False)
++
++        _reactor_thread = Thread(target=run_reactor)
++        _reactor_thread.daemon = True
++        _reactor_thread.start()
++        started.wait()
++
++
++def _as_bytes(value):
++    if isinstance(value, bytes):
++        return value
++    return str(value).encode('utf-8')
++
++
++def _request_url(request):
++    if not request.params:
++        return request.url
++
++    query = urlencode(request.params, doseq=True)
++    separator = '&' if '?' in request.url else '?'
++    return '{}{}{}'.format(request.url, separator, query)
++
++
++def _request_headers(request):
++    headers = Headers()
++    for name, value in request.headers.items():
++        values = value if isinstance(value, (list, tuple)) else [value]
++        for item in values:
++            headers.addRawHeader(_as_bytes(name), _as_bytes(item))
++    return headers
++
++
++def _proxy_agent(proxy):
++    parsed = urlparse(proxy)
++    if not parsed.hostname:
++        parsed = urlparse('http://' + proxy)
++    endpoint = TCP4ClientEndpoint(reactor, parsed.hostname, parsed.port)
++    return ProxyAgent(reactor, endpoint)
++
++
++def _decode_header_value(value):
++    if isinstance(value, bytes):
++        return value.decode('latin-1')
++    return value
++
++
++def _response_headers(response):
++    headers = {}
++    for name, values in response.headers.getAllRawHeaders():
++        decoded_name = _decode_header_value(name)
++        decoded_values = [_decode_header_value(value) for value in values]
++        if decoded_values:
++            headers[decoded_name] = ', '.join(decoded_values)
++    return headers
++
++
++@defer.inlineCallbacks
++def _perform_request(session, request, timeout, proxy):
++    body = request.data
++    if body is not None and not isinstance(body, bytes):
++        body = body.encode('utf-8')
++    agent = _proxy_agent(proxy) if proxy else None
++
++    response = yield session.request(
++        request.method,
++        _request_url(request),
++        headers=_request_headers(request),
++        data=body,
++        timeout=timeout,
++        agent=agent,
++    )
++    payload = yield treq.content(response)
++    if isinstance(payload, bytes):
++        payload = payload.decode('utf-8')
++    defer.returnValue((payload, response.code, _response_headers(response)))
++
++
+ class RequestsSender:
+     def __init__(self, max_timeout=None, proxy=None, ip=None):
+-        self.session = Session()
++        self.session = treq
+         self.max_timeout = max_timeout or 10
+         self.proxy = proxy
+         self.debug = None
+@@ -15,23 +123,30 @@
+     def send(self, smarty_request):
+         ip = self.ip
+         request = build_request(smarty_request, ip)
+-        prepped_request = self.session.prepare_request(request)
+-        prepped_proxies = self.build_proxies()
+         if self.debug:
+-            print_request_data(prepped_request)
+-
+-        settings = self.session.merge_environment_settings(
+-            prepped_request.url, prepped_proxies, None, None, None
++            print_request_data(request)
++
++        _ensure_reactor_running()
++        proxy = None
++        if self.proxy:
++            proxies = self.build_proxies()
++            proxy = proxies.get('http') or proxies.get('https')
++        response = blockingCallFromThread(
++            reactor,
++            _perform_request,
++            self.session,
++            request,
++            self.max_timeout,
++            proxy,
+         )
+-        with self.session.send(prepped_request, timeout=self.max_timeout, **settings) as response:
+-            if self.debug:
+-                print_response_data(response)
+-            return build_smarty_response(response)
++        if self.debug:
++            print_response_data(response)
++        return build_smarty_response(response)
+ 
+     def build_proxies(self):
+         if not self.proxy:
+             return {}
+-        if (self.proxy.host == 'http://' or self.proxy.host =='https://'):
++        if (self.proxy.host == 'http://' or self.proxy.host == 'https://'):
+             raise smarty.exceptions.SmartyException('Proxy must have a valid host (including port)')
+ 
+         proxy_string = self.proxy.host
+@@ -47,24 +162,35 @@
+ 
+ def build_request(smarty_request, ip=None):
+     try:
+-        request = Request(url=smarty_request.url_prefix, params=smarty_request.parameters)
+-        request.headers['User-Agent'] = "smartystreets (sdk:python@{})".format(version.__version__)
+-        request.headers['Content-Type'] = smarty_request.content_type
++        headers = {
++            'User-Agent': "smartystreets (sdk:python@{})".format(version.__version__),
++            'Content-Type': smarty_request.content_type,
++        }
+         if smarty_request.referer:
+-            request.headers['Referer'] = smarty_request.referer
++            headers['Referer'] = smarty_request.referer
+         if ip != None:
+-            request.headers['X-Forwarded-For'] = ip
++            headers['X-Forwarded-For'] = ip
++
++        payload = smarty_request.payload
++        method = 'GET'
+         if smarty_request.payload:
+-            request.data = smarty_request.payload
+-            request.method = 'POST'
+-        else:
+-            request.method = 'GET'
+-        return request
++            method = 'POST'
++
++        return Namespace(
++            url=smarty_request.url_prefix,
++            params=smarty_request.parameters,
++            headers=headers,
++            data=payload,
++            method=method,
++        )
+     except AttributeError:
+         return smarty_request
+ 
+ 
+ def build_smarty_response(inner_response, error=None):
++    if isinstance(inner_response, tuple):
++        payload, status_code, headers = inner_response
++        return Response(payload, status_code, headers, error)
+     return Response(inner_response.text, inner_response.status_code, inner_response.headers, error)
+ 
+ 
+@@ -77,12 +203,12 @@
+         print('  {}: {}'.format(header, request.headers[header]))
+     print()
+     print('Body: ')
+-    print('  {}\r\n'.format(request.body))
++    print('  {}\r\n'.format(request.data))
+ 
+ 
+ def print_response_data(response):
+     print('****** Response ******\r\n')
+-    print(response.status_code)
++    print(response[1])
+     print()
+-    print(response.text)
++    print(response[0])
+     print('**********************\r\n')

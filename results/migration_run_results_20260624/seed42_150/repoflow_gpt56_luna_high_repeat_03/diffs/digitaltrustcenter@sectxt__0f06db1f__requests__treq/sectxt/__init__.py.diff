@@ -1,0 +1,193 @@
+--- a/sectxt/__init__.py
++++ b/sectxt/__init__.py
+@@ -2,6 +2,7 @@
+ # SPDX-License-Identifier: EUPL-1.2
+ #
+ import codecs
++import ssl
+ 
+ import langcodes
+ import re
+@@ -11,10 +12,18 @@
+ from collections import defaultdict
+ from datetime import datetime, timezone
+ from typing import Optional, Union, List, DefaultDict
+-from urllib.parse import urlsplit, urlunsplit
++from urllib.parse import urljoin, urlsplit, urlunsplit
+ from pgpy_dtc import PGPMessage
+ from pgpy_dtc.errors import PGPError
+ from dateutil.relativedelta import relativedelta
++import treq
++from treq.client import HTTPClient
++from twisted.internet.error import CertificateError
++from twisted.internet.selectreactor import SelectReactor
++from twisted.internet.ssl import ClientContextFactory
++from twisted.python.failure import Failure
++from twisted.web.client import Agent
++from twisted.web.http_headers import Headers
+ 
+ if sys.version_info < (3, 8):
+     from typing_extensions import TypedDict
+@@ -22,11 +31,85 @@
+     from typing import TypedDict
+ 
+ import dateutil.parser
+-import requests
++
++try:
++    from OpenSSL.SSL import Error as OpenSSLError
++except ImportError:
++    OpenSSLError = ssl.SSLError
+ 
+ __version__ = "0.9.6"
+ 
+-s = requests.Session()
++_REDIRECT_CODES = {301, 302, 303, 307, 308}
++
++
++def _run_treq(request):
++    """Run one treq request while retaining the package's synchronous API."""
++    reactor = SelectReactor()
++    result = []
++
++    def finished(value):
++        result.append(value)
++        if reactor.running:
++            reactor.stop()
++        return value
++
++    request(reactor).addBoth(finished)
++    if result:
++        reactor.callWhenRunning(reactor.stop)
++    reactor.run(installSignalHandlers=False)
++    value = result[0]
++    if isinstance(value, Failure):
++        value.raiseException()
++    return value
++
++
++def _fetch(url: str, verify: bool = True):
++    headers = Headers({
++        b"User-Agent": [
++            b"Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) "
++            b"Gecko/20100101 Firefox/12.0"
++        ]
++    })
++
++    def request(reactor):
++        client = None
++        if not verify:
++            agent = Agent(reactor, contextFactory=ClientContextFactory())
++            client = HTTPClient(agent)
++
++        def fetch(current_url, history):
++            if verify:
++                response = treq.get(
++                    current_url, headers=headers, timeout=5, reactor=reactor
++                )
++            else:
++                response = client.get(current_url, headers=headers).addTimeout(5, reactor)
++            return response.addCallback(
++                lambda response: handle_response(response, current_url, history)
++            )
++
++        def handle_response(response, current_url, history):
++            if response.code in _REDIRECT_CODES:
++                locations = response.headers.getRawHeaders(b"location")
++                if locations:
++                    location = locations[0]
++                    if isinstance(location, bytes):
++                        location = location.decode("latin-1")
++                    next_url = urljoin(current_url, location)
++                    if next_url != current_url:
++                        if len(history) >= 30:
++                            raise RuntimeError("Too many redirects")
++                        return treq.content(response).addTimeout(5, reactor).addCallback(
++                            lambda unused: fetch(next_url, history + [current_url])
++                        )
++
++            return treq.content(response).addTimeout(5, reactor).addCallback(
++                lambda content: (response, content, history, current_url)
++            )
++
++        return fetch(url, [])
++
++    return _run_treq(request)
+ 
+ 
+ class ErrorDict(TypedDict):
+@@ -557,35 +640,22 @@
+                 for path in [".well-known/security.txt", "security.txt"]:
+                     url = urlunsplit((scheme, self._loc, path, None, None))
+                     try:
+-                        resp = requests.get(
+-                            url,
+-                            headers={
+-                                'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                              'Gecko/20100101 Firefox/12.0'},
+-                            timeout=5
+-                        )
+-                    except requests.exceptions.SSLError:
++                        resp, content, history, final_url = _fetch(url)
++                    except (ssl.SSLError, OpenSSLError, CertificateError):
+                         if not any(d["code"] == "invalid_cert" for d in self._errors):
+                             self._add_error(
+                                 "invalid_cert",
+                                 "security.txt must be served with a valid TLS certificate.",
+                             )
+                         try:
+-                            resp = requests.get(
+-                                url,
+-                                headers={
+-                                    'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                                  'Gecko/20100101 Firefox/12.0'},
+-                                timeout=5,
+-                                verify=False
+-                            )
++                            resp, content, history, final_url = _fetch(url, verify=False)
+                         except:
+                             continue
+                     except:
+                         continue
+-                    if resp.status_code == 200:
+-                        if resp.history:
+-                            if not resp.url.endswith(path):
++                    if resp.code == 200:
++                        if history:
++                            if not final_url.endswith(path):
+                                 continue
+                         self._path = path
+                         self._url = url
+@@ -603,13 +673,17 @@
+                                 "(legacy place), but must be placed under "
+                                 "the '/.well-known/' path.",
+                             )
+-                        if "content-type" not in resp.headers:
++                        content_type = resp.headers.getRawHeaders(b"content-type")
++                        if not content_type:
+                             self._add_error(
+                                 "no_content_type", "HTTP Content-Type header must be sent."
+                             )
+                         else:
+                             m = Message()
+-                            m['content-type'] = resp.headers["content-type"]
++                            content_type_value = content_type[0]
++                            if isinstance(content_type_value, bytes):
++                                content_type_value = content_type_value.decode("latin-1")
++                            m['content-type'] = content_type_value
+                             params = dict(m.get_params())
+                             if "text/plain" not in params:
+                                 self._add_error(
+@@ -625,9 +699,9 @@
+                                     "Charset parameter in Content-Type header must be "
+                                     "'utf-8' if present.",
+                                 )
+-                        self._content = resp.content
+-                        if resp.history:
+-                            self._urls = [resp.history[0].url, resp.url]
++                        self._content = content
++                        if history:
++                            self._urls = [history[0], final_url]
+                         else:
+                             self._urls = [url]
+                         super()._process()

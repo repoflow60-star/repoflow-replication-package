@@ -1,0 +1,106 @@
+--- a/src/fastAPI_aiohttp/fastAPI.py
++++ b/src/fastAPI_aiohttp/fastAPI.py
+@@ -4,12 +4,44 @@
+ from typing import List, Optional, Any, Dict
+ 
+ import aiohttp
+-from fastapi import FastAPI
+-from fastapi.logger import logger as fastAPI_logger  # convenient name
+-from fastapi.requests import Request
+-from fastapi.responses import Response
++from sanic import Sanic
++from sanic.log import logger as sanic_logger
++from sanic.request import Request
++from sanic.response import json as json_response
++from sanic.response import raw
++
++# Keep the existing logger alias for callers that imported it from this
++# module before the framework migration.
++fastAPI_logger = sanic_logger
+ 
+ SIZE_POOL_AIOHTTP = 100
++
++
++class _ASGISanic(Sanic):
++    """Finalize Sanic lazily when called by an ASGI test client."""
++
++    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
++        if scope.get("type") != "lifespan" and not self.router.finalized:
++            self.signalize(allow_fail_builtin=False)
++            self.finalize()
++        await super().__call__(scope, receive, send)
++
++
++app = _ASGISanic("fastAPI_aiohttp")
++# Sanic's ASGI interface is used by the existing test client.
++app.asgi = True
++
++
++@app.before_server_start
++async def on_start_up(app: Sanic) -> None:
++    fastAPI_logger.info("on_start_up")
++    SingletonAiohttp.get_aiohttp_client()
++
++
++@app.after_server_stop
++async def on_shutdown(app: Sanic) -> None:
++    fastAPI_logger.info("on_shutdown")
++    await SingletonAiohttp.close_aiohttp_client()
+ 
+ 
+ class SingletonAiohttp:
+@@ -46,27 +78,14 @@
+         return json_result
+ 
+ 
+-async def on_start_up() -> None:
+-    fastAPI_logger.info("on_start_up")
+-    SingletonAiohttp.get_aiohttp_client()
+-
+-
+-async def on_shutdown() -> None:
+-    fastAPI_logger.info("on_shutdown")
+-    await SingletonAiohttp.close_aiohttp_client()
+-
+-
+-app = FastAPI(docs_url="/", on_startup=[on_start_up], on_shutdown=[on_shutdown])
+-
+-
+ @app.get('/endpoint')
+-async def endpoint() -> Any:
++async def endpoint(request: Request) -> Any:
+     url = "http://localhost:8080/test"
+-    return await SingletonAiohttp.query_url(url)
++    return json_response(await SingletonAiohttp.query_url(url))
+ 
+ 
+ @app.get('/endpoint_multi')
+-async def endpoint_multi() -> Dict[str, int]:
++async def endpoint_multi(request: Request) -> Dict[str, int]:
+     url = "http://localhost:8080/test"
+ 
+     async_calls: List[Coroutine[Any, Any, Any]] = list()  # store all async operations
+@@ -75,18 +94,17 @@
+     async_calls.append(SingletonAiohttp.query_url(url))
+ 
+     all_results: List[Dict[Any, Any]] = await asyncio.gather(*async_calls)  # wait for all async operations
+-    return {'success': sum([x['success'] for x in all_results])}
++    return json_response({'success': sum([x['success'] for x in all_results])})
+ 
+ 
+-@app.post("/endpoint_stream/")
++@app.post("/endpoint_stream/", stream=True)
+ async def endpoint_stream(request: Request):
+     body = b'RST'
+-    async for chunk in request.stream():
++    async for chunk in request.stream:
+         body += chunk
+ 
+-    return Response(body, media_type='text/plain')
++    return raw(body, content_type='text/plain')
+ 
+ 
+ if __name__ == '__main__':  # local dev
+-    import uvicorn
+-    uvicorn.run(app, host="0.0.0.0", port=8000)
++    app.run(host="0.0.0.0", port=8000)

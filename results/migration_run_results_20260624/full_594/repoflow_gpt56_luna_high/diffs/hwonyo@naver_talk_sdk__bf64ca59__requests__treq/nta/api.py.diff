@@ -1,0 +1,135 @@
+--- a/nta/api.py
++++ b/nta/api.py
+@@ -7,8 +7,14 @@
+ 
+ """
+ import re
+-import requests
+ import json
++from threading import Event as ThreadingEvent
++from threading import Lock as ThreadingLock
++from threading import Thread as ThreadingThread
++
++import treq
++from twisted.internet import defer, reactor
++from twisted.python.failure import Failure
+ 
+ from .exceptions import NaverTalkApiError, NaverTalkApiConnectionError
+ from .models.responses import NaverTalkResponse, NaverTalkImageResponse
+@@ -19,6 +25,71 @@
+ from .models.events import *
+ 
+ from .utils import LOGGER, PY3, _byteify
++
++
++_reactor_lock = ThreadingLock()
++_reactor_thread = None
++_reactor_started = ThreadingEvent()
++_reactor_start_error = []
++
++
++def _ensure_reactor():
++    """Start the Twisted reactor lazily for the synchronous API bridge."""
++    global _reactor_thread
++
++    if reactor.running:
++        return
++
++    with _reactor_lock:
++        if reactor.running:
++            return
++
++        if _reactor_thread is None:
++            _reactor_started.clear()
++            _reactor_start_error[:] = []
++
++            def run_reactor():
++                try:
++                    reactor.callWhenRunning(_reactor_started.set)
++                    reactor.run(installSignalHandlers=False)
++                except BaseException as error:
++                    _reactor_start_error.append(error)
++                    _reactor_started.set()
++
++            _reactor_thread = ThreadingThread(target=run_reactor)
++            _reactor_thread.daemon = True
++            _reactor_thread.start()
++
++    _reactor_started.wait()
++    if _reactor_start_error:
++        raise _reactor_start_error[0]
++
++
++def _wait_for_deferred(operation):
++    """Run a Deferred operation and return its result synchronously."""
++    _ensure_reactor()
++
++    completed = ThreadingEvent()
++    result = []
++
++    def finish(value):
++        result.append(value)
++        completed.set()
++        return value
++
++    def invoke():
++        try:
++            defer.maybeDeferred(operation).addBoth(finish)
++        except BaseException as error:
++            finish(Failure(error))
++
++    reactor.callFromThread(invoke)
++    completed.wait()
++
++    value = result[0]
++    if isinstance(value, Failure):
++        value.raiseException()
++    return value
+ 
+ 
+ class WebhookParser(object):
+@@ -159,15 +230,30 @@
+         """
+         Request Post to Navertalktalk.
+         """
+-        data = payload.as_json_string()
+-        r = requests.post(self._endpoint,
+-                          data=data,
+-                          headers=self._headers)
+-
+-        if r.status_code != requests.codes.ok:
+-            raise NaverTalkApiConnectionError(r)
+-
+-        res = response_form.new_from_json_dict(r.json())
++        data = payload.as_json_string().encode('utf-8')
++        headers = dict((name, [value])
++                       for name, value in self._headers.items())
++
++        def request():
++            deferred = treq.post(self._endpoint,
++                                 data=data,
++                                 headers=headers)
++
++            def read_response(response):
++                if response.code != 200:
++                    return treq.text_content(response).addCallback(
++                        lambda body: (response, body, False))
++
++                return treq.json_content(response).addCallback(
++                    lambda body: (response, body, True))
++
++            return deferred.addCallback(read_response)
++
++        response, body, success = _wait_for_deferred(request)
++        if not success:
++            raise NaverTalkApiConnectionError(response, body)
++
++        res = response_form.new_from_json_dict(body)
+         self.__error_check(res)
+ 
+         if callback is not None:
+@@ -392,4 +478,4 @@
+         When recieved success: false, raise NaverTalkApiError.
+         """
+         if not response.success:
+-            raise NaverTalkApiError(response)+            raise NaverTalkApiError(response)

@@ -1,0 +1,192 @@
+--- a/cf_speedtest/speedtest.py
++++ b/cf_speedtest/speedtest.py
+@@ -3,17 +3,72 @@
+ 
+ import argparse
+ import math
++import ssl
+ import statistics
+ import time
+ from timeit import default_timer as timer
+ 
+-import requests
+ import urllib3
+ 
+ import cf_speedtest.locations as locations
+ import cf_speedtest.options as options
+ 
+-REQ_SESSION = requests.Session()
++
++class Urllib3Session:
++    """Small convenience-method facade backed by urllib3 managers.
++
++    Keeping the two convenience methods makes the rest of the module easy to
++    read, while the actual HTTP implementation (including proxy handling) is
++    provided by urllib3.
++    """
++
++    def __init__(self):
++        self._managers = {}
++
++    def _manager(self, url: str, verify: bool, proxies: dict | None):
++        proxy_url = None
++        if proxies:
++            proxy_url = proxies.get('https' if url.startswith('https:') else 'http')
++
++        key = (proxy_url, verify)
++        if key in self._managers:
++            return self._managers[key]
++
++        cert_reqs = ssl.CERT_REQUIRED if verify else ssl.CERT_NONE
++        if proxy_url:
++            if proxy_url.startswith(('socks4://', 'socks4a://', 'socks5://', 'socks5h://')):
++                from urllib3.contrib.socks import SOCKSProxyManager
++
++                manager = SOCKSProxyManager(proxy_url, cert_reqs=cert_reqs)
++            else:
++                manager = urllib3.ProxyManager(proxy_url, cert_reqs=cert_reqs)
++        else:
++            manager = urllib3.PoolManager(cert_reqs=cert_reqs)
++
++        self._managers[key] = manager
++        return manager
++
++    def request(
++        self,
++        method: str,
++        url: str,
++        *,
++        body=None,
++        headers: dict | None = None,
++        verify: bool = True,
++        proxies: dict | None = None,
++    ):
++        manager = self._manager(url, verify, proxies)
++        return manager.request(method, url, body=body, headers=headers)
++
++    def get(self, url: str, **kwargs):
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url: str, *, data=None, **kwargs):
++        return self.request('POST', url, body=data, **kwargs)
++
++
++REQ_SESSION = Urllib3Session()
+ 
+ CGI_ENDPOINT = 'https://speed.cloudflare.com/cdn-cgi/trace'
+ DOWNLOAD_ENDPOINT = 'https://speed.cloudflare.com/__down?measId=0&bytes={}'
+@@ -29,6 +84,42 @@
+ PROXY_DICT = None
+ VERIFY_SSL = True
+ OUTPUT_FILE = None
++
++
++def _raise_for_status(response) -> None:
++    """Raise urllib3's HTTP error for an unsuccessful response."""
++    # The first branch also keeps the facade useful
++    # with callers that provide a response mock.
++    raise_for_status = getattr(response, 'raise_for_status', None)
++    if callable(raise_for_status):
++        raise_for_status()
++        return
++
++    status = getattr(response, 'status', None)
++    if isinstance(status, int) and status >= 400:
++        raise urllib3.exceptions.HTTPError(
++            f'HTTP {status} response from {getattr(response, "url", "")}',
++        )
++
++
++def _response_content(response):
++    """Return response bytes for either urllib3 or a response-like object."""
++    data = getattr(response, 'data', None)
++    if isinstance(data, (bytes, bytearray)):
++        return bytes(data)
++    return getattr(response, 'content', b'')
++
++
++def _response_text(response) -> str:
++    text = getattr(response, 'text', None)
++    if isinstance(text, str):
++        return text
++
++    data = _response_content(response)
++    if isinstance(data, str):
++        return data
++    return data.decode('utf-8', errors='replace')
++
+ 
+ # Could use python's statistics library, but quantiles are only available
+ # in version 3.8 and above
+@@ -66,7 +157,7 @@
+             total_bytes,
+         ), headers=UPLOAD_HEADERS, verify=VERIFY_SSL, proxies=PROXY_DICT,
+     )
+-    r.raise_for_status()
++    _raise_for_status(r)
+     total_time_taken = timer() - start
+ 
+     # trust what the server says as time taken
+@@ -88,11 +179,11 @@
+     start = timer()
+ 
+     r = REQ_SESSION.get(endpoint, verify=VERIFY_SSL, proxies=PROXY_DICT)
+-    r.raise_for_status()
++    _raise_for_status(r)
+ 
+     total_time_taken = timer() - start
+ 
+-    content_size = len(r.content)
++    content_size = len(_response_content(r))
+     server_time_taken = get_server_timing(r.headers['Server-Timing'])
+ 
+     if OUTPUT_FILE:
+@@ -111,7 +202,7 @@
+ 
+     start = timer()
+     r = REQ_SESSION.get(endpoint, verify=VERIFY_SSL,  proxies=PROXY_DICT)
+-    r.raise_for_status()
++    _raise_for_status(r)
+ 
+     total_time_taken = timer() - start
+     server_time_taken = get_server_timing(r.headers['Server-Timing'])
+@@ -119,7 +210,7 @@
+     if OUTPUT_FILE:
+         with open(OUTPUT_FILE, 'a', encoding='utf-8') as datafile:
+             datafile.write(
+-                f'{time.time()},down,{len(r.content)},{total_time_taken},{server_time_taken}\n',
++                f'{time.time()},down,{len(_response_content(r))},{total_time_taken},{server_time_taken}\n',
+             )
+ 
+     return total_time_taken - server_time_taken
+@@ -129,9 +220,9 @@
+ 
+ def get_our_country() -> str:
+     r = REQ_SESSION.get(CGI_ENDPOINT, verify=VERIFY_SSL,  proxies=PROXY_DICT)
+-    r.raise_for_status()
+-
+-    cgi_data = r.text
++    _raise_for_status(r)
++
++    cgi_data = _response_text(r)
+     cgi_dict = {
+         k: v for k, v in [
+             line.split(
+@@ -149,7 +240,7 @@
+             0,
+         ), verify=VERIFY_SSL,  proxies=PROXY_DICT,
+     )
+-    r.raise_for_status()
++    _raise_for_status(r)
+ 
+     our_ip = r.headers.get('cf-meta-ip')
+     colo = r.headers.get('cf-meta-colo')
+@@ -290,7 +381,7 @@
+ 
+ def main(argv=None) -> int:
+     global PROXY_DICT, VERIFY_SSL, OUTPUT_FILE
+-    # disable annoying warning when using verify=False in requests.get("x", verify=False)
++    # Disable the warning when certificate verification is turned off.
+     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+ 
+     parser = argparse.ArgumentParser()

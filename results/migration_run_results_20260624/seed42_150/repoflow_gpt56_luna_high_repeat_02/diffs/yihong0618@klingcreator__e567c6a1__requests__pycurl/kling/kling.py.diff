@@ -1,0 +1,186 @@
+--- a/kling/kling.py
++++ b/kling/kling.py
+@@ -1,14 +1,16 @@
+ import argparse
++import io
++import json
+ import os
+ import time
+ import contextlib
+ from typing import Optional
+ from enum import Enum
+ from http.cookies import SimpleCookie
++from urllib.parse import urlencode
+ 
+ from fake_useragent import UserAgent
+-import requests
+-from requests.utils import cookiejar_from_dict
++import pycurl
+ from rich import print
+ import threading
+ 
+@@ -18,7 +20,136 @@
+ base_url_not_cn = "https://klingai.com/"
+ 
+ 
+-def call_for_daily_check(session: requests.Session, is_cn: bool) -> bool:
++class _CookieJar:
++    """Small cookie container with the subset of CookieJar used by this module."""
++
++    def __init__(self, cookies=None):
++        self._cookies = dict(cookies or {})
++
++    def __iter__(self):
++        return iter(self._cookies)
++
++    def __len__(self):
++        return len(self._cookies)
++
++    def __getitem__(self, key):
++        return self._cookies[key]
++
++    def __setitem__(self, key, value):
++        self._cookies[key] = value
++
++    def get(self, key, default=None):
++        return self._cookies.get(key, default)
++
++    def items(self):
++        return self._cookies.items()
++
++    def get_dict(self):
++        return dict(self._cookies)
++
++
++class _Response:
++    def __init__(self, status_code, content, headers):
++        self.status_code = status_code
++        self.content = content
++        self.text = content.decode("utf-8", errors="replace")
++        self.headers = headers
++
++    @property
++    def ok(self):
++        return self.status_code < 400
++
++    def json(self):
++        return json.loads(self.content)
++
++
++class _Session:
++    def __init__(self):
++        self.cookies = _CookieJar()
++        self.headers = {}
++
++    def _request(self, method, url, json_body=None, data=None, params=None, headers=None):
++        if params:
++            query = urlencode(params, doseq=True)
++            url = f"{url}{'&' if '?' in url else '?'}{query}"
++
++        request_headers = dict(self.headers)
++        request_headers.update(headers or {})
++        header_list = [f"{key}: {value}" for key, value in request_headers.items()]
++
++        if json_body is not None:
++            data = json.dumps(json_body).encode("utf-8")
++            if not any(key.lower() == "content-type" for key in request_headers):
++                header_list.append("Content-Type: application/json")
++        elif isinstance(data, str):
++            data = data.encode("utf-8")
++
++        response_body = io.BytesIO()
++        response_headers = {}
++        response_header_blocks = []
++
++        def capture_header(raw_header):
++            header_line = raw_header.decode("latin1") if isinstance(raw_header, bytes) else raw_header
++            header_line = header_line.rstrip("\r\n")
++            if not header_line or header_line.upper().startswith("HTTP/"):
++                if response_headers:
++                    response_header_blocks.append(dict(response_headers))
++                    response_headers.clear()
++                return len(raw_header)
++
++            name, separator, value = header_line.partition(":")
++            if not separator:
++                return len(raw_header)
++            value = value.strip()
++            response_headers[name] = value
++            if name.lower() == "set-cookie":
++                received_cookie = SimpleCookie()
++                received_cookie.load(value)
++                for key, morsel in received_cookie.items():
++                    self.cookies[key] = morsel.value
++            return len(raw_header)
++
++        cookie_header = "; ".join(
++            f"{key}={value}" for key, value in self.cookies.items()
++        )
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.WRITEFUNCTION, response_body.write)
++            curl.setopt(pycurl.HEADERFUNCTION, capture_header)
++            curl.setopt(pycurl.FOLLOWLOCATION, 1)
++            curl.setopt(pycurl.NOSIGNAL, 1)
++            if cookie_header:
++                curl.setopt(pycurl.COOKIE, cookie_header)
++            if header_list:
++                curl.setopt(pycurl.HTTPHEADER, header_list)
++            if method == "POST":
++                curl.setopt(pycurl.POST, 1)
++                if data is not None:
++                    curl.setopt(pycurl.POSTFIELDS, data)
++            else:
++                curl.setopt(pycurl.HTTPGET, 1)
++            curl.perform()
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        finally:
++            curl.close()
++
++        if response_headers:
++            response_header_blocks.append(dict(response_headers))
++        if response_header_blocks:
++            response_headers = response_header_blocks[-1]
++        return _Response(status_code, response_body.getvalue(), response_headers)
++
++    def get(self, url, params=None):
++        return self._request("GET", url, params=params)
++
++    def post(self, url, json=None, data=None, params=None, headers=None):
++        return self._request(
++            "POST", url, json_body=json, data=data, params=params, headers=headers
++        )
++
++
++def call_for_daily_check(session: _Session, is_cn: bool) -> bool:
+     if is_cn:
+         r = session.get(f"{base_url}api/pay/reward?activity=login_bonus_daily")
+     else:
+@@ -40,7 +171,7 @@
+ 
+ class BaseGen:
+     def __init__(self, cookie: str) -> None:
+-        self.session: requests.Session = requests.Session()
++        self.session = _Session()
+         self.cookie = cookie
+         self.session.cookies, is_cn = self.parse_cookie_string(self.cookie)
+         self.session.headers["user-agent"] = ua.random
+@@ -72,15 +203,13 @@
+         cookie = SimpleCookie()
+         cookie.load(cookie_string)
+         cookies_dict = {}
+-        cookiejar = None
++        cookiejar = _CookieJar()
+         is_cn = False
+         for key, morsel in cookie.items():
+             if key.startswith("kuaishou"):
+                 is_cn = True
+             cookies_dict[key] = morsel.value
+-            cookiejar = cookiejar_from_dict(
+-                cookies_dict, cookiejar=None, overwrite=True
+-            )
++            cookiejar[key] = morsel.value
+         return cookiejar, is_cn
+ 
+     def get_account_point(self) -> float:

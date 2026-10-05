@@ -1,0 +1,115 @@
+--- a/filestack/uploads/intelligent_ingestion.py
++++ b/filestack/uploads/intelligent_ingestion.py
+@@ -7,12 +7,13 @@
+ import logging
+ import functools
+ import threading
+-from urllib3.util.retry import Retry
+-from concurrent.futures import ThreadPoolExecutor
++from twisted.internet import defer
++from twisted.internet import reactor
++from twisted.internet.task import deferLater
+ 
+ from base64 import b64encode
+ 
+-from filestack.utils import requests
++import treq
+ 
+ from filestack import config
+ 
+@@ -40,6 +41,7 @@
+         raise Exception('Minimal chunk size failed')
+ 
+ 
++@defer.inlineCallbacks
+ def upload_part(apikey, filename, filepath, filesize, storage, start_response, part):
+     with open(filepath, 'rb') as f:
+         f.seek(part['seek_point'])
+@@ -69,9 +71,10 @@
+ 
+         try:
+             url = 'https://{}/multipart/upload'.format(start_response['location_url'])
+-            api_resp = requests.post(url, json=payload).json()
+-            s3_resp = requests.put(api_resp['url'], headers=api_resp['headers'], data=chunk_data)
+-            if not s3_resp.ok:
++            response = yield treq.post(url, json=payload)
++            api_resp = yield response.json()
++            s3_resp = yield treq.put(api_resp['url'], headers=api_resp['headers'], data=chunk_data)
++            if s3_resp.code >= 400:
+                 raise Exception('Incorrect S3 response')
+             offset += len(chunk_data)
+             chunk_data = part_bytes.read(CHUNK_SIZE)
+@@ -88,9 +91,10 @@
+     payload.update({'size': filesize})
+ 
+     url = 'https://{}/multipart/commit'.format(start_response['location_url'])
+-    requests.post(url, json=payload)
++    yield treq.post(url, json=payload)
+ 
+ 
++@defer.inlineCallbacks
+ def upload(apikey, filepath, file_obj, storage, params=None, security=None):
+     params = params or {}
+ 
+@@ -119,7 +123,8 @@
+             'signature': security.signature
+         })
+ 
+-    start_response = requests.post(config.MULTIPART_START_URL, json=payload).json()
++    response = yield treq.post(config.MULTIPART_START_URL, json=payload)
++    start_response = yield response.json()
+     parts = [
+         {
+             'seek_point': seek_point,
+@@ -131,8 +136,10 @@
+         upload_part, apikey, filename, filepath, filesize, storage, start_response
+     )
+ 
+-    with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
+-        list(executor.map(fii_upload, parts))
++    semaphore = defer.DeferredSemaphore(NUM_THREADS)
++    yield defer.gatherResults([
++        semaphore.run(fii_upload, part) for part in parts
++    ])
+ 
+     payload.update({
+         'uri': start_response['uri'],
+@@ -147,12 +154,30 @@
+         payload['upload_tags'] = params.pop('upload_tags')
+ 
+     complete_url = 'https://{}/multipart/complete'.format(start_response['location_url'])
+-    session = requests.Session()
+-    retries = Retry(total=7, backoff_factor=0.2, status_forcelist=[202], allowed_methods=frozenset(['POST']))
+-    session.mount('http://', requests.adapters.HTTPAdapter(max_retries=retries))
+-    response = session.post(complete_url, json=payload, headers=config.HEADERS)
+-    if response.status_code != 200:
+-        log.error('Did not receive a correct complete response: %s. Content %s', response, response.content)
+-        raise Exception('Invalid complete response: {}'.format(response.content))
++    retry_count = 0
++    response = None
+ 
+-    return response.json()
++    while retry_count <= 7:
++        try:
++            response = yield treq.post(complete_url, json=payload, headers=config.HEADERS)
++        except Exception:
++            if retry_count >= 7:
++                raise
++            response = None
++
++        if response is not None and response.code != 202:
++            break
++
++        if retry_count >= 7:
++            break
++
++        if retry_count:
++            yield deferLater(reactor, 0.2 * (2 ** retry_count), lambda: None)
++        retry_count += 1
++
++    response_content = yield response.content()
++    if response.code != 200:
++        log.error('Did not receive a correct complete response: %s. Content %s', response, response_content)
++        raise Exception('Invalid complete response: {}'.format(response_content))
++
++    return (yield response.json())

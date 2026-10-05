@@ -1,0 +1,118 @@
+--- a/fp/fp.py
++++ b/fp/fp.py
+@@ -1,11 +1,76 @@
+ #!/usr/bin/env python3
+ 
+ import random
++import threading
++from urllib.parse import urlsplit
+ 
+ import lxml.html as lh
+-import requests
++import treq
++from twisted.internet import reactor
++from twisted.internet.endpoints import HostnameEndpoint
++from twisted.web.client import ProxyAgent
+ 
+ from fp.errors import FreeProxyException
++
++
++def _request_content(url, **kwargs):
++    return treq.get(url, **kwargs).addCallback(treq.content)
++
++
++_reactor_lock = threading.Lock()
++_reactor_ready = threading.Event()
++_reactor_thread = None
++
++
++def _run_reactor():
++    _reactor_ready.set()
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor():
++    global _reactor_thread
++    if reactor.running:
++        return
++    with _reactor_lock:
++        if not reactor.running and _reactor_thread is None:
++            _reactor_thread = threading.Thread(target=_run_reactor, daemon=True)
++            _reactor_thread.start()
++    _reactor_ready.wait()
++
++
++def _resolve(operation):
++    """Run one treq operation while retaining the library's sync API."""
++    _ensure_reactor()
++    result = []
++    error = []
++    complete = threading.Event()
++
++    def succeeded(value):
++        result.append(value)
++        complete.set()
++        return value
++
++    def failed(failure):
++        try:
++            failure.raiseException()
++        except Exception as exception:
++            error.append(exception)
++        complete.set()
++        return None
++
++    def start_operation():
++        try:
++            deferred = operation()
++            deferred.addCallbacks(succeeded, failed)
++        except Exception as exception:
++            error.append(exception)
++            complete.set()
++
++    reactor.callFromThread(start_operation)
++    complete.wait()
++    if error:
++        raise error[0]
++    return result[0]
+ 
+ 
+ class FreeProxy:
+@@ -30,9 +95,10 @@
+ 
+     def get_proxy_list(self, repeat):
+         try:
+-            page = requests.get(self.__website(repeat))
+-            doc = lh.fromstring(page.content)
+-        except requests.exceptions.RequestException as e:
++            content = _resolve(
++                lambda: _request_content(self.__website(repeat)))
++            doc = lh.fromstring(content)
++        except Exception as e:
+             raise FreeProxyException(
+                 f'Request to {self.__website(repeat)} failed') from e
+         try:
+@@ -78,7 +144,7 @@
+                 working_proxy = self.__check_if_proxy_is_working(proxies)
+                 if working_proxy:
+                     return working_proxy
+-            except requests.exceptions.RequestException:
++            except Exception:
+                 continue
+         if not working_proxy and not repeat:
+             if self.country_id is not None:
+@@ -89,8 +155,9 @@
+ 
+     def __check_if_proxy_is_working(self, proxies):
+         url = f'{self.schema}://{self.url}'
+-        ip = proxies[self.schema].split(':')[1][2:]
+-        with requests.get(url, proxies=proxies, timeout=self.timeout, stream=True) as r:
+-            if r.raw.connection.sock and r.raw.connection.sock.getpeername()[0] == ip:
+-                return proxies[self.schema]
+-        return
++        proxy = urlsplit(proxies[self.schema])
++        endpoint = HostnameEndpoint(reactor, proxy.hostname, proxy.port)
++        agent = ProxyAgent(reactor, endpoint)
++        _resolve(lambda: _request_content(
++            url, agent=agent, timeout=self.timeout))
++        return proxies[self.schema]

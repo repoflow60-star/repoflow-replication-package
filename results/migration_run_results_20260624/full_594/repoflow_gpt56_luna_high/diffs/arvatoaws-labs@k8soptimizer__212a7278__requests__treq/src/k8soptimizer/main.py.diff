@@ -1,0 +1,124 @@
+--- a/src/k8soptimizer/main.py
++++ b/src/k8soptimizer/main.py
+@@ -26,9 +26,10 @@
+ import os
+ import re
+ import sys
++import threading
+ import time
+ 
+-import requests
++import treq
+ from beartype import beartype
+ from beartype.typing import Optional, Tuple
+ from kubernetes import client, config
+@@ -40,6 +41,7 @@
+     V2HorizontalPodAutoscaler,
+ )
+ from pythonjsonlogger import jsonlogger
++from twisted.internet import reactor
+ 
+ from . import __version__, helpers
+ 
+@@ -53,6 +55,73 @@
+ 
+ 
+ PROMETHEUS_URL = os.getenv("PROMETHEUS_URL", "http://localhost:9090")
++
++_reactor_lock = threading.Lock()
++_reactor_ready = threading.Event()
++_reactor_thread = None
++_reactor_thread_ident = None
++
++
++def _run_reactor():
++    global _reactor_thread_ident
++    _reactor_thread_ident = threading.get_ident()
++    reactor.callWhenRunning(_reactor_ready.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor():
++    global _reactor_thread
++    if reactor.running:
++        return
++    with _reactor_lock:
++        if not reactor.running and _reactor_thread is None:
++            _reactor_ready.clear()
++            _reactor_thread = threading.Thread(
++                target=_run_reactor,
++                name="k8soptimizer-treq-reactor",
++                daemon=True,
++            )
++            _reactor_thread.start()
++    _reactor_ready.wait()
++
++
++def _request_text(url, params=None):
++    """Make a treq request while retaining this module's synchronous API."""
++    _ensure_reactor()
++    completed = threading.Event()
++    result = []
++    error = []
++
++    def succeed(body):
++        result.append(body)
++        completed.set()
++        return body
++
++    def fail(failure):
++        error.append(failure.value)
++        completed.set()
++        return failure
++
++    def request():
++        try:
++            if params is None:
++                deferred = treq.get(url)
++            else:
++                deferred = treq.get(url, params=params)
++            deferred.addCallback(treq.text_content)
++            deferred.addCallbacks(succeed, fail)
++        except Exception as exc:
++            error.append(exc)
++            completed.set()
++
++    if _reactor_thread_ident == threading.get_ident():
++        request()
++    else:
++        reactor.callFromThread(request)
++    completed.wait()
++    if error:
++        raise error[0]
++    return result[0]
+ 
+ NAMESPACE_PATTERN = os.getenv("NAMESPACE_PATTERN", ".*")
+ DEPLOYMENT_PATTERN = os.getenv("DEPLOYMENT_PATTERN", ".*")
+@@ -196,8 +265,10 @@
+         response = query_prometheus('sum(rate(http_requests_total{job="api"}[5m]))')
+     """
+     _logger.debug("Query to prometheus: %s", query)
+-    response = requests.get(PROMETHEUS_URL + "/api/v1/query", params={"query": query})
+-    j = json.loads(response.text)
++    response_text = _request_text(
++        PROMETHEUS_URL + "/api/v1/query", params={"query": query}
++    )
++    j = json.loads(response_text)
+     _logger.debug("Response from prometheus: %s", j)
+     if "data" not in j:
+         raise RuntimeError("Got invalid results from query: {}".format(query))
+@@ -220,11 +291,11 @@
+     Example:
+         connection_successful = verify_prometheus_connection()
+     """
+-    response = requests.get(PROMETHEUS_URL + "/api/v1/status/buildinfo")
+-    j = json.loads(response.text)
++    response_text = _request_text(PROMETHEUS_URL + "/api/v1/status/buildinfo")
++    j = json.loads(response_text)
+     _logger.debug(j)
+     if "status" not in j:
+-        raise RuntimeError("Got invalid results request: {}".format(response.text))
++        raise RuntimeError("Got invalid results request: {}".format(response_text))
+     if j["status"] == "success":
+         return True
+     raise RuntimeError("Connection to prometheus api failed")

@@ -1,0 +1,93 @@
+--- a/src/coguard_cli/http_client.py
++++ b/src/coguard_cli/http_client.py
+@@ -0,0 +1,90 @@
++"""Synchronous response compatibility for the asynchronous treq client."""
++
++import json
++import threading
++from typing import Any, Callable
++
++from twisted.internet import defer, reactor, threads
++import treq
++
++
++class HttpClientError(RuntimeError):
++    """Raised when an HTTP response has an unsuccessful status code."""
++
++
++class SynchronousResponse:
++    """Small synchronous view of a fully read treq response."""
++
++    def __init__(self, response: Any, body: bytes):
++        self.status_code = response.code
++        self.reason = _decode(response.phrase)
++        self.content = body
++        self.text = _decode(body)
++
++    def json(self):
++        return json.loads(self.text)
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise HttpClientError(
++                f"{self.status_code} {self.reason}".strip()
++            )
++
++    def iter_content(self, chunk_size=8192):
++        for start in range(0, len(self.content), chunk_size):
++            yield self.content[start:start + chunk_size]
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc_value, traceback):
++        return False
++
++
++def _decode(value):
++    if isinstance(value, bytes):
++        return value.decode("utf-8", errors="replace")
++    return str(value)
++
++
++@defer.inlineCallbacks
++def _perform_request(
++        request_function: Callable[..., Any], *args, **kwargs):
++    response = yield defer.maybeDeferred(request_function, *args, **kwargs)
++    body = yield treq.content(response)
++    defer.returnValue(SynchronousResponse(response, body))
++
++
++_reactor_lock = threading.Lock()
++_reactor_ready = None
++_reactor_thread = None
++
++
++def _start_reactor():
++    global _reactor_ready, _reactor_thread
++    with _reactor_lock:
++        if reactor.running:
++            return
++        if _reactor_thread is None:
++            _reactor_ready = threading.Event()
++
++            def run_reactor():
++                reactor.callWhenRunning(_reactor_ready.set)
++                reactor.run(installSignalHandlers=False)
++
++            _reactor_thread = threading.Thread(
++                target=run_reactor,
++                name="coguard-cli-treq-reactor",
++                daemon=True,
++            )
++            _reactor_thread.start()
++    if _reactor_ready is not None:
++        _reactor_ready.wait()
++
++
++def request_sync(request_function: Callable[..., Any], *args, **kwargs):
++    """Execute one treq request synchronously for the existing CLI callers."""
++    _start_reactor()
++    return threads.blockingCallFromThread(
++        reactor, _perform_request, request_function, *args, **kwargs
++    )

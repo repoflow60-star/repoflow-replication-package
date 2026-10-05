@@ -1,0 +1,161 @@
+--- a/bigcommerce/connection.py
++++ b/bigcommerce/connection.py
+@@ -12,14 +12,99 @@
+ except ImportError:
+     from urllib.parse import urlencode
+ 
++import asyncio
++import inspect
+ import logging
+-import requests
++import threading
++
++import aiohttp
+ import jwt
+ 
+ from json import dumps, loads
+ from math import ceil
+ from time import sleep
+ 
++
++class _AiohttpResponse(object):
++    """Small, synchronous response snapshot used by the legacy API.
++
++    ``aiohttp.ClientResponse`` exposes its body through coroutines.  The
++    public Bigcommerce client predates aiohttp and is synchronous, so the
++    response is fully read before it is returned from the session adapter.
++    Keeping a snapshot also means the underlying ClientSession can be closed
++    promptly and avoids leaking connections for the existing synchronous API.
++    """
++
++    def __init__(self, response, content):
++        self.status_code = response.status
++        self.reason = response.reason
++        self.headers = response.headers
++        self.content = content
++
++    def json(self):
++        return loads(self.content.decode('utf-8'))
++
++
++def _run_awaitable(awaitable):
++    """Run an aiohttp coroutine from the client's synchronous API.
++
++    Most callers do not already have an event loop.  When the client is used
++    from asynchronous code, however, ``asyncio.run`` cannot be called on the
++    current thread; use a short-lived worker thread in that case.
++    """
++    try:
++        asyncio.get_running_loop()
++    except RuntimeError:
++        return asyncio.run(awaitable)
++
++    result = []
++    error = []
++
++    def runner():
++        try:
++            result.append(asyncio.run(awaitable))
++        except BaseException as exc:  # re-raise in the calling thread
++            error.append(exc)
++
++    thread = threading.Thread(target=runner)
++    thread.start()
++    thread.join()
++    if error:
++        raise error[0]
++    return result[0]
++
++
++class _AiohttpSession(object):
++    """Session-shaped adapter for the package's backwards-compatible API.
++
++    aiohttp sessions are tied to an event loop and their request/response
++    methods are asynchronous.  This adapter retains the old ``Connection``
++    calling convention while making every network operation use aiohttp.
++    """
++
++    def __init__(self, auth=None):
++        self.auth = auth
++        self.headers = {}
++
++    @staticmethod
++    def _auth_value(auth):
++        if auth is None or isinstance(auth, aiohttp.BasicAuth):
++            return auth
++        if isinstance(auth, (tuple, list)) and len(auth) == 2:
++            return aiohttp.BasicAuth(auth[0], auth[1])
++        return auth
++
++    async def _request(self, method, url, data, timeout, headers):
++        async with aiohttp.ClientSession(
++                auth=self._auth_value(self.auth), headers=self.headers) as session:
++            async with session.request(method, url, data=data, timeout=timeout,
++                                       headers=headers) as response:
++                content = await response.read()
++                return _AiohttpResponse(response, content)
++
++    def request(self, method, url, data=None, timeout=None, headers=None):
++        return self._request(method, url, data, timeout, headers)
++
+ from bigcommerce.exception import *
+ 
+ log = logging.getLogger("bigcommerce.connection")
+@@ -39,8 +124,7 @@
+         log.info("API Host: %s/%s" % (self.host, self.api_path))
+ 
+         # set up the session
+-        self._session = requests.Session()
+-        self._session.auth = auth
++        self._session = _AiohttpSession(auth=auth)
+         self._session.headers = {"Accept": "application/json"}
+ 
+         self._last_response = None  # for debugging
+@@ -76,8 +160,12 @@
+                 data = dumps(data)
+                 headers['Content-Type'] = 'application/json'
+         log.debug("%s %s" % (method, url))
+-        # make and send the request
+-        return self._session.request(method, url, data=data, timeout=self.timeout, headers=headers)
++        # make and send the request.  The adapter returns an awaitable for
++        # real aiohttp requests, while a synchronous mock remains supported.
++        response = self._session.request(method, url, data=data, timeout=self.timeout, headers=headers)
++        if inspect.isawaitable(response):
++            response = _run_awaitable(response)
++        return response
+ 
+     # CRUD methods
+ 
+@@ -157,9 +245,12 @@
+         if res.status_code in (200, 201, 202):
+             try:
+                 result = res.json()
++                if inspect.isawaitable(result):
++                    result = _run_awaitable(result)
+             except Exception as e:  # json might be invalid, or store might be down
+-                e.message += " (_handle_response failed to decode JSON: " + str(res.content) + ")"
+-                raise  # TODO better exception
++                raise ValueError(
++                    "_handle_response failed to decode JSON: %s" % res.content
++                ) from e
+         elif res.status_code == 204 and not suppress_empty:
+             raise EmptyResponseWarning("%d %s @ %s: %s" % (res.status_code, res.reason, url, res.content), res)
+         elif res.status_code >= 500:
+@@ -196,7 +287,7 @@
+         self.timeout = 7.0  # can attach to session?
+         self.rate_limiting_management = rate_limiting_management
+ 
+-        self._session = requests.Session()
++        self._session = _AiohttpSession()
+         self._session.headers = {"Accept": "application/json",
+                                  "Accept-Encoding": "gzip"}
+         if access_token and store_hash:
+@@ -300,7 +391,7 @@
+         self.timeout = 7.0  # can attach to session?
+         self.rate_limiting_management = rate_limiting_management
+ 
+-        self._session = requests.Session()
++        self._session = _AiohttpSession()
+         self._session.headers = {"Accept": "application/json",
+                                  "Accept-Encoding": "gzip"}
+         if access_token and store_hash:

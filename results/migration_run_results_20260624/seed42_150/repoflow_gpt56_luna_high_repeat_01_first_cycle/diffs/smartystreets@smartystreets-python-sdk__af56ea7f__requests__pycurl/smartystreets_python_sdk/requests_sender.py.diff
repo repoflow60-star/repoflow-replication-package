@@ -1,0 +1,159 @@
+--- a/smartystreets_python_sdk/requests_sender.py
++++ b/smartystreets_python_sdk/requests_sender.py
+@@ -1,12 +1,32 @@
+-from requests import Session, Request
++from io import BytesIO
++try:
++    from urllib.parse import urlencode
++except ImportError:
++    from urllib import urlencode
++
++import pycurl
++
+ from .response import Response
+-import smartystreets_python_sdk as smarty
++from .exceptions import SmartyException
+ import smartystreets_python_sdk_version as version
++
++
++class CurlRequest:
++    def __init__(self, url, params=None):
++        query = urlencode(params or {}, doseq=True)
++        if query:
++            separator = '&' if '?' in url else '?'
++            url = '{}{}{}'.format(url, separator, query)
++
++        self.url = url
++        self.headers = {}
++        self.method = 'GET'
++        self.data = None
++        self.body = None
+ 
+ 
+ class RequestsSender:
+     def __init__(self, max_timeout=None, proxy=None, ip=None):
+-        self.session = Session()
+         self.max_timeout = max_timeout or 10
+         self.proxy = proxy
+         self.debug = None
+@@ -15,24 +35,65 @@
+     def send(self, smarty_request):
+         ip = self.ip
+         request = build_request(smarty_request, ip)
+-        prepped_request = self.session.prepare_request(request)
+-        prepped_proxies = self.build_proxies()
+         if self.debug:
+-            print_request_data(prepped_request)
++            print_request_data(request)
+ 
+-        settings = self.session.merge_environment_settings(
+-            prepped_request.url, prepped_proxies, None, None, None
+-        )
+-        with self.session.send(prepped_request, timeout=self.max_timeout, **settings) as response:
+-            if self.debug:
+-                print_response_data(response)
+-            return build_smarty_response(response)
++        payload, status_code, headers = self._send_with_curl(request)
++        if self.debug:
++            print_response_data(payload, status_code)
++        return Response(payload, status_code, headers)
++
++    def _send_with_curl(self, request):
++        body = BytesIO()
++        response_headers = {}
++        curl = pycurl.Curl()
++
++        def receive_header(header):
++            line = header.decode('iso-8859-1').strip()
++            if line and not line.startswith('HTTP/') and ':' in line:
++                name, value = line.split(':', 1)
++                response_headers[name.strip()] = value.strip()
++            return len(header)
++
++        try:
++            curl.setopt(pycurl.URL, request.url)
++            curl.setopt(pycurl.TIMEOUT, self.max_timeout)
++            curl.setopt(
++                pycurl.HTTPHEADER,
++                ['{}: {}'.format(name, value) for name, value in request.headers.items()]
++            )
++            curl.setopt(pycurl.HEADERFUNCTION, receive_header)
++            curl.setopt(pycurl.WRITEDATA, body)
++
++            if request.method == 'POST':
++                curl.setopt(pycurl.POST, 1)
++                post_data = request.body
++                if isinstance(post_data, str):
++                    post_data = post_data.encode('utf-8')
++                curl.setopt(pycurl.POSTFIELDS, post_data or b'')
++            else:
++                curl.setopt(pycurl.HTTPGET, 1)
++
++            proxies = self.build_proxies()
++            if request.url.lower().startswith('https://'):
++                proxy = proxies.get('https')
++            else:
++                proxy = proxies.get('http')
++            if proxy:
++                curl.setopt(pycurl.PROXY, proxy)
++
++            curl.perform()
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++            payload = body.getvalue().decode('utf-8', errors='replace')
++            return payload, status_code, response_headers
++        finally:
++            curl.close()
+ 
+     def build_proxies(self):
+         if not self.proxy:
+             return {}
+         if (self.proxy.host == 'http://' or self.proxy.host =='https://'):
+-            raise smarty.exceptions.SmartyException('Proxy must have a valid host (including port)')
++            raise SmartyException('Proxy must have a valid host (including port)')
+ 
+         proxy_string = self.proxy.host
+ 
+@@ -46,8 +107,11 @@
+ 
+ 
+ def build_request(smarty_request, ip=None):
++    if isinstance(smarty_request, CurlRequest):
++        return smarty_request
++
+     try:
+-        request = Request(url=smarty_request.url_prefix, params=smarty_request.parameters)
++        request = CurlRequest(url=smarty_request.url_prefix, params=smarty_request.parameters)
+         request.headers['User-Agent'] = "smartystreets (sdk:python@{})".format(version.__version__)
+         request.headers['Content-Type'] = smarty_request.content_type
+         if smarty_request.referer:
+@@ -56,16 +120,13 @@
+             request.headers['X-Forwarded-For'] = ip
+         if smarty_request.payload:
+             request.data = smarty_request.payload
++            request.body = smarty_request.payload
+             request.method = 'POST'
+         else:
+             request.method = 'GET'
+         return request
+     except AttributeError:
+         return smarty_request
+-
+-
+-def build_smarty_response(inner_response, error=None):
+-    return Response(inner_response.text, inner_response.status_code, inner_response.headers, error)
+ 
+ 
+ def print_request_data(request):
+@@ -80,9 +141,9 @@
+     print('  {}\r\n'.format(request.body))
+ 
+ 
+-def print_response_data(response):
++def print_response_data(payload, status_code):
+     print('****** Response ******\r\n')
+-    print(response.status_code)
++    print(status_code)
+     print()
+-    print(response.text)
++    print(payload)
+     print('**********************\r\n')

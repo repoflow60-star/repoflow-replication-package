@@ -1,0 +1,214 @@
+--- a/whatsapp_api_client_python/API.py
++++ b/whatsapp_api_client_python/API.py
+@@ -1,11 +1,198 @@
+ import json
+ import logging
+-from typing import Any, NoReturn, Optional
+-
+-from requests import Response, Session
+-from requests.adapters import HTTPAdapter, Retry
++import time
++from io import BytesIO
++from typing import Any, Dict, NoReturn, Optional
++from urllib.parse import urlencode
++
++import pycurl
+ 
+ from .response import Response as GreenAPIResponse
++
++
++class Retry:
++    """Retry configuration used by the client transport."""
++
++    def __init__(
++            self,
++            total: int = 0,
++            backoff_factor: float = 0.0,
++            allowed_methods: Optional[set] = None,
++            status_forcelist: Optional[list] = None,
++    ):
++        self.total = total
++        self.backoff_factor = backoff_factor
++        self.allowed_methods = allowed_methods
++        self.status_forcelist = status_forcelist or []
++
++
++class HTTPAdapter:
++    """Adapter configuration retained so existing session configuration works."""
++
++    def __init__(self, max_retries: Optional[Retry] = None):
++        self.max_retries = max_retries or Retry()
++
++
++class _PycurlResponse:
++    def __init__(self, status_code: int, body: bytes):
++        self.status_code = status_code
++        self.text = body.decode("utf-8", errors="replace")
++
++
++class Session:
++    """A small session-like wrapper backed by pycurl.
++
++    The public client only needs ``headers``, ``mount`` and ``request``.  Keeping
++    those methods here preserves the client's existing session API while
++    providing the HTTP transport through pycurl.
++    """
++
++    def __init__(self):
++        self.headers: Dict[str, str] = {}
++        self._adapters: Dict[str, HTTPAdapter] = {}
++
++    def mount(self, prefix: str, adapter: HTTPAdapter) -> None:
++        self._adapters[prefix] = adapter
++
++    def request(
++            self,
++            method: str,
++            url: str,
++            json: Any = None,
++            data: Any = None,
++            files: Optional[dict] = None,
++            headers: Optional[dict] = None,
++            timeout: Optional[float] = None,
++            params: Optional[dict] = None,
++            **_: Any,
++    ) -> _PycurlResponse:
++        method = method.upper()
++        if params:
++            separator = "&" if "?" in url else "?"
++            url = f"{url}{separator}{urlencode(params, doseq=True)}"
++
++        adapter = self._adapters.get(f"{url.split(':', 1)[0]}://")
++        retry = adapter.max_retries if adapter else Retry()
++        attempts = 0
++
++        while True:
++            response = self._request_once(
++                method, url, json, data, files, headers, timeout
++            )
++            can_retry = (
++                response.status_code in retry.status_forcelist
++                and attempts < retry.total
++                and (
++                    retry.allowed_methods is None
++                    or method in retry.allowed_methods
++                )
++            )
++            if not can_retry:
++                return response
++
++            if retry.backoff_factor:
++                time.sleep(retry.backoff_factor * (2 ** attempts))
++            attempts += 1
++
++    def _request_once(
++            self,
++            method: str,
++            url: str,
++            json_data: Any,
++            data: Any,
++            files: Optional[dict],
++            headers: Optional[dict],
++            timeout: Optional[float],
++    ) -> _PycurlResponse:
++        curl = pycurl.Curl()
++        body = BytesIO()
++        mime = None
++
++        try:
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.CUSTOMREQUEST, method)
++            curl.setopt(pycurl.WRITEFUNCTION, body.write)
++            if timeout is not None:
++                # TIMEOUT_MS accepts the sub-second values supported by the
++                # public client's float timeout settings.
++                if isinstance(timeout, tuple):
++                    timeout = timeout[-1]
++                curl.setopt(pycurl.TIMEOUT_MS, max(0, int(timeout * 1000)))
++
++            request_headers = dict(self.headers)
++            request_headers.update(headers or {})
++            header_values = [
++                f"{key}: {value}"
++                for key, value in request_headers.items()
++                if value is not None
++            ]
++            if header_values:
++                curl.setopt(pycurl.HTTPHEADER, header_values)
++
++            if files:
++                mime = pycurl.CurlMime(curl)
++                fields = data if isinstance(data, dict) else {}
++                for name, value in fields.items():
++                    part = mime.addpart()
++                    part.name(name)
++                    part.data(str(value))
++
++                for name, file_info in files.items():
++                    part = mime.addpart()
++                    part.name(name)
++                    filename, file_data, content_type = self._file_info(
++                        file_info
++                    )
++                    if filename is not None:
++                        part.filename(str(filename))
++                    if content_type:
++                        part.type(content_type)
++                    if hasattr(file_data, "read"):
++                        part.data(file_data.read())
++                    elif isinstance(file_data, (bytes, bytearray)):
++                        part.data(bytes(file_data))
++                    else:
++                        part.filedata(str(file_data))
++                curl.setopt(pycurl.MIMEPOST, mime)
++            elif json_data is not None:
++                encoded = json.dumps(json_data).encode("utf-8")
++                curl.setopt(pycurl.POSTFIELDS, encoded)
++                if not any(
++                    key.lower() == "content-type" for key in request_headers
++                ):
++                    header_values.append("Content-Type: application/json")
++                    curl.setopt(pycurl.HTTPHEADER, header_values)
++            elif data is not None:
++                if isinstance(data, dict):
++                    data = urlencode(data, doseq=True).encode("utf-8")
++                elif isinstance(data, str):
++                    data = data.encode("utf-8")
++                curl.setopt(pycurl.POSTFIELDS, data)
++
++            if method == "POST" and json_data is None and data is None and not files:
++                curl.setopt(pycurl.POST, 1)
++            if method == "HEAD":
++                curl.setopt(pycurl.NOBODY, 1)
++
++            curl.perform()
++            return _PycurlResponse(
++                curl.getinfo(pycurl.RESPONSE_CODE), body.getvalue()
++            )
++        finally:
++            if mime is not None:
++                mime.close()
++            curl.close()
++
++    @staticmethod
++    def _file_info(file_info: Any):
++        if isinstance(file_info, tuple):
++            filename = file_info[0]
++            file_data = file_info[1]
++            content_type = file_info[2] if len(file_info) > 2 else None
++            return filename, file_data, content_type
++        return None, file_info, None
++
++
+ from .tools import (
+     account,
+     device,
+@@ -116,7 +303,7 @@
+ 
+         return GreenAPIResponse(response.status_code, response.text)
+ 
+-    def __handle_response(self, response: Response) -> Optional[NoReturn]:
++    def __handle_response(self, response: _PycurlResponse) -> Optional[NoReturn]:
+         status_code = response.status_code
+         if status_code != 200 or self.debug_mode:
+             try:

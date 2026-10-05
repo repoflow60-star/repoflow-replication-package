@@ -1,0 +1,181 @@
+--- a/pastepwn/util/request.py
++++ b/pastepwn/util/request.py
+@@ -1,14 +1,32 @@
+ import logging
+-from threading import Lock
++from threading import Event, Lock, Thread
++from urllib.parse import urlsplit
++from urllib.request import getproxies, proxy_bypass
+ 
+-from requests import Session, utils
+-from requests.exceptions import Timeout
++import treq
++from treq.client import HTTPClient
++from twisted.internet import reactor
++from twisted.internet.defer import CancelledError
++from twisted.internet.endpoints import HostnameEndpoint
++from twisted.internet.error import TimeoutError
++from twisted.web.client import Agent, ProxyAgent
+ 
+ 
+ class Request:
++    """Synchronous facade around treq's asynchronous HTTP client.
++
++    PastePwn's scrapers run in worker threads and historically exposed a
++    synchronous ``get``/``post`` API. Treq returns Deferreds, so a single
++    Twisted reactor is kept in a daemon thread and this class waits for each
++    Deferred to complete. This keeps the public API stable while using treq
++    for all HTTP traffic.
++    """
++
+     _instance = None
+     _initialized = False
+     _lock = Lock()
++    _reactor_started = False
++    _reactor_ready = Event()
+ 
+     def __new__(cls, *args, **kwargs):
+         # override method to implement singleton
+@@ -22,13 +40,67 @@
+     def __init__(self, proxies=None, headers=None):
+         if not self._initialized:
+             self.logger = logging.getLogger(__name__)
+-            self.session = Session()
+             self.proxies = proxies
+             self.headers = headers
+             self.logger.info("Using the following custom proxies: %s", proxies)
+-            system_proxies = utils.get_environ_proxies("https://example.com")
++            system_proxies = getproxies()
+             self.logger.info("Using the following system proxies: %s", system_proxies)
+             Request._initialized = True
++
++    @classmethod
++    def _start_reactor(cls):
++        """Start the reactor once, without taking ownership of the main thread."""
++        with cls._lock:
++            if cls._reactor_started:
++                return
++            cls._reactor_started = True
++            if reactor.running:
++                # An application embedding PastePwn may already own the
++                # reactor's thread.
++                cls._reactor_ready.set()
++                return
++
++            def run_reactor():
++                reactor.callWhenRunning(cls._reactor_ready.set)
++                reactor.run(installSignalHandlers=False)
++
++            Thread(target=run_reactor, name="PastePwnReactor", daemon=True).start()
++
++        # Do not submit work before the reactor has entered its event loop.
++        if not cls._reactor_ready.wait(5):
++            raise RuntimeError("The Twisted reactor could not be started")
++
++    def _proxy_url(self, url):
++        """Return the proxy URL applicable to *url*, if one is configured."""
++        parsed_url = urlsplit(url)
++        scheme = parsed_url.scheme.lower()
++
++        # An explicitly supplied mapping takes precedence over environment
++        # proxies, matching the old requests-based behaviour.
++        if self.proxies is not None:
++            if not isinstance(self.proxies, dict):
++                return None
++            proxy = self.proxies.get(scheme)
++            if proxy is None:
++                proxy = self.proxies.get("all")
++            return proxy or None
++
++        if parsed_url.hostname and proxy_bypass(parsed_url.hostname):
++            return None
++        return getproxies().get(scheme)
++
++    def _client(self, url):
++        """Build a treq client, optionally using an HTTP proxy."""
++        proxy_url = self._proxy_url(url)
++        if not proxy_url:
++            return HTTPClient(Agent(reactor))
++
++        parsed_proxy = urlsplit(proxy_url)
++        if not parsed_proxy.hostname:
++            raise ValueError(f"Invalid proxy URL: {proxy_url}")
++        proxy_port = parsed_proxy.port or (443 if parsed_proxy.scheme == "https" else 80)
++        endpoint = HostnameEndpoint(reactor, parsed_proxy.hostname, proxy_port)
++        return HTTPClient(ProxyAgent(endpoint, reactor=reactor))
+ 
+     def _request_wrapper(self, data, timeout, *args, **kwargs):
+         headers = {"User-Agent": "pastepwn (https://github.com/d-Rickyy-b/pastepwn)"}
+@@ -36,14 +108,67 @@
+         if self.headers is not None:
+             headers.update(self.headers)
+ 
+-        try:
+-            response = self.session.request(*args, headers=headers, proxies=self.proxies, data=data, timeout=timeout, **kwargs)
+-        except Timeout:
+-            url = kwargs.get("url")
++        url = kwargs.get("url")
++        method = kwargs.get("method", "GET")
++        finished = Event()
++        result = {}
++        deferred = []
++
++        if isinstance(data, str):
++            data = data.encode("utf-8")
++
++        def request_on_reactor():
++            try:
++                client = self._client(url)
++                request_deferred = client.request(
++                    method,
++                    url,
++                    headers=headers,
++                    data=data,
++                    timeout=timeout,
++                )
++                deferred.append(request_deferred)
++                request_deferred.addCallback(treq.content)
++                request_deferred.addCallback(lambda content: content.decode("utf-8"))
++                request_deferred.addCallback(self._store_result, result, finished)
++                request_deferred.addErrback(self._store_error, result, finished)
++            except Exception as error:
++                self._store_error(error, result, finished)
++
++        self._start_reactor()
++        reactor.callFromThread(request_on_reactor)
++
++        # Treq cancels requests when its timeout expires. The small grace
++        # period allows that cancellation Deferred to reach this thread.
++        wait_timeout = None if timeout is None else max(float(timeout), 0) + 1
++        if not finished.wait(wait_timeout):
++            if deferred:
++                reactor.callFromThread(deferred[0].cancel)
+             self.logger.warning("Timeout while requesting %s!", url)
+             return ""
+ 
+-        return response.content.decode("utf-8")
++        if result.get("timeout"):
++            self.logger.warning("Timeout while requesting %s!", url)
++            return ""
++        if "error" in result:
++            raise result["error"]
++        return result.get("body", "")
++
++    @staticmethod
++    def _store_result(content, result, finished):
++        result["body"] = content
++        finished.set()
++        return content
++
++    @staticmethod
++    def _store_error(failure, result, finished):
++        error = getattr(failure, "value", failure)
++        if isinstance(error, (CancelledError, TimeoutError)):
++            result["timeout"] = True
++        else:
++            result["error"] = error
++        finished.set()
++        return None
+ 
+     def get(self, url, data=None, timeout=5):
+         return self._request_wrapper(method="GET", url=url, data=data, timeout=timeout)

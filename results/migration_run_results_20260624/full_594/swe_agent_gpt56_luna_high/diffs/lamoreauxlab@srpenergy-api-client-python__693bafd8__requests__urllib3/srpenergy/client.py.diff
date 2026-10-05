@@ -1,0 +1,158 @@
+--- a/srpenergy/client.py
++++ b/srpenergy/client.py
+@@ -5,13 +5,109 @@
+ """
+ 
+ from datetime import datetime, timedelta
++from http.cookies import SimpleCookie
++import json
+ import re
+-from urllib.parse import unquote
++from urllib.parse import unquote, urlencode
+ 
+ from dateutil.parser import parse
+-import requests
++import urllib3
++
++
++class _Urllib3Session:
++    """Small session wrapper providing the behavior used by the client.
++
++    ``urllib3`` does not provide a high-level session or cookie jar like
++    ``requests``.  The SRP API needs both form POSTs and the cookie returned
++    by the anti-forgery endpoint, so keep that small amount of state here.
++    """
++
++    def __init__(self):
++        self._pool = urllib3.PoolManager()
++        self._cookies = {}
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc_value, traceback):
++        self._pool.clear()
++        return False
++
++    def _request(self, method, url, fields=None, headers=None):
++        request_headers = dict(headers or {})
++        if self._cookies and not any(
++            key.lower() == "cookie" for key in request_headers
++        ):
++            request_headers["Cookie"] = "; ".join(
++                f"{name}={value}" for name, value in self._cookies.items()
++            )
++
++        if method == "POST" and fields is not None:
++            request_headers.setdefault(
++                "Content-Type", "application/x-www-form-urlencoded"
++            )
++            response = self._pool.request(
++                method,
++                url,
++                body=urlencode(fields).encode("utf-8"),
++                headers=request_headers,
++            )
++        else:
++            response = self._pool.request(
++                method, url, fields=fields, headers=request_headers
++            )
++
++        self._store_cookies(response)
++        return response
++
++    def _store_cookies(self, response):
++        response_headers = getattr(response, "headers", {})
++        if hasattr(response_headers, "getlist"):
++            set_cookie_headers = response_headers.getlist("Set-Cookie")
++        else:
++            set_cookie_headers = response_headers.get("Set-Cookie", [])
++
++        if isinstance(set_cookie_headers, str):
++            set_cookie_headers = [set_cookie_headers]
++
++        for header in set_cookie_headers:
++            cookies = SimpleCookie()
++            cookies.load(header)
++            for name, morsel in cookies.items():
++                self._cookies[name] = morsel.value
++
++    @property
++    def cookies(self):
++        """Return cookies collected from responses."""
++        return self._cookies
++
++    def post(self, url, data=None, headers=None):
++        """Send a form-encoded POST request."""
++        return self._request("POST", url, fields=data, headers=headers)
++
++    def get(self, url, headers=None):
++        """Send a GET request."""
++        return self._request("GET", url, headers=headers)
++
++
++class _RequestsCompatibility:
++    """Compatibility namespace for callers patching the former session API."""
++
++    Session = _Urllib3Session
++
++
++# Keep the old module path patchable without depending on the requests package.
++requests = _RequestsCompatibility()
++
+ 
+ BASE_USAGE_URL = "https://myaccount.srpnet.com/myaccountapi/api/"
++
++
++def _response_json(response):
++    """Decode JSON from either a test response or an urllib3 response."""
++    if hasattr(response, "json"):
++        return response.json()
++    return json.loads(response.data.decode("utf-8"))
+ 
+ 
+ def get_pretty_date(date_part):
+@@ -188,13 +284,13 @@
+         """
+         try:
+ 
+-            with requests.Session() as session:
++            with _Urllib3Session() as session:
+ 
+                 response = session.post(
+                     BASE_USAGE_URL + "/login/authorize",
+                     data={"username": self.username, "password": self.password},
+                 )
+-                data = response.json()
++                data = _response_json(response)
+ 
+                 valid = data["message"] == "Log in successful."
+ 
+@@ -272,7 +368,7 @@
+             str_startdate = startdate.strftime("%m-%d-%Y")
+             str_enddate = enddate.strftime("%m-%d-%Y")
+ 
+-            with requests.Session() as session:
++            with _Urllib3Session() as session:
+ 
+                 response = session.post(
+                     BASE_USAGE_URL + "login/authorize",
+@@ -280,7 +376,8 @@
+                 )
+ 
+                 response = session.get(BASE_USAGE_URL + "login/antiforgerytoken")
+-                xsrf_token = unquote(response.cookies["xsrf-token"])
++                cookies = getattr(response, "cookies", session.cookies)
++                xsrf_token = unquote(cookies["xsrf-token"])
+ 
+                 response = session.get(
+                     BASE_USAGE_URL
+@@ -293,7 +390,7 @@
+                     headers={"x-xsrf-token": xsrf_token},
+                 )
+ 
+-                data = response.json()
++                data = _response_json(response)
+                 hourly_usage_list = data["hourlyUsageList"]
+ 
+                 usage = []

@@ -1,0 +1,185 @@
+--- a/filestack/utils.py
++++ b/filestack/utils.py
+@@ -1,9 +1,11 @@
++import asyncio
++import json
++import random
++import string
++import threading
+ import time
+-import string
+-import random
+-from functools import partial
+-import requests as original_requests
+-from requests.exceptions import HTTPError
++
++import aiohttp
+ 
+ from filestack import config
+ from filestack.exceptions import FilestackHTTPError
+@@ -13,34 +15,150 @@
+     return ''.join(random.choice(string.ascii_letters + string.digits) for i in range(length))
+ 
+ 
+-class RequestsWrapper:
++class _Headers(dict):
++    """Retain response headers with the case-insensitive lookup callers expect."""
++
++    def __getitem__(self, key):
++        key = key.lower()
++        for header, value in self.items():
++            if header.lower() == key:
++                return value
++        raise KeyError(key)
++
++    def get(self, key, default=None):
++        try:
++            return self[key]
++        except KeyError:
++            return default
++
++    def __contains__(self, key):
++        return any(header.lower() == key.lower() for header in self)
++
++
++class _ResponseAdapter:
++    """Buffered synchronous response facade over an aiohttp response."""
++
++    def __init__(self, response, content):
++        self.status_code = response.status
++        self.headers = _Headers(response.headers)
++        self.content = content
++
++    @property
++    def ok(self):
++        return self.status_code < 400
++
++    @property
++    def text(self):
++        return self.content.decode('utf-8', errors='replace')
++
++    def json(self):
++        return json.loads(self.text)
++
++    def raise_for_status(self):
++        if not self.ok:
++            raise FilestackHTTPError(self.text)
++
++    def iter_content(self, chunk_size):
++        for offset in range(0, len(self.content), chunk_size):
++            yield self.content[offset:offset + chunk_size]
++
++
++def _run(coroutine):
++    """Bridge aiohttp's async request to the SDK's synchronous API."""
++    try:
++        asyncio.get_running_loop()
++    except RuntimeError:
++        return asyncio.run(coroutine)
++
++    result = []
++    error = []
++
++    def run_in_thread():
++        try:
++            result.append(asyncio.run(coroutine))
++        except BaseException as exc:
++            error.append(exc)
++
++    thread = threading.Thread(target=run_in_thread)
++    thread.start()
++    thread.join()
++    if error:
++        raise error[0]
++    return result[0]
++
++
++def _form_data(data, files):
++    form = aiohttp.FormData()
++    if isinstance(data, dict):
++        for key, value in data.items():
++            form.add_field(key, value)
++    for key, value in files.items():
++        if len(value) == 2:
++            filename, file_obj = value
++            content_type = None
++        else:
++            filename, file_obj, content_type = value
++        form.add_field(key, file_obj, filename=filename, content_type=content_type)
++    return form
++
++
++async def _request(method, *args, **kwargs):
++    files = kwargs.pop('files', None)
++    kwargs.pop('stream', None)
++    retry_statuses = kwargs.pop('retry_statuses', ())
++    retry_attempts = kwargs.pop('retry_attempts', 0)
++    retry_delay = kwargs.pop('retry_delay', 0)
++
++    async with aiohttp.ClientSession() as session:
++        for attempt in range(retry_attempts + 1):
++            request_kwargs = kwargs.copy()
++            if files:
++                request_kwargs['data'] = _form_data(request_kwargs.get('data'), files)
++
++            async with session.request(method, *args, **request_kwargs) as response:
++                content = await response.read()
++                result = _ResponseAdapter(response, content)
++
++            if result.status_code not in retry_statuses or attempt == retry_attempts:
++                return result
++            await asyncio.sleep(retry_delay * (2 ** attempt))
++
++
++class AiohttpWrapper:
+     """
+-    This class wraps selected methods from requests package and adds
+-    default headers if no headers were specified.
++    This class wraps selected aiohttp methods and adds default headers when
++    no headers were specified.
+     """
+-    def __getattr__(self, name):
+-        if name in ('get', 'post', 'put', 'delete'):
+-            return partial(self.handle_request, name)
+-        return original_requests.__getattribute__(name)
++    def get(self, *args, **kwargs):
++        return self.handle_request('GET', *args, **kwargs)
++
++    def post(self, *args, **kwargs):
++        return self.handle_request('POST', *args, **kwargs)
++
++    def put(self, *args, **kwargs):
++        return self.handle_request('PUT', *args, **kwargs)
++
++    def delete(self, *args, **kwargs):
++        return self.handle_request('DELETE', *args, **kwargs)
+ 
+     def handle_request(self, name, *args, **kwargs):
++        check_status = kwargs.pop('check_status', True)
+         if 'headers' not in kwargs:
+-            kwargs['headers'] = config.HEADERS
++            kwargs['headers'] = dict(config.HEADERS)
+             kwargs['headers']['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
+             kwargs['headers']['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
+ 
+-        requests_method = getattr(original_requests, name)
+-        response = requests_method(*args, **kwargs)
++        response = _run(_request(name, *args, **kwargs))
+ 
+-        try:
+-            response.raise_for_status()
+-        except HTTPError as e:
+-            raise FilestackHTTPError(response.text) from e
++        if check_status and not response.ok:
++            raise FilestackHTTPError(response.text)
+ 
+         return response
+ 
+ 
+-requests = RequestsWrapper()
++http = AiohttpWrapper()
++# Keep the established wrapper export while routing all I/O through aiohttp.
++requests = http
+ 
+ 
+ def return_transform_task(transformation, params):

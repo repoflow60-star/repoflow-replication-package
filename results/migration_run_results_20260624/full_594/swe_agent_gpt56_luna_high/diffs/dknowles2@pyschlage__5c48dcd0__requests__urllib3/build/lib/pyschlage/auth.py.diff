@@ -1,0 +1,188 @@
+--- a/build/lib/pyschlage/auth.py
++++ b/build/lib/pyschlage/auth.py
+@@ -0,0 +1,185 @@
++"""Authentication support for the Schlage WiFi cloud service."""
++
++from __future__ import annotations
++
++import json
++from collections.abc import Mapping
++from functools import wraps
++from typing import Callable
++from urllib.parse import urlencode, urlsplit, urlunsplit
++
++from botocore.exceptions import ClientError
++import pycognito
++from pycognito import utils
++import urllib3
++from urllib3.response import BaseHTTPResponse
++
++from .exceptions import NotAuthorizedError, UnknownError
++
++
++class _AuthRequest:
++    """Small request object understood by pycognito's requests auth plugin.
++
++    ``RequestsSrpAuth`` only needs a mutable ``headers`` attribute.  Keeping
++    this adapter local lets the transport use urllib3 without creating a
++    dependency on requests in this package.
++    """
++
++    def __init__(self, headers: dict[str, str] | None = None) -> None:
++        self.headers = {} if headers is None else headers
++
++
++_DEFAULT_TIMEOUT = 60
++_NOT_AUTHORIZED_ERRORS = (
++    "NotAuthorizedException",
++    "InvalidPasswordException",
++    "PasswordResetRequiredException",
++    "UserNotFoundException",
++    "UserNotConfirmedException",
++)
++API_KEY = "hnuu9jbbJr7MssFDWm5nU2Z7nG5Q5rxsaqWsE7e9"
++BASE_URL = "https://api.allegion.yonomi.cloud/v1"
++CLIENT_ID = "t5836cptp2s1il0u9lki03j5"
++CLIENT_SECRET = "1kfmt18bgaig51in4j4v1j3jbe7ioqtjhle5o6knqc5dat0tpuvo"
++USER_POOL_REGION = "us-west-2"
++USER_POOL_ID = USER_POOL_REGION + "_2zhrVs9d4"
++
++
++def _translate_auth_errors(
++    # pylint: disable=invalid-name
++    fn: Callable[..., BaseHTTPResponse],
++    # pylint: enable=invalid-name
++) -> Callable[..., BaseHTTPResponse]:
++    @wraps(fn)
++    def wrapper(*args, **kwargs) -> BaseHTTPResponse:
++        try:
++            return fn(*args, **kwargs)
++        except ClientError as ex:
++            resp_err = ex.response.get("Error", {})
++            if resp_err.get("Code") in _NOT_AUTHORIZED_ERRORS:
++                raise NotAuthorizedError(
++                    resp_err.get("Message", "Not authorized")
++                ) from ex
++            raise UnknownError(str(ex)) from ex  # pragma: no cover
++
++    return wrapper
++
++
++def _translate_http_errors(
++    # pylint: disable=invalid-name
++    fn: Callable[..., BaseHTTPResponse],
++    # pylint: enable=invalid-name
++) -> Callable[..., BaseHTTPResponse]:
++    @wraps(fn)
++    def wrapper(*args, **kwargs) -> BaseHTTPResponse:
++        resp = fn(*args, **kwargs)
++        try:
++            if resp.status >= 400:
++                raise urllib3.exceptions.HTTPError(
++                    f"{resp.status} {resp.reason or ''}".strip()
++                )
++            return resp
++        except urllib3.exceptions.HTTPError as ex:
++            reason = resp.reason
++            try:
++                message = resp.json().get("message", reason)
++            except (AttributeError, json.JSONDecodeError, UnicodeDecodeError):
++                message = reason
++            raise UnknownError(message) from ex
++
++    return wrapper
++
++
++class Auth:
++    """Handles authentication for the Schlage WiFi cloud service."""
++
++    def __init__(self, username: str, password: str) -> None:
++        """Initializes an Auth object.
++
++        :param username: The username associated with the Schlage account.
++        :type username: str
++        :param password: The password for the account.
++        :type password: str
++        """
++        self.cognito = pycognito.Cognito(
++            username=username,
++            user_pool_region=USER_POOL_REGION,
++            user_pool_id=USER_POOL_ID,
++            client_id=CLIENT_ID,
++            client_secret=CLIENT_SECRET,
++        )
++        self.auth = utils.RequestsSrpAuth(
++            password=password,
++            cognito=self.cognito,
++        )
++        self._user_id: str | None = None
++
++    @_translate_auth_errors
++    def authenticate(self):
++        """Performs authentication with AWS.
++
++        :raise pyschlage.exceptions.NotAuthorizedError: When authentication fails.
++        :raise pyschlage.exceptions.UnknownError: On other errors.
++        """
++        self.auth(_AuthRequest())
++
++    @property
++    def user_id(self) -> str:
++        """Returns the unique user id for the authenticated user."""
++        if self._user_id is None:
++            self._user_id = self._get_user_id()
++        return self._user_id
++
++    def _get_user_id(self) -> str:
++        resp = self.request("get", "users/@me")
++        return resp.json()["identityId"]
++
++    @_translate_http_errors
++    @_translate_auth_errors
++    def request(
++        self, method: str, path: str, base_url: str = BASE_URL, **kwargs
++    ) -> BaseHTTPResponse:
++        """Performs a request against the Schlage WiFi cloud service.
++
++        :meta private:
++        """
++        headers = dict(kwargs.pop("headers", {}))
++        headers["X-Api-Key"] = API_KEY
++
++        # pycognito's auth plugin is written for requests, but it only relies
++        # on a request's mutable headers.  Apply it before handing the request
++        # to urllib3, which has no auth keyword of its own.
++        auth = kwargs.pop("auth", self.auth)
++        if auth is not None:
++            auth_request = auth(_AuthRequest(headers))
++            if auth_request is not None and isinstance(
++                auth_request.headers, Mapping
++            ):
++                headers = dict(auth_request.headers)
++
++        params = kwargs.pop("params", None)
++        if params:
++            if isinstance(params, Mapping):
++                params = [
++                    (key, value)
++                    for key, value in params.items()
++                    if value is not None
++                ]
++            else:
++                params = [(key, value) for key, value in params if value is not None]
++            split_url = urlsplit(f"{base_url}/{path.lstrip('/')}")
++            query = urlencode(params, doseq=True)
++            if query:
++                query = f"{split_url.query}&{query}" if split_url.query else query
++                url = urlunsplit(split_url._replace(query=query))
++            else:
++                url = urlunsplit(split_url)
++        else:
++            url = f"{base_url}/{path.lstrip('/')}"
++
++        if "data" in kwargs:
++            kwargs["body"] = kwargs.pop("data")
++        kwargs["headers"] = headers
++        kwargs.setdefault("timeout", _DEFAULT_TIMEOUT)
++        # pylint: disable=missing-timeout
++        return urllib3.request(method, url, **kwargs)

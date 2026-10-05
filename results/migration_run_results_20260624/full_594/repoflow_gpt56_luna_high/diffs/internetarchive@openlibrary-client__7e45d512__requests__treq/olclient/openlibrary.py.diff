@@ -1,0 +1,310 @@
+--- a/olclient/openlibrary.py
++++ b/olclient/openlibrary.py
+@@ -2,18 +2,25 @@
+ 
+ 
+ import json
++from concurrent.futures import Future
++from io import BytesIO
+ from typing import List, Dict, Optional, Any
+ 
+ import jsonschema
+ import logging
+ import os
+ import re
++import threading
+ from urllib.parse import urlencode
+ from urllib.request import pathname2url
+ 
+ import backoff
+-import requests
+-from requests import Response
++import treq
++from treq.client import HTTPClient
++from http.cookiejar import CookieJar
++from twisted.internet import reactor
++from twisted.web.client import Agent, CookieAgent, FileBodyProducer, RedirectAgent
++from twisted.web.http_headers import Headers
+ 
+ from olclient import common
+ from olclient.config import Config
+@@ -21,6 +28,226 @@
+ from olclient.utils import merge_unique_lists
+ 
+ logger = logging.getLogger('openlibrary')
++
++
++class _RequestError(Exception):
++    def __init__(self, message='', response=None):
++        super().__init__(message)
++        self.response = response
++
++
++class _HTTPError(_RequestError):
++    pass
++
++
++class _Response:
++    """Synchronous response facade for a completed treq response."""
++
++    def __init__(self, response, content, url):
++        self._response = response
++        self.content = content
++        self.status_code = response.code
++        request = getattr(response, 'request', None)
++        response_url = getattr(request, 'absoluteURI', url)
++        self.url = self._decode(response_url)
++        self.reason = self._decode(response.phrase)
++        self.headers = {
++            self._decode(name): self._decode(values[-1])
++            for name, values in response.headers.getAllRawHeaders()
++        }
++
++    @staticmethod
++    def _decode(value):
++        return value.decode('latin1') if isinstance(value, bytes) else value
++
++    @property
++    def text(self):
++        return self.content.decode('utf-8')
++
++    def json(self):
++        return json.loads(self.content.decode('utf-8'))
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise _HTTPError(
++                f'{self.status_code} {self.reason} for url: {self.url}',
++                response=self,
++            )
++
++
++class _ReactorBridge:
++    _lock = threading.Lock()
++    _thread = None
++
++    @classmethod
++    def _ensure_running(cls):
++        with cls._lock:
++            if reactor.running or cls._thread is not None:
++                return
++            cls._thread = threading.Thread(
++                target=reactor.run,
++                kwargs={'installSignalHandlers': False},
++                daemon=True,
++            )
++            cls._thread.start()
++
++    @classmethod
++    def call(cls, function, *args, **kwargs):
++        cls._ensure_running()
++        if cls._thread is not None and threading.get_ident() == cls._thread.ident:
++            raise RuntimeError(
++                'Synchronous OpenLibrary calls cannot run on the Twisted reactor thread'
++            )
++
++        result = Future()
++
++        def invoke():
++            try:
++                deferred = function(*args, **kwargs)
++            except BaseException as error:
++                result.set_exception(error)
++                return
++
++            if not hasattr(deferred, 'addCallbacks'):
++                result.set_result(deferred)
++                return
++
++            def succeeded(value):
++                result.set_result(value)
++                return value
++
++            def failed(failure):
++                error = failure.value
++                if not isinstance(error, _RequestError):
++                    error = _RequestError(str(error))
++                result.set_exception(error)
++                return failure
++
++            deferred.addCallbacks(succeeded, failed)
++
++        reactor.callFromThread(invoke)
++        return result.result()
++
++
++class _TreqSession:
++    def __init__(self):
++        self.cookies = CookieJar()
++        self._client = None
++
++    @staticmethod
++    def _has_header(headers, name):
++        return any(key.lower() == name.lower() for key in headers)
++
++    @staticmethod
++    def _bytes(value):
++        if isinstance(value, bytes):
++            return value
++        return str(value).encode('utf-8')
++
++    @classmethod
++    def _multipart_body(cls, data, files):
++        boundary = b'----openlibrary-client-treq'
++        parts = []
++
++        def add_field(name, value):
++            parts.extend([
++                b'--' + boundary,
++                b'Content-Disposition: form-data; name="' + cls._bytes(name) + b'"',
++                b'',
++                cls._bytes(value),
++            ])
++
++        for name, value in (data or {}).items():
++            values = value if isinstance(value, (list, tuple)) else [value]
++            for item in values:
++                add_field(name, item)
++
++        for name, value in (files or {}).items():
++            filename = name
++            content_type = None
++            if isinstance(value, tuple):
++                filename = value[0]
++                content_type = value[2] if len(value) > 2 else None
++                value = value[1]
++            if filename is None:
++                add_field(name, value)
++                continue
++            if hasattr(value, 'read'):
++                value = value.read()
++            disposition = (
++                b'Content-Disposition: form-data; name="'
++                + cls._bytes(name)
++                + b'"; filename="'
++                + cls._bytes(filename)
++                + b'"'
++            )
++            parts.extend([b'--' + boundary, disposition])
++            if content_type:
++                parts.append(b'Content-Type: ' + cls._bytes(content_type))
++            parts.extend([b'', cls._bytes(value)])
++
++        return b'\r\n'.join(parts + [b'--' + boundary + b'--', b''])
++
++    @classmethod
++    def _body_producer(cls, data, files, headers):
++        if files is not None:
++            body = cls._multipart_body(data, files)
++            if not cls._has_header(headers, 'Content-Type'):
++                headers['Content-Type'] = (
++                    'multipart/form-data; boundary=----openlibrary-client-treq'
++                )
++        elif isinstance(data, dict):
++            body = urlencode(data, doseq=True).encode('utf-8')
++            if not cls._has_header(headers, 'Content-Type'):
++                headers['Content-Type'] = 'application/x-www-form-urlencoded'
++        elif data is None:
++            return None
++        else:
++            body = cls._bytes(data)
++        return FileBodyProducer(BytesIO(body))
++
++    def _request(self, method, url, data=None, **kwargs):
++        headers = dict(kwargs.pop('headers', {}) or {})
++        params = kwargs.pop('params', None)
++        files = kwargs.pop('files', None)
++        timeout = kwargs.pop('timeout', None)
++        if kwargs:
++            raise TypeError('Unsupported request arguments: {}'.format(', '.join(kwargs)))
++        if params:
++            separator = '&' if '?' in url else '?'
++            url += separator + urlencode(params, doseq=True)
++        body_producer = self._body_producer(data, files, headers)
++        if self._client is None:
++            agent = CookieAgent(RedirectAgent(Agent(reactor)), self.cookies)
++            self._client = HTTPClient(agent)
++        request_headers = Headers()
++        for name, value in headers.items():
++            request_headers.addRawHeader(self._bytes(name), self._bytes(value))
++
++        # HTTPClient performs the method and URL byte encoding itself.
++        return self._client.request(
++            method,
++            url,
++            headers=request_headers,
++            data=body_producer,
++            timeout=timeout,
++        ).addCallback(
++            lambda response: treq.content(response).addCallback(
++                lambda content: _Response(response, content, url)
++            )
++        )
++
++    def request(self, method, url, data=None, **kwargs):
++        return _ReactorBridge.call(self._request, method, url, data=data, **kwargs)
++
++    def get(self, url, **kwargs):
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, data=None, **kwargs):
++        return self.request('POST', url, data=data, **kwargs)
++
++    def put(self, url, data=None, **kwargs):
++        return self.request('PUT', url, data=data, **kwargs)
+ 
+ 
+ class OpenLibrary:
+@@ -51,7 +278,7 @@
+     VALID_IDS = ['isbn_10', 'isbn_13', 'lccn', 'ocaid']
+     BACKOFF_KWARGS = {
+         'wait_gen': backoff.expo,
+-        'exception': requests.exceptions.RequestException,
++        'exception': _RequestError,
+         'giveup': lambda e: hasattr(e.response, 'status_code')
+         and 400 <= e.response.status_code < 500,
+         'max_tries': 5,
+@@ -62,14 +289,14 @@
+     WORKS_PAGINATION_OFFSET = 0
+ 
+     def __init__(self, credentials=None, base_url='https://openlibrary.org'):
+-        self.session = requests.Session()
++        self.session = _TreqSession()
+         self.base_url = base_url
+         credentials = credentials or Config().get_config().get('s3', None)
+         if credentials:
+             self.login(credentials)
+ 
+     def login(self, credentials):
+-        """Login to Open Library with given credentials, ensures the requests
++        """Login to Open Library with given credentials, ensuring the HTTP
+         session has valid cookies for future requests.
+         """
+ 
+@@ -90,7 +317,7 @@
+ 
+         _ = _login(url, headers, data)
+ 
+-        if not self.session.cookies:
++        if not list(self.session.cookies):
+             raise ValueError("No cookie set")
+ 
+     def validate(self, doc, schema_name):
+@@ -119,7 +346,7 @@
+         url = self._generate_url_from_olid(olid)
+         return self.session.put(url, data=data)
+ 
+-    def save_many(self, docs, comment) -> Response:
++    def save_many(self, docs, comment) -> Any:
+         """
+         Uses the Open Library save_many API endpoint to
+         write any number or combination of documents (Edition, Work, or Author)
+@@ -135,7 +362,7 @@
+             f'{self.base_url}/api/save_many', json.dumps(doc_json), headers=headers
+         )
+ 
+-    def delete_many(self, ol_ids: List[str], comment: str) -> Response:
++    def delete_many(self, ol_ids: List[str], comment: str) -> Any:
+         return self.save_many(
+             [self.Delete(ol_id) for ol_id in ol_ids],
+             comment=comment

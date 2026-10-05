@@ -1,0 +1,164 @@
+--- a/tinychat/llms/google.py
++++ b/tinychat/llms/google.py
+@@ -1,11 +1,85 @@
+ import json
++import queue
++import threading
+ from typing import Generator
+ 
+-import requests
++import pycurl
+ from sseclient import SSEClient
+ 
+ from tinychat.llms.base import BaseLLMClient
+ from tinychat.settings import GOOGLE_API_KEY_NAME
++
++
++class _PycurlEventSource:
++    def __init__(self, response_queue, state) -> None:
++        self._response_queue = response_queue
++        self._state = state
++        self._line_iterator = None
++        self.raw = self
++
++    def iter_content(self, chunk_size=None):
++        while True:
++            chunk = self._response_queue.get()
++            if chunk is None:
++                if self._state["error"] is not None:
++                    raise self._state["error"]
++                return
++            yield chunk
++
++    def iter_lines(self, chunk_size=None, decode_unicode=False):
++        buffer = b""
++        while True:
++            chunk = self._response_queue.get()
++            if chunk is None:
++                if buffer.endswith(b"\r"):
++                    buffer = buffer[:-1]
++                if buffer:
++                    line = buffer
++                    if decode_unicode:
++                        line = line.decode("utf-8")
++                    yield line
++                if self._state["error"] is not None:
++                    raise self._state["error"]
++                return
++
++            buffer += chunk
++            while True:
++                line_end = buffer.find(b"\n")
++                carriage_return_end = buffer.find(b"\r")
++                if line_end == -1:
++                    line_end = carriage_return_end
++                elif carriage_return_end != -1:
++                    line_end = min(line_end, carriage_return_end)
++
++                if line_end == -1:
++                    break
++
++                if (
++                    buffer[line_end:line_end + 1] == b"\r"
++                    and line_end == len(buffer) - 1
++                ):
++                    break
++
++                line = buffer[:line_end]
++                if buffer[line_end:line_end + 2] == b"\r\n":
++                    buffer = buffer[line_end + 2:]
++                else:
++                    buffer = buffer[line_end + 1:]
++
++                if decode_unicode:
++                    line = line.decode("utf-8")
++                yield line
++
++    def __iter__(self):
++        return self.iter_lines()
++
++    def readline(self):
++        if self._line_iterator is None:
++            self._line_iterator = self.iter_lines()
++        try:
++            return next(self._line_iterator)
++        except StopIteration:
++            return b""
+ 
+ 
+ class GoogleAIClient(BaseLLMClient):
+@@ -61,16 +135,60 @@
+             "safetySettings": self.SAFETY_SETTINGS,
+             "generationConfig": self.generation_config,
+         }
+-        response = requests.post(
+-            self.gemini_endpoint,
+-            headers=self.gemini_headers,  # type: ignore
+-            json=data,
+-            stream=True,
+-        )
+-        if response.status_code != 200:
++
++        response_queue = queue.Queue()
++        response_ready = threading.Event()
++        state = {"status_code": None, "error": None}
++
++        def write_callback(chunk):
++            response_queue.put(chunk)
++            return len(chunk)
++
++        def header_callback(header):
++            if header.startswith(b"HTTP/"):
++                state["status_code"] = int(header.split()[1])
++                response_ready.set()
++            return len(header)
++
++        def perform_request():
++            curl = pycurl.Curl()
++            try:
++                curl.setopt(pycurl.URL, self.gemini_endpoint)
++                curl.setopt(
++                    pycurl.HTTPHEADER,
++                    [
++                        f"{key}: {value}"
++                        for key, value in self.gemini_headers.items()
++                    ],
++                )
++                curl.setopt(pycurl.POST, 1)
++                curl.setopt(
++                    pycurl.POSTFIELDS,
++                    json.dumps(data).encode("utf-8"),
++                )
++                curl.setopt(pycurl.HEADERFUNCTION, header_callback)
++                curl.setopt(pycurl.WRITEFUNCTION, write_callback)
++                curl.perform()
++                state["status_code"] = curl.getinfo(pycurl.RESPONSE_CODE)
++            except Exception as error:
++                state["error"] = error
++            finally:
++                curl.close()
++                response_ready.set()
++                response_queue.put(None)
++
++        threading.Thread(target=perform_request, daemon=True).start()
++        response_ready.wait()
++
++        if state["error"] is not None:
++            raise state["error"]
++
++        if state["status_code"] != 200:
+             raise ValueError(
+-                f"Server responded with an error. Status Code: {response.status_code}"
++                f"Server responded with an error. Status Code: {state['status_code']}"
+             )
++
++        response = _PycurlEventSource(response_queue, state)
+         return SSEClient(event_source=response)  # type: ignore
+ 
+ 
+@@ -124,4 +242,4 @@
+                 ]
+                 lm_response += response_piece
+                 yield response_piece
+-        self._messages.append({"parts": [{"text": lm_response}], "role": "model"})
++        self._messages.append({"parts": [{"text": lm_response}], "role": "model"})

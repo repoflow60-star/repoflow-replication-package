@@ -1,0 +1,324 @@
+--- a/whatsapp_api_client_python/API.py
++++ b/whatsapp_api_client_python/API.py
+@@ -1,9 +1,11 @@
++import io
+ import json
+ import logging
++import time
+ from typing import Any, NoReturn, Optional
+-
+-from requests import Response, Session
+-from requests.adapters import HTTPAdapter, Retry
++from urllib.parse import urlencode
++
++import pycurl
+ 
+ from .response import Response as GreenAPIResponse
+ from .tools import (
+@@ -18,6 +20,266 @@
+     serviceMethods,
+     webhooks
+ )
++
++
++class _PycurlResponse:
++    def __init__(self, status_code: int, text: str):
++        self.status_code = status_code
++        self.text = text
++
++
++class _PycurlSession:
++    def __init__(self):
++        self.headers = {}
++        self.retries = 0
++        self.backoff_factor = 0.0
++        self.status_forcelist = []
++
++    def request(self, method: str, url: str, **arguments: Any) -> _PycurlResponse:
++        json_payload = arguments.pop("json", None)
++        data = arguments.pop("data", None)
++        files = arguments.pop("files", None)
++        headers = arguments.pop("headers", None)
++        timeout = arguments.pop("timeout", None)
++        params = arguments.pop("params", None)
++        verify = arguments.pop("verify", True)
++        allow_redirects = arguments.pop("allow_redirects", True)
++        auth = arguments.pop("auth", None)
++        proxies = arguments.pop("proxies", None)
++        cert = arguments.pop("cert", None)
++
++        if params:
++            if isinstance(params, str):
++                query = params
++            else:
++                query = urlencode(params, doseq=True)
++
++            url = f"{url}{'&' if '?' in url else '?'}{query}"
++
++        request_headers = dict(self.headers)
++
++        if headers:
++            request_headers.update(headers)
++
++        for attempt in range(self.retries + 1):
++            try:
++                response = self.__perform_request(
++                    method=method,
++                    url=url,
++                    json_payload=json_payload,
++                    data=data,
++                    files=files,
++                    headers=request_headers,
++                    timeout=timeout,
++                    verify=verify,
++                    allow_redirects=allow_redirects,
++                    auth=auth,
++                    proxies=proxies,
++                    cert=cert
++                )
++            except Exception:
++                if attempt >= self.retries:
++                    raise
++
++                self.__sleep_before_retry(attempt)
++                continue
++
++            if (
++                response.status_code not in self.status_forcelist
++                or attempt >= self.retries
++            ):
++                return response
++
++            self.__sleep_before_retry(attempt)
++
++        return response
++
++    def __perform_request(
++            self,
++            method: str,
++            url: str,
++            json_payload: Any = None,
++            data: Any = None,
++            files: Any = None,
++            headers: Optional[dict] = None,
++            timeout: Any = None,
++            verify: Any = True,
++            allow_redirects: bool = True,
++            auth: Any = None,
++            proxies: Any = None,
++            cert: Any = None
++    ) -> _PycurlResponse:
++        curl = pycurl.Curl()
++        response_buffer = io.BytesIO()
++
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.CUSTOMREQUEST, method)
++        curl.setopt(pycurl.WRITEFUNCTION, response_buffer.write)
++        curl.setopt(pycurl.NOSIGNAL, 1)
++
++        if timeout is not None:
++            if isinstance(timeout, tuple):
++                curl.setopt(pycurl.TIMEOUT, timeout[1])
++                curl.setopt(pycurl.CONNECTTIMEOUT, timeout[0])
++            else:
++                curl.setopt(pycurl.TIMEOUT, timeout)
++
++        if headers:
++            curl.setopt(
++                pycurl.HTTPHEADER,
++                [f"{key}: {value}" for key, value in headers.items()]
++            )
++
++        if json_payload is not None:
++            request_body = json.dumps(json_payload)
++
++            if not any(
++                    str(key).lower() == "content-type"
++                    for key in (headers or {})
++            ):
++                request_headers = dict(headers or {})
++                request_headers["Content-Type"] = "application/json"
++                curl.setopt(
++                    pycurl.HTTPHEADER,
++                    [
++                        f"{key}: {value}"
++                        for key, value in request_headers.items()
++                    ]
++                )
++
++            curl.setopt(pycurl.POSTFIELDS, request_body)
++        elif files:
++            curl.setopt(pycurl.HTTPPOST, self.__prepare_multipart(data, files))
++        elif data is not None:
++            if isinstance(data, dict):
++                curl.setopt(
++                    pycurl.POSTFIELDS,
++                    urlencode(data, doseq=True)
++                )
++            else:
++                curl.setopt(pycurl.POSTFIELDS, data)
++
++        if verify is False:
++            curl.setopt(pycurl.SSL_VERIFYPEER, 0)
++            curl.setopt(pycurl.SSL_VERIFYHOST, 0)
++        elif isinstance(verify, str):
++            curl.setopt(pycurl.CAINFO, verify)
++
++        if allow_redirects:
++            curl.setopt(pycurl.FOLLOWLOCATION, 1)
++
++        if auth:
++            curl.setopt(
++                pycurl.USERPWD,
++                f"{auth[0]}:{auth[1]}"
++            )
++
++        if proxies:
++            if isinstance(proxies, dict):
++                proxy = proxies.get(
++                    "https" if url.startswith("https://") else "http"
++                )
++            else:
++                proxy = proxies
++
++            if proxy:
++                curl.setopt(pycurl.PROXY, proxy)
++
++        if cert:
++            if isinstance(cert, tuple):
++                curl.setopt(pycurl.SSLCERT, cert[0])
++                if len(cert) > 1:
++                    curl.setopt(pycurl.SSLKEY, cert[1])
++            else:
++                curl.setopt(pycurl.SSLCERT, cert)
++
++        try:
++            curl.perform()
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        finally:
++            curl.close()
++
++        text = response_buffer.getvalue().decode(
++            "utf-8", errors="replace"
++        )
++
++        return _PycurlResponse(status_code, text)
++
++    def __prepare_multipart(self, data: Any, files: dict) -> list:
++        form = []
++
++        if data:
++            if isinstance(data, dict):
++                data_items = data.items()
++            else:
++                data_items = data
++
++            for key, value in data_items:
++                if isinstance(value, (list, tuple)):
++                    for item in value:
++                        form.append((str(key), str(item)))
++                else:
++                    form.append((str(key), str(value)))
++
++        for key, file_value in files.items():
++            file_values = (
++                file_value
++                if isinstance(file_value, list)
++                else [file_value]
++            )
++
++            for current_file in file_values:
++                filename = str(key)
++                content_type = None
++
++                if isinstance(current_file, tuple):
++                    if len(current_file) > 0 and current_file[0]:
++                        filename = str(current_file[0])
++
++                    file_content = (
++                        current_file[1]
++                        if len(current_file) > 1
++                        else b""
++                    )
++
++                    if len(current_file) > 2:
++                        content_type = current_file[2]
++                else:
++                    file_content = current_file
++                    if hasattr(current_file, "name"):
++                        filename = str(current_file.name)
++
++                if hasattr(file_content, "read"):
++                    file_content = file_content.read()
++
++                if isinstance(file_content, str):
++                    file_content = file_content.encode()
++
++                if file_content is None:
++                    file_content = b""
++
++                file_options = [
++                    pycurl.FORM_BUFFER,
++                    filename,
++                    pycurl.FORM_BUFFERPTR,
++                    file_content
++                ]
++
++                if content_type:
++                    file_options.extend([
++                        pycurl.FORM_CONTENTTYPE,
++                        content_type
++                    ])
++
++                form.append((str(key), tuple(file_options)))
++
++        return form
++
++    def __sleep_before_retry(self, attempt: int) -> None:
++        if attempt > 0:
++            time.sleep(
++                self.backoff_factor * (2 ** (attempt - 1))
++            )
+ 
+ 
+ class GreenApi:
+@@ -49,7 +311,7 @@
+         self.idInstance = idInstance
+         self.apiTokenInstance = apiTokenInstance
+ 
+-        self.session = Session()
++        self.session = _PycurlSession()
+         self.__prepare_session()
+ 
+         self.account = account.Account(self)
+@@ -116,7 +378,10 @@
+ 
+         return GreenAPIResponse(response.status_code, response.text)
+ 
+-    def __handle_response(self, response: Response) -> Optional[NoReturn]:
++    def __handle_response(
++            self,
++            response: _PycurlResponse
++    ) -> Optional[NoReturn]:
+         status_code = response.status_code
+         if status_code != 200 or self.debug_mode:
+             try:
+@@ -161,15 +426,9 @@
+     def __prepare_session(self) -> None:
+         self.session.headers["Connection"] = "close"
+ 
+-        retry = Retry(
+-            total=3,
+-            backoff_factor=1.0,
+-            allowed_methods=None,
+-            status_forcelist=[429]
+-        )
+-
+-        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
++        self.session.retries = 3
++        self.session.backoff_factor = 1.0
++        self.session.status_forcelist = [429]
+ 
+ 
+ class GreenAPI(GreenApi):

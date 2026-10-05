@@ -1,0 +1,122 @@
+--- a/segment/analytics/request.py
++++ b/segment/analytics/request.py
+@@ -1,16 +1,91 @@
+ from datetime import date, datetime
+ from io import BytesIO
+ from gzip import GzipFile
++from concurrent.futures import ThreadPoolExecutor
++import asyncio
+ import logging
+ import json
+ from dateutil.tz import tzutc
+-from requests.auth import HTTPBasicAuth
+-from requests import sessions
++import aiohttp
+ 
+ from segment.analytics.version import VERSION
+ from segment.analytics.utils import remove_trailing_slash
+ 
+-_session = sessions.Session()
++
++class _HttpResult(object):
++    """Materialized response data for the library's synchronous API."""
++
++    def __init__(self, status, headers, reason, content):
++        self.status_code = status
++        self.headers = headers
++        self.reason = reason
++        self._content = content
++        self.text = content.decode('utf-8', errors='replace')
++
++    def json(self):
++        return json.loads(self.text)
++
++
++async def _post_async(url, data, headers, timeout, proxy=None):
++    request_options = {
++        'data': data,
++        'headers': headers,
++    }
++    if timeout is not None:
++        request_options['timeout'] = aiohttp.ClientTimeout(total=timeout)
++    if proxy:
++        request_options['proxy'] = proxy
++
++    async with aiohttp.ClientSession() as session:
++        async with session.post(url, **request_options) as response:
++            content = await response.read()
++            return _HttpResult(
++                response.status,
++                dict(response.headers),
++                response.reason,
++                content,
++            )
++
++
++def _run_async(coroutine):
++    try:
++        asyncio.get_running_loop()
++    except RuntimeError:
++        return asyncio.run(coroutine)
++
++    # Keep the public API synchronous when called from an active event loop.
++    with ThreadPoolExecutor(max_workers=1) as executor:
++        return executor.submit(asyncio.run, coroutine).result()
++
++
++def _proxy_url(proxies):
++    if not proxies:
++        return None
++    if isinstance(proxies, str):
++        proxy = proxies
++    else:
++        proxy = proxies.get('https') or proxies.get('http')
++    if proxy and '://' not in proxy:
++        proxy = 'http://' + proxy
++    return proxy
++
++
++class _AiohttpSession(object):
++    """Synchronous adapter around aiohttp's asynchronous request API."""
++
++    def post(self, url, data=None, headers=None, timeout=None, proxies=None):
++        return _run_async(
++            _post_async(
++                url,
++                data,
++                headers,
++                timeout,
++                proxy=_proxy_url(proxies),
++            )
++        )
++
++
++_session = _AiohttpSession()
+ 
+ 
+ def post(write_key, host=None, gzip=False, timeout=15, proxies=None, oauth_manager=None, **kwargs):
+@@ -42,17 +117,17 @@
+             gz.write(data.encode('utf-8'))
+         data = buf.getvalue()
+ 
+-    kwargs = {
+-        "data": data,
+-        "headers": headers,
+-        "timeout": 15,
++    request_options = {
++        'data': data,
++        'headers': headers,
++        'timeout': timeout,
+     }
++    if proxies:
++        request_options['proxies'] = proxies
+ 
+-    if proxies:
+-        kwargs['proxies'] = proxies
+     res = None
+     try:
+-        res = _session.post(url, data=data, headers=headers, timeout=timeout)
++        res = _session.post(url, **request_options)
+     except Exception as e:
+         log.error(e)
+         raise e

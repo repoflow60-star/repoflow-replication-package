@@ -1,0 +1,127 @@
+--- a/certbot_dns_infomaniak/dns_infomaniak.py
++++ b/certbot_dns_infomaniak/dns_infomaniak.py
+@@ -3,11 +3,13 @@
+ # SPDX-FileCopyrightText: 2021      Romain Autran <romain.autran@2itea.ch>
+ # SPDX-License-Identifier: Apache-2.0
+ """DNS Authenticator for Infomaniak"""
++import asyncio
+ import json
+ import logging
+ import idna
+-
+-import requests
++from urllib.parse import urlencode, urlsplit
++
++import aiohttp
+ 
+ from certbot import errors
+ from certbot.plugins import dns_common
+@@ -17,6 +19,99 @@
+     import os
+ 
+ logger = logging.getLogger(__name__)
++
++
++class _PreparedRequest:
++    """Request data passed to a mounted transport."""
++
++    def __init__(self, method, url, headers, body):
++        self.method = method
++        self.url = url
++        self.headers = headers
++        self.body = body
++        parsed_url = urlsplit(url)
++        self.path_url = parsed_url.path or "/"
++        if parsed_url.query:
++            self.path_url += "?" + parsed_url.query
++
++
++class _Response:
++    """Synchronous response facade used by the API client."""
++
++    def __init__(self, data):
++        self._data = data
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc_value, traceback):
++        return False
++
++    def json(self):
++        if isinstance(self._data, str):
++            return json.loads(self._data)
++        return self._data
++
++
++class _AiohttpSession:
++    """Synchronous facade around aiohttp for the existing API client."""
++
++    def __init__(self, headers=None):
++        self.headers = dict(headers or {})
++        self._mounts = []
++
++    def mount(self, prefix, transport):
++        self._mounts.append((prefix, transport))
++
++    @staticmethod
++    def _run(coroutine):
++        loop = asyncio.new_event_loop()
++        try:
++            return loop.run_until_complete(coroutine)
++        finally:
++            loop.close()
++
++    @staticmethod
++    def _url_with_params(url, params):
++        if not params:
++            return url
++        query = urlencode(params, doseq=True)
++        return "{}{}{}".format(url, "&" if "?" in url else "?", query)
++
++    def _mounted_transport(self, url):
++        matches = [mount for mount in self._mounts if url.startswith(mount[0])]
++        if not matches:
++            return None
++        return max(matches, key=lambda mount: len(mount[0]))[1]
++
++    async def _request_with_aiohttp(self, method, url, params, data, headers):
++        request_headers = dict(self.headers)
++        request_headers.update(headers or {})
++        async with aiohttp.ClientSession(headers=request_headers) as session:
++            async with session.request(method, url, params=params, data=data) as response:
++                return await response.text()
++
++    def request(self, method, url, params=None, data=None, headers=None):
++        request_url = self._url_with_params(url, params)
++        transport = self._mounted_transport(request_url)
++        if transport is not None:
++            request_headers = dict(self.headers)
++            request_headers.update(headers or {})
++            request = _PreparedRequest(method, request_url, request_headers, data)
++            return _Response(transport.send(request).json())
++        response_text = self._run(
++            self._request_with_aiohttp(method, url, params, data, headers)
++        )
++        return _Response(response_text)
++
++    def get(self, url, params=None):
++        return self.request("GET", url, params=params)
++
++    def post(self, url, data=None, headers=None):
++        return self.request("POST", url, data=data, headers=headers)
++
++    def delete(self, url):
++        return self.request("DELETE", url)
+ 
+ 
+ class Authenticator(dns_common.DNSAuthenticator):
+@@ -86,7 +181,7 @@
+         :param str token: oauth2 token to consume Infomaniak API
+         """
+         self.token = token
+-        self.session = requests.Session()
++        self.session = _AiohttpSession()
+         self.session.headers.update({"Authorization": "Bearer {token}".format(token=self.token)})
+ 
+     def _get_request(self, url, payload=None):

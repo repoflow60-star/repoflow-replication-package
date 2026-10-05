@@ -1,0 +1,98 @@
+--- a/census/core.py
++++ b/census/core.py
+@@ -1,4 +1,7 @@
++import asyncio
++import json
+ import warnings
++from concurrent.futures import ThreadPoolExecutor
+ from functools import wraps, lru_cache
+ from importlib.metadata import version
+ 
+@@ -7,9 +10,73 @@
+ ALL = '*'
+ 
+ 
++class _Response:
++    """Small synchronous response object used by the synchronous API.
++
++    ``aiohttp`` exposes its response body through coroutines, while the
++    public census client has historically been synchronous.  The transport
++    adapter below reads the response before returning it and this object keeps
++    the response interface used by the client (``status_code``, ``text`` and
++    ``json``).
++    """
++
++    def __init__(self, status, text):
++        self.status_code = status
++        self.text = text
++
++    def json(self):
++        return json.loads(self.text)
++
++
++def _run(coro):
++    """Run an aiohttp coroutine from the synchronous client.
++
++    ``asyncio.run`` cannot be called while the caller already has an active
++    event loop.  Running the short-lived request in a worker thread keeps the
++    synchronous API usable from notebooks and other async applications too.
++    """
++    try:
++        asyncio.get_running_loop()
++    except RuntimeError:
++        return asyncio.run(coro)
++
++    with ThreadPoolExecutor(max_workers=1) as executor:
++        return executor.submit(asyncio.run, coro).result()
++
++
++class _AiohttpSession:
++    """Synchronous adapter around aiohttp's asynchronous client session."""
++
++    def __init__(self, *args, **kwargs):
++        self._args = args
++        self._kwargs = dict(kwargs)
++        self.headers = dict(self._kwargs.pop('headers', {}) or {})
++        self._closed = False
++
++    async def _get(self, url, **kwargs):
++        import aiohttp
++
++        request_headers = dict(self.headers)
++        request_headers.update(kwargs.pop('headers', {}) or {})
++        session_kwargs = dict(self._kwargs)
++        session_kwargs['headers'] = request_headers
++
++        async with aiohttp.ClientSession(*self._args, **session_kwargs) as session:
++            async with session.get(url, **kwargs) as response:
++                return _Response(response.status, await response.text())
++
++    def get(self, url, **kwargs):
++        return _run(self._get(url, **kwargs))
++
++    def close(self):
++        # A new aiohttp session is scoped to each request and is closed by the
++        # context manager above.  Keep close() for compatibility with existing
++        # callers.
++        self._closed = True
++
++
+ def new_session(*args, **kwargs):
+-    import requests
+-    return requests.session(*args, **kwargs)
++    return _AiohttpSession(*args, **kwargs)
+ 
+ 
+ class APIKeyError(Exception):
+@@ -149,9 +216,9 @@
+     def get(self, fields, geo, year=None, **kwargs):
+         """
+         The API only accepts up to 50 fields on each query.
+-        Chunk requests, and use the unique GEO_ID to match up the chunks
++        Chunk API calls, and use the unique GEO_ID to match up the chunks
+         in case the responses are in different orders.
+-        GEO_ID is not reliably present in pre-2010 requests.
++        GEO_ID is not reliably present in pre-2010 calls.
+         """
+         sort_by_geoid = len(fields) > 49 and (not year or year > 2009)
+         all_results = (self.query(forty_nine_fields, geo, year, sort_by_geoid=sort_by_geoid, **kwargs)

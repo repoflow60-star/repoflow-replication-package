@@ -1,0 +1,189 @@
+--- a/authomize/rest_api_client/client/base_client.py
++++ b/authomize/rest_api_client/client/base_client.py
+@@ -1,7 +1,10 @@
++import io
++import json
++from enum import Enum
+ from typing import Optional
++from urllib.parse import urlencode
+ 
+-import requests
+-from requests import Response
++import pycurl
+ 
+ AUTHOMIZE_API_URL = 'https://api.authomize.com'
+ 
+@@ -11,19 +14,49 @@
+         self.message = message
+ 
+ 
++class _CurlResponse:
++    def __init__(self, status_code, headers, content, url, reason):
++        self.status_code = status_code
++        self.headers = headers
++        self.content = content
++        self.url = url
++        self.reason = reason
++
++    @property
++    def ok(self):
++        return self.status_code < 400
++
++    @property
++    def text(self):
++        return self.content.decode('utf-8', errors='replace')
++
++    def json(self):
++        return json.loads(self.content)
++
++    def raise_for_status(self):
++        if not self.ok:
++            raise ClientError(
++                message={
++                    'status_code': self.status_code,
++                    'url': self.url,
++                    'message': self.reason or 'HTTP request failed',
++                },
++            )
++
++
+ class BaseClient:
+     def __init__(self, auth_token: str, base_url: str = AUTHOMIZE_API_URL):
+         self.auth_token = auth_token
+         self.base_url = base_url
+-        self.session = requests.Session()
+-        self.session.headers.update({'Authorization': self.authorization_header})
++        self.session = pycurl.Curl()
++        self.headers = {'Authorization': self.authorization_header}
+ 
+     @property
+     def authorization_header(self) -> str:
+         raise NotImplementedError()
+ 
+     @staticmethod
+-    def _handle_response(response: Response):
++    def _handle_response(response: _CurlResponse):
+         if response.ok:
+             return BaseClient._handle_ok_response(response)
+         try:
+@@ -38,7 +71,7 @@
+         response.raise_for_status()
+ 
+     @staticmethod
+-    def _handle_ok_response(response: Response) -> dict:
++    def _handle_ok_response(response: _CurlResponse) -> dict:
+         if content_type := response.headers.get('content-type'):
+             if content_type.startswith('application/json'):
+                 return response.json()
+@@ -54,28 +87,105 @@
+ 
+     def http_get(self, url, params=None):
+         url = self.base_url + url
+-        response = self.session.get(url, params=params)
++        response = self._request('GET', url, params=params)
+         return self._handle_response(response)
+ 
+     def http_post(self, url: str, body: Optional[str] = None):
+         url = self.base_url + url
+-        response = self.session.post(
++        response = self._request(
++            'POST',
+             url,
++            body=body,
+             headers={'Content-Type': 'application/json'},
+-            data=body,
+         )
+         return self._handle_response(response)
+ 
+     def http_patch(self, url: str, body: Optional[str] = None):
+         url = self.base_url + url
+-        response = self.session.patch(
++        response = self._request(
++            'PATCH',
+             url,
++            body=body,
+             headers={'Content-Type': 'application/json'},
+-            data=body,
+         )
+         return self._handle_response(response)
+ 
+     def http_delete(self, url: str, params=None):
+         url = self.base_url + url
+-        response = self.session.delete(url, params=params)
++        response = self._request('DELETE', url, params=params)
+         return self._handle_response(response)
++
++    def _request(self, method, url, params=None, body=None, headers=None):
++        if params:
++            query = []
++            for key, value in params.items():
++                if value is None:
++                    continue
++                values = value if isinstance(value, (list, tuple)) else [value]
++                for item in values:
++                    if item is not None:
++                        if isinstance(item, Enum):
++                            item = item.value
++                        query.append((key, item))
++            if query:
++                separator = '&' if '?' in url else '?'
++                url = f'{url}{separator}{urlencode(query)}'
++
++        response_body = io.BytesIO()
++        response_headers = io.BytesIO()
++        request_headers = {
++            **self.headers,
++            **(headers or {}),
++        }
++
++        self.session.reset()
++        self.session.setopt(pycurl.URL, url)
++        self.session.setopt(
++            pycurl.HTTPHEADER,
++            [f'{key}: {value}' for key, value in request_headers.items()],
++        )
++        self.session.setopt(pycurl.WRITEFUNCTION, response_body.write)
++        self.session.setopt(pycurl.HEADERFUNCTION, response_headers.write)
++        self.session.setopt(pycurl.FOLLOWLOCATION, 1)
++
++        if method == 'GET':
++            self.session.setopt(pycurl.HTTPGET, 1)
++        elif method == 'POST':
++            self.session.setopt(pycurl.POST, 1)
++        else:
++            self.session.setopt(pycurl.CUSTOMREQUEST, method)
++
++        if body is not None:
++            if isinstance(body, str):
++                body = body.encode('utf-8')
++            self.session.setopt(pycurl.POSTFIELDS, body)
++
++        self.session.perform()
++        status_code = self.session.getinfo(pycurl.RESPONSE_CODE)
++        response_url = self.session.getinfo(pycurl.EFFECTIVE_URL) or url
++        if isinstance(response_url, bytes):
++            response_url = response_url.decode('utf-8', errors='replace')
++
++        headers, reason = self._parse_response_headers(response_headers.getvalue())
++        return _CurlResponse(
++            status_code=status_code,
++            headers=headers,
++            content=response_body.getvalue(),
++            url=response_url,
++            reason=reason,
++        )
++
++    @staticmethod
++    def _parse_response_headers(raw_headers):
++        headers = {}
++        reason = ''
++        for raw_line in raw_headers.splitlines():
++            line = raw_line.decode('latin-1').strip()
++            if line.startswith('HTTP/'):
++                headers = {}
++                parts = line.split(' ', 2)
++                reason = parts[2] if len(parts) == 3 else ''
++            elif ':' in line:
++                key, value = line.split(':', 1)
++                headers[key.lower()] = value.strip()
++        return headers, reason

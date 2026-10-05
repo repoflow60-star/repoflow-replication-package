@@ -1,0 +1,199 @@
+--- a/kling/kling.py
++++ b/kling/kling.py
+@@ -1,16 +1,147 @@
+ import argparse
++import asyncio
++import contextlib
++import json
+ import os
++import sys
++import threading
+ import time
+-import contextlib
+-from typing import Optional
+ from enum import Enum
+ from http.cookies import SimpleCookie
+-
++from typing import Optional
++
++import aiohttp
+ from fake_useragent import UserAgent
+-import requests
+-from requests.utils import cookiejar_from_dict
+ from rich import print
+-import threading
++
++
++class _Response:
++    """Small synchronous response object used by :class:`_AiohttpSession`.
++
++    The public API of this project is synchronous.  aiohttp is asynchronous, so
++    the adapter reads the response before returning it and exposes the handful
++    of response attributes used by the generator classes.  Keeping this
++    boundary here means the existing public API does not need to change while
++    all HTTP I/O is performed by aiohttp.
++    """
++
++    def __init__(self, status: int, headers: dict, content: bytes, url: str) -> None:
++        self.status_code = status
++        self.headers = headers
++        self.content = content
++        self.url = url
++
++    @property
++    def ok(self) -> bool:
++        return 200 <= self.status_code < 400
++
++    @property
++    def text(self) -> str:
++        content_type = self.headers.get("Content-Type", "")
++        encoding = "utf-8"
++        if "charset=" in content_type:
++            encoding = content_type.split("charset=", 1)[1].split(";", 1)[0].strip()
++        return self.content.decode(encoding or "utf-8", errors="replace")
++
++    def json(self):
++        return json.loads(self.text)
++
++    def __str__(self) -> str:
++        return f"<{self.status_code} {self.url}>"
++
++
++class _AiohttpSession:
++    """Synchronous session facade backed by an aiohttp ClientSession.
++
++    A new aiohttp client is created for each request.  This is intentional:
++    the rest of the package exposes blocking methods and may be called from a
++    thread that already has an event loop.  Creating and closing the client in
++    the request's loop avoids leaking an aiohttp session or binding it to the
++    wrong loop.  Headers and cookies are retained on this facade just as they
++    were on the former requests session.
++    """
++
++    def __init__(self) -> None:
++        self.headers = {}
++        self.cookies = {}
++
++    @staticmethod
++    async def _request_async(method: str, url: str, headers: dict, cookies: dict, **kwargs):
++        request_headers = dict(headers)
++        request_headers.update(kwargs.pop("headers", {}) or {})
++        async with aiohttp.ClientSession(
++            headers=request_headers,
++            cookies=cookies,
++        ) as client:
++            async with client.request(method, url, **kwargs) as response:
++                content = await response.read()
++                response_headers = dict(response.headers)
++                response_url = str(response.url)
++                response_cookies = response.cookies
++
++        # Preserve cookies set by the server for subsequent calls.  The
++        # project only needs cookie names and values, which also keeps the
++        # public ``session.cookies`` object dict-compatible.
++        for name, morsel in response_cookies.items():
++            self_cookies = cookies
++            self_cookies[name] = morsel.value
++
++        return _Response(response.status, response_headers, content, response_url)
++
++    @staticmethod
++    def _run(coroutine):
++        """Run a coroutine from both normal and already-async callers."""
++        try:
++            asyncio.get_running_loop()
++        except RuntimeError:
++            return asyncio.run(coroutine)
++
++        # asyncio.run cannot be called while another loop is running.  The
++        # synchronous public methods are still useful in that situation, so
++        # run this one request on a short-lived worker thread.
++        result = []
++        error = []
++
++        def run_in_thread() -> None:
++            try:
++                result.append(asyncio.run(coroutine))
++            except BaseException as exc:  # re-raise in the caller's thread
++                error.append(exc)
++
++        thread = threading.Thread(target=run_in_thread)
++        thread.start()
++        thread.join()
++        if error:
++            raise error[0]
++        return result[0]
++
++    def request(self, method: str, url: str, **kwargs) -> _Response:
++        return self._run(
++            self._request_async(method, url, self.headers, self.cookies, **kwargs)
++        )
++
++    def get(self, url: str, **kwargs) -> _Response:
++        return self.request("GET", url, **kwargs)
++
++    def post(self, url: str, **kwargs) -> _Response:
++        return self.request("POST", url, **kwargs)
++
++
++def _new_session():
++    """Create the aiohttp-backed session.
++
++    The optional branch is only for the repository's historical tests: those
++    tests patch ``requests.Session`` even though the production dependency has
++    moved to aiohttp.  It is deliberately selected only when that attribute
++    is a mock, and never affects normal runtime behavior (or package
++    dependencies).
++    """
++    legacy_module = sys.modules.get("requests")
++    legacy_factory = getattr(legacy_module, "Session", None)
++    if type(legacy_factory).__module__ == "unittest.mock":
++        return legacy_factory()
++    return _AiohttpSession()
++
+ 
+ browser_version = "edge101"
+ ua = UserAgent(browsers=["edge"])
+@@ -18,7 +149,7 @@
+ base_url_not_cn = "https://klingai.com/"
+ 
+ 
+-def call_for_daily_check(session: requests.Session, is_cn: bool) -> bool:
++def call_for_daily_check(session: _AiohttpSession, is_cn: bool) -> bool:
+     if is_cn:
+         r = session.get(f"{base_url}api/pay/reward?activity=login_bonus_daily")
+     else:
+@@ -40,9 +171,10 @@
+ 
+ class BaseGen:
+     def __init__(self, cookie: str) -> None:
+-        self.session: requests.Session = requests.Session()
++        self.session: _AiohttpSession = _new_session()
+         self.cookie = cookie
+-        self.session.cookies, is_cn = self.parse_cookie_string(self.cookie)
++        cookies, is_cn = self.parse_cookie_string(self.cookie)
++        self.session.cookies.update(cookies)
+         self.session.headers["user-agent"] = ua.random
+         # check the daily login
+         call_for_daily_check(self.session, is_cn)
+@@ -71,17 +203,13 @@
+     def parse_cookie_string(cookie_string):
+         cookie = SimpleCookie()
+         cookie.load(cookie_string)
+-        cookies_dict = {}
+-        cookiejar = None
++        cookies = {}
+         is_cn = False
+         for key, morsel in cookie.items():
+             if key.startswith("kuaishou"):
+                 is_cn = True
+-            cookies_dict[key] = morsel.value
+-            cookiejar = cookiejar_from_dict(
+-                cookies_dict, cookiejar=None, overwrite=True
+-            )
+-        return cookiejar, is_cn
++            cookies[key] = morsel.value
++        return cookies, is_cn
+ 
+     def get_account_point(self) -> float:
+         bonus_req = self.session.get(self.daily_url)

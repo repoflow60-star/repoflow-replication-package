@@ -1,0 +1,120 @@
+--- a/chessdotcom/client.py
++++ b/chessdotcom/client.py
+@@ -4,11 +4,15 @@
+ import warnings
+ from functools import wraps
+ 
+-import requests
+ from aiohttp import ClientSession
+ 
+ from .errors import ChessDotComClientError
+ from .response_builder import DefaultResponseBuilder
++
++# ``requests`` used to be an implementation detail of the synchronous client.
++# Keep a nullable injection point for applications that supplied a custom
++# transport there; normal operation never imports or uses that package.
++requests = None
+ 
+ 
+ class RateLimitHandler(object):
+@@ -48,7 +52,7 @@
+     Client for Chess.com Public API. The client is only responsible for making calls.
+ 
+     :cvar request_config: Dictionary containing extra keyword arguments for
+-        requests to the API (headers, proxy, etc).
++        aiohttp requests to the API (headers, proxy, etc).
+     :cvar aio: Determines if the functions behave asynchronously.
+     :cvar :rate_limit_handler: A RateLimitHandler object.
+         See :obj:`chessdotcom.client.RateLimitHandler`.
+@@ -102,32 +106,61 @@
+         return options
+ 
+     def _do_sync_get_request(self, resource):
+-        r = requests.get(
+-            url=resource.url, **self._build_request_options(resource), timeout=30
+-        )
+-        resource.times_requested += 1
+-
+-        if r.status_code != 200:
+-            if self.rate_limit_handler.should_try_again(r.status_code, resource):
+-                return self._do_sync_get_request(resource)
+-            raise ChessDotComClientError(
+-                status_code=r.status_code, response_text=r.text, headers=r.headers
++        """Execute an aiohttp request from the synchronous client API.
++
++        aiohttp is asynchronous by design, so the synchronous API runs the same
++        request implementation in a short-lived event loop.  Keeping one
++        implementation for both client modes also makes status handling,
++        retries, and response decoding consistent.
++        """
++        if requests is not None:
++            # Compatibility for callers that explicitly supplied the former
++            # transport.  aiohttp remains the default and only packaged
++            # transport.
++            response = requests.get(
++                url=resource.url, **self._build_request_options(resource), timeout=30
+             )
+-        return resource.response_builder.build(r.text)
+-
+-    async def _do_async_get_request(self, resource):
++            resource.times_requested += 1
++            if response.status_code != 200:
++                if self.rate_limit_handler.should_try_again(
++                    response.status_code, resource
++                ):
++                    return self._do_sync_get_request(resource)
++                raise ChessDotComClientError(
++                    status_code=response.status_code,
++                    response_text=response.text,
++                    headers=response.headers,
++                )
++            return resource.response_builder.build(response.text)
++
++        return asyncio.run(self._do_async_get_request(resource, timeout=30))
++
++    async def _do_async_get_request(self, resource, timeout=None):
++        options = self._build_request_options(resource)
++
++        # ``verify`` was the requests spelling used by the synchronous client.
++        # Translate it before handing options to aiohttp, which uses
++        # ``verify_ssl`` (and supports it in the requested aiohttp version).
++        if "verify" in options:
++            options.setdefault("verify_ssl", options["verify"])
++            options.pop("verify")
++        if timeout is not None:
++            options.setdefault("timeout", timeout)
++
+         async with ClientSession(loop=self.loop_callback()) as session:
+-            async with session.get(
+-                url=resource.url, **self._build_request_options(resource)
+-            ) as r:
+-                text = await r.text()
++            async with session.get(url=resource.url, **options) as response:
++                text = await response.text()
+                 resource.times_requested += 1
+ 
+-                if r.status != 200:
+-                    if self.rate_limit_handler.should_try_again(r.status, resource):
+-                        return await self._do_async_get_request(resource)
++                if response.status != 200:
++                    if self.rate_limit_handler.should_try_again(
++                        response.status, resource
++                    ):
++                        return await self._do_async_get_request(resource, timeout=timeout)
+                     raise ChessDotComClientError(
+-                        status_code=r.status, response_text=text, headers=r.headers
++                        status_code=response.status,
++                        response_text=text,
++                        headers=response.headers,
+                     )
+                 return resource.response_builder.build(text)
+ 
+@@ -137,7 +170,7 @@
+     Client for Chess.com Public API. The client can be initialized withe following options.
+ 
+     :ivar request_config: Dictionary containing extra keyword arguments
+-        for requests to the API (headers, proxy, etc).
++        for aiohttp requests to the API (headers, proxy, etc).
+         This value will be set from Client if nothing is provided
+     :ivar aio: Determines if the functions behave asynchronously. Defaults to False
+     :ivar rate_limit_handler: A RateLimitHandler object.

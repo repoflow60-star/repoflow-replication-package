@@ -1,0 +1,162 @@
+--- a/ldnlib/base.py
++++ b/ldnlib/base.py
+@@ -1,5 +1,8 @@
++import io
++import re
++
+ from rdflib import Graph, URIRef
+-import requests
++import pycurl
+ 
+ 
+ class BaseLDN(object):
+@@ -14,18 +17,141 @@
+     def __init__(self, **kwargs):
+         self.accept_headers = kwargs.get('accept_headers', self.ACCEPT_HEADERS)
+ 
++    def _request(self, method, url, **kwargs):
++        """Execute an HTTP request through libcurl."""
++        headers = kwargs.pop('headers', {})
++        allow_redirects = kwargs.pop('allow_redirects', True)
++        auth = kwargs.pop('auth', None)
++        params = kwargs.pop('params', None)
++        data = kwargs.pop('data', None)
++        timeout = kwargs.pop('timeout', None)
++        verify = kwargs.pop('verify', True)
++
++        if params:
++            from urllib.parse import urlencode, urlsplit, urlunsplit
++
++            if isinstance(params, bytes):
++                query = params.decode('utf-8')
++            elif isinstance(params, str):
++                query = params
++            else:
++                query = urlencode(params, doseq=True)
++            parts = urlsplit(url)
++            if parts.query:
++                query = '{}&{}'.format(parts.query, query)
++            url = urlunsplit((parts.scheme, parts.netloc, parts.path,
++                              query, parts.fragment))
++
++        body = io.BytesIO()
++        response_headers = {}
++        links = {}
++
++        def receive_headers(raw_header):
++            if isinstance(raw_header, bytes):
++                line = raw_header.decode('iso-8859-1').strip()
++            else:
++                line = raw_header.strip()
++            if line.startswith('HTTP/'):
++                # A redirect or provisional response starts a new response.
++                response_headers.clear()
++                links.clear()
++                body.seek(0)
++                body.truncate()
++            elif ':' in line:
++                name, value = line.split(':', 1)
++                name = name.strip().lower()
++                value = value.strip()
++                if name in response_headers:
++                    response_headers[name] = '{}, {}'.format(
++                        response_headers[name], value)
++                else:
++                    response_headers[name] = value
++                if name == 'link':
++                    for match in re.finditer(r'<([^>]+)>\s*([^,]*)', value):
++                        relation = re.search(
++                            r'(?:^|;)\s*rel\s*=\s*(?:"([^"]+)"|'
++                            r"'([^']+)'|([^;\s]+))",
++                            match.group(2), re.I)
++                        if relation:
++                            rel_value = next(
++                                item for item in relation.groups()
++                                if item is not None)
++                            for rel in rel_value.split():
++                                links[rel] = {'url': match.group(1)}
++            return len(raw_header)
++
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.CUSTOMREQUEST, method)
++            curl.setopt(pycurl.FOLLOWLOCATION, bool(allow_redirects))
++            curl.setopt(pycurl.WRITEFUNCTION, body.write)
++            curl.setopt(pycurl.HEADERFUNCTION, receive_headers)
++
++            if headers:
++                curl.setopt(
++                    pycurl.HTTPHEADER,
++                    ['{}: {}'.format(name, value)
++                     for name, value in headers.items()])
++
++            if method == 'HEAD':
++                curl.setopt(pycurl.NOBODY, True)
++            elif data is not None:
++                if isinstance(data, str):
++                    data = data.encode('utf-8')
++                elif isinstance(data, bytearray):
++                    data = bytes(data)
++                elif not isinstance(data, bytes):
++                    from urllib.parse import urlencode
++
++                    data = urlencode(data, doseq=True).encode('utf-8')
++                curl.setopt(pycurl.POSTFIELDS, data)
++
++            if auth is not None:
++                if isinstance(auth, (tuple, list)):
++                    auth = '{}:{}'.format(auth[0], auth[1])
++                curl.setopt(pycurl.HTTPAUTH, pycurl.HTTPAUTH_ANY)
++                curl.setopt(pycurl.USERPWD, auth)
++            if timeout is not None:
++                if isinstance(timeout, (tuple, list)):
++                    curl.setopt(pycurl.CONNECTTIMEOUT, timeout[0])
++                    curl.setopt(pycurl.TIMEOUT, timeout[1])
++                elif isinstance(timeout, float):
++                    curl.setopt(pycurl.TIMEOUT_MS, int(timeout * 1000))
++                else:
++                    curl.setopt(pycurl.TIMEOUT, timeout)
++            if verify is False:
++                curl.setopt(pycurl.SSL_VERIFYPEER, False)
++                curl.setopt(pycurl.SSL_VERIFYHOST, 0)
++            elif isinstance(verify, str):
++                curl.setopt(pycurl.CAINFO, verify)
++
++            curl.perform()
++            return (curl.getinfo(pycurl.RESPONSE_CODE), response_headers,
++                    links, body.getvalue())
++        finally:
++            curl.close()
++
++    def _raise_for_status(self, status_code, url):
++        if status_code >= 400:
++            raise IOError('HTTP error {} for {}'.format(status_code, url))
++
++    def _response_text(self, body):
++        return body.decode('utf-8')
++
+     def __discover_head(self, target, **kwargs):
+-        r = requests.head(target, **kwargs)
+-        r.raise_for_status()
+-        if self.LDP_INBOX in r.links:
+-            return r.links[self.LDP_INBOX].get('url')
++        status_code, _, links, _ = self._request('HEAD', target, **kwargs)
++        self._raise_for_status(status_code, target)
++        if self.LDP_INBOX in links:
++            return links[self.LDP_INBOX].get('url')
+ 
+     def __discover_get(self, target, **kwargs):
+-        r = requests.get(target, **kwargs)
+-        r.raise_for_status()
++        status_code, headers, _, body = self._request('GET', target, **kwargs)
++        self._raise_for_status(status_code, target)
+         # TODO -- check for HTML
+-        g = Graph().parse(data=r.text, format=self.content_type_to_mime_type(
+-            r.headers['content-type']))
++        g = Graph().parse(data=self._response_text(body),
++                          format=self.content_type_to_mime_type(
++                              headers['content-type']))
+ 
+         for (subject, inbox) in g[:URIRef(self.LDP_INBOX)]:
+             return str(inbox)

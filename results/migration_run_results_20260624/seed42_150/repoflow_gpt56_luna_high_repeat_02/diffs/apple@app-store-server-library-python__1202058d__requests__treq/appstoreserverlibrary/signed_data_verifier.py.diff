@@ -1,0 +1,95 @@
+--- a/appstoreserverlibrary/signed_data_verifier.py
++++ b/appstoreserverlibrary/signed_data_verifier.py
+@@ -8,7 +8,7 @@
+ 
+ import asn1
+ import jwt
+-import requests
++import treq
+ from cryptography import x509
+ from cryptography.hazmat.primitives import hashes, serialization
+ from cryptography.hazmat.primitives.asymmetric.ec import ECDSA
+@@ -23,6 +23,60 @@
+ from .models.ResponseBodyV2DecodedPayload import ResponseBodyV2DecodedPayload
+ from .models.JWSTransactionDecodedPayload import JWSTransactionDecodedPayload
+ from .models.JWSRenewalInfoDecodedPayload import JWSRenewalInfoDecodedPayload
++
++
++def _wait_for_treq(value):
++    if not hasattr(value, "addCallbacks"):
++        return value
++    from threading import Event, Thread
++    from twisted.internet import reactor
++
++    result = []
++    failure = []
++    done = Event()
++
++    def succeeded(response):
++        result.append(response)
++        done.set()
++        return response
++
++    def failed(error):
++        failure.append(error)
++        done.set()
++        return error
++
++    value.addCallbacks(succeeded, failed)
++    if not done.is_set():
++        if not reactor.running:
++            Thread(target=lambda: reactor.run(installSignalHandlers=False), daemon=True).start()
++        done.wait()
++    if failure:
++        failure[0].raiseException()
++    return result[0]
++
++
++def _get_treq_content(response):
++    if hasattr(response, "code"):
++        content = treq.content(response)
++    else:
++        content = getattr(response, "content")
++    if callable(content):
++        content = treq.content(response)
++    return _wait_for_treq(content)
++
++
++def _request_with_treq(request):
++    if not hasattr(request, "addCallback"):
++        return request
++
++    def include_content(response):
++        content = treq.content(response)
++        if hasattr(content, "addCallback"):
++            content.addCallback(lambda body: (response, body))
++            return content
++        return response, content
++
++    return _wait_for_treq(request.addCallback(include_content))
+ 
+ class SignedDataVerifier:
+     """
+@@ -212,13 +266,18 @@
+         )
+         ocsps = [val for val in authority_values if val.access_method == x509.oid.AuthorityInformationAccessOID.OCSP]
+         for o in ocsps:
+-            r = requests.post(
++            r = _request_with_treq(treq.request(
++                "POST",
+                 o.access_location.value,
+                 headers={"Content-Type": "application/ocsp-request"},
+                 data=req.public_bytes(serialization.Encoding.DER),
+-            )
+-            if r.status_code == 200:
+-                ocsp_resp = ocsp.load_der_ocsp_response(r.content)
++            ))
++            if isinstance(r, tuple):
++                r, response_body = r
++            else:
++                response_body = _get_treq_content(r)
++            if getattr(r, "code", getattr(r, "status_code", None)) == 200:
++                ocsp_resp = ocsp.load_der_ocsp_response(response_body)
+                 if ocsp_resp.response_status == ocsp.OCSPResponseStatus.SUCCESSFUL:
+                     certs = [issuer]
+                     for ocsp_cert in ocsp_resp.certificates:

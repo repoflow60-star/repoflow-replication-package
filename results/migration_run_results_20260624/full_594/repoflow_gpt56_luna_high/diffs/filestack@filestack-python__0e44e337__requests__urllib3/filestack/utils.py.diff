@@ -1,0 +1,198 @@
+--- a/filestack/utils.py
++++ b/filestack/utils.py
+@@ -1,9 +1,10 @@
++import json
++import random
++import string
+ import time
+-import string
+-import random
+-from functools import partial
+-import requests as original_requests
+-from requests.exceptions import HTTPError
++from urllib.parse import urlencode
++
++import urllib3
+ 
+ from filestack import config
+ from filestack.exceptions import FilestackHTTPError
+@@ -13,34 +14,159 @@
+     return ''.join(random.choice(string.ascii_letters + string.digits) for i in range(length))
+ 
+ 
+-class RequestsWrapper:
+-    """
+-    This class wraps selected methods from requests package and adds
+-    default headers if no headers were specified.
+-    """
+-    def __getattr__(self, name):
+-        if name in ('get', 'post', 'put', 'delete'):
+-            return partial(self.handle_request, name)
+-        return original_requests.__getattribute__(name)
++class HTTPResponse:
++    """Expose the response operations used by the SDK over urllib3."""
+ 
+-    def handle_request(self, name, *args, **kwargs):
+-        if 'headers' not in kwargs:
+-            kwargs['headers'] = config.HEADERS
+-            kwargs['headers']['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
+-            kwargs['headers']['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
++    def __init__(self, response):
++        self._response = response
+ 
+-        requests_method = getattr(original_requests, name)
+-        response = requests_method(*args, **kwargs)
++    @property
++    def status_code(self):
++        return self._response.status
+ 
++    @property
++    def ok(self):
++        return self._response.status < 400
++
++    @property
++    def content(self):
++        return self._response.data
++
++    @property
++    def text(self):
++        data = self.content
++        if isinstance(data, bytes):
++            return data.decode('utf-8', errors='replace')
++        return str(data)
++
++    @property
++    def headers(self):
++        return self._response.headers
++
++    def json(self, **kwargs):
++        return json.loads(self.text, **kwargs)
++
++    def iter_content(self, chunk_size=1):
+         try:
++            for chunk in self._response.stream(chunk_size, decode_content=True):
++                yield chunk
++        finally:
++            self.release_conn()
++
++    def release_conn(self):
++        self._response.release_conn()
++
++    def raise_for_status(self):
++        if not self.ok:
++            raise FilestackHTTPError(self.text)
++
++
++class HTTPAdapter:
++    """Configuration holder for the session compatibility surface."""
++
++    def __init__(self, max_retries=None):
++        self.max_retries = max_retries
++
++
++class _Adapters:
++    HTTPAdapter = HTTPAdapter
++
++
++class HTTPSession:
++    def __init__(self, client):
++        self.client = client
++        self.retries = None
++
++    def mount(self, prefix, adapter):
++        self.retries = adapter.max_retries
++
++    def request(self, method, url, **kwargs):
++        kwargs.setdefault('raise_status', False)
++        if self.retries is not None:
++            kwargs.setdefault('retries', self.retries)
++        return self.client.request(method, url, **kwargs)
++
++    def get(self, url, **kwargs):
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, **kwargs):
++        return self.request('POST', url, **kwargs)
++
++    def put(self, url, **kwargs):
++        return self.request('PUT', url, **kwargs)
++
++    def delete(self, url, **kwargs):
++        return self.request('DELETE', url, **kwargs)
++
++
++class HTTPClient:
++    """Small synchronous HTTP client backed by urllib3."""
++
++    adapters = _Adapters()
++
++    def __init__(self):
++        self.pool = urllib3.PoolManager()
++
++    def request(self, method, url, **kwargs):
++        raise_status = kwargs.pop('raise_status', True)
++        if 'headers' in kwargs:
++            headers = dict(kwargs.pop('headers'))
++        else:
++            headers = dict(config.HEADERS)
++            headers['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
++            headers['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
++
++        params = kwargs.pop('params', None)
++        if params:
++            separator = '&' if '?' in url else '?'
++            url = '{}{}{}'.format(url, separator, urlencode(params, doseq=True))
++
++        request_kwargs = {
++            'headers': headers,
++            'preload_content': not kwargs.pop('stream', False),
++            'decode_content': True,
++        }
++
++        json_body = kwargs.pop('json', None)
++        files = kwargs.pop('files', None)
++        data = kwargs.pop('data', None)
++        body = kwargs.pop('body', None)
++        if json_body is not None:
++            request_kwargs['body'] = json.dumps(json_body)
++            headers.setdefault('Content-Type', 'application/json')
++        elif files is not None:
++            request_kwargs['fields'] = files
++        elif data is not None:
++            request_kwargs['body'] = urlencode(data, doseq=True) if isinstance(data, dict) else data
++            if isinstance(data, dict):
++                headers.setdefault('Content-Type', 'application/x-www-form-urlencoded')
++        elif body is not None:
++            request_kwargs['body'] = body
++
++        request_kwargs.update(kwargs)
++        response = HTTPResponse(self.pool.request(method, url, **request_kwargs))
++        if raise_status:
+             response.raise_for_status()
+-        except HTTPError as e:
+-            raise FilestackHTTPError(response.text) from e
+-
+         return response
+ 
++    def get(self, url, **kwargs):
++        return self.request('GET', url, **kwargs)
+ 
+-requests = RequestsWrapper()
++    def post(self, url, **kwargs):
++        return self.request('POST', url, **kwargs)
++
++    def put(self, url, **kwargs):
++        return self.request('PUT', url, **kwargs)
++
++    def delete(self, url, **kwargs):
++        return self.request('DELETE', url, **kwargs)
++
++    def Session(self):
++        return HTTPSession(self)
++
++
++# Keep the established module-level name while changing its transport.
++requests = HTTPClient()
+ 
+ 
+ def return_transform_task(transformation, params):

@@ -1,0 +1,189 @@
+--- a/qtrade/questrade.py
++++ b/qtrade/questrade.py
+@@ -1,9 +1,12 @@
+ """Core module for Questrade API wrapper."""
+ 
++import io
++import json as json_module
+ import logging
+ from typing import Any, Dict, List, Optional, Union
+-
+-import requests
++from urllib.parse import urlencode
++
++import pycurl
+ import yaml
+ 
+ from .utility import TokenDict, get_access_token_yaml, validate_access_token
+@@ -11,6 +14,133 @@
+ log = logging.getLogger(__name__)  # pylint: disable=C0103
+ 
+ TOKEN_URL = "https://login.questrade.com/oauth2/token?grant_type=refresh_token&refresh_token="
++
++
++class _CurlResponse:
++    def __init__(self, status_code: int, body: bytes):
++        self.status_code = status_code
++        self._body = body
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise Exception(f"HTTP {self.status_code}")
++
++    def json(self):
++        return json_module.loads(self._body.decode("utf-8"))
++
++
++class _CurlSession:
++    def __init__(self):
++        self.headers: Dict[str, str] = {}
++
++    def request(
++        self,
++        method: str,
++        url: str,
++        params: Optional[Dict] = None,
++        data: Optional[Dict] = None,
++        json: Optional[Dict] = None,
++        headers: Optional[Dict[str, str]] = None,
++        timeout: int = 30,
++        **_kwargs,
++    ) -> _CurlResponse:
++        request_url = url
++        if params:
++            query_string = urlencode(params, doseq=True)
++            request_url = request_url + ("&" if "?" in request_url else "?") + query_string
++
++        merged_headers = dict(self.headers)
++        if headers:
++            merged_headers.update(headers)
++
++        request_headers = [f"{key}: {value}" for key, value in merged_headers.items()]
++        body = None
++        if json is not None:
++            body = json_module.dumps(json).encode("utf-8")
++            request_headers.append("Content-Type: application/json")
++        elif data is not None:
++            if isinstance(data, (bytes, bytearray)):
++                body = bytes(data)
++            elif isinstance(data, str):
++                body = data.encode("utf-8")
++            else:
++                body = urlencode(data, doseq=True).encode("utf-8")
++                request_headers.append("Content-Type: application/x-www-form-urlencoded")
++
++        buffer = io.BytesIO()
++        curl = pycurl.Curl()
++        status_code = 0
++        try:
++            curl.setopt(pycurl.URL, request_url)
++            curl.setopt(pycurl.WRITEFUNCTION, buffer.write)
++            curl.setopt(pycurl.FOLLOWLOCATION, 1)
++            curl.setopt(pycurl.CONNECTTIMEOUT, timeout)
++            curl.setopt(pycurl.TIMEOUT, timeout)
++            curl.setopt(pycurl.NOSIGNAL, 1)
++
++            method_upper = method.upper()
++            if method_upper == "GET" and body is None:
++                curl.setopt(pycurl.HTTPGET, 1)
++            elif method_upper == "POST":
++                curl.setopt(pycurl.POST, 1)
++                if body is not None:
++                    curl.setopt(pycurl.POSTFIELDS, body)
++            else:
++                curl.setopt(pycurl.CUSTOMREQUEST, method_upper)
++                if body is not None:
++                    curl.setopt(pycurl.POSTFIELDS, body)
++
++            if request_headers:
++                curl.setopt(pycurl.HTTPHEADER, request_headers)
++
++            curl.perform()
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        finally:
++            curl.close()
++
++        return _CurlResponse(status_code, buffer.getvalue())
++
++    def get(self, url: str, timeout: int = 30, **kwargs) -> _CurlResponse:
++        return self.request("get", url, timeout=timeout, **kwargs)
++
++    def post(self, url: str, json: Optional[Dict] = None, timeout: int = 30, **kwargs) -> _CurlResponse:
++        return self.request("post", url, json=json, timeout=timeout, **kwargs)
++
++    def close(self):
++        return None
++
++
++class _RequestsCompat:
++    Session = _CurlSession
++
++    @staticmethod
++    def request(method: str, url: str, timeout: int = 30, **kwargs):
++        session = _CurlSession()
++        try:
++            return session.request(method, url, timeout=timeout, **kwargs)
++        finally:
++            session.close()
++
++    @staticmethod
++    def get(url: str, timeout: int = 30, **kwargs):
++        session = _CurlSession()
++        try:
++            return session.get(url, timeout=timeout, **kwargs)
++        finally:
++            session.close()
++
++    @staticmethod
++    def post(url: str, json: Optional[Dict] = None, timeout: int = 30, **kwargs):
++        session = _CurlSession()
++        try:
++            return session.post(url, json=json, timeout=timeout, **kwargs)
++        finally:
++            session.close()
++
++
++REQUESTS = _RequestsCompat()
++requests = REQUESTS
++Session = _CurlSession
+ 
+ 
+ class Questrade:
+@@ -38,7 +168,7 @@
+     ):
+         self.access_token: TokenDict
+         self.headers = None
+-        self.session = requests.Session()
++        self.session = Session()
+ 
+         self.access_code = access_code
+         self.token_yaml = token_yaml
+@@ -131,7 +261,7 @@
+         """
+         url = TOKEN_URL + str(self.access_code)
+         log.info("Getting access token...")
+-        data = requests.get(url)
++        data = REQUESTS.get(url)
+         data.raise_for_status()
+         response = data.json()
+ 
+@@ -191,7 +321,7 @@
+ 
+         url = TOKEN_URL + str(old_access_token["refresh_token"])
+         log.info("Refreshing access token...")
+-        data = requests.get(url)
++        data = REQUESTS.get(url)
+         data.raise_for_status()
+         response = data.json()
+ 
+@@ -755,7 +885,9 @@
+ 
+     def __del__(self):
+         """Close session when class instance is deleted."""
+-        self.session.close()
++        session = getattr(self, "session", None)
++        if session is not None:
++            session.close()
+ 
+     @staticmethod
+     def _valid_intervals():

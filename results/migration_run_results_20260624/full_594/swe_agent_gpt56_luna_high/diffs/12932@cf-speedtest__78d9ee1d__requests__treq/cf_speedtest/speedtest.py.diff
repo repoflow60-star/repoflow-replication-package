@@ -1,0 +1,230 @@
+--- a/cf_speedtest/speedtest.py
++++ b/cf_speedtest/speedtest.py
+@@ -4,16 +4,201 @@
+ import argparse
+ import math
+ import statistics
++import threading
+ import time
+ from timeit import default_timer as timer
+-
+-import requests
+-import urllib3
++from urllib.parse import urlsplit
++
++import treq
++from twisted.internet import reactor
++from twisted.internet.defer import inlineCallbacks
++from twisted.internet.defer import returnValue
++from twisted.internet.endpoints import HostnameEndpoint
++from twisted.internet.ssl import CertificateOptions
++from twisted.web.client import Agent
++from twisted.web.client import BrowserLikePolicyForHTTPS
++from twisted.web.client import ProxyAgent
+ 
+ import cf_speedtest.locations as locations
+ import cf_speedtest.options as options
+ 
+-REQ_SESSION = requests.Session()
++
++class _ResponseHeaders(dict):
++    """A small, case-insensitive mapping for response headers."""
++
++    def __getitem__(self, key):
++        return super().__getitem__(key.lower())
++
++    def get(self, key, default=None):
++        return super().get(key.lower(), default)
++
++
++class _TreqResponse:
++    """The synchronous response shape used by the speed test functions.
++
++    Treq is Deferred-based, while the public API of this application is
++    intentionally synchronous (it is also used by the command-line entry
++    point).  This object contains the already-buffered response body and keeps
++    the rest of the application independent of Treq's Deferred API.
++    """
++
++    def __init__(self, response, body):
++        self._response = response
++        self.content = body
++        self.headers = _ResponseHeaders(
++            {
++                name.decode('latin1').lower(): values[-1].decode('latin1')
++                for name, values in response.headers.getAllRawHeaders()
++            },
++        )
++
++    @property
++    def text(self):
++        return self.content.decode('utf-8', errors='replace')
++
++    def raise_for_status(self):
++        if self._response.code >= 400:
++            raise RuntimeError(
++                f'HTTP {self._response.code}: {self._response.phrase.decode("latin1")}',
++            )
++
++
++class _TreqSession:
++    """A synchronous session adapter backed by treq.
++
++    The application predates treq and exposes synchronous measurement
++    functions.  A single background reactor lets those functions wait for a
++    Deferred without attempting to start and stop Twisted's reactor for every
++    measurement (a reactor cannot be restarted).
++    """
++
++    def __init__(self):
++        self._reactor_ready = threading.Event()
++        self._reactor_thread = None
++        self._agents = {}
++
++    def _start_reactor(self):
++        if reactor.running:
++            return
++        if self._reactor_thread is None:
++            self._reactor_thread = threading.Thread(
++                target=self._run_reactor,
++                name='cf-speedtest-reactor',
++                daemon=True,
++            )
++            self._reactor_thread.start()
++        self._reactor_ready.wait()
++
++    def _run_reactor(self):
++        reactor.callWhenRunning(self._reactor_ready.set)
++        reactor.run(installSignalHandlers=False)
++
++    @staticmethod
++    def _proxy_for_url(url, proxies):
++        if not proxies:
++            return None
++        scheme = urlsplit(url).scheme
++        return proxies.get(scheme) or proxies.get('https') or proxies.get('http')
++
++    def _get_agent(self, proxy, verify):
++        key = (proxy, verify)
++        if key in self._agents:
++            return self._agents[key]
++
++        if proxy:
++            parsed = urlsplit(proxy)
++            if parsed.scheme.startswith('socks'):
++                raise ValueError('SOCKS proxies are not supported by treq')
++            if not parsed.hostname or not parsed.port:
++                raise ValueError(f'Invalid proxy URL: {proxy}')
++            endpoint = HostnameEndpoint(reactor, parsed.hostname, parsed.port)
++            agent = ProxyAgent(endpoint, reactor=reactor)
++        elif verify:
++            agent = Agent(reactor, contextFactory=BrowserLikePolicyForHTTPS())
++        else:
++            # CertificateOptions with verification disabled is the Twisted
++            # equivalent of disabling TLS certificate verification.
++            class _InsecurePolicy:
++                def creatorForNetloc(self, hostname, port):
++                    return CertificateOptions(verify=False)
++
++            agent = Agent(reactor, contextFactory=_InsecurePolicy())
++
++        self._agents[key] = agent
++        return agent
++
++    def _request_on_reactor(self, method, url, data, headers, verify, proxies):
++        proxy = self._proxy_for_url(url, proxies)
++        agent = self._get_agent(proxy, verify)
++
++        @inlineCallbacks
++        def request():
++            response = yield treq.request(
++                method,
++                url,
++                data=data,
++                headers=headers,
++                agent=agent,
++                reactor=reactor,
++            )
++            body = yield response.content()
++            returnValue(_TreqResponse(response, body))
++
++        deferred = request()
++        result = []
++        failure = []
++
++        def succeeded(value):
++            result.append(value)
++
++        def failed(error):
++            failure.append(error)
++
++        deferred.addCallbacks(succeeded, failed)
++        return deferred, result, failure
++
++    def request(self, method, url, data=None, headers=None, verify=True, proxies=None):
++        self._start_reactor()
++        result = []
++        failure = []
++        request_error = []
++        done = threading.Event()
++
++        def make_request():
++            try:
++                deferred, request_result, request_failure = self._request_on_reactor(
++                    method, url, data, headers, verify, proxies,
++                )
++            except BaseException as error:
++                request_error.append(error)
++                done.set()
++                return
++
++            def complete(value):
++                result.extend(request_result)
++                failure.extend(request_failure)
++                done.set()
++                return value
++
++            # The inner Deferred is already wired to request_result/failure;
++            # this callback only wakes the waiting caller.
++            deferred.addBoth(complete)
++
++        reactor.callFromThread(make_request)
++        done.wait()
++        if failure:
++            failure[0].raiseException()
++        if request_error:
++            raise request_error[0]
++        return result[0]
++
++    def get(self, url, **kwargs):
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, data=None, **kwargs):
++        return self.request('POST', url, data=data, **kwargs)
++
++REQ_SESSION = _TreqSession()
+ 
+ CGI_ENDPOINT = 'https://speed.cloudflare.com/cdn-cgi/trace'
+ DOWNLOAD_ENDPOINT = 'https://speed.cloudflare.com/__down?measId=0&bytes={}'
+@@ -62,9 +247,9 @@
+     start = timer()
+ 
+     r = REQ_SESSION.post(
+-        UPLOAD_ENDPOINT, data=bytearray(
++        UPLOAD_ENDPOINT, data=bytes(bytearray(
+             total_bytes,
+-        ), headers=UPLOAD_HEADERS, verify=VERIFY_SSL, proxies=PROXY_DICT,
++        )), headers=UPLOAD_HEADERS, verify=VERIFY_SSL, proxies=PROXY_DICT,
+     )
+     r.raise_for_status()
+     total_time_taken = timer() - start
+@@ -290,9 +475,6 @@
+ 
+ def main(argv=None) -> int:
+     global PROXY_DICT, VERIFY_SSL, OUTPUT_FILE
+-    # disable annoying warning when using verify=False in requests.get("x", verify=False)
+-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+-
+     parser = argparse.ArgumentParser()
+     parser_with_args = options.add_run_options(parser)
+ 

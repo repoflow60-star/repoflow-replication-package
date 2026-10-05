@@ -1,0 +1,341 @@
+--- a/hxl/input.py
++++ b/hxl/input.py
+@@ -33,7 +33,7 @@
+ 
+ import abc, collections, csv, datetime, dateutil.parser, hashlib, \
+     io, io_wrapper, json, jsonpath_ng.ext, logging, \
+-    os.path, re, requests, shutil, six, sys, \
++    os.path, pycurl, re, shutil, six, sys, \
+     tempfile, time, urllib.parse, xlrd3 as xlrd, zipfile
+ 
+ logger = logging.getLogger(__name__)
+@@ -164,6 +164,69 @@
+     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+     'application/vnd.ms-excel',
+ )
++
++
++def _http_request(url, method='GET', verify_ssl=True, headers=None,
++                  timeout=None, params=None, data=None,
++                  follow_redirects=True):
++    """Make an HTTP request and return its status, headers, and body."""
++    if params:
++        query = urllib.parse.urlencode(params, doseq=True)
++        separator = '&' if urllib.parse.urlparse(url).query else '?'
++        url = '{}{}{}'.format(url, separator, query)
++
++    body = io.BytesIO()
++    response_headers = {}
++
++    def receive_header(line):
++        text = line.decode('iso-8859-1').strip()
++        if text.startswith('HTTP/'):
++            # Redirect and proxy headers precede the final response headers.
++            response_headers.clear()
++        elif ':' in text:
++            name, value = text.split(':', 1)
++            response_headers[name.strip().lower()] = value.strip()
++        return len(line)
++
++    curl = pycurl.Curl()
++    try:
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.WRITEFUNCTION, body.write)
++        curl.setopt(pycurl.HEADERFUNCTION, receive_header)
++        curl.setopt(pycurl.FOLLOWLOCATION, bool(follow_redirects))
++        curl.setopt(pycurl.MAXREDIRS, 30)
++        curl.setopt(pycurl.SSL_VERIFYPEER, bool(verify_ssl))
++        curl.setopt(pycurl.SSL_VERIFYHOST, 2 if verify_ssl else 0)
++        curl.setopt(pycurl.ACCEPT_ENCODING, '')
++        if headers:
++            curl.setopt(
++                pycurl.HTTPHEADER,
++                ['{}: {}'.format(name, value) for name, value in headers.items()]
++            )
++        if timeout is not None:
++            curl.setopt(pycurl.TIMEOUT_MS, int(float(timeout) * 1000))
++        if method == 'HEAD':
++            curl.setopt(pycurl.NOBODY, True)
++        elif method == 'POST':
++            curl.setopt(pycurl.POST, True)
++            curl.setopt(pycurl.POSTFIELDS, urllib.parse.urlencode(data or {}, doseq=True))
++        curl.perform()
++        status = curl.getinfo(pycurl.RESPONSE_CODE)
++    except pycurl.error as error:
++        raise HXLIOException("Unable to open URL {}: {}".format(url, error), url=url)
++    finally:
++        curl.close()
++
++    return status, response_headers, body.getvalue()
++
++
++def _raise_for_http_status(status, url):
++    if 400 <= status < 600:
++        raise HXLIOException('HTTP error {} for {}'.format(status, url), url=url)
++
++
++def _decode_json(body):
++    return json.loads(body)
+ 
+ 
+ ########################################################################
+@@ -621,23 +684,22 @@
+         try:
+             url = munge_url(url_or_filename, input_options)
+             logup("Trying to open remote resource", {"url": url_or_filename})
+-            response = requests.get(
++            status, response_headers, response_body = _http_request(
+                 url,
+-                stream=True,
+-                verify=input_options.verify_ssl,
++                verify_ssl=input_options.verify_ssl,
+                 timeout=input_options.timeout,
+                 headers=input_options.http_headers
+             )
+-            logup("Response status", {"url": url_or_filename, "status": response.status_code})
+-            if (response.status_code == 403): # CKAN sends "403 Forbidden" for a private file
++            logup("Response status", {"url": url_or_filename, "status": status})
++            if status == 403: # CKAN sends "403 Forbidden" for a private file
+                 raise HXLAuthorizationException("Access not authorized", url=url)
+             else:
+-                response.raise_for_status()
++                _raise_for_http_status(status, url)
+         except Exception as e:
+             logger.error("Cannot open URL %s (%s)", url_or_filename, str(e))
+             raise e
+ 
+-        content_type = response.headers.get('content-type')
++        content_type = response_headers.get('content-type')
+         if content_type:
+             result = re.match(r'^(\S+)\s*;\s*charset=(\S+)$', content_type)
+             if result:
+@@ -646,15 +708,14 @@
+             else:
+                 mime_type = content_type.lower()
+ 
+-        content_length = response.headers.get('content-length')
++        content_length = response_headers.get('content-length')
+         if content_length is not None:
+             try:
+                 content_length = int(content_length)
+             except:
+                 content_length = None
+ 
+-        # return (RequestResponseIOWrapper(response), mime_type, file_ext, encoding, content_length, fileno,)
+-        return (io.BytesIO(response.content), mime_type, file_ext, encoding, content_length, fileno,)
++        return (io.BytesIO(response_body), mime_type, file_ext, encoding, content_length, fileno,)
+ 
+     elif input_options.allow_local:
+         # Default to a local file, if allowed
+@@ -816,82 +877,6 @@
+         self.encoding = encoding
+         self.expand_merged = expand_merged
+         self.scan_ckan_resources = scan_ckan_resources
+-
+-
+-# Deprecated - will remove in future release
+-class RequestResponseIOWrapper(io.RawIOBase):
+-    """Wrapper for a Response object from the requests library.  Streaming
+-    in requests is a bit broken: for example, if you're streaming, the
+-    stream from the raw property doesn't unzip the payload.
+-    """
+-
+-    BUFFER_SIZE = 0x1000
+-    """Size of input chunk buffer from requests.raw.iter_content"""
+-
+-    def __init__(self, response):
+-        """Construct a wrapper around a requests response object
+-        @param response: the HTTP response from the requests library
+-        """
+-        self.response = response
+-        self.buffer = None
+-        self.buffer_pos = -1
+-        self.iter = response.iter_content(self.BUFFER_SIZE) # iterator through the input
+-
+-    def read(self, size=-1):
+-        """Read raw byte input from the requests raw.iter_content iterator
+-        The function will unzip zipped content.
+-        @param size: the maximum number of bytes to read, or -1 for all available.
+-        """
+-        result = bytearray()
+-
+-        if size == -1:
+-            # Read all of the content at once
+-            for chunk in self.iter:
+-                result += chunk
+-            self.buffer = None
+-        else:
+-            # Read from chunks until we have enough content
+-            while size > 0:
+-                if not self.buffer:
+-                    try:
+-                        self.buffer = next(self.iter)
+-                    except StopIteration:
+-                         # stop if we've run out of input
+-                        break
+-                    self.buffer_pos = 0
+-                avail = min(len(self.buffer)-self.buffer_pos, size) #actually read
+-                result += self.buffer[self.buffer_pos:self.buffer_pos+avail]
+-                size -= avail
+-                self.buffer_pos += avail
+-                if self.buffer_pos >= len(self.buffer):
+-                    self.buffer = None
+-
+-        return bytes(result) # FIXME - how can we avoid a copy?
+-
+-    def readinto(self, b):
+-        """Read content into a buffer of some kind.
+-        This is not very efficient right now -- too much copying.
+-        @param b: the buffer to read into (will read up to its length)
+-        """
+-        result = self.read(len(b))[:len(b)]
+-        size = len(result)
+-        b[:size] = result[:size]
+-        return size
+-
+-    def readable(self):
+-        """Flag whether the content is readable."""
+-        try:
+-            return self.response.raw.readable()
+-        except:
+-            return True
+-
+-    @property
+-    def content_type(self):
+-        return self.response.headers.get('Content-type')
+-
+-    def close(self):
+-        """Close the streaming response."""
+-        return self.response.close()
+ 
+ 
+ class AbstractInput(object):
+@@ -1657,9 +1642,11 @@
+     result = re.match(GOOGLE_DRIVE_URL, url)
+     if result:
+         logup("HEAD request for Google Drive URL", {"url": url})
+-        response = requests.head(url)
+-        if response.is_redirect:
+-            new_url = response.headers['Location']
++        status, response_headers, _ = _http_request(
++            url, method='HEAD', follow_redirects=False
++        )
++        if status in (301, 302, 303, 307, 308) and 'location' in response_headers:
++            new_url = response_headers['location']
+             logup("Google Drive redirect", {"url": url, "redirect": new_url})
+             logger.info("Following Google Drive redirect to %s", new_url)
+             url = new_url
+@@ -1752,7 +1739,12 @@
+         # CKAN resource URL
+         ckan_api_query = '{}/api/3/action/resource_show?id={}'.format(site_url, resource_id)
+         logup("Trying CKAN API call", {"url": ckan_api_query})
+-        ckan_api_result = requests.get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
++        status, _, response_body = _http_request(
++            ckan_api_query,
++            verify_ssl=input_options.verify_ssl,
++            headers=input_options.http_headers
++        )
++        ckan_api_result = _decode_json(response_body)
+         if ckan_api_result['success']:
+             url = ckan_api_result['result']['url']
+             logup("Found candidate URL for CKAN dataset", {"url": url})
+@@ -1775,7 +1767,12 @@
+     else:
+         # CKAN dataset (package) URL
+         ckan_api_query = '{}/api/3/action/package_show?id={}'.format(site_url, dataset_id)
+-        ckan_api_result = requests.get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
++        status, _, response_body = _http_request(
++            ckan_api_query,
++            verify_ssl=input_options.verify_ssl,
++            headers=input_options.http_headers
++        )
++        ckan_api_result = _decode_json(response_body)
+         if ckan_api_result['success']:
+             for resource in ckan_api_result['result']['resources']:
+                 url = resource['url']
+@@ -1825,20 +1822,20 @@
+         "q": "source:{}".format(asset_id)
+     }
+     logup("Trying Kobo dataset", {"url": asset_id})
+-    response = requests.get(
++    status, _, response_body = _http_request(
+         "https://kobo.humanitarianresponse.info/exports/",
+-        verify=input_options.verify_ssl,
++        verify_ssl=input_options.verify_ssl,
+         headers=input_options.http_headers,
+         params=params
+     )
+-    logup("Result for Kobo dataset", {"asset_id": asset_id, "status": response.status_code})
++    logup("Result for Kobo dataset", {"asset_id": asset_id, "status": status})
+     # check for errors
+-    if (response.status_code == 403): # CKAN sends "403 Forbidden" for a private file
++    if status == 403: # CKAN sends "403 Forbidden" for a private file
+         raise HXLAuthorizationException("Access not authorized", url=url)
+     else:
+-        response.raise_for_status()
+-
+-    exports = response.json()['results']
++        _raise_for_http_status(status, url)
++
++    exports = _decode_json(response_body)['results']
+     if len(exports) > 0:
+         export = exports[-1]
+         created = dateutil.parser.isoparse(export['date_created'])
+@@ -1861,40 +1858,41 @@
+         "hierarchy_in_labels": False,
+         "group_sep": ",",
+     }
+-    response = requests.post(
++    status, _, response_body = _http_request(
+         "https://kobo.humanitarianresponse.info/exports/",
+-        verify=input_options.verify_ssl,
+-        headers=http_headers,
++        method='POST',
++        verify_ssl=input_options.verify_ssl,
++        headers=input_options.http_headers,
+         data=params
+     )
+-    logup("Generated Kobo export", {"asset_id": asset_id, "status": response.status_code})
++    logup("Generated Kobo export", {"asset_id": asset_id, "status": status})
+     # check for errors
+-    if (response.status_code == 403): # CKAN sends "403 Forbidden" for a private file
++    if status == 403: # CKAN sends "403 Forbidden" for a private file
+         raise HXLAuthorizationException("Access not authorized", url=url)
+     else:
+-        response.raise_for_status()
+-
+-    info_url = response.json().get("url")
++        _raise_for_http_status(status, url)
++
++    info_url = _decode_json(response_body).get("url")
+ 
+     # 3. Look up the data record for the export to get the download URL
+ 
+     fail_counter = 0
+     while True:
+         logup("Getting info for Kobo export", {"url": info_url})
+-        response = requests.get(
++        status, _, response_body = _http_request(
+             info_url,
+-            verify=input_options.verify_ssl,
+-            headers=http_headers
++            verify_ssl=input_options.verify_ssl,
++            headers=input_options.http_headers
+         )
+-        logup("Response for Kobo info", {"url": info_url, "status": response.status_code})
++        logup("Response for Kobo info", {"url": info_url, "status": status})
+ 
+         # check for errors
+-        if (response.status_code == 403): # CKAN sends "403 Forbidden" for a private file
++        if status == 403: # CKAN sends "403 Forbidden" for a private file
+             raise HXLAuthorizationException("Access not authorized", url=info_url)
+         else:
+-            response.raise_for_status()
+-
+-        url = response.json().get("result")
++            _raise_for_http_status(status, info_url)
++
++        url = _decode_json(response_body).get("result")
+ 
+         if url:
+             logger.info("Kobo export URL: %s", url)

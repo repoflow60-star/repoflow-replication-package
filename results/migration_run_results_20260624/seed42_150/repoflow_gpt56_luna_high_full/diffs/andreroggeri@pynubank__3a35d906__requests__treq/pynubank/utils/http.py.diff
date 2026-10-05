@@ -1,0 +1,155 @@
+--- a/pynubank/utils/http.py
++++ b/pynubank/utils/http.py
+@@ -1,7 +1,60 @@
+-from requests import Response
+-from requests_pkcs12 import get, post
++import json
++import threading
++
++import treq
++from OpenSSL import crypto
++from cryptography.hazmat.primitives import serialization
++from cryptography.hazmat.primitives.serialization import pkcs12
++from twisted.internet import reactor
++from twisted.internet.ssl import CertificateOptions
++from twisted.internet.threads import blockingCallFromThread
++from twisted.web.client import Agent
+ 
+ from pynubank import NuRequestException
++
++
++_reactor_thread = None
++_reactor_ready = threading.Event()
++
++
++def _run_reactor():
++    reactor.callWhenRunning(_reactor_ready.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _wait(operation):
++    global _reactor_thread
++
++    if not reactor.running:
++        if _reactor_thread is None:
++            _reactor_ready.clear()
++            _reactor_thread = threading.Thread(target=_run_reactor, daemon=True)
++            _reactor_thread.start()
++        _reactor_ready.wait()
++
++    return blockingCallFromThread(reactor, operation)
++
++
++def _request(method, url, headers=None, json_body=None, **kwargs):
++    if headers is not None:
++        headers = {
++            name.encode() if isinstance(name, str) else name: [
++                item.encode() if isinstance(item, str) else item
++                for item in (value if isinstance(value, (list, tuple)) else [value])
++            ]
++            for name, value in headers.items()
++        }
++
++    data = None if json_body is None else json.dumps(json_body).encode()
++    return _wait(lambda: treq.request(method, url, headers=headers, data=data, **kwargs))
++
++
++def get(url, headers=None, **kwargs):
++    return _request('GET', url, headers=headers, **kwargs)
++
++
++def post(url, json=None, headers=None, **kwargs):
++    return _request('POST', url, headers=headers, json_body=json, **kwargs)
+ 
+ 
+ class HttpClient:
+@@ -26,24 +79,79 @@
+     def get_header(self, name: str):
+         return self._headers.get(name)
+ 
+-    @property
+-    def _cert_args(self):
+-        return {'pkcs12_data': self._cert, 'pkcs12_password': ''} if self._cert else {}
+-
+-    def _handle_response(self, response: Response) -> dict:
+-        if response.status_code != 200:
++    def _handle_response(self, response) -> dict:
++        if self._response_status(response) != 200:
+             raise NuRequestException(response)
+ 
+-        return response.json()
++        return self.json_content(response)
+ 
+-    def raw_get(self, url: str) -> Response:
++    def raw_get(self, url: str):
+         return get(url, headers=self._headers, **self._cert_args)
+ 
+-    def raw_post(self, url: str, json: dict) -> Response:
++    def raw_post(self, url: str, json: dict):
+         return post(url, json=json, headers=self._headers, **self._cert_args)
+ 
+     def get(self, url: str) -> dict:
+         return self._handle_response(self.raw_get(url))
+ 
+     def post(self, url: str, json: dict) -> dict:
+-        return self._handle_response(post(url, json=json, headers=self._headers, **self._cert_args))
++        return self._handle_response(self.raw_post(url, json))
++
++    @property
++    def _cert_args(self):
++        if not self._cert:
++            return {}
++
++        try:
++            private_key, certificate, additional_certs = pkcs12.load_key_and_certificates(self._cert, None)
++        except ValueError:
++            private_key, certificate, additional_certs = pkcs12.load_key_and_certificates(self._cert, b'')
++
++        if certificate is None and additional_certs:
++            certificate = additional_certs[0]
++        if private_key is None or certificate is None:
++            raise ValueError('The PKCS#12 certificate does not contain a key and certificate.')
++
++        private_key = crypto.load_privatekey(
++            crypto.FILETYPE_PEM,
++            private_key.private_bytes(
++                serialization.Encoding.PEM,
++                serialization.PrivateFormat.TraditionalOpenSSL,
++                serialization.NoEncryption(),
++            ),
++        )
++        certificate = crypto.load_certificate(
++            crypto.FILETYPE_PEM,
++            certificate.public_bytes(serialization.Encoding.PEM),
++        )
++        context = CertificateOptions(privateKey=private_key, certificate=certificate)
++        return {'agent': Agent(reactor, contextFactory=context)}
++
++    def json_content(self, response):
++        if hasattr(response, 'json'):
++            return response.json()
++        return _wait(lambda: treq.json_content(response))
++
++    @staticmethod
++    def response_header(response, name: str):
++        headers = getattr(response, 'headers', None)
++        if headers is None:
++            return None
++
++        if hasattr(headers, 'getRawHeaders'):
++            try:
++                values = headers.getRawHeaders(name)
++            except TypeError:
++                values = headers.getRawHeaders(name.encode())
++            if not values:
++                return None
++            value = values[0]
++        else:
++            value = headers.get(name)
++
++        return value.decode() if isinstance(value, bytes) else value
++
++    @staticmethod
++    def _response_status(response):
++        status = getattr(response, 'code', None)
++        return status if status is not None else response.status_code

@@ -1,0 +1,168 @@
+--- a/sectxt/__init__.py
++++ b/sectxt/__init__.py
+@@ -22,12 +22,14 @@
+     from typing import TypedDict
+ 
+ import dateutil.parser
+-import requests
++import threading
++
++import treq
++from twisted.internet import reactor, ssl, threads
++from twisted.web.client import Agent
++from twisted.web.http_headers import Headers
+ 
+ __version__ = "0.9.6"
+-
+-s = requests.Session()
+-
+ 
+ class ErrorDict(TypedDict):
+     code: str
+@@ -531,6 +533,66 @@
+ CORRECT_PATH = ".well-known/security.txt"
+ 
+ 
++_reactor_ready = threading.Event()
++
++
++def _run_reactor() -> None:
++    reactor.callWhenRunning(_reactor_ready.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _treq_get(url: str, headers: dict, timeout: int, verify: bool = True):
++    """Run treq's asynchronous request API behind the existing sync boundary."""
++    if not reactor.running:
++        threading.Thread(target=_run_reactor, daemon=True).start()
++        _reactor_ready.wait()
++
++    def request():
++        options = {
++            "headers": Headers(
++                {
++                    key.encode("ascii"): [value.encode("ascii")]
++                    for key, value in headers.items()
++                }
++            ),
++            "timeout": timeout,
++            "browser_like_redirects": True,
++        }
++        if not verify:
++            options["agent"] = Agent(
++                reactor, contextFactory=ssl.ClientContextFactory()
++            )
++        deferred = treq.get(url, **options)
++        deferred.addCallback(
++            lambda response: treq.content(response).addCallback(
++                lambda content: (response, content)
++            )
++        )
++        return deferred
++
++    return threads.blockingCallFromThread(reactor, request)
++
++
++def _is_certificate_error(error: Exception) -> bool:
++    return "certificate" in str(error).lower()
++
++
++def _response_url(response) -> str:
++    value = response.request.absoluteURI
++    if isinstance(value, bytes):
++        return value.decode("ascii")
++    return value
++
++
++def _response_history(response) -> list:
++    history = []
++    previous = getattr(response, "previousResponse", None)
++    while previous is not None:
++        history.append(previous)
++        previous = getattr(previous, "previousResponse", None)
++    return history
++
++
+ class SecurityTXT(Parser):
+     def __init__(self, url: str, recommend_unknown_fields: bool = True, is_local: bool = False):
+         url_parts = urlsplit(url)
+@@ -557,35 +619,37 @@
+                 for path in [".well-known/security.txt", "security.txt"]:
+                     url = urlunsplit((scheme, self._loc, path, None, None))
+                     try:
+-                        resp = requests.get(
++                        resp, content = _treq_get(
+                             url,
+                             headers={
+                                 'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+                                               'Gecko/20100101 Firefox/12.0'},
+                             timeout=5
+                         )
+-                    except requests.exceptions.SSLError:
++                    except Exception as error:
++                        if not _is_certificate_error(error):
++                            continue
+                         if not any(d["code"] == "invalid_cert" for d in self._errors):
+                             self._add_error(
+                                 "invalid_cert",
+                                 "security.txt must be served with a valid TLS certificate.",
+                             )
+                         try:
+-                            resp = requests.get(
++                            resp, content = _treq_get(
+                                 url,
+                                 headers={
+                                     'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+                                                   'Gecko/20100101 Firefox/12.0'},
+                                 timeout=5,
+-                                verify=False
++                                verify=False,
+                             )
+                         except:
+                             continue
+-                    except:
+-                        continue
+-                    if resp.status_code == 200:
+-                        if resp.history:
+-                            if not resp.url.endswith(path):
++                    if resp.code == 200:
++                        history = _response_history(resp)
++                        response_url = _response_url(resp)
++                        if history:
++                            if not response_url.endswith(path):
+                                 continue
+                         self._path = path
+                         self._url = url
+@@ -603,13 +667,17 @@
+                                 "(legacy place), but must be placed under "
+                                 "the '/.well-known/' path.",
+                             )
+-                        if "content-type" not in resp.headers:
++                        content_type = resp.headers.getRawHeaders(b"content-type")
++                        if not content_type:
+                             self._add_error(
+                                 "no_content_type", "HTTP Content-Type header must be sent."
+                             )
+                         else:
+                             m = Message()
+-                            m['content-type'] = resp.headers["content-type"]
++                            value = content_type[0]
++                            if isinstance(value, bytes):
++                                value = value.decode("ascii")
++                            m['content-type'] = value
+                             params = dict(m.get_params())
+                             if "text/plain" not in params:
+                                 self._add_error(
+@@ -625,9 +693,9 @@
+                                     "Charset parameter in Content-Type header must be "
+                                     "'utf-8' if present.",
+                                 )
+-                        self._content = resp.content
+-                        if resp.history:
+-                            self._urls = [resp.history[0].url, resp.url]
++                        self._content = content
++                        if history:
++                            self._urls = [_response_url(history[-1]), response_url]
+                         else:
+                             self._urls = [url]
+                         super()._process()

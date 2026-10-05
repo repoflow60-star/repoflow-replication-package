@@ -1,0 +1,203 @@
+--- a/certbot_dns_infomaniak/dns_infomaniak.py
++++ b/certbot_dns_infomaniak/dns_infomaniak.py
+@@ -3,11 +3,13 @@
+ # SPDX-FileCopyrightText: 2021      Romain Autran <romain.autran@2itea.ch>
+ # SPDX-License-Identifier: Apache-2.0
+ """DNS Authenticator for Infomaniak"""
++import io
+ import json
+ import logging
++from urllib.parse import urlencode, urlsplit
++
+ import idna
+-
+-import requests
++import pycurl
+ 
+ from certbot import errors
+ from certbot.plugins import dns_common
+@@ -76,6 +78,74 @@
+         return _APIDomain(self.token)
+ 
+ 
++class _PreparedRequest:
++    """Minimal request object for mounted transport adapters."""
++
++    def __init__(self, method, url, headers, body):
++        self.method = method
++        self.url = url
++        self.headers = headers
++        self.body = body
++        self._cookies = {}
++        parsed_url = urlsplit(url)
++        self.path_url = parsed_url.path or "/"
++        if parsed_url.query:
++            self.path_url += "?" + parsed_url.query
++
++
++class _PycurlSession:
++    """Small session abstraction backed by pycurl."""
++
++    def __init__(self):
++        self.headers = {}
++        self._curl = pycurl.Curl()
++        self._mounts = {}
++
++    def mount(self, prefix, adapter):
++        """Register a transport adapter for URLs beginning with prefix."""
++        self._mounts[prefix] = adapter
++
++    def request(self, method, url, params=None, data=None, headers=None):
++        if params:
++            query = urlencode(params, doseq=True)
++            url += "&" if "?" in url else "?"
++            url += query
++
++        request_headers = dict(self.headers)
++        if headers:
++            request_headers.update(headers)
++
++        adapter = self._adapter_for(url)
++        if adapter is not None:
++            request = _PreparedRequest(method, url, request_headers, data)
++            return adapter.send(request)
++
++        response = io.BytesIO()
++        self._curl.reset()
++        self._curl.setopt(pycurl.URL, url)
++        self._curl.setopt(
++            pycurl.HTTPHEADER,
++            ["{key}: {value}".format(key=key, value=value)
++             for key, value in request_headers.items()],
++        )
++        self._curl.setopt(pycurl.WRITEFUNCTION, response.write)
++        if method == "GET":
++            self._curl.setopt(pycurl.HTTPGET, 1)
++        elif method == "POST":
++            self._curl.setopt(pycurl.POST, 1)
++            self._curl.setopt(pycurl.POSTFIELDS, data)
++        else:
++            self._curl.setopt(pycurl.CUSTOMREQUEST, method)
++        self._curl.perform()
++        return response.getvalue()
++
++    def _adapter_for(self, url):
++        for prefix in sorted(self._mounts, key=len, reverse=True):
++            if url.startswith(prefix):
++                return self._mounts[prefix]
++        return None
++
++
+ class _APIDomain:
+ 
+     baseUrl = "https://api.infomaniak.com"
+@@ -86,8 +156,21 @@
+         :param str token: oauth2 token to consume Infomaniak API
+         """
+         self.token = token
+-        self.session = requests.Session()
++        self.session = _PycurlSession()
+         self.session.headers.update({"Authorization": "Bearer {token}".format(token=self.token)})
++
++    def _request(self, method, url, payload=None, headers=None):
++        """Perform a request through the pycurl-backed session."""
++        if method == "GET":
++            response = self.session.request(method, url, params=payload, headers=headers)
++        else:
++            data = json.dumps(payload) if payload is not None else None
++            response = self.session.request(method, url, data=data, headers=headers)
++        response_body = getattr(response, "content", response)
++        try:
++            return json.loads(response_body)
++        except json.decoder.JSONDecodeError as exc:
++            raise errors.PluginError("no JSON in API response") from exc
+ 
+     def _get_request(self, url, payload=None):
+         """Performs a GET request against API
+@@ -97,20 +180,16 @@
+         """
+         url = self.baseUrl + url
+         logger.debug("GET %s", url)
+-        with self.session.get(url, params=payload) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            if result["error"]["code"] == "not_authorized":
+-                raise errors.PluginError("cannot authenticate")
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++        result = self._request("GET", url, payload)
++        if result["result"] == "success":
++            return result["data"]
++        if result["error"]["code"] == "not_authorized":
++            raise errors.PluginError("cannot authenticate")
++        raise errors.PluginError(
++            "error in API request: {} / {}".format(
++                result["error"]["code"], result["error"]["description"]
++            )
++        )
+ 
+     def _post_request(self, url, payload):
+         """Performs a POST request
+@@ -120,20 +199,15 @@
+         """
+         url = self.baseUrl + url
+         headers = {"Content-Type": "application/json"}
+-        json_data = json.dumps(payload)
+         logger.debug("POST %s", url)
+-        with self.session.post(url, data=json_data, headers=headers) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++        result = self._request("POST", url, payload, headers)
++        if result["result"] == "success":
++            return result["data"]
++        raise errors.PluginError(
++            "error in API request: {} / {}".format(
++                result["error"]["code"], result["error"]["description"]
++            )
++        )
+ 
+     def _delete_request(self, url):
+         """Performs a POST request
+@@ -142,18 +216,14 @@
+         """
+         url = self.baseUrl + url
+         logger.debug("DELETE %s", url)
+-        with self.session.delete(url) as req:
+-            try:
+-                result = req.json()
+-            except json.decoder.JSONDecodeError as exc:
+-                raise errors.PluginError("no JSON in API response") from exc
+-            if result["result"] == "success":
+-                return result["data"]
+-            raise errors.PluginError(
+-                "error in API request: {} / {}".format(
+-                    result["error"]["code"], result["error"]["description"]
+-                )
+-            )
++        result = self._request("DELETE", url)
++        if result["result"] == "success":
++            return result["data"]
++        raise errors.PluginError(
++            "error in API request: {} / {}".format(
++                result["error"]["code"], result["error"]["description"]
++            )
++        )
+ 
+     def _get_records(self, domain, domain_id, record):
+         """Find record matching arguments

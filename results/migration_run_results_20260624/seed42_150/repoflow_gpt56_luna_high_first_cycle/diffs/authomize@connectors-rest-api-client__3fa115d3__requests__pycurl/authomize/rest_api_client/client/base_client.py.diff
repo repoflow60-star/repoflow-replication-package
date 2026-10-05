@@ -1,0 +1,170 @@
+--- a/authomize/rest_api_client/client/base_client.py
++++ b/authomize/rest_api_client/client/base_client.py
+@@ -1,7 +1,9 @@
++import json
++from io import BytesIO
+ from typing import Optional
++from urllib.parse import urlencode
+ 
+-import requests
+-from requests import Response
++import pycurl
+ 
+ AUTHOMIZE_API_URL = 'https://api.authomize.com'
+ 
+@@ -15,67 +17,128 @@
+     def __init__(self, auth_token: str, base_url: str = AUTHOMIZE_API_URL):
+         self.auth_token = auth_token
+         self.base_url = base_url
+-        self.session = requests.Session()
+-        self.session.headers.update({'Authorization': self.authorization_header})
++        self.session = pycurl.Curl()
+ 
+     @property
+     def authorization_header(self) -> str:
+         raise NotImplementedError()
+ 
+     @staticmethod
+-    def _handle_response(response: Response):
+-        if response.ok:
+-            return BaseClient._handle_ok_response(response)
++    def _handle_response(status_code: int, headers: dict, content: bytes, url: str):
++        if status_code < 400:
++            return BaseClient._handle_ok_response(
++                status_code=status_code,
++                headers=headers,
++                content=content,
++                url=url,
++            )
+         try:
+-            response_json = response.json()
++            response_json = json.loads(content)
+             detail = response_json.get('detail')
+-            if 400 <= response.status_code < 500:
+-                response.reason = response.text
+         except Exception:
+             detail = None
+         if detail:
+             raise ClientError(str(detail))
+-        response.raise_for_status()
++        raise ClientError(
++            message={
++                'status_code': status_code,
++                'url': url,
++                'message': 'Unexpected response from API',
++                'raw': content,
++            },
++        )
+ 
+     @staticmethod
+-    def _handle_ok_response(response: Response) -> dict:
+-        if content_type := response.headers.get('content-type'):
++    def _handle_ok_response(
++        status_code: int,
++        headers: dict,
++        content: bytes,
++        url: str,
++    ) -> dict:
++        if content_type := headers.get('content-type'):
+             if content_type.startswith('application/json'):
+-                return response.json()
++                return json.loads(content)
+ 
+         raise ClientError(
+             message={
+-                'status_code': response.status_code,
+-                'url': response.url,
++                'status_code': status_code,
++                'url': url,
+                 'message': 'Unexpected response from API',
+-                'raw': response.content,
++                'raw': content,
+             },
++        )
++
++    @staticmethod
++    def _parse_headers(raw_headers: bytes) -> dict:
++        headers = {}
++        for line in raw_headers.splitlines():
++            if line.startswith(b'HTTP/'):
++                headers = {}
++            elif b':' in line:
++                key, value = line.split(b':', 1)
++                headers[key.decode('latin-1').lower()] = value.decode('latin-1').strip()
++        return headers
++
++    def _request(self, method: str, url: str, params=None, body: Optional[str] = None):
++        if params:
++            if hasattr(params, 'items'):
++                params = params.items()
++            query = urlencode(
++                [(key, value) for key, value in params if value is not None],
++                doseq=True,
++            )
++            if query:
++                url = f'{url}&{query}' if '?' in url else f'{url}?{query}'
++
++        response_body = BytesIO()
++        response_headers = BytesIO()
++        curl = self.session
++        curl.setopt(pycurl.URL, url)
++        headers = [f'Authorization: {self.authorization_header}']
++        if method in {'POST', 'PATCH'}:
++            headers.append('Content-Type: application/json')
++        curl.setopt(pycurl.HTTPHEADER, headers)
++        curl.setopt(pycurl.WRITEFUNCTION, response_body.write)
++        curl.setopt(pycurl.HEADERFUNCTION, response_headers.write)
++        curl.setopt(pycurl.CUSTOMREQUEST, method)
++        curl.setopt(pycurl.HTTPGET, 1 if method == 'GET' else 0)
++        curl.setopt(pycurl.POST, 1 if method == 'POST' else 0)
++        curl.setopt(pycurl.FOLLOWLOCATION, 1)
++        if method in {'POST', 'PATCH'}:
++            curl.setopt(pycurl.POSTFIELDS, (body or '').encode('utf-8'))
++        else:
++            curl.setopt(pycurl.POSTFIELDS, b'')
++        curl.perform()
++
++        status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        effective_url = curl.getinfo(pycurl.EFFECTIVE_URL) or url
++        return self._handle_response(
++            status_code=status_code,
++            headers=self._parse_headers(response_headers.getvalue()),
++            content=response_body.getvalue(),
++            url=effective_url,
+         )
+ 
+     def http_get(self, url, params=None):
+         url = self.base_url + url
+-        response = self.session.get(url, params=params)
+-        return self._handle_response(response)
++        return self._request('GET', url, params=params)
+ 
+     def http_post(self, url: str, body: Optional[str] = None):
+         url = self.base_url + url
+-        response = self.session.post(
++        return self._request(
++            'POST',
+             url,
+-            headers={'Content-Type': 'application/json'},
+-            data=body,
++            body=body,
+         )
+-        return self._handle_response(response)
+ 
+     def http_patch(self, url: str, body: Optional[str] = None):
+         url = self.base_url + url
+-        response = self.session.patch(
++        return self._request(
++            'PATCH',
+             url,
+-            headers={'Content-Type': 'application/json'},
+-            data=body,
++            body=body,
+         )
+-        return self._handle_response(response)
+ 
+     def http_delete(self, url: str, params=None):
+         url = self.base_url + url
+-        response = self.session.delete(url, params=params)
+-        return self._handle_response(response)
++        return self._request('DELETE', url, params=params)

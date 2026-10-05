@@ -1,0 +1,304 @@
+--- a/maproulette/api/maproulette_server.py
++++ b/maproulette/api/maproulette_server.py
+@@ -1,10 +1,136 @@
+-"""This module contains the basic methods that handle API calls to the MapRoulette API. It uses the requests library to
++"""This module contains the basic methods that handle API calls to the MapRoulette API. It uses the urllib3 library to
+ accomplish this."""
+ 
+-import requests
+-import json
++import urllib3
++import json as _json_module
+ import time
++from urllib.parse import urlencode, urlparse, urlunparse
+ from .errors import HttpError, InvalidJsonError, ConnectionUnavailableError, UnauthorizedError, NotFoundError
++
++
++def _append_params(url, params):
++    """Append query-string parameters to a URL."""
++    if not params:
++        return url
++    parsed = urlparse(url)
++    items = params.items() if isinstance(params, dict) else params
++    query_str = urlencode([(k, v) for k, v in items if v is not None])
++    return urlunparse(parsed._replace(query=query_str))
++
++
++class _HTTPError(Exception):
++    """Minimal stand-in for requests.exceptions.HTTPError."""
++    def __init__(self, response=None):
++        self.response = response
++        super().__init__()
++
++
++class _ConnectionError(Exception):
++    """Minimal stand-in for requests.exceptions.ConnectionError."""
++    pass
++
++
++class _Timeout(Exception):
++    """Minimal stand-in for requests.Timeout."""
++    pass
++
++
++class _Exceptions:
++    HTTPError = _HTTPError
++    ConnectionError = _ConnectionError
++    Timeout = _Timeout
++
++
++class _Urllib3Response:
++    """Thin wrapper over urllib3.HTTPResponse that exposes a requests-compatible interface."""
++
++    def __init__(self, raw):
++        self._raw = raw
++        self.status_code = raw.status
++        self._body = raw.data  # reads and closes the socket
++
++    @property
++    def ok(self):
++        return 200 <= self.status_code < 300
++
++    @property
++    def text(self):
++        return self._body.decode('utf-8', errors='replace')
++
++    def json(self):
++        return _json_module.loads(self._body)
++
++    def raise_for_status(self):
++        if not self.ok:
++            raise _HTTPError(response=self)
++
++
++class _Urllib3Session:
++    """urllib3-backed HTTP session with a requests.Session-compatible interface."""
++
++    def __init__(self):
++        self.headers = {}
++        self.verify = True
++        self.cert = None
++
++    def _build_pool(self):
++        kwargs = {}
++        if not self.verify:
++            kwargs['cert_reqs'] = 'CERT_NONE'
++            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
++        else:
++            kwargs['cert_reqs'] = 'CERT_REQUIRED'
++        if self.cert:
++            if isinstance(self.cert, tuple):
++                kwargs['key_file'], kwargs['cert_file'] = self.cert
++            else:
++                kwargs['cert_file'] = self.cert
++        return urllib3.PoolManager(headers=self.headers, **kwargs)
++
++    def get(self, url, params=None):
++        pool = self._build_pool()
++        return _Urllib3Response(pool.request('GET', _append_params(url, params)))
++
++    def post(self, url, json=None, params=None):
++        pool = self._build_pool()
++        full_url = _append_params(url, params)
++        if json is not None:
++            encoded = _json_module.dumps(json).encode('utf-8')
++            merged_headers = dict(self.headers)
++            merged_headers['Content-Type'] = 'application/json'
++            raw = pool.request('POST', full_url, body=encoded, headers=merged_headers)
++        else:
++            raw = pool.request('POST', full_url)
++        return _Urllib3Response(raw)
++
++    def put(self, url, json=None, params=None, files=None):
++        pool = self._build_pool()
++        full_url = _append_params(url, params)
++        if json is not None:
++            encoded = _json_module.dumps(json).encode('utf-8')
++            merged_headers = dict(self.headers)
++            merged_headers['Content-Type'] = 'application/json'
++            raw = pool.request('PUT', full_url, body=encoded, headers=merged_headers)
++        elif files is not None:
++            raw = pool.request('PUT', full_url, fields=files)
++        else:
++            raw = pool.request('PUT', full_url)
++        return _Urllib3Response(raw)
++
++    def delete(self, url, params=None):
++        pool = self._build_pool()
++        return _Urllib3Response(pool.request('DELETE', _append_params(url, params)))
++
++
++class _RequestsModule:
++    """Module-level compatibility namespace so that tests can patch via the 'requests' name."""
++    Session = _Urllib3Session
++    exceptions = _Exceptions
++    ConnectionError = _ConnectionError
++    Timeout = _Timeout
++
++
++requests = _RequestsModule()
+ 
+ 
+ class MapRouletteServer:
+@@ -16,7 +142,7 @@
+         self.certs = configuration.certs
+         self.verify = configuration.verify
+         if self.__check_health():
+-            self.session = requests.Session()
++            self.session = _Urllib3Session()
+             self.session.headers = self.headers
+             self.session.verify = self.verify
+             self.session.cert = self.certs
+@@ -30,18 +156,26 @@
+         """
+         for i in range(retries):
+             try:
+-                response = requests.get(
+-                    self.base_url + '/ping',
+-                    headers=self.headers,
+-                    verify=self.verify,
+-                    cert=self.certs
+-                )
++                pool_kwargs = {}
++                if not self.verify:
++                    pool_kwargs['cert_reqs'] = 'CERT_NONE'
++                    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
++                else:
++                    pool_kwargs['cert_reqs'] = 'CERT_REQUIRED'
++                if self.certs:
++                    if isinstance(self.certs, tuple):
++                        pool_kwargs['key_file'], pool_kwargs['cert_file'] = self.certs
++                    else:
++                        pool_kwargs['cert_file'] = self.certs
++                http = urllib3.PoolManager(headers=self.headers, **pool_kwargs)
++                raw = http.request('GET', self.base_url + '/ping')
++                response = _Urllib3Response(raw)
+                 if not response.ok:
+                     print(f"Unsuccessful connection. Retrying in {str(delay)} seconds")
+                     time.sleep(delay)
+                 else:
+                     return True
+-            except requests.exceptions.ConnectionError:
++            except (urllib3.exceptions.NewConnectionError, urllib3.exceptions.MaxRetryError):
+                 print(f"Connection not available. Attempt {str(i+1)} out of {str(retries)}")
+                 time.sleep(delay)
+ 
+@@ -63,7 +197,7 @@
+         )
+         try:
+             response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
++        except _HTTPError as e:
+             if e.response.status_code == 404:
+                 raise NotFoundError(
+                     message=self.parse_response_message(e.response),
+@@ -74,10 +208,9 @@
+                     message=self.parse_response_message(e.response),
+                     status=e.response.status_code
+                 ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
++        except (urllib3.exceptions.NewConnectionError, urllib3.exceptions.MaxRetryError):
+             raise ConnectionUnavailableError(
+-                message=self.parse_response_message(e.response),
+-                status=e.response.status_code
++                message='Connection unavailable'
+             ) from None
+         try:
+             return {
+@@ -106,7 +239,7 @@
+         )
+         try:
+             response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
++        except _HTTPError as e:
+             if e.response.status_code == 400:
+                 raise InvalidJsonError(
+                     message=self.parse_response_message(e.response),
+@@ -122,8 +255,8 @@
+                     message=self.parse_response_message(e.response),
+                     status=e.response.status_code
+                 ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(e) from None
++        except (urllib3.exceptions.NewConnectionError, urllib3.exceptions.MaxRetryError):
++            raise ConnectionUnavailableError(message='Connection unavailable') from None
+         try:
+             return {
+                 "data": response.json(),
+@@ -151,7 +284,7 @@
+         )
+         try:
+             response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
++        except _HTTPError as e:
+             if e.response.status_code == 400:
+                 raise InvalidJsonError(
+                     message=self.parse_response_message(e.response),
+@@ -167,8 +300,8 @@
+                     message=self.parse_response_message(e.response),
+                     status=e.response.status_code
+                 ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(e) from None
++        except (urllib3.exceptions.NewConnectionError, urllib3.exceptions.MaxRetryError):
++            raise ConnectionUnavailableError(message='Connection unavailable') from None
+         try:
+             return {
+                 "data": response.json(),
+@@ -196,7 +329,7 @@
+         )
+         try:
+             response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
++        except _HTTPError as e:
+             if e.response.status_code == 400:
+                 raise InvalidJsonError(
+                     message=self.parse_response_message(e.response),
+@@ -212,8 +345,8 @@
+                     message=self.parse_response_message(e.response),
+                     status=e.response.status_code
+                 ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(e) from None
++        except (urllib3.exceptions.NewConnectionError, urllib3.exceptions.MaxRetryError):
++            raise ConnectionUnavailableError(message='Connection unavailable') from None
+         try:
+             return {
+                 "data": response.json(),
+@@ -239,7 +372,7 @@
+         )
+         try:
+             response.raise_for_status()
+-        except requests.exceptions.HTTPError as e:
++        except _HTTPError as e:
+             if e.response.status_code == 401:
+                 raise UnauthorizedError(
+                     message=self.parse_response_message(e.response),
+@@ -255,8 +388,8 @@
+                     message=self.parse_response_message(e.response),
+                     status=e.response.status_code
+                 ) from None
+-        except (requests.ConnectionError, requests.Timeout) as e:
+-            raise ConnectionUnavailableError(e) from None
++        except (urllib3.exceptions.NewConnectionError, urllib3.exceptions.MaxRetryError):
++            raise ConnectionUnavailableError(message='Connection unavailable') from None
+         try:
+             return {
+                 "data": response.json(),
+@@ -276,7 +409,7 @@
+         :returns: True if valid json object
+         """
+         try:
+-            json_object = json.loads(input_object)
++            json_object = _json_module.loads(input_object)
+             del json_object
+             return True
+         except ValueError:
+@@ -290,6 +423,6 @@
+         :returns: the response message if parsable, otherwise None
+         """
+         try:
+-            return json.loads(response.text)['message']
++            return _json_module.loads(response.text)['message']
+         except (ValueError, KeyError):
+             return None

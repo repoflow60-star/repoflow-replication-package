@@ -1,0 +1,153 @@
+--- a/chessdotcom/client.py
++++ b/chessdotcom/client.py
+@@ -1,14 +1,112 @@
+ import asyncio
+ import copy
++import io
+ import time
+ import warnings
+ from functools import wraps
+-
+-import requests
++from typing import Mapping
++from urllib.parse import urlparse
++
++import pycurl
+ from aiohttp import ClientSession
+ 
+ from .errors import ChessDotComClientError
+ from .response_builder import DefaultResponseBuilder
++
++
++class _PycurlResponse:
++    """Small response object exposing the values used by the client."""
++
++    def __init__(self, status_code, text, headers):
++        self.status_code = status_code
++        self.text = text
++        self.headers = headers
++
++
++class _PycurlTransport:
++    """Synchronous HTTP transport implemented with :mod:`pycurl`.
++
++    The transport deliberately has a ``get`` method with the same call shape as
++    the old synchronous transport.  Apart from keeping the client code small,
++    this also leaves a stable seam for applications that replace the transport
++    in tests; no ``requests`` package is used here.
++    """
++
++    @staticmethod
++    def _header_callback(response_headers):
++        def callback(line):
++            if isinstance(line, bytes):
++                line = line.decode("iso-8859-1")
++
++            # A response can contain an interim status (for example 100
++            # Continue) or several header blocks when redirects are enabled.
++            # Keep the headers belonging to the last status line.
++            if line.startswith(("HTTP/", "ICY ")):
++                response_headers.clear()
++                return len(line)
++
++            if ":" in line:
++                name, value = line.split(":", 1)
++                response_headers[name.strip()] = value.strip()
++            return len(line)
++
++        return callback
++
++    @staticmethod
++    def _header_values(headers):
++        if isinstance(headers, Mapping):
++            return [
++                f"{name}: {value}"
++                for name, value in headers.items()
++                if value is not None
++            ]
++        return list(headers or [])
++
++    def get(self, url, headers=None, timeout=30, **options):
++        body = io.BytesIO()
++        response_headers = {}
++        curl = pycurl.Curl()
++
++        try:
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.WRITEDATA, body)
++            curl.setopt(
++                pycurl.HEADERFUNCTION,
++                self._header_callback(response_headers),
++            )
++            curl.setopt(pycurl.TIMEOUT, timeout)
++            curl.setopt(pycurl.HTTPHEADER, self._header_values(headers))
++
++            verify = options.get("verify", options.get("verify_ssl", True))
++            curl.setopt(pycurl.SSL_VERIFYPEER, int(bool(verify)))
++            curl.setopt(pycurl.SSL_VERIFYHOST, 2 if verify else 0)
++
++            # ``proxy`` is convenient for pycurl callers, while ``proxies``
++            # keeps the commonly used requests-style configuration working.
++            proxy = options.get("proxy")
++            if proxy is None:
++                proxies = options.get("proxies") or {}
++                scheme = urlparse(url).scheme
++                if isinstance(proxies, Mapping):
++                    proxy = proxies.get(scheme) or proxies.get("all")
++            if proxy:
++                curl.setopt(pycurl.PROXY, proxy)
++
++            if options.get("proxy_port") is not None:
++                curl.setopt(pycurl.PROXYPORT, int(options["proxy_port"]))
++
++            curl.perform()
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++            text = body.getvalue().decode("utf-8")
++            return _PycurlResponse(status_code, text, response_headers)
++        finally:
++            curl.close()
++
++
++# Kept as a module-level transport seam for backwards-compatible test patches.
++# This is an in-process pycurl adapter, not the third-party requests library.
++requests = _PycurlTransport()
++
+ 
+ 
+ class RateLimitHandler(object):
+@@ -48,7 +146,7 @@
+     Client for Chess.com Public API. The client is only responsible for making calls.
+ 
+     :cvar request_config: Dictionary containing extra keyword arguments for
+-        requests to the API (headers, proxy, etc).
++        HTTP requests to the API (headers, proxy, etc).
+     :cvar aio: Determines if the functions behave asynchronously.
+     :cvar :rate_limit_handler: A RateLimitHandler object.
+         See :obj:`chessdotcom.client.RateLimitHandler`.
+@@ -90,8 +188,9 @@
+ 
+     def _build_request_options(self, resource):
+         options = {**resource.request_options, **self.request_config}
+-
+-        if "user-agent" not in [header.lower() for header in options["headers"].keys()]:
++        headers = options.get("headers") or {}
++
++        if "user-agent" not in [header.lower() for header in headers.keys()]:
+             warnings.warn(
+                 "Calls to api.chess.com require an updated 'User-Agent' header. "
+                 "You can update this with something like "
+@@ -137,12 +236,12 @@
+     Client for Chess.com Public API. The client can be initialized withe following options.
+ 
+     :ivar request_config: Dictionary containing extra keyword arguments
+-        for requests to the API (headers, proxy, etc).
++        for HTTP requests to the API (headers, proxy, etc).
+         This value will be set from Client if nothing is provided
+     :ivar aio: Determines if the functions behave asynchronously. Defaults to False
+     :ivar rate_limit_handler: A RateLimitHandler object.
+         See :obj:`chessdotcom.client.RateLimitHandler`.
+-    :ivar user_agent: A string that will be used as the User-Agent header in requests to the API.
++    :ivar user_agent: A string that will be used as the User-Agent header in HTTP requests to the API.
+         This value will override the value in request_config if provided.
+     """
+ 

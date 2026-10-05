@@ -1,0 +1,177 @@
+--- a/olclient/openlibrary.py
++++ b/olclient/openlibrary.py
+@@ -4,12 +4,11 @@
+ import json
+ from typing import List, Dict, Optional, Any
+ 
+-import jsonschema
++import cerberus
+ import logging
+ import os
+ import re
+ from urllib.parse import urlencode
+-from urllib.request import pathname2url
+ 
+ import backoff
+ import requests
+@@ -21,6 +20,83 @@
+ from olclient.utils import merge_unique_lists
+ 
+ logger = logging.getLogger('openlibrary')
++
++
++def _resolve_schema_reference(reference, document_schema, schema_documents):
++    """Resolve a local schema reference and return its target document."""
++    document_name, _, pointer = reference.partition('#')
++    target_document = (
++        schema_documents[document_name] if document_name else document_schema
++    )
++
++    target = target_document
++    for part in pointer.lstrip('/').split('/'):
++        if part:
++            target = target[part.replace('~1', '/').replace('~0', '~')]
++    return target, target_document
++
++
++def _cerberus_rule(schema, document_schema, schema_documents):
++    """Translate one schema rule into the corresponding Cerberus rule."""
++    if '$ref' in schema:
++        schema, document_schema = _resolve_schema_reference(
++            schema['$ref'], document_schema, schema_documents
++        )
++
++    rule = {}
++    schema_type = schema.get('type')
++    type_map = {
++        'array': 'list',
++        'boolean': 'boolean',
++        'integer': 'integer',
++        'number': 'number',
++        'object': 'dict',
++        'string': 'string',
++    }
++    if schema_type in type_map:
++        rule['type'] = type_map[schema_type]
++    if 'enum' in schema:
++        rule['allowed'] = schema['enum']
++    if 'pattern' in schema:
++        rule['regex'] = schema['pattern']
++
++    if schema_type == 'array':
++        if 'items' in schema:
++            rule['schema'] = _cerberus_rule(
++                schema['items'], document_schema, schema_documents
++            )
++        if 'minItems' in schema:
++            rule['minlength'] = schema['minItems']
++        if 'maxItems' in schema:
++            rule['maxlength'] = schema['maxItems']
++    elif schema_type == 'object':
++        if 'properties' in schema:
++            rule['schema'] = _cerberus_schema(
++                schema, document_schema, schema_documents
++            )
++        additional_properties = schema.get('additionalProperties', True)
++        if isinstance(additional_properties, dict):
++            rule['allow_unknown'] = _cerberus_rule(
++                additional_properties, document_schema, schema_documents
++            )
++        else:
++            rule['allow_unknown'] = additional_properties
++
++    return rule
++
++
++def _cerberus_schema(schema, document_schema, schema_documents):
++    """Translate an object schema into a Cerberus schema."""
++    required = set(schema.get('required', []))
++    result = {}
++    for name, property_schema in schema.get('properties', {}).items():
++        rule = _cerberus_rule(
++            property_schema, document_schema, schema_documents
++        )
++        if name in required:
++            rule['required'] = True
++        result[name] = rule
++    return result
+ 
+ 
+ class OpenLibrary:
+@@ -95,19 +171,43 @@
+ 
+     def validate(self, doc, schema_name):
+         """Validates a doc's json representation against
+-        its JSON Schema using jsonschema.validate().
++        its canonical schema using Cerberus.
+         Returns:
+           None
+         Raises:
+-          jsonschema.exceptions.ValidationError if validation fails.
++          ValueError if validation fails.
+         """
+         path = os.path.dirname(os.path.realpath(__file__))
+         schemata_path = os.path.join(path, 'schemata', schema_name)
++        schema_documents = {}
+         with open(schemata_path) as schema_data:
+             schema = json.load(schema_data)
+-            resolver = jsonschema.RefResolver('file:' + pathname2url(schemata_path), schema)
+-            return jsonschema.Draft4Validator(schema, resolver=resolver).validate(
+-                doc.json()
++
++        schema_documents[schema_name] = schema
++        for document_name in (
++            'author.schema.json',
++            'edition.schema.json',
++            'import.schema.json',
++            'shared_definitions.json',
++            'work.schema.json',
++        ):
++            if document_name not in schema_documents:
++                document_path = os.path.join(path, 'schemata', document_name)
++                with open(document_path) as document_data:
++                    schema_documents[document_name] = json.load(document_data)
++
++        validation_schema = _cerberus_schema(
++            schema, schema, schema_documents
++        )
++        validator = cerberus.Validator(
++            validation_schema,
++            allow_unknown=schema.get('additionalProperties', True),
++        )
++        if not validator.validate(doc.json()):
++            raise ValueError(
++                'Document failed {} validation: {}'.format(
++                    schema_name, validator.errors
++                )
+             )
+ 
+     def delete(self, olid, comment):
+@@ -247,11 +347,11 @@
+ 
+             def validate(self):
+                 """Validates an Edition's json representation against the canonical
+-                JSON Schema for Editions using jsonschema.validate().
++                schema for Editions using Cerberus.
+                 Returns:
+                    None
+                 Raises:
+-                   jsonschema.exceptions.ValidationError if the Edition is invalid.
++                   ValueError if the Edition is invalid.
+                 """
+                 return self.OL.validate(self, 'edition.schema.json')
+ 
+@@ -504,11 +604,11 @@
+ 
+             def validate(self):
+                 """Validates an Author's json representation against the canonical
+-                JSON Schema for Authors using jsonschema.validate().
++                schema for Authors using Cerberus.
+                 Returns:
+                    None
+                 Raises:
+-                   jsonschema.exceptions.ValidationError if the Author is invalid.
++                   ValueError if the Author is invalid.
+                 """
+                 return self.OL.validate(self, 'author.schema.json')
+ 

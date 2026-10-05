@@ -1,0 +1,235 @@
+--- a/whatsapp_api_client_python/API.py
++++ b/whatsapp_api_client_python/API.py
+@@ -1,9 +1,13 @@
+ import json
+ import logging
+-from typing import Any, NoReturn, Optional
+-
+-from requests import Response, Session
+-from requests.adapters import HTTPAdapter, Retry
++from typing import Any, NoReturn, Optional, Tuple
++from urllib.parse import urlencode
++
++from urllib3 import PoolManager
++from urllib3.filepost import encode_multipart_formdata
++from urllib3.util.retry import Retry
++
++Session = PoolManager
+ 
+ from .response import Response as GreenAPIResponse
+ from .tools import (
+@@ -49,6 +53,13 @@
+         self.idInstance = idInstance
+         self.apiTokenInstance = apiTokenInstance
+ 
++        self.default_headers = {"Connection": "close"}
++        self.retry = Retry(
++            total=3,
++            backoff_factor=1.0,
++            allowed_methods=None,
++            status_forcelist=[429]
++        )
+         self.session = Session()
+         self.__prepare_session()
+ 
+@@ -79,13 +90,27 @@
+         url = url.replace("{{apiTokenInstance}}", self.apiTokenInstance)
+ 
+         try:
++            headers = self.__merge_headers(
++                {"Content-Type": "application/json"} if payload is not None else None
++            )
+             if not files:
+                 response = self.session.request(
+-                    method=method, url=url, json=payload, timeout=self.host_timeout
++                    method=method,
++                    url=url,
++                    body=self.__encode_json(payload),
++                    headers=headers,
++                    timeout=self.host_timeout,
++                    retries=self.retry,
+                 )
+             else:
++                body, headers = self.__encode_multipart(payload, files, headers)
+                 response = self.session.request(
+-                    method=method, url=url, data=payload, files=files, timeout=self.media_timeout
++                    method=method,
++                    url=url,
++                    body=body,
++                    headers=headers,
++                    timeout=self.media_timeout,
++                    retries=self.retry,
+                 )
+         except Exception as error:
+             error_message = f"Request was failed with error: {error}."
+@@ -98,11 +123,43 @@
+ 
+         self.__handle_response(response)
+ 
+-        return GreenAPIResponse(response.status_code, response.text)
++        return GreenAPIResponse(self.__get_status(response), self.__get_text(response))
+ 
+     def raw_request(self, **arguments: Any) -> GreenAPIResponse:
+         try:
+-            response = self.session.request(**arguments)
++            body = arguments.pop("body", None)
++            data = arguments.pop("data", None)
++            files = arguments.pop("files", None)
++            headers = arguments.pop("headers", None)
++            retries = arguments.pop("retries", self.retry)
++
++            if body is None:
++                body = data
++
++            json_payload = arguments.pop("json", None)
++            if json_payload is not None:
++                body = self.__encode_json(json_payload)
++                headers = self.__merge_headers(headers)
++                headers["Content-Type"] = "application/json"
++            elif isinstance(body, dict) and not files:
++                body = self.__encode_form(body)
++                headers = self.__merge_headers(headers)
++                headers["Content-Type"] = "application/x-www-form-urlencoded"
++
++            if files is not None:
++                body, headers = self.__encode_multipart(body, files, headers)
++
++            request_kwargs = dict(
++                retries=retries,
++                body=body,
++                **arguments,
++            )
++
++            merged_headers = self.__merge_headers(headers)
++            if merged_headers:
++                request_kwargs["headers"] = merged_headers
++
++            response = self.session.request(**request_kwargs)
+         except Exception as error:
+             error_message = f"Request was failed with error: {error}."
+ 
+@@ -114,17 +171,17 @@
+ 
+         self.__handle_response(response)
+ 
+-        return GreenAPIResponse(response.status_code, response.text)
+-
+-    def __handle_response(self, response: Response) -> Optional[NoReturn]:
+-        status_code = response.status_code
++        return GreenAPIResponse(self.__get_status(response), self.__get_text(response))
++
++    def __handle_response(self, response: Any) -> Optional[NoReturn]:
++        status_code = self.__get_status(response)
+         if status_code != 200 or self.debug_mode:
+             try:
+                 data = json.dumps(
+-                    json.loads(response.text), ensure_ascii=False, indent=4
++                    json.loads(self.__get_text(response)), ensure_ascii=False, indent=4
+                 )
+             except json.JSONDecodeError:
+-                data = response.text
++                data = self.__get_text(response)
+ 
+             if status_code != 200:
+                 error_message = (
+@@ -159,17 +216,89 @@
+             self.logger.setLevel(logging.DEBUG)
+ 
+     def __prepare_session(self) -> None:
+-        self.session.headers["Connection"] = "close"
+-
+-        retry = Retry(
+-            total=3,
+-            backoff_factor=1.0,
+-            allowed_methods=None,
+-            status_forcelist=[429]
+-        )
+-
+-        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
++        pass
++
++    def __merge_headers(self, headers: Optional[dict] = None) -> dict:
++        merged_headers = dict(self.default_headers)
++        if headers:
++            merged_headers.update(headers)
++
++        return merged_headers
++
++    def __encode_form(self, payload: dict) -> bytes:
++        return urlencode(payload, doseq=True).encode("utf-8")
++
++    def __encode_json(self, payload: Optional[dict]) -> Optional[bytes]:
++        if payload is None:
++            return None
++
++        return json.dumps(payload).encode("utf-8")
++
++    def __normalize_multipart_value(self, value: Any) -> Any:
++        if isinstance(value, tuple):
++            normalized = list(value)
++            if len(normalized) > 1 and hasattr(normalized[1], "read"):
++                normalized[1] = normalized[1].read()
++
++            return tuple(normalized)
++
++        if hasattr(value, "read"):
++            return value.read()
++
++        return value
++
++    def __encode_multipart(
++            self,
++            payload: Optional[dict],
++            files: Optional[dict],
++            headers: Optional[dict] = None,
++    ) -> Tuple[bytes, dict]:
++        fields = []
++
++        if payload:
++            fields.extend(
++                (key, self.__normalize_multipart_value(value))
++                for key, value in payload.items()
++            )
++
++        if files:
++            fields.extend(
++                (key, self.__normalize_multipart_value(value))
++                for key, value in files.items()
++            )
++
++        body, content_type = encode_multipart_formdata(fields)
++
++        merged_headers = self.__merge_headers(headers)
++        merged_headers["Content-Type"] = content_type
++
++        return body, merged_headers
++
++    def __get_status(self, response: Any) -> Optional[int]:
++        status = getattr(response, "status_code", None)
++        if isinstance(status, int):
++            return status
++
++        status = getattr(response, "status", None)
++        if isinstance(status, int):
++            return status
++
++        return None
++
++    def __get_text(self, response: Any) -> str:
++        text = getattr(response, "text", None)
++        if isinstance(text, bytes):
++            return text.decode("utf-8", errors="replace")
++        if isinstance(text, str):
++            return text
++
++        data = getattr(response, "data", None)
++        if isinstance(data, bytes):
++            return data.decode("utf-8", errors="replace")
++        if isinstance(data, str):
++            return data
++
++        return ""
+ 
+ 
+ class GreenAPI(GreenApi):

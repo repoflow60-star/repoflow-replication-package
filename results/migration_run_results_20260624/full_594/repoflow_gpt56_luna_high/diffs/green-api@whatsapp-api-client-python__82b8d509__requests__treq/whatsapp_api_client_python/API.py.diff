@@ -1,0 +1,126 @@
+--- a/whatsapp_api_client_python/API.py
++++ b/whatsapp_api_client_python/API.py
+@@ -1,9 +1,11 @@
+ import json
+ import logging
++from threading import Event, Lock, Thread
+ from typing import Any, NoReturn, Optional
+ 
+-from requests import Response, Session
+-from requests.adapters import HTTPAdapter, Retry
++import treq
++from twisted.internet import defer, reactor, task
++from twisted.python.failure import Failure
+ 
+ from .response import Response as GreenAPIResponse
+ from .tools import (
+@@ -18,6 +20,81 @@
+     serviceMethods,
+     webhooks
+ )
++
++
++_reactor_start_lock = Lock()
++
++
++class _TreqResponse:
++    def __init__(self, status_code: int, text: str):
++        self.status_code = status_code
++        self.text = text
++
++
++@defer.inlineCallbacks
++def _request_with_retries(**arguments: Any):
++    for attempt in range(4):
++        try:
++            response = yield treq.request(**arguments)
++            body = yield treq.content(response)
++            result = _TreqResponse(
++                response.code, body.decode("utf-8", "replace")
++            )
++            if result.status_code != 429 or attempt == 3:
++                defer.returnValue(result)
++        except Exception:
++            if attempt == 3:
++                raise
++
++        delay = 0 if attempt == 0 else 2 ** attempt
++        yield task.deferLater(reactor, delay, lambda: None)
++
++
++def _wait_for_deferred(result: Any) -> Any:
++    completed = Event()
++    value = []
++
++    def store(result: Any) -> Any:
++        value.append(result)
++        completed.set()
++        return result
++
++    result.addBoth(store)
++
++    with _reactor_start_lock:
++        if not reactor.running:
++            Thread(
++                target=reactor.run,
++                kwargs={"installSignalHandlers": False},
++                daemon=True,
++            ).start()
++
++    completed.wait()
++    result = value[0]
++    if isinstance(result, Failure):
++        result.raiseException()
++    return result
++
++
++class Session:
++    """Synchronous session surface backed by treq's asynchronous client."""
++
++    def __init__(self):
++        self.headers = {}
++
++    def request(self, method: str, url: str, **arguments: Any) -> _TreqResponse:
++        headers = dict(self.headers)
++        supplied_headers = arguments.pop("headers", None)
++        if supplied_headers:
++            headers.update(supplied_headers)
++
++        payload = arguments.pop("json", None)
++        if payload is not None and "data" not in arguments:
++            arguments["data"] = json.dumps(payload).encode("utf-8")
++            headers["Content-Type"] = "application/json"
++
++        arguments.update({"method": method, "url": url, "headers": headers})
++        return _wait_for_deferred(_request_with_retries(**arguments))
+ 
+ 
+ class GreenApi:
+@@ -116,7 +193,9 @@
+ 
+         return GreenAPIResponse(response.status_code, response.text)
+ 
+-    def __handle_response(self, response: Response) -> Optional[NoReturn]:
++    def __handle_response(
++            self, response: _TreqResponse
++    ) -> Optional[NoReturn]:
+         status_code = response.status_code
+         if status_code != 200 or self.debug_mode:
+             try:
+@@ -161,16 +240,6 @@
+     def __prepare_session(self) -> None:
+         self.session.headers["Connection"] = "close"
+ 
+-        retry = Retry(
+-            total=3,
+-            backoff_factor=1.0,
+-            allowed_methods=None,
+-            status_forcelist=[429]
+-        )
+-
+-        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+-
+ 
+ class GreenAPI(GreenApi):
+     pass

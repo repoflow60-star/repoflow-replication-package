@@ -1,0 +1,138 @@
+--- a/cronitor/monitor.py
++++ b/cronitor/monitor.py
+@@ -3,28 +3,98 @@
+ import logging
+ import json
+ import os
+-import requests
++import pycurl
++from io import BytesIO
++from urllib.parse import urlencode
+ from yaml.loader import SafeLoader
+ 
+ 
+ import cronitor
+-from urllib3.util.retry import Retry
+-from requests.adapters import HTTPAdapter
+ 
+ logger = logging.getLogger(__name__)
++
++class PycurlResponse(object):
++    def __init__(self, status_code, content):
++        self.status_code = status_code
++        self.content = content
++        self.text = content.decode('utf-8')
++
++    def json(self):
++        return json.loads(self.text)
++
++
++def _pycurl_request(method, url, auth=None, data=None, headers=None, timeout=None, params=None):
++    if params:
++        query = urlencode([(key, value) for key, value in params.items() if value is not None], doseq=True)
++        url = '{}{}{}'.format(url, '&' if '?' in url else '?', query)
++
++    body = BytesIO()
++    curl = pycurl.Curl()
++
++    try:
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.WRITEDATA, body)
++
++        if timeout is not None:
++            curl.setopt(pycurl.TIMEOUT, timeout)
++
++        if auth:
++            curl.setopt(pycurl.USERPWD, '{}:{}'.format(auth[0], auth[1]))
++            curl.setopt(pycurl.HTTPAUTH, pycurl.HTTPAUTH_BASIC)
++
++        if headers:
++            curl.setopt(pycurl.HTTPHEADER, [
++                '{}: {}'.format(key, value)
++                for key, value in headers.items()
++                if value is not None
++            ])
++
++        if method == 'GET':
++            curl.setopt(pycurl.HTTPGET, 1)
++        else:
++            curl.setopt(pycurl.CUSTOMREQUEST, method)
++
++        if data is not None:
++            if isinstance(data, str):
++                data = data.encode('utf-8')
++            curl.setopt(pycurl.POSTFIELDS, data)
++
++        curl.perform()
++        return PycurlResponse(curl.getinfo(pycurl.RESPONSE_CODE), body.getvalue())
++    finally:
++        curl.close()
++
++
++class PycurlSession(object):
++    def __init__(self, retries=0, backoff_factor=0.3):
++        self.retries = retries
++        self.backoff_factor = backoff_factor
++
++    def request(self, method, url, **kwargs):
++        attempt = 0
++        while True:
++            try:
++                return _pycurl_request(method, url, **kwargs)
++            except pycurl.error:
++                if attempt >= self.retries:
++                    raise
++                attempt += 1
++                if attempt > 1:
++                    time.sleep(self.backoff_factor * (2 ** (attempt - 1)))
++
++    def get(self, url, **kwargs):
++        return self.request('GET', url, **kwargs)
++
++    def put(self, url, **kwargs):
++        return self.request('PUT', url, **kwargs)
++
++    def delete(self, url, **kwargs):
++        return self.request('DELETE', url, **kwargs)
++
+ 
+ # https://stackoverflow.com/questions/49121365/implementing-retry-for-requests-in-python
+ def retry_session(retries, session=None, backoff_factor=0.3):
+-    session = session or requests.Session()
+-    retry = Retry(
+-        total=retries,
+-        read=retries,
+-        connect=retries,
+-        backoff_factor=backoff_factor,
+-    )
+-    adapter = HTTPAdapter(max_retries=retry)
+-    session.mount('http://', adapter)
+-    session.mount('https://', adapter)
++    session = session or PycurlSession(retries=retries, backoff_factor=backoff_factor)
+     return session
+ 
+ JSON = 'json'
+@@ -135,7 +205,7 @@
+         self._data = Struct(**data)
+ 
+     def delete(self):
+-        resp = requests.delete(
++        resp = PycurlSession().delete(
+                     self._monitor_api_url(self.key),
+                     auth=(self.api_key, ''),
+                     headers=self._headers,
+@@ -172,7 +242,7 @@
+         if not self.api_key:
+             raise cronitor.AuthenticationError('No api_key detected. Set cronitor.api_key or initialize Monitor with kwarg.')
+ 
+-        resp = requests.get(self._monitor_api_url(self.key),
++        resp = PycurlSession().get(self._monitor_api_url(self.key),
+                             timeout=10,
+                             auth=(self.api_key, ''),
+                             headers=dict(self._headers, **{'Content-Type': 'application/json', 'Cronitor-Version': self.api_verion}))
+@@ -217,4 +287,4 @@
+ 
+ class Struct(object):
+     def __init__(self, **kwargs):
+-        self.__dict__.update(kwargs)
++        self.__dict__.update(kwargs)

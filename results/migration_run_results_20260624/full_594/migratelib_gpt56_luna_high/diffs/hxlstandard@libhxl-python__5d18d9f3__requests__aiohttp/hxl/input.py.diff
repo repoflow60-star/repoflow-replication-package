@@ -1,0 +1,290 @@
+--- a/hxl/input.py
++++ b/hxl/input.py
+@@ -31,12 +31,93 @@
+ 
+ from hxl.util import logup
+ 
+-import abc, collections, csv, datetime, dateutil.parser, hashlib, \
++import abc, asyncio, aiohttp, collections, csv, datetime, dateutil.parser, hashlib, \
+     io, io_wrapper, json, jsonpath_ng.ext, logging, \
+-    os.path, re, requests, shutil, six, sys, \
++    os.path, re, shutil, six, sys, \
+     tempfile, time, urllib.parse, xlrd3 as xlrd, zipfile
+ 
+ logger = logging.getLogger(__name__)
++
++
++class _AiohttpResponse:
++    """Buffered response adapter for the synchronous input API."""
++
++    def __init__(self, response, content):
++        self.status_code = response.status
++        self.headers = response.headers.copy()
++        self.content = content
++        self.is_redirect = (
++            response.status in (301, 302, 303, 307, 308)
++            and 'Location' in response.headers
++        )
++
++    def json(self):
++        return json.loads(self.content)
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise aiohttp.ClientResponseError(
++                request_info=None,
++                history=(),
++                status=self.status_code,
++                message="HTTP status {}".format(self.status_code),
++                headers=self.headers
++            )
++
++    def iter_content(self, chunk_size):
++        for offset in range(0, len(self.content), chunk_size):
++            yield self.content[offset:offset + chunk_size]
++
++    def close(self):
++        pass
++
++
++async def _aiohttp_request_async(
++        method,
++        url,
++        verify_ssl=True,
++        timeout=None,
++        headers=None,
++        params=None,
++        data=None):
++    timeout_config = aiohttp.ClientTimeout(total=timeout)
++
++    async with aiohttp.ClientSession(timeout=timeout_config) as session:
++        request_args = {
++            "ssl": verify_ssl,
++            "headers": headers,
++            "params": params,
++            "data": data,
++        }
++
++        if method.upper() == "HEAD":
++            request_args["allow_redirects"] = False
++
++        async with session.request(method, url, **request_args) as response:
++            content = await response.read()
++            return _AiohttpResponse(response, content)
++
++
++def _aiohttp_request(
++        method,
++        url,
++        verify_ssl=True,
++        timeout=None,
++        headers=None,
++        params=None,
++        data=None):
++    return asyncio.run(
++        _aiohttp_request_async(
++            method=method,
++            url=url,
++            verify_ssl=verify_ssl,
++            timeout=timeout,
++            headers=headers,
++            params=params,
++            data=data
++        )
++    )
++
+ 
+ __all__ = (
+     "data",
+@@ -398,7 +479,7 @@
+         },
+         {
+             "#adm1+name": "Plains",
+-            "#org": "Org B",
++            "#org": "Org A",
+             "#sector+cluster": "Education"
+         },
+         {
+@@ -621,10 +702,10 @@
+         try:
+             url = munge_url(url_or_filename, input_options)
+             logup("Trying to open remote resource", {"url": url_or_filename})
+-            response = requests.get(
++            response = _aiohttp_request(
++                "GET",
+                 url,
+-                stream=True,
+-                verify=input_options.verify_ssl,
++                verify_ssl=input_options.verify_ssl,
+                 timeout=input_options.timeout,
+                 headers=input_options.http_headers
+             )
+@@ -653,7 +734,6 @@
+             except:
+                 content_length = None
+ 
+-        # return (RequestResponseIOWrapper(response), mime_type, file_ext, encoding, content_length, fileno,)
+         return (io.BytesIO(response.content), mime_type, file_ext, encoding, content_length, fileno,)
+ 
+     elif input_options.allow_local:
+@@ -760,7 +840,7 @@
+             message (str): the error message
+             url (str): the URL that triggered the exception
+         """
+-        super().init__(message, url)
++        super().init(message, url)
+ 
+ 
+ class HXLTagsNotFoundException(HXLParseException):
+@@ -820,17 +900,14 @@
+ 
+ # Deprecated - will remove in future release
+ class RequestResponseIOWrapper(io.RawIOBase):
+-    """Wrapper for a Response object from the requests library.  Streaming
+-    in requests is a bit broken: for example, if you're streaming, the
+-    stream from the raw property doesn't unzip the payload.
+-    """
++    """Wrapper for a buffered response object from aiohttp."""
+ 
+     BUFFER_SIZE = 0x1000
+-    """Size of input chunk buffer from requests.raw.iter_content"""
++    """Size of input chunk buffer from the response content"""
+ 
+     def __init__(self, response):
+-        """Construct a wrapper around a requests response object
+-        @param response: the HTTP response from the requests library
++        """Construct a wrapper around an aiohttp response object
++        @param response: the HTTP response from aiohttp
+         """
+         self.response = response
+         self.buffer = None
+@@ -838,7 +915,7 @@
+         self.iter = response.iter_content(self.BUFFER_SIZE) # iterator through the input
+ 
+     def read(self, size=-1):
+-        """Read raw byte input from the requests raw.iter_content iterator
++        """Read raw byte input from the response content iterator
+         The function will unzip zipped content.
+         @param size: the maximum number of bytes to read, or -1 for all available.
+         """
+@@ -890,7 +967,7 @@
+         return self.response.headers.get('Content-type')
+ 
+     def close(self):
+-        """Close the streaming response."""
++        """Close the response."""
+         return self.response.close()
+ 
+ 
+@@ -1034,7 +1111,7 @@
+     def __init__(self, input, input_options, url_or_filename=None):
+         """
+         Args:
+-            input (io.IOBase): an input byte stream
++            input (io.IOBase): a byte input stream
+             input_options (InputOptions): options for reading a dataset.
+ 
+         """
+@@ -1187,7 +1264,7 @@
+ 
+         Args:
+             contents: contents of the Excel file
+-            input_options (InputOptions): options for reading a dataset.
++            input_options (InputOptions): options for reading the dataset.
+             url_or_filename (string): the original URL or filename or None
+         """
+         super().__init__(input_options, url_or_filename)
+@@ -1209,7 +1286,7 @@
+     def get_sheet_info (self):
+         """ Return sheet metadata for the top-level info() function """
+ 
+-        result = [] # list of dicts containing info for each sheet in the workbook
++        result = [] # list of dicts containing info for each sheet
+ 
+         for sheet_index in range(0, self._workbook.nsheets):
+             sheet = self._get_sheet(sheet_index)
+@@ -1620,7 +1697,7 @@
+ 
+ 
+ def munge_url(url, input_options):
+-    """Munge a URL to get at underlying data for well-known types.
++    """Munge a URL to get at underlying data from well-known types.
+ 
+     For example, if it's an HDX dataset, figure out the download
+     link for the first resource. If it's a Kobo survey, create an
+@@ -1657,7 +1734,7 @@
+     result = re.match(GOOGLE_DRIVE_URL, url)
+     if result:
+         logup("HEAD request for Google Drive URL", {"url": url})
+-        response = requests.head(url)
++        response = _aiohttp_request("HEAD", url)
+         if response.is_redirect:
+             new_url = response.headers['Location']
+             logup("Google Drive redirect", {"url": url, "redirect": new_url})
+@@ -1752,7 +1829,12 @@
+         # CKAN resource URL
+         ckan_api_query = '{}/api/3/action/resource_show?id={}'.format(site_url, resource_id)
+         logup("Trying CKAN API call", {"url": ckan_api_query})
+-        ckan_api_result = requests.get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
++        ckan_api_result = _aiohttp_request(
++            "GET",
++            ckan_api_query,
++            verify_ssl=input_options.verify_ssl,
++            headers=input_options.http_headers
++        ).json()
+         if ckan_api_result['success']:
+             url = ckan_api_result['result']['url']
+             logup("Found candidate URL for CKAN dataset", {"url": url})
+@@ -1775,7 +1857,12 @@
+     else:
+         # CKAN dataset (package) URL
+         ckan_api_query = '{}/api/3/action/package_show?id={}'.format(site_url, dataset_id)
+-        ckan_api_result = requests.get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
++        ckan_api_result = _aiohttp_request(
++            "GET",
++            ckan_api_query,
++            verify_ssl=input_options.verify_ssl,
++            headers=input_options.http_headers
++        ).json()
+         if ckan_api_result['success']:
+             for resource in ckan_api_result['result']['resources']:
+                 url = resource['url']
+@@ -1825,9 +1912,10 @@
+         "q": "source:{}".format(asset_id)
+     }
+     logup("Trying Kobo dataset", {"url": asset_id})
+-    response = requests.get(
++    response = _aiohttp_request(
++        "GET",
+         "https://kobo.humanitarianresponse.info/exports/",
+-        verify=input_options.verify_ssl,
++        verify_ssl=input_options.verify_ssl,
+         headers=input_options.http_headers,
+         params=params
+     )
+@@ -1861,9 +1949,10 @@
+         "hierarchy_in_labels": False,
+         "group_sep": ",",
+     }
+-    response = requests.post(
++    response = _aiohttp_request(
++        "POST",
+         "https://kobo.humanitarianresponse.info/exports/",
+-        verify=input_options.verify_ssl,
++        verify_ssl=input_options.verify_ssl,
+         headers=http_headers,
+         data=params
+     )
+@@ -1881,9 +1970,10 @@
+     fail_counter = 0
+     while True:
+         logup("Getting info for Kobo export", {"url": info_url})
+-        response = requests.get(
++        response = _aiohttp_request(
++            "GET",
+             info_url,
+-            verify=input_options.verify_ssl,
++            verify_ssl=input_options.verify_ssl,
+             headers=http_headers
+         )
+         logup("Response for Kobo info", {"url": info_url, "status": response.status_code})

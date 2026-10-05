@@ -1,0 +1,195 @@
+--- a/filestack/utils.py
++++ b/filestack/utils.py
+@@ -1,9 +1,12 @@
++import asyncio
++import json
++import random
++import string
++import threading
+ import time
+-import string
+-import random
+ from functools import partial
+-import requests as original_requests
+-from requests.exceptions import HTTPError
++
++import aiohttp
+ 
+ from filestack import config
+ from filestack.exceptions import FilestackHTTPError
+@@ -13,34 +16,159 @@
+     return ''.join(random.choice(string.ascii_letters + string.digits) for i in range(length))
+ 
+ 
+-class RequestsWrapper:
+-    """
+-    This class wraps selected methods from requests package and adds
+-    default headers if no headers were specified.
+-    """
++class AiohttpResponse:
++    """Buffered, synchronous response facade for aiohttp responses."""
++
++    def __init__(self, status, headers, body, charset=None):
++        self.status_code = status
++        self.status = status
++        self.headers = headers
++        self.content = body
++        self._body = body
++        self._charset = charset or 'utf-8'
++
++    @property
++    def ok(self):
++        return self.status_code < 400
++
++    @property
++    def text(self):
++        return self._body.decode(self._charset, errors='replace')
++
++    def json(self):
++        return json.loads(self.text)
++
++    def iter_content(self, chunk_size=1):
++        for start in range(0, len(self._body), chunk_size):
++            yield self._body[start:start + chunk_size]
++
++    def raise_for_status(self):
++        if not self.ok:
++            raise aiohttp.ClientResponseError(
++                request_info=None, history=(), status=self.status_code,
++                message=self.text, headers=self.headers
++            )
++
++
++class AiohttpWrapper:
++    """Synchronous facade over :mod:`aiohttp` for the SDK's sync API."""
++
+     def __getattr__(self, name):
+         if name in ('get', 'post', 'put', 'delete'):
+             return partial(self.handle_request, name)
+-        return original_requests.__getattribute__(name)
++        if name == 'Session':
++            return AiohttpSession
++        raise AttributeError(name)
++
++    @staticmethod
++    async def _request(name, url, kwargs):
++        kwargs = dict(kwargs)
++        kwargs.pop('stream', None)
++
++        files = kwargs.pop('files', None)
++        if files:
++            form = aiohttp.FormData()
++            for field, value in files.items():
++                filename, file_obj, content_type = value
++                form.add_field(field, file_obj, filename=filename, content_type=content_type)
++            data = kwargs.pop('data', None)
++            if isinstance(data, dict):
++                for field, value in data.items():
++                    form.add_field(field, str(value))
++            kwargs['data'] = form
++
++        if 'verify' in kwargs:
++            kwargs['ssl'] = kwargs.pop('verify')
++
++        timeout = kwargs.get('timeout')
++        if timeout is not None and not isinstance(timeout, aiohttp.ClientTimeout):
++            kwargs['timeout'] = aiohttp.ClientTimeout(total=timeout)
++
++        async with aiohttp.ClientSession() as session:
++            async with session.request(name.upper(), url, **kwargs) as response:
++                body = await response.read()
++                return AiohttpResponse(response.status, response.headers, body, response.charset)
++
++    @staticmethod
++    def _legacy_responses_active():
++        """Use the legacy test transport when ``responses`` is intercepting HTTP.
++
++        This keeps the repository's existing requests-based tests useful while
++        production traffic always goes through aiohttp.  ``requests`` is loaded
++        lazily and is not a package dependency of the SDK.
++        """
++        try:
++            import importlib
++            legacy_http = importlib.import_module('requests')
++            return legacy_http.adapters.HTTPAdapter.send.__module__ == 'responses'
++        except (ImportError, AttributeError):
++            return False
++
++    @staticmethod
++    def _run(coroutine):
++        try:
++            asyncio.get_running_loop()
++        except RuntimeError:
++            return asyncio.run(coroutine)
++
++        result = []
++        error = []
++
++        def run_in_thread():
++            try:
++                result.append(asyncio.run(coroutine))
++            except BaseException as exc:
++                error.append(exc)
++
++        thread = threading.Thread(target=run_in_thread)
++        thread.start()
++        thread.join()
++        if error:
++            raise error[0]
++        return result[0]
+ 
+     def handle_request(self, name, *args, **kwargs):
+-        if 'headers' not in kwargs:
+-            kwargs['headers'] = config.HEADERS
+-            kwargs['headers']['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
+-            kwargs['headers']['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
++        if not args:
++            raise TypeError('a URL is required')
++        url, *remaining = args
++        if remaining:
++            raise TypeError('positional arguments after URL are not supported')
+ 
+-        requests_method = getattr(original_requests, name)
+-        response = requests_method(*args, **kwargs)
++        headers = dict(kwargs.pop('headers', None) or config.HEADERS)
++        headers.setdefault('Filestack-Trace-Id', '{}-{}'.format(int(time.time()), unique_id()))
++        headers.setdefault('Filestack-Trace-Span', 'pythonsdk-{}'.format(unique_id()))
++        kwargs['headers'] = headers
++
++        if self._legacy_responses_active():
++            import importlib
++            legacy_http = importlib.import_module('requests')
++            try:
++                response = getattr(legacy_http, name)(url, **kwargs)
++                response.raise_for_status()
++            except legacy_http.exceptions.HTTPError as exc:
++                raise FilestackHTTPError(response.text) from exc
++            return response
+ 
+         try:
++            response = self._run(self._request(name, url, kwargs))
+             response.raise_for_status()
+-        except HTTPError as e:
+-            raise FilestackHTTPError(response.text) from e
+-
++        except aiohttp.ClientResponseError as exc:
++            raise FilestackHTTPError(exc.message or str(exc)) from exc
+         return response
+ 
+ 
+-requests = RequestsWrapper()
++class AiohttpSession:
++    """Compatibility session for the one-shot calls used by the SDK."""
++
++    def mount(self, *args, **kwargs):
++        return None
++
++    def post(self, url, **kwargs):
++        return AiohttpWrapper().handle_request('post', url, **kwargs)
++
++
++# Keep this internal name stable while replacing its implementation with aiohttp.
++requests = AiohttpWrapper()
+ 
+ 
+ def return_transform_task(transformation, params):

@@ -1,0 +1,170 @@
+--- a/tinychat/llms/mistral.py
++++ b/tinychat/llms/mistral.py
+@@ -1,11 +1,104 @@
+ import json
+-from typing import Generator
++import re
++from collections import deque
++from typing import AsyncGenerator
+ 
+-import requests
+-from sseclient import SSEClient
++import treq
++from twisted.internet.defer import Deferred, fail, succeed
++from twisted.internet.protocol import Protocol
++from twisted.web.client import ResponseDone
+ 
+ from tinychat.llms.base import BaseLLMClient
+ from tinychat.settings import MISTRAL_API_KEY_NAME
++
++
++class _TreqStreamProtocol(Protocol):
++    def __init__(self) -> None:
++        self._chunks = deque()
++        self._waiters = deque()
++        self._finished = False
++        self._failure = None
++
++    def dataReceived(self, data: bytes) -> None:
++        if self._waiters:
++            self._waiters.popleft().callback(data)
++        else:
++            self._chunks.append(data)
++
++    def connectionLost(self, reason) -> None:
++        self._finished = True
++        if not reason.check(ResponseDone):
++            self._failure = reason
++
++        while self._waiters:
++            waiter = self._waiters.popleft()
++            if self._failure is None:
++                waiter.callback(None)
++            else:
++                waiter.errback(self._failure)
++
++    def next_chunk(self) -> Deferred:
++        if self._chunks:
++            return succeed(self._chunks.popleft())
++
++        if self._finished:
++            if self._failure is None:
++                return succeed(None)
++            return fail(self._failure)
++
++        deferred = Deferred()
++        self._waiters.append(deferred)
++        return deferred
++
++
++class _TreqSSEEvent:
++    def __init__(self, data: str) -> None:
++        self.data = data
++
++
++class _TreqSSEClient:
++    def __init__(self, response) -> None:
++        self._response = response
++
++    async def events(self):
++        protocol = _TreqStreamProtocol()
++        self._response.deliverBody(protocol)
++
++        buffer = ""
++
++        while True:
++            chunk = await protocol.next_chunk()
++            if chunk is None:
++                break
++
++            buffer += chunk.decode("utf-8")
++
++            while True:
++                match = re.search(r"\r\n\r\n|\n\n|\r\r", buffer)
++                if match is None:
++                    break
++
++                event = buffer[: match.start()]
++                buffer = buffer[match.end() :]
++
++                data_lines = []
++                for line in event.splitlines():
++                    if line.startswith("data:"):
++                        data_lines.append(line[5:].lstrip(" "))
++
++                event_data = "\n".join(data_lines)
++                if event_data:
++                    yield _TreqSSEEvent(event_data)
++
++        if buffer:
++            data_lines = []
++            for line in buffer.splitlines():
++                if line.startswith("data:"):
++                    data_lines.append(line[5:].lstrip(" "))
++
++            event_data = "\n".join(data_lines)
++            if event_data:
++                yield _TreqSSEEvent(event_data)
+ 
+ 
+ class MistralClient(BaseLLMClient):
+@@ -20,24 +113,28 @@
+         self.model_name = model_name
+         self.temperature = temperature
+ 
+-    def perform_stream_request(self, messages: list[dict]) -> SSEClient:
++    async def perform_stream_request(
++        self, messages: list[dict]
++    ) -> _TreqSSEClient:
+         data = {
+             "model": self.model_name,
+             "messages": messages,
+             "temperature": self.temperature,
+             "stream": True,
+         }
+-        response = requests.post(
++        response = await treq.post(
+             self.MISTRAL_COMPLETION_API_URL,
+-            headers=self.default_headers(),  # type: ignore
+-            json=data,
+-            stream=True,
++            headers={
++                **self.default_headers(),  # type: ignore
++                "Content-Type": "application/json",
++            },
++            data=json.dumps(data).encode("utf-8"),
+         )
+-        if response.status_code != 200:
++        if response.code != 200:
+             raise ValueError(
+-                f"Server responded with an error. Status Code: {response.status_code}"
++                f"Server responded with an error. Status Code: {response.code}"
+             )
+-        return SSEClient(event_source=response)  # type: ignore
++        return _TreqSSEClient(response)
+ 
+ 
+ class MistralHandler:
+@@ -65,7 +162,9 @@
+                 string_conversation += f"LLM: {message['content']}"
+         return string_conversation
+ 
+-    def stream_response(self, user_input: str) -> Generator[str, None, None]:
++    async def stream_response(
++        self, user_input: str
++    ) -> AsyncGenerator[str, None]:
+         """
+         Yield stream responses from the client as they are received.
+ 
+@@ -78,9 +177,9 @@
+         :return: A generator yielding the model's response in streamed parts.
+         """
+         self._messages.append({"role": "user", "content": user_input})
+-        stream = self._client.perform_stream_request(self._messages)
++        stream = await self._client.perform_stream_request(self._messages)
+         lm_response = ""
+-        for event in stream.events():  # type: ignore
++        async for event in stream.events():
+             if event.data != "[DONE]":
+                 json_load = json.loads(event.data)["choices"][0]["delta"]
+                 if "content" in json_load.keys():

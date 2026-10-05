@@ -1,0 +1,191 @@
+--- a/segment/analytics/request.py
++++ b/segment/analytics/request.py
+@@ -3,14 +3,161 @@
+ from gzip import GzipFile
+ import logging
+ import json
++import threading
++
++import treq
++from twisted.internet import reactor
++from twisted.internet.defer import Deferred
++
+ from dateutil.tz import tzutc
+-from requests.auth import HTTPBasicAuth
+-from requests import sessions
+ 
+ from segment.analytics.version import VERSION
+ from segment.analytics.utils import remove_trailing_slash
+ 
+-_session = sessions.Session()
++
++class TreqTimeoutError(TimeoutError):
++    """Raised when a treq request exceeds its timeout."""
++
++
++class ResponseHeaders(dict):
++    """A small, case-insensitive mapping for HTTP response headers."""
++
++    def get(self, key, default=None):
++        for header, value in self.items():
++            if header.lower() == key.lower():
++                return value
++        return default
++
++
++class Response:
++    """The synchronous response used by the existing client API.
++
++    treq exposes responses and their bodies through Deferreds.  The analytics
++    client, however, has always returned a completed response from ``post``.
++    This object buffers the body once and keeps the response attributes used by
++    the client (and its callers) compatible with that API.
++    """
++
++    def __init__(self, response, body):
++        self.status_code = response.code
++        self.reason = _decode(response.phrase)
++        self.headers = ResponseHeaders(_response_headers(response))
++        self._body = body
++
++    def json(self):
++        return json.loads(self._body.decode('utf-8'))
++
++    @property
++    def text(self):
++        return self._body.decode('utf-8', errors='replace')
++
++
++def _decode(value):
++    if isinstance(value, bytes):
++        return value.decode('latin-1')
++    return value
++
++
++def _response_headers(response):
++    headers = {}
++    for name in response.headers.getAllRawHeaders():
++        key, values = name
++        key = _decode(key)
++        headers[key] = _decode(values[0]) if values else ''
++    return headers
++
++
++class TreqSession:
++    """A blocking facade over treq for the client's synchronous API."""
++
++    def post(self, url, data=None, headers=None, timeout=None, **kwargs):
++        if isinstance(data, str):
++            data = data.encode('utf-8')
++        return _blocking_post(url, data=data, headers=headers, timeout=timeout)
++
++
++_reactor_lock = threading.Lock()
++_reactor_thread = None
++
++
++def _ensure_reactor():
++    """Run Twisted's reactor once in a background thread.
++
++    The public analytics API is synchronous and is also called from consumer
++    threads.  Running the reactor separately lets treq do asynchronous I/O
++    without changing that public API or trying to start/stop Twisted's
++    reactor for every request (which is not supported).
++    """
++    global _reactor_thread
++    if reactor.running:
++        return
++    with _reactor_lock:
++        if reactor.running:
++            return
++        if _reactor_thread is None:
++            _reactor_thread = threading.Thread(
++                target=reactor.run,
++                kwargs={'installSignalHandlers': False},
++                name='segment-treq-reactor',
++                daemon=True,
++            )
++            _reactor_thread.start()
++    # callFromThread is safe as soon as reactor.run has started; waiting here
++    # avoids a race where the first call is made before the reactor is ready.
++    while not reactor.running:
++        if _reactor_thread is not None and not _reactor_thread.is_alive():
++            raise RuntimeError('Unable to start the Twisted reactor')
++
++
++def _blocking_post(url, data=None, headers=None, timeout=None):
++    _ensure_reactor()
++    completed = threading.Event()
++    result = []
++
++    def failed(failure):
++        result.append(failure.value)
++        completed.set()
++        return None
++
++    def received(response):
++        body_deferred = treq.content(response)
++        if isinstance(body_deferred, Deferred):
++            body_deferred.addCallback(
++                lambda body: result.append(Response(response, body)) or completed.set()
++            )
++            body_deferred.addErrback(failed)
++        else:  # Useful for lightweight test doubles.
++            result.append(Response(response, body_deferred))
++            completed.set()
++        return body_deferred
++
++    def start_request():
++        try:
++            deferred = treq.post(
++                url, data=data, headers=headers, timeout=timeout,
++            )
++            if isinstance(deferred, Deferred):
++                deferred.addCallback(received)
++                deferred.addErrback(failed)
++            else:  # Useful for lightweight test doubles.
++                result.append(deferred)
++                completed.set()
++        except Exception as error:  # Errors before a Deferred is returned.
++            result.append(error)
++            completed.set()
++
++    reactor.callFromThread(start_request)
++    completed.wait()
++    error_or_response = result[0]
++    if isinstance(error_or_response, Exception):
++        # treq implements timeouts by cancelling the Deferred.
++        if error_or_response.__class__.__name__ == 'CancelledError':
++            raise TreqTimeoutError('request timed out') from error_or_response
++        raise error_or_response
++    return error_or_response
++
++
++_session = TreqSession()
+ 
+ 
+ def post(write_key, host=None, gzip=False, timeout=15, proxies=None, oauth_manager=None, **kwargs):
+@@ -41,22 +188,13 @@
+             # whose default encoding is utf-8.
+             gz.write(data.encode('utf-8'))
+         data = buf.getvalue()
+-
+-    kwargs = {
+-        "data": data,
+-        "headers": headers,
+-        "timeout": 15,
+-    }
+-
+-    if proxies:
+-        kwargs['proxies'] = proxies
+     res = None
+     try:
+         res = _session.post(url, data=data, headers=headers, timeout=timeout)
+     except Exception as e:
+         log.error(e)
+         raise e
+-        
++
+     if res.status_code == 200:
+         log.debug('data uploaded successfully')
+         return res

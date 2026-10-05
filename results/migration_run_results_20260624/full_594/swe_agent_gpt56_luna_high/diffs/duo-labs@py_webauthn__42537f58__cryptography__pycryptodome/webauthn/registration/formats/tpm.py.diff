@@ -1,0 +1,165 @@
+--- a/webauthn/registration/formats/tpm.py
++++ b/webauthn/registration/formats/tpm.py
+@@ -1,19 +1,15 @@
+ from typing import List
+ 
+ import cbor2
+-from cryptography import x509
+-from cryptography.exceptions import InvalidSignature
+-from cryptography.hazmat.backends import default_backend
+-from cryptography.x509 import (
+-    ExtendedKeyUsage,
+-    GeneralName,
+-    Name,
+-    SubjectAlternativeName,
+-    Version,
+-    BasicConstraints,
+-)
+-from cryptography.x509.extensions import ExtensionNotFound
+-from cryptography.x509.oid import ExtensionOID
++
++from webauthn.helpers.certificates import (
++    CertificateExtensionNotFound,
++    certificate_extension,
++    certificate_is_v3,
++    certificate_public_key,
++    load_der_certificate,
++)
++from webauthn.helpers.exceptions import InvalidSignature
+ 
+ from webauthn.helpers import (
+     decode_credential_public_key,
+@@ -191,8 +187,8 @@
+     # Verify the sig is a valid signature over certInfo using the attestation
+     # public key in aikCert with the algorithm specified in alg.
+     attestation_cert_bytes = attestation_statement.x5c[0]
+-    attestation_cert = x509.load_der_x509_certificate(attestation_cert_bytes, default_backend())
+-    attestation_cert_pub_key = attestation_cert.public_key()
++    attestation_cert = load_der_certificate(attestation_cert_bytes)
++    attestation_cert_pub_key = certificate_public_key(attestation_cert)
+ 
+     try:
+         verify_signature(
+@@ -209,50 +205,33 @@
+     # https://w3c.github.io/webauthn/#sctn-tpm-cert-requirements
+ 
+     # Version MUST be set to 3.
+-    if attestation_cert.version != Version.v3:
+-        raise InvalidRegistrationResponse(
+-            f'Certificate Version "{attestation_cert.version}" was not "{Version.v3}"" Constraints CA was not False (TPM)'
++    if not certificate_is_v3(attestation_cert):
++        raise InvalidRegistrationResponse(
++            'Certificate Version was not v3 (TPM)'
+         )
+ 
+     # Subject field MUST be set to empty.
+-    if len(attestation_cert.subject) > 0:
+-        raise InvalidRegistrationResponse(
+-            f'Certificate Subject "{attestation_cert.subject}" was not empty (TPM)'
++    if len(attestation_cert.subject.native) > 0:
++        raise InvalidRegistrationResponse(
++            f'Certificate Subject "{attestation_cert.subject.native}" was not empty (TPM)'
+         )
+ 
+     # Start extensions analysis
+-    cert_extensions = attestation_cert.extensions
+ 
+     # The Subject Alternative Name extension MUST be set as defined in
+     # [TPMv2-EK-Profile] section 3.2.9.
+     try:
+-        # Ignore mypy because we're casting to a known type
+-        ext_subject_alt_name: SubjectAlternativeName = cert_extensions.get_extension_for_oid(
+-            ExtensionOID.SUBJECT_ALTERNATIVE_NAME
+-        ).value  # type: ignore[assignment]
+-    except ExtensionNotFound:
+-        raise InvalidRegistrationResponse(
+-            f"Certificate missing extension {ExtensionOID.SUBJECT_ALTERNATIVE_NAME} (TPM)"
+-        )
+-
+-    # `type(tcg_at_tpm_values)` return "<class 'cryptography.x509.name.Name'>" so ignore mypy
+-    tcg_at_tpm_values: Name = ext_subject_alt_name.get_values_for_type(GeneralName)[0]  # type: ignore[arg-type, assignment]
+-    tcg_at_tpm_manufacturer = None
+-    tcg_at_tpm_model = None
+-    tcg_at_tpm_version = None
+-    for obj in tcg_at_tpm_values:
+-        oid = obj.oid.dotted_string
+-        if oid == "2.23.133.2.1":
+-            tcg_at_tpm_manufacturer = str(obj.value)
+-        elif oid == "2.23.133.2.2":
+-            tcg_at_tpm_model = obj.value
+-        elif oid == "2.23.133.2.3":
+-            tcg_at_tpm_version = obj.value
++        san = certificate_extension(attestation_cert, "2.5.29.17").native[0]
++        tcg_at_tpm_manufacturer = san.get("tpm_manufacturer")
++        tcg_at_tpm_model = san.get("tpm_model")
++        tcg_at_tpm_version = san.get("tpm_version")
++    except (CertificateExtensionNotFound, IndexError, AttributeError):
++        raise InvalidRegistrationResponse(
++            "Certificate Subject Alt Name was invalid (TPM)"
++        )
+ 
+     if not tcg_at_tpm_manufacturer or not tcg_at_tpm_model or not tcg_at_tpm_version:
+-        raise InvalidRegistrationResponse(
+-            f"Certificate Subject Alt Name was invalid value {tcg_at_tpm_values} (TPM)",
+-        )
++        raise InvalidRegistrationResponse("Certificate Subject Alt Name was invalid (TPM)")
+ 
+     try:
+         TPM_MANUFACTURERS[tcg_at_tpm_manufacturer]
+@@ -261,38 +240,24 @@
+             f'Unrecognized TPM Manufacturer "{tcg_at_tpm_manufacturer}" (TPM)'
+         )
+ 
+-    # The Extended Key Usage extension MUST contain the OID 2.23.133.8.3
+-    # ("joint-iso-itu-t(2) internationalorganizations(23) 133 tcg-kp(8)
+-    # tcg-kp-AIKCertificate(3)").
+-    try:
+-        # Ignore mypy because we're casting to a known type
+-        ext_extended_key_usage: ExtendedKeyUsage = cert_extensions.get_extension_for_oid(
+-            ExtensionOID.EXTENDED_KEY_USAGE
+-        ).value  # type: ignore[assignment]
+-    except ExtensionNotFound:
+-        raise InvalidRegistrationResponse(
+-            f"Certificate missing extension {ExtensionOID.EXTENDED_KEY_USAGE} (TPM)"
+-        )
+-
+-    ext_key_usage_oid = ext_extended_key_usage[0].dotted_string
+-
+-    if ext_key_usage_oid != "2.23.133.8.3":
+-        raise InvalidRegistrationResponse(
+-            f'Certificate Extended Key Usage OID "{ext_key_usage_oid}" was not "2.23.133.8.3" (TPM)'
+-        )
+-
+-    try:
+-        # Ignore mypy because we're casting to a known type
+-        ext_basic_constraints: BasicConstraints = cert_extensions.get_extension_for_oid(
+-            ExtensionOID.BASIC_CONSTRAINTS
+-        ).value  # type: ignore[assignment]
+-    except ExtensionNotFound:
+-        raise InvalidRegistrationResponse(
+-            f"Certificate missing extension {ExtensionOID.BASIC_CONSTRAINTS} (TPM)"
+-        )
+-
+-    # The Basic Constraints extension MUST have the CA component set to false.
+-    if ext_basic_constraints.ca is not False:
++    # The Extended Key Usage extension MUST contain the AIK OID.
++    try:
++        ext_key_usage_oids = certificate_extension(attestation_cert, "2.5.29.37").native
++    except CertificateExtensionNotFound:
++        raise InvalidRegistrationResponse("Certificate missing extension 2.5.29.37 (TPM)")
++
++    if not ext_key_usage_oids or ext_key_usage_oids[0] != "2.23.133.8.3":
++        actual = ext_key_usage_oids[0] if ext_key_usage_oids else None
++        raise InvalidRegistrationResponse(
++            f'Certificate Extended Key Usage OID "{actual}" was not "2.23.133.8.3" (TPM)'
++        )
++
++    try:
++        ext_basic_constraints = certificate_extension(attestation_cert, "2.5.29.19").native
++    except CertificateExtensionNotFound:
++        raise InvalidRegistrationResponse("Certificate missing extension 2.5.29.19 (TPM)")
++
++    if ext_basic_constraints["ca"] is not False:
+         raise InvalidRegistrationResponse("Certificate Basic Constraints CA was not False (TPM)")
+ 
+     # If aikCert contains an extension with OID 1.3.6.1.4.1.45724.1.1.4

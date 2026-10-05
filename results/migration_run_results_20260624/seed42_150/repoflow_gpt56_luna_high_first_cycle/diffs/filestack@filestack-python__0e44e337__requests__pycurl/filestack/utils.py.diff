@@ -1,0 +1,197 @@
+--- a/filestack/utils.py
++++ b/filestack/utils.py
+@@ -1,9 +1,11 @@
++import io
++import json
++import random
++import string
+ import time
+-import string
+-import random
+-from functools import partial
+-import requests as original_requests
+-from requests.exceptions import HTTPError
++from urllib.parse import urlencode
++
++import pycurl
+ 
+ from filestack import config
+ from filestack.exceptions import FilestackHTTPError
+@@ -13,34 +15,160 @@
+     return ''.join(random.choice(string.ascii_letters + string.digits) for i in range(length))
+ 
+ 
+-class RequestsWrapper:
++class CurlHeaders(dict):
++    def __getitem__(self, key):
++        try:
++            return super().__getitem__(key)
++        except KeyError:
++            normalized_key = key.lower()
++            for actual_key, value in self.items():
++                if actual_key.lower() == normalized_key:
++                    return value
++            raise
++
++
++class CurlResponse:
++    def __init__(self, content, status_code, headers):
++        self.content = content
++        self.status_code = status_code
++        self.headers = CurlHeaders(headers)
++
++    @property
++    def text(self):
++        return self.content.decode('utf-8', errors='replace')
++
++    @property
++    def ok(self):
++        return self.status_code < 400
++
++    def json(self):
++        return json.loads(self.text)
++
++    def iter_content(self, chunk_size=1):
++        for offset in range(0, len(self.content), chunk_size):
++            yield self.content[offset:offset + chunk_size]
++
++    def raise_for_status(self):
++        if not self.ok:
++            raise FilestackHTTPError(self.text)
++
++
++class PycurlWrapper:
+     """
+-    This class wraps selected methods from requests package and adds
++    This class wraps selected methods from pycurl and adds
+     default headers if no headers were specified.
+     """
+-    def __getattr__(self, name):
+-        if name in ('get', 'post', 'put', 'delete'):
+-            return partial(self.handle_request, name)
+-        return original_requests.__getattribute__(name)
++    def get(self, *args, **kwargs):
++        return self.handle_request('GET', *args, **kwargs)
+ 
+-    def handle_request(self, name, *args, **kwargs):
+-        if 'headers' not in kwargs:
+-            kwargs['headers'] = config.HEADERS
+-            kwargs['headers']['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
+-            kwargs['headers']['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
++    def post(self, *args, **kwargs):
++        return self.handle_request('POST', *args, **kwargs)
+ 
+-        requests_method = getattr(original_requests, name)
+-        response = requests_method(*args, **kwargs)
++    def put(self, *args, **kwargs):
++        return self.handle_request('PUT', *args, **kwargs)
+ 
++    def delete(self, *args, **kwargs):
++        return self.handle_request('DELETE', *args, **kwargs)
++
++    def post_with_retries(self, *args, retries=0, retry_statuses=(), backoff_factor=0, **kwargs):
++        for attempt in range(retries + 1):
++            response = self.post(*args, **kwargs)
++            if response.status_code not in retry_statuses or attempt == retries:
++                return response
++            time.sleep(backoff_factor * (2 ** attempt))
++
++    def handle_request(self, method, url, **kwargs):
++        params = kwargs.pop('params', None)
++        headers = kwargs.pop('headers', None)
++        json_payload = kwargs.pop('json', None)
++        data = kwargs.pop('data', None)
++        files = kwargs.pop('files', None)
++        kwargs.pop('stream', None)
++
++        if kwargs:
++            unexpected = next(iter(kwargs))
++            raise TypeError('Unexpected request option: {}'.format(unexpected))
++
++        if headers is None:
++            headers = dict(config.HEADERS)
++            headers['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
++            headers['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
++        else:
++            headers = dict(headers)
++
++        if params:
++            query = urlencode(params, doseq=True)
++            url = '{}{}{}'.format(url, '&' if '?' in url else '?', query)
++
++        if json_payload is not None and not any(key.lower() == 'content-type' for key in headers):
++            headers['Content-Type'] = 'application/json'
++        elif isinstance(data, dict) and not any(key.lower() == 'content-type' for key in headers):
++            headers['Content-Type'] = 'application/x-www-form-urlencoded'
++
++        body = io.BytesIO()
++        response_headers = {}
++        curl = pycurl.Curl()
+         try:
+-            response.raise_for_status()
+-        except HTTPError as e:
+-            raise FilestackHTTPError(response.text) from e
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.CUSTOMREQUEST, method)
++            curl.setopt(pycurl.FOLLOWLOCATION, 1)
++            curl.setopt(pycurl.WRITEFUNCTION, body.write)
++            curl.setopt(pycurl.HEADERFUNCTION, self._header_callback(response_headers))
++            curl.setopt(pycurl.HTTPHEADER, [
++                '{}: {}'.format(key, value) for key, value in headers.items()
++            ])
+ 
++            if json_payload is not None:
++                payload = json.dumps(json_payload).encode('utf-8')
++                curl.setopt(pycurl.POSTFIELDS, payload)
++            elif files:
++                curl.setopt(pycurl.HTTPPOST, self._multipart_fields(files, data))
++            elif data is not None:
++                if isinstance(data, dict):
++                    data = urlencode(data, doseq=True).encode('utf-8')
++                elif isinstance(data, str):
++                    data = data.encode('utf-8')
++                curl.setopt(pycurl.POSTFIELDS, data)
++
++            curl.perform()
++            response = CurlResponse(
++                body.getvalue(), curl.getinfo(pycurl.RESPONSE_CODE), response_headers
++            )
++        finally:
++            curl.close()
++
++        response.raise_for_status()
+         return response
+ 
++    @staticmethod
++    def _header_callback(response_headers):
++        def collect_header(raw_line):
++            line = raw_line.decode('iso-8859-1').strip()
++            if ':' in line:
++                key, value = line.split(':', 1)
++                response_headers[key.strip()] = value.strip()
++            return len(raw_line)
+ 
+-requests = RequestsWrapper()
++        return collect_header
++
++    @staticmethod
++    def _multipart_fields(files, data):
++        fields = []
++        for key, value in (data or {}).items():
++            fields.append((key, str(value)))
++
++        for key, file_info in files.items():
++            filename, file_obj, content_type = file_info
++            fields.append((
++                pycurl.FORM_BUFFER, key, filename,
++                pycurl.FORM_BUFFERPTR, file_obj.read(),
++                pycurl.FORM_CONTENTTYPE, content_type,
++            ))
++        return fields
++
++
++http = PycurlWrapper()
++requests = http
+ 
+ 
+ def return_transform_task(transformation, params):

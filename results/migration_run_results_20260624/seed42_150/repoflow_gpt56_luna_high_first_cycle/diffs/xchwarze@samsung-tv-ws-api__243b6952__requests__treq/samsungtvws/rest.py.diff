@@ -1,0 +1,119 @@
+--- a/samsungtvws/rest.py
++++ b/samsungtvws/rest.py
+@@ -7,13 +7,94 @@
+ """
+ 
+ import logging
+-from typing import Any, Dict, Optional
++import threading
++from queue import Empty, Queue
++from typing import Any, Dict, List, Optional, Union, cast
+ 
+-import requests
++import treq
++from twisted.internet import reactor
++from twisted.internet.ssl import ClientContextFactory
++from twisted.web.client import Agent
+ 
+ from . import connection, exceptions, helper
+ 
+ _LOGGING = logging.getLogger(__name__)
++
++
++class _TreqConnectionError(Exception):
++    pass
++
++
++class _TreqRunner:
++    def __init__(self) -> None:
++        self._lock = threading.Lock()
++        self._reactor_started = threading.Event()
++        self._thread: Optional[threading.Thread] = None
++
++    def _ensure_reactor(self) -> None:
++        if reactor.running:
++            return
++
++        with self._lock:
++            if reactor.running:
++                return
++            if self._thread is None:
++                reactor.callWhenRunning(self._reactor_started.set)
++                self._thread = threading.Thread(
++                    target=reactor.run,
++                    kwargs={"installSignalHandlers": False},
++                    daemon=True,
++                )
++                self._thread.start()
++
++        self._reactor_started.wait()
++
++    def request(
++        self, method: str, url: str, timeout: Optional[float]
++    ) -> bytes:
++        self._ensure_reactor()
++        result: "Queue[Union[bytes, _TreqConnectionError]]" = Queue(maxsize=1)
++        pending: List[Any] = []
++
++        def succeeded(body: bytes) -> bytes:
++            result.put(body)
++            return body
++
++        def failed(failure: Any) -> None:
++            error = getattr(failure, "value", failure)
++            result.put(_TreqConnectionError(error))
++
++        def issue_request() -> None:
++            try:
++                deferred = treq.request(
++                    method,
++                    url,
++                    agent=Agent(
++                        reactor,
++                        contextFactory=ClientContextFactory(),
++                    ),
++                    timeout=timeout,
++                )
++                pending.append(deferred)
++                deferred.addCallback(treq.content)
++                deferred.addCallbacks(succeeded, failed)
++            except Exception as err:
++                failed(err)
++
++        reactor.callFromThread(issue_request)
++        try:
++            response = result.get(timeout=timeout)
++        except Empty as err:
++            if pending:
++                reactor.callFromThread(pending[0].cancel)
++            raise _TreqConnectionError("Request timed out") from err
++
++        if isinstance(response, _TreqConnectionError):
++            raise response
++        return cast(bytes, response)
++
++
++_TREQ_RUNNER = _TreqRunner()
+ 
+ 
+ class SamsungTVRest(connection.SamsungTVWSBaseConnection):
+@@ -33,16 +114,9 @@
+     def _rest_request(self, target: str, method: str = "GET") -> Dict[str, Any]:
+         url = self._format_rest_url(target)
+         try:
+-            if method == "POST":
+-                response = requests.post(url, timeout=self.timeout, verify=False)
+-            elif method == "PUT":
+-                response = requests.put(url, timeout=self.timeout, verify=False)
+-            elif method == "DELETE":
+-                response = requests.delete(url, timeout=self.timeout, verify=False)
+-            else:
+-                response = requests.get(url, timeout=self.timeout, verify=False)
+-            return helper.process_api_response(response.text)
+-        except requests.ConnectionError as err:
++            response = _TREQ_RUNNER.request(method, url, self.timeout)
++            return helper.process_api_response(response)
++        except _TreqConnectionError as err:
+             raise exceptions.HttpApiError(
+                 "TV unreachable or feature not supported on this model."
+             ) from err

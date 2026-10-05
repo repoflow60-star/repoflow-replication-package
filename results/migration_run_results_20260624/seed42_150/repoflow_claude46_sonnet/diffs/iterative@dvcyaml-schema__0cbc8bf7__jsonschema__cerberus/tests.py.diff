@@ -1,0 +1,196 @@
+--- a/tests.py
++++ b/tests.py
+@@ -3,9 +3,10 @@
+ # pylint: disable=redefined-outer-name
+ 
+ import json
++import re
+ from pathlib import Path
+ 
+-import jsonschema
++import cerberus
+ import pytest
+ from ruamel.yaml import YAML
+ 
+@@ -15,6 +16,167 @@
+ examples_dir = root / "examples"
+ valid_dir = examples_dir / "valid"
+ invalid_dir = examples_dir / "invalid"
++
++
++class ValidationError(Exception):
++    """Raised when cerberus-based JSON Schema validation fails."""
++
++
++def _resolve_ref(ref: str, root_schema: dict) -> dict:
++    """Resolve a $ref pointer within the root schema."""
++    parts = ref.lstrip("#/").split("/")
++    node = root_schema
++    for part in parts:
++        node = node[part]
++    return node
++
++
++def _validate_json_schema(data, schema: dict, root_schema: dict) -> list:
++    """
++    Recursively validate *data* against *schema* (JSON Schema subset) using
++    cerberus for structural checks.  Returns a list of error messages; an
++    empty list means the data is valid.
++    """
++    errors = []
++
++    # Resolve $ref
++    if "$ref" in schema:
++        schema = _resolve_ref(schema["$ref"], root_schema)
++
++    # allOf – data must be valid against every sub-schema
++    if "allOf" in schema:
++        for sub in schema["allOf"]:
++            sub_errors = _validate_json_schema(data, sub, root_schema)
++            errors.extend(sub_errors)
++        return errors
++
++    # oneOf – data must be valid against exactly one sub-schema
++    if "oneOf" in schema:
++        matches = []
++        for sub in schema["oneOf"]:
++            sub_errors = _validate_json_schema(data, sub, root_schema)
++            if not sub_errors:
++                matches.append(sub)
++        if len(matches) != 1:
++            errors.append(
++                f"oneOf failed: {len(matches)} schemas matched (expected 1)"
++            )
++        return errors
++
++    json_type = schema.get("type")
++
++    # ---- null ----
++    if json_type == "null":
++        if data is not None:
++            errors.append(f"Expected null, got {type(data).__name__}")
++        return errors
++
++    # ---- boolean ----
++    if json_type == "boolean":
++        if not isinstance(data, bool):
++            errors.append(f"Expected boolean, got {type(data).__name__}")
++        return errors
++
++    # ---- string ----
++    if json_type == "string":
++        if not isinstance(data, str):
++            errors.append(f"Expected string, got {type(data).__name__}")
++            return errors
++        pattern = schema.get("pattern")
++        if pattern and not re.search(pattern, data):
++            errors.append(f"String {data!r} does not match pattern {pattern!r}")
++        return errors
++
++    # ---- array ----
++    if json_type == "array":
++        if not isinstance(data, list):
++            errors.append(f"Expected array, got {type(data).__name__}")
++            return errors
++        items_schema = schema.get("items")
++        if items_schema is not None:
++            for i, item in enumerate(data):
++                item_errors = _validate_json_schema(item, items_schema, root_schema)
++                for e in item_errors:
++                    errors.append(f"[{i}]: {e}")
++        return errors
++
++    # ---- object ----
++    if json_type == "object":
++        if not isinstance(data, dict):
++            errors.append(f"Expected object, got {type(data).__name__}")
++            return errors
++
++        properties = schema.get("properties", {})
++        required = schema.get("required", [])
++        additional = schema.get("additionalProperties")
++        pattern_props = schema.get("patternProperties", {})
++
++        # Use cerberus to check required fields and known property types
++        cerberus_schema = {}
++        for prop, prop_schema in properties.items():
++            resolved = prop_schema
++            if "$ref" in resolved:
++                resolved = _resolve_ref(resolved["$ref"], root_schema)
++            cerberus_schema[prop] = {
++                "required": prop in required,
++                "nullable": True,
++            }
++
++        v = cerberus.Validator(cerberus_schema, allow_unknown=True)
++        if not v.validate(data if data is not None else {}):
++            for field, field_errors in v.errors.items():
++                for fe in field_errors:
++                    errors.append(f"{field}: {fe}")
++
++        # Check required fields explicitly (cerberus handles it above, but double-check)
++        for req_field in required:
++            if req_field not in data:
++                errors.append(f"Required field missing: {req_field!r}")
++
++        # Validate known properties recursively
++        for prop, prop_schema in properties.items():
++            if prop in data and data[prop] is not None:
++                prop_errors = _validate_json_schema(data[prop], prop_schema, root_schema)
++                for e in prop_errors:
++                    errors.append(f"{prop}: {e}")
++
++        # Check additional/unknown properties
++        known_keys = set(properties.keys())
++        # Also track pattern-matched keys
++        pattern_matched = set()
++        for pattern, pat_schema in pattern_props.items():
++            for key in data:
++                if re.search(pattern, key):
++                    pattern_matched.add(key)
++                    val_errors = _validate_json_schema(data[key], pat_schema, root_schema)
++                    for e in val_errors:
++                        errors.append(f"{key}: {e}")
++
++        unknown_keys = set(data.keys()) - known_keys - pattern_matched
++        if unknown_keys:
++            if additional is False:
++                for key in sorted(unknown_keys):
++                    errors.append(f"Additional property not allowed: {key!r}")
++            elif isinstance(additional, dict):
++                for key in unknown_keys:
++                    val_errors = _validate_json_schema(data[key], additional, root_schema)
++                    for e in val_errors:
++                        errors.append(f"{key}: {e}")
++
++        return errors
++
++    # No type constraint – accept anything (bare {} schema)
++    return errors
++
++
++def validate(instance, schema: dict) -> None:
++    """
++    Validate *instance* against *schema* using cerberus as the validation
++    engine.  Raises :class:`ValidationError` if validation fails.
++    """
++    errors = _validate_json_schema(instance, schema, schema)
++    if errors:
++        raise ValidationError("; ".join(errors))
+ 
+ 
+ @pytest.fixture
+@@ -32,10 +194,10 @@
+ 
+ @pytest.mark.parametrize("example", valid_dir.iterdir(), ids=ids_gen)
+ def test_valid_examples(schema: dict, example: Path) -> None:
+-    jsonschema.validate(yaml.load(example), schema=schema)
++    validate(yaml.load(example), schema=schema)
+ 
+ 
+ @pytest.mark.parametrize("example", invalid_dir.iterdir(), ids=ids_gen)
+ def test_invalid_examples(schema: dict, example: Path) -> None:
+-    with pytest.raises(jsonschema.ValidationError):
+-        jsonschema.validate(yaml.load(example), schema=schema)
++    with pytest.raises(ValidationError):
++        validate(yaml.load(example), schema=schema)

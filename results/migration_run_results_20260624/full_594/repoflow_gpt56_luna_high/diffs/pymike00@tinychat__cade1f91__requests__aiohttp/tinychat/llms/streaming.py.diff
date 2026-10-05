@@ -1,0 +1,122 @@
+--- a/tinychat/llms/streaming.py
++++ b/tinychat/llms/streaming.py
+@@ -0,0 +1,119 @@
++import asyncio
++from dataclasses import dataclass
++from queue import Queue
++from threading import Event, Thread
++from typing import Iterator
++
++import aiohttp
++
++
++@dataclass(frozen=True)
++class AiohttpEvent:
++    data: str
++
++
++_END = object()
++
++
++class AiohttpStream:
++    """Synchronous SSE view over an aiohttp streaming response."""
++
++    def __init__(self, url: str, headers: dict[str, str], payload: dict) -> None:
++        self._events: Queue[object] = Queue()
++        self._ready = Event()
++        self._stop = Event()
++        self._status: int | None = None
++        self._error: BaseException | None = None
++        self._thread = Thread(
++            target=self._run,
++            args=(url, headers, payload),
++            daemon=True,
++        )
++        self._thread.start()
++        self._ready.wait()
++        self._raise_error()
++
++    @property
++    def status(self) -> int:
++        self._ready.wait()
++        self._raise_error()
++        if self._status is None:
++            raise RuntimeError("The HTTP response did not provide a status.")
++        return self._status
++
++    def _raise_error(self) -> None:
++        if self._error is not None:
++            raise self._error
++
++    def _run(self, url: str, headers: dict[str, str], payload: dict) -> None:
++        try:
++            asyncio.run(self._receive(url, headers, payload))
++        except BaseException as error:
++            self._error = error
++            self._ready.set()
++        finally:
++            self._events.put(_END)
++
++    async def _receive(
++        self, url: str, headers: dict[str, str], payload: dict
++    ) -> None:
++        data_lines: list[str] = []
++        buffer = b""
++        async with aiohttp.ClientSession() as session:
++            async with session.post(url, headers=headers, json=payload) as response:
++                self._status = response.status
++                self._ready.set()
++                if response.status != 200:
++                    return
++
++                async for chunk in response.content.iter_any():
++                    if self._stop.is_set():
++                        return
++                    buffer = self._parse_chunk(chunk, buffer, data_lines)
++
++                if buffer:
++                    self._parse_line(buffer, data_lines)
++                self._emit_event(data_lines)
++
++    def _parse_chunk(
++        self, chunk: bytes, buffer: bytes, data_lines: list[str]
++    ) -> bytes:
++        lines = (buffer + chunk).split(b"\n")
++        remainder = lines.pop()
++        for line in lines:
++            self._parse_line(line.rstrip(b"\r"), data_lines)
++        return remainder
++
++    def _parse_line(self, line: bytes, data_lines: list[str]) -> None:
++        if not line:
++            self._emit_event(data_lines)
++            return
++        if line.startswith(b":"):
++            return
++        if line.startswith(b"data:"):
++            line = line[5:]
++            if line.startswith(b" "):
++                line = line[1:]
++        elif line.startswith((b"event:", b"id:", b"retry:")):
++            return
++        data_lines.append(line.decode("utf-8"))
++
++    def _emit_event(self, data_lines: list[str]) -> None:
++        if data_lines:
++            self._events.put(AiohttpEvent("\n".join(data_lines)))
++            data_lines.clear()
++
++    def events(self) -> Iterator[AiohttpEvent]:
++        while True:
++            event = self._events.get()
++            if event is _END:
++                self._raise_error()
++                return
++            yield event  # type: ignore[misc]
++
++    def __iter__(self) -> Iterator[bytes]:
++        for event in self.events():
++            yield event.data.encode("utf-8")
++
++    def close(self) -> None:
++        self._stop.set()

@@ -1,0 +1,241 @@
+--- a/bigcommerce/connection.py
++++ b/bigcommerce/connection.py
+@@ -13,7 +13,8 @@
+     from urllib.parse import urlencode
+ 
+ import logging
+-import requests
++import treq
++from twisted.internet import defer
+ import jwt
+ 
+ from json import dumps, loads
+@@ -39,9 +40,8 @@
+         log.info("API Host: %s/%s" % (self.host, self.api_path))
+ 
+         # set up the session
+-        self._session = requests.Session()
+-        self._session.auth = auth
+-        self._session.headers = {"Accept": "application/json"}
++        self._auth = auth
++        self._session_headers = {"Accept": "application/json"}
+ 
+         self._last_response = None  # for debugging
+ 
+@@ -77,7 +77,10 @@
+                 headers['Content-Type'] = 'application/json'
+         log.debug("%s %s" % (method, url))
+         # make and send the request
+-        return self._session.request(method, url, data=data, timeout=self.timeout, headers=headers)
++        request_headers = self._session_headers.copy()
++        request_headers.update(headers)
++        return treq.request(method, url, data=data, timeout=self.timeout,
++                            headers=request_headers, auth=getattr(self, '_auth', None))
+ 
+     # CRUD methods
+ 
+@@ -97,7 +100,7 @@
+                 resource += '/'
+             resource += str(rid)
+         response = self._run_method('GET', resource, query=query)
+-        return self._handle_response(resource, response)
++        return response.addCallback(lambda response: self._handle_response(resource, response))
+ 
+     def update(self, resource, rid, updates):
+         """
+@@ -123,13 +126,13 @@
+                 resource += '/'
+             resource += str(rid)
+         response = self._run_method('DELETE', resource)
+-        return self._handle_response(resource, response, suppress_empty=True)
++        return response.addCallback(lambda response: self._handle_response(resource, response, suppress_empty=True))
+ 
+     # Raw-er stuff
+ 
+     def make_request(self, method, url, data=None, params=None, headers=None):
+         response = self._run_method(method, url, data, params, headers)
+-        return self._handle_response(url, response)
++        return response.addCallback(lambda response: self._handle_response(url, response))
+ 
+     def put(self, url, data):
+         """
+@@ -137,8 +140,15 @@
+         data should be a dictionary.
+         """
+         response = self._run_method('PUT', url, data=data)
+-        log.debug("OUTPUT: %s" % response.content)
+-        return self._handle_response(url, response)
++
++        def handle_response(response):
++            def handle_content(content):
++                response._treq_content = content
++                log.debug("OUTPUT: %s" % content)
++                return self._handle_response(url, response)
++            return treq.content(response).addCallback(handle_content)
++
++        return response.addCallback(handle_response)
+ 
+     def post(self, url, data, headers={}):
+         """
+@@ -146,31 +156,37 @@
+         data should be a dictionary.
+         """
+         response = self._run_method('POST', url, data=data, headers=headers)
+-        return self._handle_response(url, response)
+-
++        return response.addCallback(lambda response: self._handle_response(url, response))
++
++    @defer.inlineCallbacks
+     def _handle_response(self, url, res, suppress_empty=True):
+         """
+         Returns parsed JSON or raises an exception appropriately.
+         """
+         self._last_response = res
+         result = {}
+-        if res.status_code in (200, 201, 202):
++        content = getattr(res, '_treq_content', None)
++        if content is None:
++            content = yield treq.content(res)
++            res._treq_content = content
++
++        if res.code in (200, 201, 202):
+             try:
+-                result = res.json()
++                result = loads(content)
+             except Exception as e:  # json might be invalid, or store might be down
+-                e.message += " (_handle_response failed to decode JSON: " + str(res.content) + ")"
++                e.message += " (_handle_response failed to decode JSON: " + str(content) + ")"
+                 raise  # TODO better exception
+-        elif res.status_code == 204 and not suppress_empty:
+-            raise EmptyResponseWarning("%d %s @ %s: %s" % (res.status_code, res.reason, url, res.content), res)
+-        elif res.status_code >= 500:
+-            raise ServerException("%d %s @ %s: %s" % (res.status_code, res.reason, url, res.content), res)
+-        elif res.status_code == 429:
+-            raise RateLimitingException("%d %s @ %s: %s" % (res.status_code, res.reason, url, res.content), res)
+-        elif res.status_code >= 400:
+-            raise ClientRequestException("%d %s @ %s: %s" % (res.status_code, res.reason, url, res.content), res)
+-        elif res.status_code >= 300:
+-            raise RedirectionException("%d %s @ %s: %s" % (res.status_code, res.reason, url, res.content), res)
+-        return result
++        elif res.code == 204 and not suppress_empty:
++            raise EmptyResponseWarning("%d %s @ %s: %s" % (res.code, res.phrase, url, content), res)
++        elif res.code >= 500:
++            raise ServerException("%d %s @ %s: %s" % (res.code, res.phrase, url, content), res)
++        elif res.code == 429:
++            raise RateLimitingException("%d %s @ %s: %s" % (res.code, res.phrase, url, content), res)
++        elif res.code >= 400:
++            raise ClientRequestException("%d %s @ %s: %s" % (res.code, res.phrase, url, content), res)
++        elif res.code >= 300:
++            raise RedirectionException("%d %s @ %s: %s" % (res.code, res.phrase, url, content), res)
++        defer.returnValue(result)
+ 
+     def __repr__(self):
+         return "%s %s%s" % (self.__class__.__name__, self.host, self.api_path)
+@@ -196,11 +212,10 @@
+         self.timeout = 7.0  # can attach to session?
+         self.rate_limiting_management = rate_limiting_management
+ 
+-        self._session = requests.Session()
+-        self._session.headers = {"Accept": "application/json",
++        self._session_headers = {"Accept": "application/json",
+                                  "Accept-Encoding": "gzip"}
+         if access_token and store_hash:
+-            self._session.headers.update(self._oauth_headers(client_id, access_token))
++            self._session_headers.update(self._oauth_headers(client_id, access_token))
+ 
+         self._last_response = None  # for debugging
+ 
+@@ -253,40 +268,44 @@
+ 
+         Raises HttpException on failure (same as Connection methods).
+         """
+-        res = self.post(token_url, {'client_id': self.client_id,
+-                                    'client_secret': client_secret,
+-                                    'code': code,
+-                                    'context': context,
+-                                    'scope': scope,
+-                                    'grant_type': 'authorization_code',
+-                                    'redirect_uri': redirect_uri},
+-                        headers={'Content-Type': 'application/x-www-form-urlencoded'})
+-        self._session.headers.update(self._oauth_headers(self.client_id, res['access_token']))
+-        return res
++        def update_headers(res):
++            self._session_headers.update(self._oauth_headers(self.client_id, res['access_token']))
++            return res
++
++        return self.post(token_url, {'client_id': self.client_id,
++                                     'client_secret': client_secret,
++                                     'code': code,
++                                     'context': context,
++                                     'scope': scope,
++                                     'grant_type': 'authorization_code',
++                                     'redirect_uri': redirect_uri},
++                         headers={'Content-Type': 'application/x-www-form-urlencoded'}).addCallback(update_headers)
+ 
+     def _handle_response(self, url, res, suppress_empty=True):
+         """
+         Adds rate limiting information on to the response object
+         """
+-        result = Connection._handle_response(self, url, res, suppress_empty)
+-        if 'X-Rate-Limit-Time-Reset-Ms' in res.headers:
+-            self.rate_limit = dict(ms_until_reset=int(res.headers['X-Rate-Limit-Time-Reset-Ms']),
+-                                   window_size_ms=int(res.headers['X-Rate-Limit-Time-Window-Ms']),
+-                                   requests_remaining=int(res.headers['X-Rate-Limit-Requests-Left']),
+-                                   requests_quota=int(res.headers['X-Rate-Limit-Requests-Quota']))
+-            if self.rate_limiting_management:
+-                if self.rate_limiting_management['min_requests_remaining'] >= self.rate_limit['requests_remaining']:
+-                    if self.rate_limiting_management['wait']:
+-                        sleep(ceil(float(self.rate_limit['ms_until_reset']) / 1000))
+-                    if self.rate_limiting_management.get('callback_function'):
+-                        callback = self.rate_limiting_management['callback_function']
+-                        args_dict = self.rate_limiting_management.get('callback_args')
+-                        if args_dict:
+-                            callback(args_dict)
+-                        else:
+-                            callback()
+-
+-        return result
++        def handle_result(result):
++            if res.headers.hasHeader('X-Rate-Limit-Time-Reset-Ms'):
++                self.rate_limit = dict(ms_until_reset=int(res.headers.getRawHeaders('X-Rate-Limit-Time-Reset-Ms')[0]),
++                                       window_size_ms=int(res.headers.getRawHeaders('X-Rate-Limit-Time-Window-Ms')[0]),
++                                       requests_remaining=int(res.headers.getRawHeaders('X-Rate-Limit-Requests-Left')[0]),
++                                       requests_quota=int(res.headers.getRawHeaders('X-Rate-Limit-Requests-Quota')[0]))
++                if self.rate_limiting_management:
++                    if self.rate_limiting_management['min_requests_remaining'] >= self.rate_limit['requests_remaining']:
++                        if self.rate_limiting_management['wait']:
++                            sleep(ceil(float(self.rate_limit['ms_until_reset']) / 1000))
++                        if self.rate_limiting_management.get('callback_function'):
++                            callback = self.rate_limiting_management['callback_function']
++                            args_dict = self.rate_limiting_management.get('callback_args')
++                            if args_dict:
++                                callback(args_dict)
++                            else:
++                                callback()
++
++            return result
++
++        return Connection._handle_response(self, url, res, suppress_empty).addCallback(handle_result)
+ 
+ 
+ class GraphQLConnection(OAuthConnection):
+@@ -300,11 +319,10 @@
+         self.timeout = 7.0  # can attach to session?
+         self.rate_limiting_management = rate_limiting_management
+ 
+-        self._session = requests.Session()
+-        self._session.headers = {"Accept": "application/json",
++        self._session_headers = {"Accept": "application/json",
+                                  "Accept-Encoding": "gzip"}
+         if access_token and store_hash:
+-            self._session.headers.update(self._oauth_headers(client_id, access_token))
++            self._session_headers.update(self._oauth_headers(client_id, access_token))
+ 
+         self._last_response = None  # for debugging
+ 
+@@ -403,4 +421,4 @@
+             }
+           }
+         }
+-        """)
++        """)

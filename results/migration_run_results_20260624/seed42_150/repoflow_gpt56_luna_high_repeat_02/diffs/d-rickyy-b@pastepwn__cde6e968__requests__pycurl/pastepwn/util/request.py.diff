@@ -1,0 +1,99 @@
+--- a/pastepwn/util/request.py
++++ b/pastepwn/util/request.py
+@@ -1,8 +1,12 @@
++import io
+ import logging
+ from threading import Lock
++from urllib.parse import urlencode, urlsplit
++from urllib.request import getproxies
+ 
+-from requests import Session, utils
+-from requests.exceptions import Timeout
++import pycurl
++
++from .network import get_ip_resolve
+ 
+ 
+ class Request:
+@@ -22,11 +26,15 @@
+     def __init__(self, proxies=None, headers=None):
+         if not self._initialized:
+             self.logger = logging.getLogger(__name__)
+-            self.session = Session()
+             self.proxies = proxies
+             self.headers = headers
+             self.logger.info("Using the following custom proxies: %s", proxies)
+-            system_proxies = utils.get_environ_proxies("https://example.com")
++            system_proxies = {}
++            environment_proxies = getproxies()
++            for scheme in ("http", "https"):
++                proxy = environment_proxies.get(scheme)
++                if proxy:
++                    system_proxies[scheme] = proxy
+             self.logger.info("Using the following system proxies: %s", system_proxies)
+             Request._initialized = True
+ 
+@@ -36,14 +44,57 @@
+         if self.headers is not None:
+             headers.update(self.headers)
+ 
++        method = kwargs.pop("method", args[0] if args else "GET")
++        url = kwargs.pop("url", args[1] if len(args) > 1 else None)
++        response_buffer = io.BytesIO()
++        curl = pycurl.Curl()
++
+         try:
+-            response = self.session.request(*args, headers=headers, proxies=self.proxies, data=data, timeout=timeout, **kwargs)
+-        except Timeout:
+-            url = kwargs.get("url")
+-            self.logger.warning("Timeout while requesting %s!", url)
+-            return ""
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.WRITEDATA, response_buffer)
++            curl.setopt(pycurl.IPRESOLVE, get_ip_resolve())
++            curl.setopt(pycurl.FOLLOWLOCATION, 1)
++            curl.setopt(pycurl.HTTPHEADER, [f"{key}: {value}" for key, value in headers.items()])
+ 
+-        return response.content.decode("utf-8")
++            if timeout is not None:
++                curl.setopt(pycurl.TIMEOUT, timeout)
++
++            if self.proxies:
++                scheme = urlsplit(url).scheme
++                if isinstance(self.proxies, dict):
++                    proxy = self.proxies.get(scheme) or self.proxies.get("all")
++                else:
++                    proxy = self.proxies
++                if proxy:
++                    curl.setopt(pycurl.PROXY, proxy)
++
++            if data is not None:
++                if isinstance(data, (dict, list, tuple)):
++                    data = urlencode(data, doseq=True).encode("utf-8")
++                    if not any(key.lower() == "content-type" for key in headers):
++                        curl.setopt(pycurl.HTTPHEADER, [
++                            *[f"{key}: {value}" for key, value in headers.items()],
++                            "Content-Type: application/x-www-form-urlencoded",
++                        ])
++                elif isinstance(data, str):
++                    data = data.encode("utf-8")
++                curl.setopt(pycurl.POSTFIELDS, data)
++
++            if method.upper() == "POST":
++                curl.setopt(pycurl.POST, 1)
++            else:
++                curl.setopt(pycurl.CUSTOMREQUEST, method.upper())
++
++            curl.perform()
++        except pycurl.error as error:
++            if error.args and error.args[0] == pycurl.E_OPERATION_TIMEDOUT:
++                self.logger.warning("Timeout while requesting %s!", url)
++                return ""
++            raise
++        finally:
++            curl.close()
++
++        return response_buffer.getvalue().decode("utf-8")
+ 
+     def get(self, url, data=None, timeout=5):
+         return self._request_wrapper(method="GET", url=url, data=data, timeout=timeout)

@@ -1,0 +1,150 @@
+--- a/cronitor/monitor.py
++++ b/cronitor/monitor.py
+@@ -3,29 +3,90 @@
+ import logging
+ import json
+ import os
+-import requests
++from io import BytesIO
++from urllib.parse import quote, urlencode
++
++import pycurl
+ from yaml.loader import SafeLoader
+ 
+ 
+ import cronitor
+-from urllib3.util.retry import Retry
+-from requests.adapters import HTTPAdapter
+ 
+ logger = logging.getLogger(__name__)
+ 
+-# https://stackoverflow.com/questions/49121365/implementing-retry-for-requests-in-python
++class _CurlResponse(object):
++    def __init__(self, status_code, content):
++        self.status_code = status_code
++        self.content = content
++
++    @property
++    def text(self):
++        return self.content.decode('utf-8', errors='replace')
++
++    def json(self):
++        return json.loads(self.text)
++
++
++class _CurlSession(object):
++    def __init__(self, retries=0, backoff_factor=0.3):
++        self.retries = retries
++        self.backoff_factor = backoff_factor
++
++    def get(self, url, **kwargs):
++        return self._request('GET', url, **kwargs)
++
++    def put(self, url, **kwargs):
++        return self._request('PUT', url, **kwargs)
++
++    def delete(self, url, **kwargs):
++        return self._request('DELETE', url, **kwargs)
++
++    def _request(self, method, url, params=None, auth=None, data=None,
++                 headers=None, timeout=None):
++        if params:
++            query = urlencode(
++                {key: value for key, value in params.items() if value is not None},
++                doseq=True,
++            )
++            if query:
++                url = '{}{}{}'.format(url, '&' if '?' in url else '?', query)
++
++        request_headers = [
++            '{}: {}'.format(key, value)
++            for key, value in (headers or {}).items()
++        ]
++
++        for attempt in range(self.retries + 1):
++            curl = pycurl.Curl()
++            body = BytesIO()
++            try:
++                curl.setopt(pycurl.URL, url.encode('utf-8'))
++                curl.setopt(pycurl.CUSTOMREQUEST, method)
++                curl.setopt(pycurl.WRITEFUNCTION, body.write)
++                curl.setopt(pycurl.FOLLOWLOCATION, 1)
++                if request_headers:
++                    curl.setopt(pycurl.HTTPHEADER, request_headers)
++                if auth:
++                    curl.setopt(pycurl.HTTPAUTH, pycurl.HTTPAUTH_BASIC)
++                    curl.setopt(pycurl.USERPWD, '{}:{}'.format(auth[0], auth[1]))
++                if timeout is not None:
++                    curl.setopt(pycurl.TIMEOUT, timeout)
++                if data is not None:
++                    curl.setopt(pycurl.POSTFIELDS, data)
++
++                curl.perform()
++                status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++                return _CurlResponse(status_code, body.getvalue())
++            except pycurl.error:
++                if attempt >= self.retries:
++                    raise
++                time.sleep(self.backoff_factor * (2 ** attempt))
++            finally:
++                curl.close()
++
++
+ def retry_session(retries, session=None, backoff_factor=0.3):
+-    session = session or requests.Session()
+-    retry = Retry(
+-        total=retries,
+-        read=retries,
+-        connect=retries,
+-        backoff_factor=backoff_factor,
+-    )
+-    adapter = HTTPAdapter(max_retries=retry)
+-    session.mount('http://', adapter)
+-    session.mount('https://', adapter)
+-    return session
++    return session or _CurlSession(retries=retries, backoff_factor=backoff_factor)
+ 
+ JSON = 'json'
+ YAML = 'yaml'
+@@ -135,7 +196,7 @@
+         self._data = Struct(**data)
+ 
+     def delete(self):
+-        resp = requests.delete(
++        resp = self._req.delete(
+                     self._monitor_api_url(self.key),
+                     auth=(self.api_key, ''),
+                     headers=self._headers,
+@@ -172,10 +233,10 @@
+         if not self.api_key:
+             raise cronitor.AuthenticationError('No api_key detected. Set cronitor.api_key or initialize Monitor with kwarg.')
+ 
+-        resp = requests.get(self._monitor_api_url(self.key),
+-                            timeout=10,
+-                            auth=(self.api_key, ''),
+-                            headers=dict(self._headers, **{'Content-Type': 'application/json', 'Cronitor-Version': self.api_verion}))
++        resp = self._req.get(self._monitor_api_url(self.key),
++                             timeout=10,
++                             auth=(self.api_key, ''),
++                             headers=dict(self._headers, **{'Content-Type': 'application/json', 'Cronitor-Version': self.api_verion}))
+ 
+         if resp.status_code == 404:
+             raise cronitor.MonitorNotFound("Monitor '%s' not found" % self.key)
+@@ -197,12 +258,15 @@
+         }
+ 
+     def _ping_api_url(self):
+-        return "https://cronitor.link/p/{}/{}".format(self.api_key, self.key)
++        return "https://cronitor.link/p/{}/{}".format(
++            quote(str(self.api_key), safe=''),
++            quote(str(self.key), safe=''),
++        )
+ 
+     @classmethod
+     def _monitor_api_url(cls, key=None):
+         if not key: return "https://cronitor.io/api/monitors"
+-        return "https://cronitor.io/api/monitors/{}".format(key)
++        return "https://cronitor.io/api/monitors/{}".format(quote(str(key), safe=''))
+ 
+ def _prepare_payload(monitors, rollback=False, request_format=JSON):
+     ret = {}

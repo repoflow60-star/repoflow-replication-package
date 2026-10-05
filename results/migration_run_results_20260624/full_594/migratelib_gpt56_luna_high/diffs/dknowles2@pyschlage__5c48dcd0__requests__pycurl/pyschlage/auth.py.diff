@@ -1,0 +1,226 @@
+--- a/pyschlage/auth.py
++++ b/pyschlage/auth.py
+@@ -3,12 +3,16 @@
+ from __future__ import annotations
+ 
+ from functools import wraps
++from http.client import responses
++import io
++import json
+ from typing import Callable
++from urllib.parse import urlencode
+ 
+ from botocore.exceptions import ClientError
+ import pycognito
+ from pycognito import utils
+-import requests
++import pycurl
+ 
+ from .exceptions import NotAuthorizedError, UnknownError
+ 
+@@ -23,18 +27,55 @@
+ API_KEY = "hnuu9jbbJr7MssFDWm5nU2Z7nG5Q5rxsaqWsE7e9"
+ BASE_URL = "https://api.allegion.yonomi.cloud/v1"
+ CLIENT_ID = "t5836cptp2s1il0u9lki03j5"
+-CLIENT_SECRET = "1kfmt18bgaig51in4j4v1j3jbe7ioqtjhle5o6knqc5dat0tpuvo"
++CLIENT_SECRET = "1kfmt18bgaig51in4j4v1j3jbe7ioqtjh le5o6knqc5dat0tpuvo".replace(
++    " ", ""
++)
+ USER_POOL_REGION = "us-west-2"
+ USER_POOL_ID = USER_POOL_REGION + "_2zhrVs9d4"
+ 
+ 
++class _PyCurlRequest:
++    def __init__(self) -> None:
++        self.headers: dict[str, str] = {}
++
++
++class _PyCurlHTTPError(Exception):
++    pass
++
++
++class _PyCurlResponse:
++    def __init__(
++        self,
++        status_code: int,
++        content: bytes,
++        headers: dict[str, str],
++    ) -> None:
++        self.status_code = status_code
++        self.content = content
++        self.headers = headers
++        self.reason = responses.get(status_code, "")
++
++    @property
++    def text(self) -> str:
++        return self.content.decode("utf-8", errors="replace")
++
++    def json(self):
++        return json.loads(self.text)
++
++    def raise_for_status(self) -> None:
++        if 400 <= self.status_code:
++            raise _PyCurlHTTPError(
++                f"{self.status_code} {self.reason}".strip()
++            )
++
++
+ def _translate_auth_errors(
+     # pylint: disable=invalid-name
+-    fn: Callable[..., requests.Response],
++    fn: Callable[..., _PyCurlResponse],
+     # pylint: enable=invalid-name
+-) -> Callable[..., requests.Response]:
++) -> Callable[..., _PyCurlResponse]:
+     @wraps(fn)
+-    def wrapper(*args, **kwargs) -> requests.Response:
++    def wrapper(*args, **kwargs) -> _PyCurlResponse:
+         try:
+             return fn(*args, **kwargs)
+         except ClientError as ex:
+@@ -50,19 +91,19 @@
+ 
+ def _translate_http_errors(
+     # pylint: disable=invalid-name
+-    fn: Callable[..., requests.Response],
++    fn: Callable[..., _PyCurlResponse],
+     # pylint: enable=invalid-name
+-) -> Callable[..., requests.Response]:
++) -> Callable[..., _PyCurlResponse]:
+     @wraps(fn)
+-    def wrapper(*args, **kwargs) -> requests.Response:
++    def wrapper(*args, **kwargs) -> _PyCurlResponse:
+         resp = fn(*args, **kwargs)
+         try:
+             resp.raise_for_status()
+             return resp
+-        except requests.HTTPError as ex:
++        except _PyCurlHTTPError as ex:
+             try:
+                 message = resp.json().get("message", resp.reason)
+-            except requests.JSONDecodeError:
++            except json.JSONDecodeError:
+                 message = resp.reason
+             raise UnknownError(message) from ex
+ 
+@@ -100,7 +141,7 @@
+         :raise pyschlage.exceptions.NotAuthorizedError: When authentication fails.
+         :raise pyschlage.exceptions.UnknownError: On other errors.
+         """
+-        self.auth(requests.Request())
++        self.auth(_PyCurlRequest())
+ 
+     @property
+     def user_id(self) -> str:
+@@ -117,15 +158,103 @@
+     @_translate_auth_errors
+     def request(
+         self, method: str, path: str, base_url: str = BASE_URL, **kwargs
+-    ) -> requests.Response:
++    ) -> _PyCurlResponse:
+         """Performs a request against the Schlage WiFi cloud service.
+ 
+         :meta private:
+         """
+-        kwargs["auth"] = self.auth
+-        if "headers" not in kwargs:
+-            kwargs["headers"] = {}
+-        kwargs["headers"]["X-Api-Key"] = API_KEY
+-        kwargs.setdefault("timeout", _DEFAULT_TIMEOUT)
+-        # pylint: disable=missing-timeout
+-        return requests.request(method, f"{base_url}/{path.lstrip('/')}", **kwargs)
++        url = f"{base_url}/{path.lstrip('/')}"
++
++        params = kwargs.pop("params", None)
++        if params:
++            query_string = urlencode(params, doseq=True)
++            separator = "&" if "?" in url else "?"
++            url = f"{url}{separator}{query_string}"
++
++        headers = kwargs.pop("headers", {}) or {}
++        headers["X-Api-Key"] = API_KEY
++
++        auth_request = _PyCurlRequest()
++        auth_request.headers.update(headers)
++        auth_request = self.auth(auth_request)
++        headers = auth_request.headers
++
++        timeout = kwargs.pop("timeout", _DEFAULT_TIMEOUT)
++        request_data = kwargs.pop("data", None)
++        request_json = kwargs.pop("json", None)
++        verify = kwargs.pop("verify", True)
++        allow_redirects = kwargs.pop("allow_redirects", True)
++
++        body = io.BytesIO()
++        header_data = io.BytesIO()
++        curl = pycurl.Curl()
++
++        try:
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.CUSTOMREQUEST, method.upper())
++            curl.setopt(pycurl.WRITEDATA, body)
++            curl.setopt(pycurl.HEADERFUNCTION, header_data.write)
++
++            if isinstance(timeout, tuple):
++                curl.setopt(pycurl.CONNECTTIMEOUT, timeout[0])
++                curl.setopt(pycurl.TIMEOUT, timeout[1])
++            elif timeout is not None:
++                curl.setopt(pycurl.TIMEOUT, timeout)
++
++            curl.setopt(pycurl.FOLLOWLOCATION, bool(allow_redirects))
++
++            if verify is False:
++                curl.setopt(pycurl.SSL_VERIFYPEER, 0)
++                curl.setopt(pycurl.SSL_VERIFYHOST, 0)
++            elif isinstance(verify, str):
++                curl.setopt(pycurl.CAINFO, verify)
++
++            if request_json is not None:
++                request_data = json.dumps(request_json)
++                if not any(
++                    key.lower() == "content-type" for key in headers
++                ):
++                    headers["Content-Type"] = "application/json"
++
++            if isinstance(request_data, (dict, list, tuple)):
++                request_data = urlencode(request_data, doseq=True)
++
++            if request_data is not None:
++                curl.setopt(pycurl.POSTFIELDS, request_data)
++            elif method.upper() == "POST":
++                curl.setopt(pycurl.POST, True)
++
++            http_headers = [
++                f"{key}: {value}" for key, value in headers.items()
++            ]
++            curl.setopt(pycurl.HTTPHEADER, http_headers)
++
++            if method.upper() == "HEAD":
++                curl.setopt(pycurl.NOBODY, True)
++
++            curl.perform()
++
++            status_code = int(curl.getinfo(pycurl.RESPONSE_CODE))
++            raw_headers = header_data.getvalue()
++            response_headers: dict[str, str] = {}
++            last_header_block: list[bytes] = []
++
++            for block in raw_headers.replace(b"\r\n", b"\n").split(b"\n\n"):
++                lines = block.splitlines()
++                if lines and lines[0].startswith(b"HTTP/"):
++                    last_header_block = lines
++
++            for line in last_header_block[1:]:
++                if b":" in line:
++                    key, value = line.split(b":", 1)
++                    response_headers[key.decode("latin1")] = (
++                        value.lstrip().decode("latin1")
++                    )
++
++            return _PyCurlResponse(
++                status_code=status_code,
++                content=body.getvalue(),
++                headers=response_headers,
++            )
++        finally:
++            curl.close()

@@ -1,0 +1,313 @@
+--- a/git_pw/api.py
++++ b/git_pw/api.py
+@@ -11,29 +11,28 @@
+ import typing as ty
+ 
+ import click
+-import requests
++import httpx
+ 
+ import git_pw
+ from git_pw import config
+ 
+-CONF = config.CONF
+-LOG = logging.getLogger(__name__)
+-
++
++_HTTPX_CLIENT_ATTR = '_git_pw_httpx_client'
+ Filters = ty.List[ty.Tuple[str, str]]
+ 
+ 
+-class HTTPTokenAuth(requests.auth.AuthBase):
+-    """Attaches HTTP Token Authentication to the given Request object."""
++class HTTPTokenAuth(httpx.Auth):
++    """Attach HTTP token authentication to an HTTPX request."""
+ 
+     def __init__(self, token: str):
+         self.token = token
+ 
+-    def __call__(
++    def auth_flow(
+         self,
+-        r: requests.PreparedRequest,
+-    ) -> requests.PreparedRequest:
+-        r.headers['Authorization'] = self._token_auth_str(self.token)
+-        return r
++        request: httpx.Request,
++    ) -> ty.Generator[httpx.Request, httpx.Response, None]:
++        request.headers['Authorization'] = self._token_auth_str(self.token)
++        yield request
+ 
+     @staticmethod
+     def _token_auth_str(token: str) -> str:
+@@ -41,11 +40,15 @@
+         return 'Token {}'.format(token.strip())
+ 
+ 
+-def _get_auth(optional: bool = False) -> ty.Optional[requests.auth.AuthBase]:
++CONF = config.CONF
++LOG = logging.getLogger(__name__)
++
++
++def _get_auth(optional: bool = False) -> ty.Optional[httpx.Auth]:
+     if CONF.token:
+         return HTTPTokenAuth(CONF.token)
+     elif CONF.username and CONF.password:
+-        return requests.auth.HTTPBasicAuth(CONF.username, CONF.password)
++        return httpx.BasicAuth(CONF.username, CONF.password)
+     elif not optional:
+         LOG.error('Authentication information missing')
+         LOG.error(
+@@ -54,6 +57,40 @@
+         )
+         sys.exit(1)
+     return None
++
++
++def _close_response(rsp: ty.Optional[httpx.Response]) -> None:
++    """Close a response and its client, if it owns a streaming client."""
++    if rsp is None:
++        return
++
++    rsp.close()
++    client = getattr(rsp, _HTTPX_CLIENT_ATTR, None)
++    if client is not None:
++        client.close()
++
++
++def _streaming_get(
++    url: str,
++    params: ty.Optional[Filters],
++) -> httpx.Response:
++    """Make a streaming GET request while retaining its client."""
++    client = httpx.Client(
++        auth=_get_auth(optional=True),
++        headers=_get_headers(),
++        follow_redirects=True,
++    )
++    try:
++        request = client.build_request('GET', url, params=params)
++        rsp = client.send(request, stream=True)
++    except Exception:
++        client.close()
++        raise
++
++    # A streamed response needs its client to stay alive until it is consumed.
++    # Keep it with the response; ``download`` closes both when finished.
++    setattr(rsp, _HTTPX_CLIENT_ATTR, client)
++    return rsp
+ 
+ 
+ def _get_headers() -> ty.Dict[str, str]:
+@@ -107,23 +144,37 @@
+ 
+ def _handle_error(
+     operation: str,
+-    exc: requests.exceptions.RequestException,
++    exc: httpx.HTTPError,
+ ) -> None:
+-    if exc.response is not None and exc.response.content:
+-        # server errors should always be reported
+-        if exc.response.status_code in range(500, 512):  # 5xx Server Error
+-            LOG.error(
+-                'Server error. Please report this issue to '
+-                'https://github.com/getpatchwork/patchwork'
+-            )
+-            raise
+-
+-        # we make the assumption that all responses will be JSON encoded
+-        if exc.response.status_code == 404:
+-            LOG.error('Resource not found')
++    response = getattr(exc, 'response', None)
++    if response is not None:
++        # A streamed response has not necessarily been read yet. Read it so
++        # that the same response handling works for both streamed and normal
++        # HTTP requests.
++        try:
++            content = response.content
++        except httpx.ResponseNotRead:
++            response.read()
++            content = response.content
++
++        if content:
++            # server errors should always be reported
++            if response.status_code in range(500, 512):  # 5xx Server Error
++                LOG.error(
++                    'Server error. Please report this issue to '
++                    'https://github.com/getpatchwork/patchwork'
++                )
++                raise
++
++            # we make the assumption that all responses will be JSON encoded
++            if response.status_code == 404:
++                LOG.error('Resource not found')
++            else:
++                LOG.error(response.json())
+         else:
+-            LOG.error(exc.response.json())
+-    else:
++            response = None
++
++    if response is None:
+         LOG.error(
+             'Failed to %s resource. Is your configuration '
+             'correct?' % operation
+@@ -140,86 +191,106 @@
+     url: str,
+     params: ty.Optional[Filters] = None,
+     stream: bool = False,
+-) -> requests.Response:
++) -> httpx.Response:
+     """Make GET request and handle errors."""
+     LOG.debug('GET %s', url)
+ 
++    rsp = None
+     try:
+         # TODO(stephenfin): We only use a subset of the types possible for
+         # 'params' (namely a list of tuples) but it doesn't seem possible to
+         # indicate this
+-        rsp = requests.get(
+-            url,
+-            auth=_get_auth(optional=True),
+-            headers=_get_headers(),
+-            stream=stream,
+-            params=params,
+-        )  # type: ignore
++        if stream:
++            rsp = _streaming_get(url, params)
++        else:
++            rsp = httpx.get(
++                url,
++                auth=_get_auth(optional=True),
++                headers=_get_headers(),
++                follow_redirects=True,
++                params=params,
++            )
+         rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
+-        _handle_error('fetch', exc)
++    except httpx.HTTPError as exc:
++        try:
++            _handle_error('fetch', exc)
++        finally:
++            _close_response(rsp)
+ 
+     LOG.debug('Got response')
+ 
+-    return rsp
++    return ty.cast(httpx.Response, rsp)
+ 
+ 
+ def _post(
+     url: str,
+     data: ty.List[ty.Tuple[str, ty.Any]],
+-) -> requests.Response:
++) -> httpx.Response:
+     """Make POST request and handle errors."""
+     LOG.debug('POST %s, data=%r', url, data)
+ 
++    rsp = None
+     try:
+-        rsp = requests.post(
+-            url, auth=_get_auth(), headers=_get_headers(), data=data
++        rsp = httpx.post(
++            url,
++            auth=_get_auth(),
++            headers=_get_headers(),
++            follow_redirects=True,
++            data=dict(data),
+         )
+         rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++    except httpx.HTTPError as exc:
+         _handle_error('create', exc)
+ 
+     LOG.debug('Got response')
+ 
+-    return rsp
++    return ty.cast(httpx.Response, rsp)
+ 
+ 
+ def _patch(
+     url: str,
+     data: ty.List[ty.Tuple[str, ty.Any]],
+-) -> requests.Response:
++) -> httpx.Response:
+     """Make PATCH request and handle errors."""
+     LOG.debug('PATCH %s, data=%r', url, data)
+ 
++    rsp = None
+     try:
+-        rsp = requests.patch(
++        rsp = httpx.patch(
+             url,
+             auth=_get_auth(),
+             headers=_get_headers(),
+-            data=data,
++            follow_redirects=True,
++            data=dict(data),
+         )
+         rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++    except httpx.HTTPError as exc:
+         _handle_error('update', exc)
+ 
+     LOG.debug('Got response')
+ 
+-    return rsp
+-
+-
+-def _delete(url: str) -> requests.Response:
++    return ty.cast(httpx.Response, rsp)
++
++
++def _delete(url: str) -> httpx.Response:
+     """Make DELETE request and handle errors."""
+     LOG.debug('DELETE %s', url)
+ 
++    rsp = None
+     try:
+-        rsp = requests.delete(url, auth=_get_auth(), headers=_get_headers())
++        rsp = httpx.delete(
++            url,
++            auth=_get_auth(),
++            headers=_get_headers(),
++            follow_redirects=True,
++        )
+         rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++    except httpx.HTTPError as exc:
+         _handle_error('delete', exc)
+ 
+     LOG.debug('Got response')
+ 
+-    return rsp
++    return ty.cast(httpx.Response, rsp)
+ 
+ 
+ def version() -> ty.Tuple[int, int]:
+@@ -264,6 +335,7 @@
+         rsp.headers.get('content-disposition') or '',
+     )
+     if not header:
++        _close_response(rsp)
+         LOG.error('Filename was expected but was not provided in response')
+         sys.exit(1)
+ 
+@@ -284,11 +356,13 @@
+         output_file = open(output_path, 'wb')
+ 
+     try:
+-        # we use iter_content because patches can be binary
+-        for block in rsp.iter_content(1024):
++        # We use iter_bytes because patches can be binary.
++        for block in rsp.iter_bytes(1024):
+             output_file.write(block)
+     finally:
+-        output_file.close()
++        if output != '-':
++            output_file.close()
++        _close_response(rsp)
+ 
+     return output_path
+ 

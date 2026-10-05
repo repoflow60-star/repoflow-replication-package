@@ -1,0 +1,104 @@
+--- a/appstoreserverlibrary/_treq_client.py
++++ b/appstoreserverlibrary/_treq_client.py
+@@ -0,0 +1,101 @@
++# Copyright (c) 2023 Apple Inc. Licensed under MIT License.
++
++import json
++from dataclasses import dataclass
++from threading import Event, Lock, Thread
++from typing import Any, Dict, MutableMapping, Optional
++
++from twisted.internet import defer, reactor
++from twisted.internet.threads import blockingCallFromThread
++from twisted.python import threadable
++
++
++@dataclass
++class _TreqResponse:
++    status_code: int
++    headers: MutableMapping[str, str]
++    content: bytes
++
++    def json(self):
++        return json.loads(self.content.decode("utf-8"))
++
++
++_reactor_started = Event()
++_reactor_start_lock = Lock()
++_reactor_thread: Optional[Thread] = None
++
++
++def _coerce_header_value(value: Any) -> str:
++    if isinstance(value, bytes):
++        return value.decode("utf-8")
++    return str(value)
++
++
++def _normalize_headers(headers) -> Dict[str, str]:
++    normalized_headers: Dict[str, str] = {}
++    for name, values in headers.getAllRawHeaders():
++        if not values:
++            continue
++        normalized_headers[_coerce_header_value(name).lower()] = _coerce_header_value(values[0])
++    return normalized_headers
++
++
++def _run_reactor():
++    reactor.callWhenRunning(_reactor_started.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor_running():
++    global _reactor_thread
++    if reactor.running:
++        return
++
++    with _reactor_start_lock:
++        if reactor.running:
++            return
++        if _reactor_thread is None or not _reactor_thread.is_alive():
++            # Keep Twisted off the caller thread so the public sync API can still block.
++            _reactor_started.clear()
++            _reactor_thread = Thread(target=_run_reactor, name="app-store-server-library-treq-reactor", daemon=True)
++            _reactor_thread.start()
++
++    _reactor_started.wait()
++
++
++@defer.inlineCallbacks
++def _perform_request(treq_module, method: str, url: str, params, headers, json_body, data):
++    request_kwargs = {}
++    if params:
++        request_kwargs["params"] = params
++    if headers:
++        request_kwargs["headers"] = headers
++    if json_body is not None:
++        request_kwargs["json"] = json_body
++    if data is not None:
++        request_kwargs["data"] = data
++
++    response = yield treq_module.request(method, url, **request_kwargs)
++    content = yield treq_module.content(response)
++    defer.returnValue(
++        _TreqResponse(status_code=response.code, headers=_normalize_headers(response.headers), content=content)
++    )
++
++
++def _sync_treq_request(
++    method: str,
++    url: str,
++    params=None,
++    headers: Optional[Dict[str, str]] = None,
++    json_body=None,
++    data: Optional[bytes] = None,
++) -> _TreqResponse:
++    try:
++        import treq
++    except ModuleNotFoundError as exc:
++        raise ModuleNotFoundError("treq not found but attempting to make an HTTP request") from exc
++
++    if threadable.isInIOThread():
++        raise RuntimeError("Synchronous App Store Server requests cannot run on the Twisted reactor thread")
++
++    _ensure_reactor_running()
++    return blockingCallFromThread(reactor, _perform_request, treq, method, url, params, headers, json_body, data)

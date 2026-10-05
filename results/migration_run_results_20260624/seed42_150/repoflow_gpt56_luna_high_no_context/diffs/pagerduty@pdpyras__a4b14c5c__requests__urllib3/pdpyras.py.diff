@@ -1,0 +1,588 @@
+--- a/pdpyras.py
++++ b/pdpyras.py
+@@ -3,22 +3,30 @@
+ # See LICENSE for details.
+ 
+ # Standard libraries
++import json
+ import logging
+ import sys
+ import time
+ from copy import deepcopy
+-from datetime import datetime
++from datetime import datetime, timedelta
+ from random import random
++from types import SimpleNamespace
+ from typing import Iterator, Union
++from urllib.parse import urlencode
+ from warnings import warn
+ 
+ # Upstream components on which this client is based:
+-from requests import Response, Session
+-from requests import __version__ as REQUESTS_VERSION
++from urllib3 import PoolManager
++from urllib3 import __version__ as URLLIB3_VERSION
++from urllib3.response import HTTPResponse
++from urllib3.util import Timeout as URLTimeout
+ 
+ # HTTP client exceptions:
+ from urllib3.exceptions import HTTPError, PoolError
+-from requests.exceptions import RequestException
++
++# Keep the historical exception name while sourcing transport failures from
++# the migrated HTTP client.
++RequestException = HTTPError
+ 
+ __version__ = '5.4.0'
+ 
+@@ -579,7 +587,99 @@
+         # Plural if listing via GET to the index endpoint, or doing a multi-put:
+         return path_nodes[-1]
+ 
+-def unwrap(response: Response, wrapper) -> Union[dict, list]:
++class _ResponseAdapter:
++    """Expose the response attributes used by the public client API."""
++
++    def __init__(self, response, method, url, elapsed):
++        self.raw = response
++        self.status_code = getattr(response, 'status_code',
++            getattr(response, 'status', 0))
++        self.ok = getattr(response, 'ok', self.status_code < 400)
++        self.headers = getattr(response, 'headers', {})
++        request = getattr(response, 'request', None)
++        self.request = request or SimpleNamespace(method=method, url=url)
++        self.url = getattr(response, 'url', url)
++        self.elapsed = getattr(response, 'elapsed',
++            timedelta(seconds=elapsed))
++
++    @property
++    def text(self) -> str:
++        text = getattr(self.raw, 'text', None)
++        if text is not None:
++            return text
++        content = getattr(self.raw, 'data', b'')
++        if content is None:
++            return ''
++        if isinstance(content, bytes):
++            return content.decode('utf-8', errors='replace')
++        return str(content)
++
++    @property
++    def content(self):
++        content = getattr(self.raw, 'content', None)
++        if content is not None:
++            return content
++        data = getattr(self.raw, 'data', None)
++        if data is not None:
++            return data
++        return self.text.encode('utf-8')
++
++    def json(self):
++        json_method = getattr(self.raw, 'json', None)
++        if callable(json_method):
++            return json_method()
++        return json.loads(self.text)
++
++    def close(self):
++        close = getattr(self.raw, 'close', None)
++        if callable(close):
++            close()
++
++    def __getattr__(self, name):
++        return getattr(self.raw, name)
++
++
++def response_request_info(response):
++    """Return the method and URL associated with an HTTP response."""
++    request = getattr(response, 'request', None)
++    if request is not None:
++        return getattr(request, 'method', ''), getattr(request, 'url', '')
++    return (
++        getattr(response, '_pdpyras_request_method', ''),
++        getattr(response, '_pdpyras_request_url', ''),
++    )
++
++
++def response_status_code(response) -> int:
++    """Return the status code used by a response object."""
++    status_code = getattr(response, 'status_code', None)
++    if status_code is not None:
++        return status_code
++    return getattr(response, 'status', 0)
++
++
++def response_is_ok(response) -> bool:
++    """Return whether a response has a successful HTTP status."""
++    ok = getattr(response, 'ok', None)
++    if ok is not None:
++        return ok
++    return response_status_code(response) < 400
++
++
++def response_text(response) -> str:
++    """Return a response body as text."""
++    text = getattr(response, 'text', None)
++    if text is not None:
++        return text
++    content = getattr(response, 'data', b'')
++    if content is None:
++        return ''
++    if isinstance(content, bytes):
++        return content.decode('utf-8', errors='replace')
++    return str(content)
++
++
++def unwrap(response: HTTPResponse, wrapper) -> Union[dict, list]:
+     """
+     Unwraps a wrapped entity.
+ 
+@@ -591,7 +691,8 @@
+         the response, which is expected to be a dictionary (map).
+     """
+     body = try_decoding(response)
+-    endpoint = "%s %s"%(response.request.method.upper(), response.request.url)
++    method, url = response_request_info(response)
++    endpoint = "%s %s"%(method.upper(), url)
+     if wrapper is not None:
+         # There is a wrapped entity to unpack:
+         bod_type = type(body)
+@@ -624,7 +725,7 @@
+     Makes methods return the full response body object after decoding from JSON.
+ 
+     Intended for use on functions that take a URL positional argument followed
+-    by keyword arguments and return a `requests.Response`_ object.
++    by keyword arguments and return a urllib3 HTTPResponse object.
+     """
+     doc = method.__doc__
+     def call(self, url, **kw):
+@@ -680,7 +781,7 @@
+     the ``json`` keyword argument will be normalized to include the wrapper.
+ 
+     Methods using this decorator will raise a :class:`PDHTTPError` with its
+-    ``response`` property being being the `requests.Response`_ object in the
++    ``response`` property being being the urllib3 HTTPResponse object in the
+     case of any error (as of version 4.2 this is subclassed as
+     :class:`PDHTTPError`), so that the implementer can access it by catching the
+     exception, and thus design their own custom logic around different types of
+@@ -689,7 +790,7 @@
+     :param method: Method being decorated. Must take one positional argument
+         after ``self`` that is the URL/path to the resource, followed by keyword
+         any number of keyword arguments, and must return an object of class
+-        `requests.Response`_, and be named after the HTTP method but with "r"
++        urllib3 HTTPResponse, and be named after the HTTP method but with "r"
+         prepended.
+     :returns: A callable object; the reformed method
+     """
+@@ -731,7 +832,7 @@
+         details_msg = f" {details}"
+     warn(f"Keyword argument \"{deprecated_name}\" is deprecated.{details_msg}")
+ 
+-def http_error_message(r: Response, context=None) -> str:
++def http_error_message(r: HTTPResponse, context=None) -> str:
+     """
+     Formats a message describing a HTTP error.
+ 
+@@ -742,24 +843,26 @@
+     :returns:
+         The message to include in the HTTP error
+     """
+-    received_http_response = bool(r.status_code)
+-    endpoint = "%s %s"%(r.request.method.upper(), r.request.url)
++    status_code = response_status_code(r)
++    received_http_response = bool(status_code)
++    method, url = response_request_info(r)
++    endpoint = "%s %s"%(method.upper(), url)
+     context_msg = ""
+     if type(context) is str:
+         context_msg=f" in {context}"
+-    if received_http_response and not r.ok:
++    if received_http_response and not response_is_ok(r):
+         err_type = 'unknown'
+-        if r.status_code / 100 == 4:
++        if status_code / 100 == 4:
+             err_type = 'client'
+-        elif r.status_code / 100 == 5:
++        elif status_code / 100 == 5:
+             err_type = 'server'
+-        tr_bod = truncate_text(r.text)
++        tr_bod = truncate_text(response_text(r))
+         return f"{endpoint}: API responded with {err_type} error (status " \
+-            f"{r.status_code}){context_msg}: {tr_bod}"
++            f"{status_code}){context_msg}: {tr_bod}"
+     elif not received_http_response:
+         return f"{endpoint}: Network or other unknown error{context_msg}"
+     else:
+-        return f"{endpoint}: Success (status {r.status_code}) but an " \
++        return f"{endpoint}: Success (status {status_code}) but an " \
+             f"expectation still failed{context_msg}"
+ 
+ def last_4(secret: str) -> str:
+@@ -809,7 +912,7 @@
+     else:
+         return r_name.rstrip('s')
+ 
+-def successful_response(r: Response, context=None) -> Response:
++def successful_response(r: HTTPResponse, context=None) -> HTTPResponse:
+     """Validates the response as successful.
+ 
+     Returns the response if it was successful; otherwise, raises an exception.
+@@ -821,11 +924,12 @@
+     :returns:
+         The response object, if it was successful
+     """
+-    if r.ok and bool(r.status_code):
++    status_code = response_status_code(r)
++    if response_is_ok(r) and bool(status_code):
+         return r
+-    elif r.status_code / 100 == 5:
++    elif status_code / 100 == 5:
+         raise PDServerError(http_error_message(r, context=context), r)
+-    elif bool(r.status_code):
++    elif bool(status_code):
+         raise PDHTTPError(http_error_message(r, context=context), r)
+     else:
+         raise PDClientError(http_error_message(r, context=context))
+@@ -840,7 +944,7 @@
+     else:
+         return text
+ 
+-def try_decoding(r: Response) -> Union[dict, list, str]:
++def try_decoding(r: HTTPResponse) -> Union[dict, list, str]:
+     """
+     JSON-decode a response body
+ 
+@@ -851,10 +955,13 @@
+         The response object
+     """
+     try:
+-        return r.json()
++        json_method = getattr(r, 'json', None)
++        if callable(json_method):
++            return json_method()
++        return json.loads(response_text(r))
+     except ValueError as e:
+         raise PDServerError(
+-            "API responded with invalid JSON: " + truncate_text(r.text),
++            "API responded with invalid JSON: " + truncate_text(response_text(r)),
+             r,
+         )
+ 
+@@ -862,11 +969,11 @@
+ ### CLASSES ###
+ ###############
+ 
+-class PDSession(Session):
++class PDSession(PoolManager):
+     """
+     Base class for making HTTP requests to PagerDuty APIs
+ 
+-    This is an opinionated wrapper of `requests.Session`_, with a few additional
++    This is an opinionated wrapper of `urllib3.PoolManager`_, with a few additional
+     features:
+ 
+     - The client will reattempt the request with auto-increasing cooldown/retry
+@@ -911,7 +1018,7 @@
+     """
+ 
+     parent = None
+-    """The ``super`` object (`requests.Session`_)"""
++    """The ``super`` object providing the urllib3 connection pool."""
+ 
+     permitted_methods = ()
+     """
+@@ -937,7 +1044,7 @@
+       encountered first), and then return the final response.
+ 
+     The default behavior is to retry without limit on status 429, raise an
+-    exception on a 401, and return the `requests.Response`_ object in any other case
++    exception on a 401, and return the urllib3 HTTPResponse in any other case
+     (assuming a HTTP response was received from the server).
+     """
+ 
+@@ -959,7 +1066,7 @@
+ 
+     timeout = TIMEOUT
+     """
+-    This is the value sent to `Requests`_ as the ``timeout`` parameter that
++    This is the value sent to urllib3 as the ``timeout`` parameter that
+     determines the TCP read timeout.
+     """
+ 
+@@ -968,6 +1075,7 @@
+     def __init__(self, api_key: str, debug=False):
+         self.parent = super(PDSession, self)
+         self.parent.__init__()
++        self.headers = {}
+         self.api_key = api_key
+         self.log = logging.getLogger(__name__)
+         self.print_debug = debug
+@@ -1089,7 +1197,23 @@
+             delattr(self, '_debugHandler')
+         # else: no-op; only happens if debug is set to the same value twice
+ 
+-    def request(self, method, url, **kwargs) -> Response:
++    def get(self, url, **kwargs) -> HTTPResponse:
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, **kwargs) -> HTTPResponse:
++        return self.request('POST', url, **kwargs)
++
++    def put(self, url, **kwargs) -> HTTPResponse:
++        return self.request('PUT', url, **kwargs)
++
++    def delete(self, url, **kwargs) -> HTTPResponse:
++        return self.request('DELETE', url, **kwargs)
++
++    def close(self):
++        """Release pooled HTTP connections."""
++        self.clear()
++
++    def request(self, method, url, **kwargs) -> HTTPResponse:
+         """
+         Make a generic PagerDuty API request.
+ 
+@@ -1100,11 +1224,11 @@
+             The path/URL to request. If it does not start with the base URL, the
+             base URL will be prepended.
+         :param **kwargs:
+-            Custom keyword arguments to pass to ``requests.Session.request``.
++            Custom keyword arguments to pass to urllib3.
+         :type method: str
+         :type url: str
+         :returns:
+-            The `requests.Response`_ object corresponding to the HTTP response
++            The urllib3 HTTPResponse corresponding to the HTTP response
+         """
+         sleep_timer = self.sleep_timer
+         network_attempts = 0
+@@ -1122,18 +1246,58 @@
+         headers = kwargs.get('headers', {})
+         req_kw.update({
+             'headers': self.prepare_headers(method, user_headers=headers),
+-            'stream': False,
+             'timeout': self.timeout
+         })
+ 
+         # Special changes to user-supplied parameters, for convenience
+-        if 'params' in kwargs and kwargs['params']:
+-            req_kw['params'] = self.normalize_params(kwargs['params'])
++        params = req_kw.pop('params', None)
++        if params:
++            params = self.normalize_params(params)
++            full_url += ('&' if '?' in full_url else '?') + urlencode(
++                params, doseq=True
++            )
++
++        # Translate requests-style body arguments to urllib3's request API.
++        req_kw.pop('stream', None)
++        allow_redirects = req_kw.pop('allow_redirects', True)
++        data = req_kw.pop('data', None)
++        json_body = req_kw.pop('json', None)
++        if json_body is not None and data is None:
++            if not any(key.lower() == 'content-type'
++                    for key in req_kw['headers']):
++                req_kw['headers']['Content-Type'] = 'application/json'
++            req_kw['body'] = json.dumps(json_body)
++        elif data is not None:
++            if isinstance(data, (dict, list, tuple)):
++                if not any(key.lower() == 'content-type'
++                        for key in req_kw['headers']):
++                    req_kw['headers']['Content-Type'] = \
++                        'application/x-www-form-urlencoded'
++                req_kw['body'] = urlencode(data, doseq=True)
++            else:
++                req_kw['body'] = data
++
++        # urllib3 accepts a scalar timeout or a Timeout object, while the
++        # public API also permits the requests-style (connect, read) tuple.
++        if isinstance(req_kw['timeout'], tuple):
++            req_kw['timeout'] = URLTimeout(
++                connect=req_kw['timeout'][0], read=req_kw['timeout'][1]
++            )
++        req_kw.update({
++            'preload_content': True,
++            'redirect': allow_redirects,
++            'retries': False,
++        })
+ 
+         # Make the request (and repeat w/cooldown if the rate limit is reached):
+         while True:
+             try:
+-                response = self.parent.request(method, full_url, **req_kw)
++                request_started = time.monotonic()
++                raw_response = self.parent.request(method, full_url, **req_kw)
++                response = _ResponseAdapter(
++                    raw_response, method, full_url,
++                    time.monotonic() - request_started,
++                )
+                 self.postprocess(response)
+             except (HTTPError, PoolError, RequestException) as e:
+                 network_attempts += 1
+@@ -1149,9 +1313,9 @@
+                 time.sleep(sleep_timer)
+                 continue
+ 
+-            status = response.status_code
++            status = response_status_code(response)
+             retry_logic = self.retry.get(status, 0)
+-            if not response.ok and retry_logic != 0:
++            if not response_is_ok(response) and retry_logic != 0:
+                 # Take special action as defined by the retry logic
+                 if retry_logic != -1:
+                     # Retry a specific number of times (-1 implies infinite)
+@@ -1237,9 +1401,9 @@
+ 
+     @property
+     def user_agent(self) -> str:
+-        return 'pdpyras/%s python-requests/%s Python/%d.%d'%(
++        return 'pdpyras/%s python-urllib3/%s Python/%d.%d'%(
+             __version__,
+-            REQUESTS_VERSION,
++            URLLIB3_VERSION,
+             sys.version_info.major,
+             sys.version_info.minor
+         )
+@@ -1351,13 +1515,13 @@
+         if type(response_body) is not dict or 'dedup_key' not in response_body:
+             err_msg = 'Malformed response body from the events API; it is ' \
+                 'not a dict that has a key named "dedup_key" after ' \
+-                'decoding. Body = '+truncate_text(response.text)
++                'decoding. Body = '+truncate_text(response_text(response))
+             raise PDServerError(err_msg, response)
+         return response_body['dedup_key']
+ 
+-    def post(self, *args, **kw) -> Response:
+-        """
+-        Override of ``requests.Session.post``
++    def post(self, *args, **kw) -> HTTPResponse:
++        """
++        Override of the session's ``post`` method
+ 
+         Adds the ``routing_key`` parameter to the body before sending.
+         """
+@@ -1540,7 +1704,7 @@
+     PagerDuty REST API v2 session object class.
+ 
+     Implements the most generic and oft-implemented aspects of PagerDuty's REST
+-    API v2 as an opinionated wrapper of `requests.Session`_.
++    API v2 as an opinionated wrapper of `urllib3.PoolManager`_.
+ 
+     Inherits from :class:`PDSession`.
+ 
+@@ -1611,7 +1775,7 @@
+         """
+         if not hasattr(self, '_api_key_access') or self._api_key_access is None:
+             response = self.get('/users/me')
+-            if response.status_code == 400:
++            if response_status_code(response) == 400:
+                 message = try_decoding(response).get('error', '')
+                 if 'account-level access token' in message:
+                     self._api_key_access = 'account'
+@@ -1619,7 +1783,7 @@
+                     self._api_key_access = None
+                     self.log.error("Failed to obtain API key access level; "
+                         "the API did not respond as expected.")
+-                    self.log.debug("Body = %s", truncate_text(response.text))
++                    self.log.debug("Body = %s", truncate_text(response_text(response)))
+             else:
+                 self._api_key_access = 'user'
+         return self._api_key_access
+@@ -1995,24 +2159,28 @@
+         else:
+             return self.rpost(resource, json=values)
+ 
+-    def postprocess(self, response: Response, suffix=None):
++    def postprocess(self, response: HTTPResponse, suffix=None):
+         """
+         Records performance information / request metadata about the API call.
+ 
+         :param response:
+-            The `requests.Response`_ object returned by the request method
++            The urllib3 HTTPResponse returned by the request method
+         :param suffix:
+             Optional suffix to append to the key
+         :type method: str
+-        :type response: `requests.Response`_
++        :type response: urllib3 HTTPResponse
+         :type suffix: str or None
+         """
+-        method = response.request.method.upper()
+-        url = response.request.url
+-        status = response.status_code
++        method, url = response_request_info(response)
++        method = method.upper()
++        status = response_status_code(response)
+         request_date = response.headers.get('date', '(missing header)')
+         request_id = response.headers.get('x-request-id', '(missing header)')
+-        request_time = response.elapsed.total_seconds()
++        elapsed = getattr(response, 'elapsed', None)
++        if elapsed is not None:
++            request_time = elapsed.total_seconds()
++        else:
++            request_time = 0.0
+ 
+         try:
+             endpoint = "%s %s"%(method, canonical_path(self.url, url))
+@@ -2049,7 +2217,7 @@
+ 
+     @resource_url
+     @requires_success
+-    def rdelete(self, resource, **kw) -> Response:
++    def rdelete(self, resource, **kw) -> HTTPResponse:
+         """
+         Delete a resource.
+ 
+@@ -2058,7 +2226,7 @@
+             representing an API resource that contains an item with key ``self``
+             whose value is the URL of the resource.
+         :param **kw:
+-            Custom keyword arguments to pass to ``requests.Session.delete``
++            Custom keyword arguments to pass to the session's ``delete`` method
+         :type resource: str or dict
+         """
+         return self.delete(resource, **kw)
+@@ -2077,7 +2245,7 @@
+             representing an API resource that contains an item with key ``self``
+             whose value is the URL of the resource.
+         :param **kw:
+-            Custom keyword arguments to pass to ``requests.Session.get``
++            Custom keyword arguments to pass to the session's ``get`` method
+         :returns:
+             Dictionary representation of the requested object
+         :type resource: str or dict
+@@ -2095,7 +2263,7 @@
+             The path/URL to which to send the POST request, which should be an
+             index endpoint.
+         :param **kw:
+-            Custom keyword arguments to pass to ``requests.Session.post``
++            Custom keyword arguments to pass to the session's ``post`` method
+         :returns:
+             Dictionary representation of the created object
+         :type path: str
+@@ -2115,7 +2283,7 @@
+             representing an API resource that contains an item with key ``self``
+             whose value is the URL of the resource.
+         :param **kw:
+-            Custom keyword arguments to pass to ``requests.Session.put``
++            Custom keyword arguments to pass to the session's ``put`` method
+         :returns:
+             Dictionary representation of the updated object
+         """
+@@ -2186,7 +2354,7 @@
+ 
+     This class was created to make it easier to more cleanly handle errors by
+     way of a class that is guaranteed to have its ``response`` be a valid
+-    `requests.Response`_ object.
++    urllib3 HTTPResponse object.
+ 
+     Whereas, the more generic :class:`PDClientError` could also be used
+     to denote such things as non-transient network errors wherein no response
+@@ -2214,7 +2382,7 @@
+             print("HTTP error: "+str(e.response.status_code))
+     """
+ 
+-    def __init__(self, message, response: Response):
++    def __init__(self, message, response: HTTPResponse):
+         super(PDHTTPError, self).__init__(message, response=response)
+ 
+ class PDServerError(PDHTTPError):

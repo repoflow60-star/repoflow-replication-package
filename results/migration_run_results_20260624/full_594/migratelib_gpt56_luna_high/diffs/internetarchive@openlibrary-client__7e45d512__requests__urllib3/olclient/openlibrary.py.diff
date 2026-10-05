@@ -1,0 +1,139 @@
+--- a/olclient/openlibrary.py
++++ b/olclient/openlibrary.py
+@@ -8,19 +8,88 @@
+ import logging
+ import os
+ import re
++from http.cookies import SimpleCookie
+ from urllib.parse import urlencode
+ from urllib.request import pathname2url
+ 
+ import backoff
+-import requests
+-from requests import Response
++import urllib3
++from urllib3.response import HTTPResponse as Response
+ 
+ from olclient import common
+ from olclient.config import Config
+ from olclient.entity_helpers.work import get_work_helper_class
+ from olclient.utils import merge_unique_lists
+ 
++
+ logger = logging.getLogger('openlibrary')
++
++
++class _Urllib3Session:
++
++    def __init__(self):
++        self.http = urllib3.PoolManager(retries=False)
++        self.cookies = {}
++
++    def _request(self, method, url, data=None, headers=None, files=None):
++        headers = headers.copy() if headers else {}
++
++        if self.cookies and 'Cookie' not in headers:
++            headers['Cookie'] = '; '.join(
++                f'{key}={value}' for key, value in self.cookies.items()
++            )
++
++        if files is not None:
++            response = self.http.request(
++                method,
++                url,
++                fields=files,
++                headers=headers,
++            )
++        else:
++            if isinstance(data, dict):
++                data = urlencode(data).encode('utf-8')
++                headers.setdefault(
++                    'Content-Type',
++                    'application/x-www-form-urlencoded',
++                )
++            elif isinstance(data, str):
++                data = data.encode('utf-8')
++
++            response = self.http.request(
++                method,
++                url,
++                body=data,
++                headers=headers,
++            )
++
++        for cookie_header in response.headers.getlist('Set-Cookie'):
++            cookie = SimpleCookie()
++            cookie.load(cookie_header)
++            for key, morsel in cookie.items():
++                self.cookies[key] = morsel.value
++
++        return response
++
++    def get(self, url, headers=None):
++        return self._request('GET', url, headers=headers)
++
++    def post(self, url, data=None, headers=None, files=None):
++        return self._request(
++            'POST',
++            url,
++            data=data,
++            headers=headers,
++            files=files,
++        )
++
++    def put(self, url, data=None, headers=None):
++        return self._request(
++            'PUT',
++            url,
++            data=data,
++            headers=headers,
++        )
+ 
+ 
+ class OpenLibrary:
+@@ -51,9 +120,10 @@
+     VALID_IDS = ['isbn_10', 'isbn_13', 'lccn', 'ocaid']
+     BACKOFF_KWARGS = {
+         'wait_gen': backoff.expo,
+-        'exception': requests.exceptions.RequestException,
+-        'giveup': lambda e: hasattr(e.response, 'status_code')
+-        and 400 <= e.response.status_code < 500,
++        'exception': urllib3.exceptions.HTTPError,
++        'giveup': lambda e: hasattr(e, 'response')
++        and e.response is not None
++        and 400 <= e.response.status < 500,
+         'max_tries': 5,
+     }
+ 
+@@ -62,14 +132,14 @@
+     WORKS_PAGINATION_OFFSET = 0
+ 
+     def __init__(self, credentials=None, base_url='https://openlibrary.org'):
+-        self.session = requests.Session()
++        self.session = _Urllib3Session()
+         self.base_url = base_url
+         credentials = credentials or Config().get_config().get('s3', None)
+         if credentials:
+             self.login(credentials)
+ 
+     def login(self, credentials):
+-        """Login to Open Library with given credentials, ensures the requests
++        """Login to Open Library with given credentials, ensures the urllib3
+         session has valid cookies for future requests.
+         """
+ 
+@@ -147,7 +217,13 @@
+     def get_ol_response(self, path):
+         """Makes best effort to perform request w/ exponential backoff"""
+         response = self.session.get(self.base_url + path)
+-        response.raise_for_status()
++        if response.status >= 400:
++            error = urllib3.exceptions.HTTPError(
++                f"{response.status} Server Error: {response.reason} "
++                f"for url: {response.geturl()}"
++            )
++            error.response = response
++            raise error
+         return response
+ 
+     @property

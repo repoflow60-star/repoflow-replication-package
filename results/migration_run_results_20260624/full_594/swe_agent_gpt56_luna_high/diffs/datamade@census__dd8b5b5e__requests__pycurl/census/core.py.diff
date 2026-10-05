@@ -1,0 +1,154 @@
+--- a/census/core.py
++++ b/census/core.py
+@@ -1,15 +1,136 @@
++import json
+ import warnings
++from email.message import Message
+ from functools import wraps, lru_cache
+ from importlib.metadata import version
++from io import BytesIO
++from urllib.parse import urlencode, urlsplit, urlunsplit
++
++import pycurl
+ 
+ __version__ = version('census')
+ 
+ ALL = '*'
+ 
+ 
++class PyCurlResponse(object):
++    """Small response object exposing the API used by the Census clients.
++
++    PycURL is intentionally a low-level binding and returns response data via a
++    callback.  Keeping that detail here means the Census clients can continue
++    to work with a response-like object (and custom sessions).
++    """
++
++    def __init__(self, status_code, content, headers):
++        self.status_code = status_code
++        self.content = content
++        self.headers = headers
++
++    @property
++    def text(self):
++        content_type = self.headers.get('content-type', '')
++        message = Message()
++        message['content-type'] = content_type
++        encoding = message.get_param('charset')
++
++        if encoding:
++            try:
++                return self.content.decode(encoding)
++            except (LookupError, UnicodeDecodeError):
++                pass
++
++        # Census responses are normally UTF-8.  A few older endpoints have
++        # returned Windows-1252 bytes without declaring a charset, so retain a
++        # useful text value for those responses as well.
++        try:
++            return self.content.decode('utf-8')
++        except UnicodeDecodeError:
++            return self.content.decode('cp1252')
++
++    def json(self, **kwargs):
++        return json.loads(self.text, **kwargs)
++
++
++class PyCurlSession(object):
++    """A minimal session adapter backed by :mod:`pycurl`.
++
++    The public attributes and methods provide the small session interface used
++    by this package: ``headers``, ``get`` and ``close``.  This also keeps the
++    existing ``Census(..., session=...)``
++    extension point available for callers that provide their own adapter.
++    """
++
++    def __init__(self, *args, **kwargs):
++        self.headers = dict(kwargs.pop('headers', {}))
++        if args or kwargs:
++            raise TypeError('PyCurlSession accepts only an optional headers argument')
++
++    def get(self, url, params=None, **kwargs):
++        if params:
++            parts = urlsplit(url)
++            query = urlencode(params, doseq=True)
++            if parts.query:
++                query = '{}&{}'.format(parts.query, query)
++            url = urlunsplit((parts.scheme, parts.netloc, parts.path,
++                              query, parts.fragment))
++
++        body = BytesIO()
++        response_headers = {}
++
++        def capture_header(line):
++            # Header lines are bytes and include the terminating CRLF.
++            line = line.decode('iso-8859-1').strip()
++            if ':' in line:
++                name, value = line.split(':', 1)
++                response_headers[name.lower()] = value.strip()
++
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(curl.URL, url)
++            curl.setopt(curl.WRITEDATA, body)
++            curl.setopt(curl.HEADERFUNCTION, capture_header)
++            curl.setopt(curl.FOLLOWLOCATION, 1)
++            # Ask libcurl to negotiate and transparently decompress responses.
++            curl.setopt(curl.ACCEPT_ENCODING, '')
++
++            headers = kwargs.pop('headers', None)
++            request_headers = dict(self.headers)
++            if headers:
++                request_headers.update(headers)
++            if request_headers:
++                curl.setopt(curl.HTTPHEADER, [
++                    '{}: {}'.format(name, value)
++                    for name, value in request_headers.items()
++                ])
++
++            timeout = kwargs.pop('timeout', None)
++            if timeout is not None:
++                if isinstance(timeout, (tuple, list)):
++                    timeout = max(timeout)
++                curl.setopt(curl.TIMEOUT, timeout)
++            if kwargs:
++                raise TypeError('unsupported pycurl request options: {}'.format(
++                    ', '.join(sorted(kwargs))))
++
++            curl.perform()
++            status_code = curl.getinfo(curl.RESPONSE_CODE)
++        finally:
++            curl.close()
++
++        return PyCurlResponse(status_code, body.getvalue(), response_headers)
++
++    def close(self):
++        # Each request owns and closes its Curl handle.
++        return None
++
++
+ def new_session(*args, **kwargs):
+-    import requests
+-    return requests.session(*args, **kwargs)
++    return PyCurlSession(*args, **kwargs)
++
++
++# Backwards-compatible, concise name for callers that want to construct a
++# pycurl-backed session explicitly.
++Session = PyCurlSession
+ 
+ 
+ class APIKeyError(Exception):
+@@ -149,9 +270,9 @@
+     def get(self, fields, geo, year=None, **kwargs):
+         """
+         The API only accepts up to 50 fields on each query.
+-        Chunk requests, and use the unique GEO_ID to match up the chunks
+-        in case the responses are in different orders.
+-        GEO_ID is not reliably present in pre-2010 requests.
++        Chunk API calls, and use the unique GEO_ID to match up the chunks in
++        case the responses are in different orders.
++        GEO_ID is not reliably present in pre-2010 calls.
+         """
+         sort_by_geoid = len(fields) > 49 and (not year or year > 2009)
+         all_results = (self.query(forty_nine_fields, geo, year, sort_by_geoid=sort_by_geoid, **kwargs)

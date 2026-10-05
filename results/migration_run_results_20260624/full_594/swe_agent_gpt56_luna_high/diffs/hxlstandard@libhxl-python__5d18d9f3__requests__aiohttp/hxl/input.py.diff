@@ -1,0 +1,220 @@
+--- a/hxl/input.py
++++ b/hxl/input.py
+@@ -31,12 +31,121 @@
+ 
+ from hxl.util import logup
+ 
+-import abc, collections, csv, datetime, dateutil.parser, hashlib, \
++import abc, asyncio, aiohttp, collections, csv, datetime, dateutil.parser, hashlib, \
+     io, io_wrapper, json, jsonpath_ng.ext, logging, \
+-    os.path, re, requests, shutil, six, sys, \
++    os.path, re, shutil, six, sys, threading, \
+     tempfile, time, urllib.parse, xlrd3 as xlrd, zipfile
++from yarl import URL
+ 
+ logger = logging.getLogger(__name__)
++
++
++class _HTTPResponseError(aiohttp.ClientResponseError, IOError):
++    """HTTP error retaining the IOError behavior of the former client."""
++
++
++class _HTTPResponse:
++    """Small synchronous response adapter for the aiohttp client.
++
++    The rest of this module has a synchronous API, while aiohttp is
++    asynchronous.  Requests are fully read before this adapter is returned;
++    this is also what the existing implementation did for normal inputs.
++    """
++
++    def __init__(self, status_code, headers, content, method, url):
++        self.status_code = status_code
++        self.headers = headers
++        self.content = content
++        self.method = method
++        self.url = url
++        self.is_redirect = 300 <= status_code < 400 and 'Location' in headers
++
++    def json(self):
++        return json.loads(self.content.decode('utf-8'))
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            request_url = URL(self.url)
++            raise _HTTPResponseError(
++                request_info=aiohttp.RequestInfo(
++                    request_url, self.method, self.headers, real_url=request_url
++                ),
++                history=(),
++                status=self.status_code,
++                message='HTTP status {}'.format(self.status_code),
++                headers=self.headers,
++            )
++
++
++async def _aiohttp_request(method, url, *, headers=None, params=None, data=None,
++                           timeout=None, verify_ssl=True, allow_redirects=True):
++    """Make an aiohttp request and return a fully buffered response adapter."""
++    client_timeout = aiohttp.ClientTimeout(total=timeout)
++    ssl = None if verify_ssl else False
++    async with aiohttp.ClientSession(timeout=client_timeout) as session:
++        async with session.request(
++                method,
++                url,
++                headers=headers,
++                params=params,
++                data=data,
++                ssl=ssl,
++                allow_redirects=allow_redirects,
++        ) as response:
++            return _HTTPResponse(
++                response.status,
++                response.headers,
++                await response.read(),
++                method,
++                url,
++            )
++
++
++def _run_async(awaitable):
++    """Run an aiohttp coroutine from the library's synchronous API.
++
++    ``asyncio.run`` is sufficient for normal callers.  If a caller already
++    owns the current thread's event loop (for example, a notebook), execute
++    the request on a short-lived worker thread instead of failing with
++    ``RuntimeError: asyncio.run() cannot be called from a running event loop``.
++    """
++    try:
++        asyncio.get_running_loop()
++    except RuntimeError:
++        return asyncio.run(awaitable)
++
++    result = []
++    error = []
++
++    def run():
++        try:
++            result.append(asyncio.run(awaitable))
++        except BaseException as exc:
++            error.append(exc)
++
++    thread = threading.Thread(target=run)
++    thread.start()
++    thread.join()
++    if error:
++        raise error[0]
++    return result[0]
++
++
++def _http_request(method, url, **kwargs):
++    """Synchronous bridge used by the legacy public API and CLI."""
++    return _run_async(_aiohttp_request(method, url, **kwargs))
++
++
++def _http_get(url, **kwargs):
++    return _http_request('GET', url, **kwargs)
++
++
++def _http_post(url, **kwargs):
++    return _http_request('POST', url, **kwargs)
++
++
++def _http_head(url, **kwargs):
++    return _http_request('HEAD', url, **kwargs)
+ 
+ __all__ = (
+     "data",
+@@ -621,11 +730,10 @@
+         try:
+             url = munge_url(url_or_filename, input_options)
+             logup("Trying to open remote resource", {"url": url_or_filename})
+-            response = requests.get(
++            response = _http_get(
+                 url,
+-                stream=True,
+-                verify=input_options.verify_ssl,
+                 timeout=input_options.timeout,
++                verify_ssl=input_options.verify_ssl,
+                 headers=input_options.http_headers
+             )
+             logup("Response status", {"url": url_or_filename, "status": response.status_code})
+@@ -1657,7 +1765,7 @@
+     result = re.match(GOOGLE_DRIVE_URL, url)
+     if result:
+         logup("HEAD request for Google Drive URL", {"url": url})
+-        response = requests.head(url)
++        response = _http_head(url, allow_redirects=False)
+         if response.is_redirect:
+             new_url = response.headers['Location']
+             logup("Google Drive redirect", {"url": url, "redirect": new_url})
+@@ -1752,7 +1860,11 @@
+         # CKAN resource URL
+         ckan_api_query = '{}/api/3/action/resource_show?id={}'.format(site_url, resource_id)
+         logup("Trying CKAN API call", {"url": ckan_api_query})
+-        ckan_api_result = requests.get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
++        ckan_api_result = _http_get(
++            ckan_api_query,
++            verify_ssl=input_options.verify_ssl,
++            headers=input_options.http_headers,
++        ).json()
+         if ckan_api_result['success']:
+             url = ckan_api_result['result']['url']
+             logup("Found candidate URL for CKAN dataset", {"url": url})
+@@ -1775,7 +1887,11 @@
+     else:
+         # CKAN dataset (package) URL
+         ckan_api_query = '{}/api/3/action/package_show?id={}'.format(site_url, dataset_id)
+-        ckan_api_result = requests.get(ckan_api_query, verify=input_options.verify_ssl, headers=input_options.http_headers).json()
++        ckan_api_result = _http_get(
++            ckan_api_query,
++            verify_ssl=input_options.verify_ssl,
++            headers=input_options.http_headers,
++        ).json()
+         if ckan_api_result['success']:
+             for resource in ckan_api_result['result']['resources']:
+                 url = resource['url']
+@@ -1825,11 +1941,11 @@
+         "q": "source:{}".format(asset_id)
+     }
+     logup("Trying Kobo dataset", {"url": asset_id})
+-    response = requests.get(
++    response = _http_get(
+         "https://kobo.humanitarianresponse.info/exports/",
+-        verify=input_options.verify_ssl,
++        verify_ssl=input_options.verify_ssl,
+         headers=input_options.http_headers,
+-        params=params
++        params=params,
+     )
+     logup("Result for Kobo dataset", {"asset_id": asset_id, "status": response.status_code})
+     # check for errors
+@@ -1861,11 +1977,11 @@
+         "hierarchy_in_labels": False,
+         "group_sep": ",",
+     }
+-    response = requests.post(
++    response = _http_post(
+         "https://kobo.humanitarianresponse.info/exports/",
+-        verify=input_options.verify_ssl,
+-        headers=http_headers,
+-        data=params
++        verify_ssl=input_options.verify_ssl,
++        headers=input_options.http_headers,
++        data=params,
+     )
+     logup("Generated Kobo export", {"asset_id": asset_id, "status": response.status_code})
+     # check for errors
+@@ -1881,10 +1997,10 @@
+     fail_counter = 0
+     while True:
+         logup("Getting info for Kobo export", {"url": info_url})
+-        response = requests.get(
++        response = _http_get(
+             info_url,
+-            verify=input_options.verify_ssl,
+-            headers=http_headers
++            verify_ssl=input_options.verify_ssl,
++            headers=input_options.http_headers,
+         )
+         logup("Response for Kobo info", {"url": info_url, "status": response.status_code})
+ 

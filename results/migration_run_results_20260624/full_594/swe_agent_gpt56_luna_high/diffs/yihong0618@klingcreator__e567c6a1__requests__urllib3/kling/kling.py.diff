@@ -1,0 +1,150 @@
+--- a/kling/kling.py
++++ b/kling/kling.py
+@@ -1,16 +1,103 @@
+ import argparse
++import contextlib
++import json as json_module
+ import os
++import threading
+ import time
+-import contextlib
+-from typing import Optional
+ from enum import Enum
+ from http.cookies import SimpleCookie
+-
++from typing import Any, Optional
++from urllib.parse import urlencode, urlsplit, urlunsplit
++
++import urllib3
+ from fake_useragent import UserAgent
+-import requests
+-from requests.utils import cookiejar_from_dict
+ from rich import print
+-import threading
++
++
++class _CookieJar(dict):
++    """Small mapping used to retain the cookie values for urllib3 requests."""
++
++
++class _Response:
++    """Requests-like response attributes used by the generator code."""
++
++    def __init__(self, response: urllib3.BaseHTTPResponse) -> None:
++        self._response = response
++        self.status_code = response.status
++        self.content = response.data
++
++    @property
++    def ok(self) -> bool:
++        return self.status_code < 400
++
++    @property
++    def text(self) -> str:
++        return self.content.decode("utf-8", errors="replace")
++
++    def json(self) -> Any:
++        return json_module.loads(self.content.decode("utf-8"))
++
++    def __str__(self) -> str:
++        return f"<Response [{self.status_code}]>"
++
++
++class _Session:
++    """A small session facade backed by urllib3's connection pool."""
++
++    def __init__(self) -> None:
++        self._pool = urllib3.PoolManager()
++        self.headers: dict[str, str] = {}
++        self.cookies: Optional[_CookieJar] = None
++
++    def _url_with_params(self, url: str, params: Optional[dict]) -> str:
++        if not params:
++            return url
++        parts = urlsplit(url)
++        query = urlencode(params, doseq=True)
++        combined_query = f"{parts.query}&{query}" if parts.query else query
++        return urlunsplit(
++            (parts.scheme, parts.netloc, parts.path, combined_query, parts.fragment)
++        )
++
++    def request(
++        self,
++        method: str,
++        url: str,
++        *,
++        params: Optional[dict] = None,
++        data: Any = None,
++        json: Any = None,
++        headers: Optional[dict[str, str]] = None,
++    ) -> _Response:
++        request_headers = dict(self.headers)
++        if headers:
++            request_headers.update(headers)
++        has_cookie_header = any(
++            key.lower() == "cookie" for key in request_headers
++        )
++        if self.cookies and not has_cookie_header:
++            request_headers["Cookie"] = "; ".join(
++                f"{key}={value}" for key, value in self.cookies.items()
++            )
++
++        body = data
++        if json is not None:
++            body = json_module.dumps(json).encode("utf-8")
++            request_headers.setdefault("Content-Type", "application/json")
++
++        response = self._pool.request(
++            method,
++            self._url_with_params(url, params),
++            body=body,
++            headers=request_headers,
++        )
++        return _Response(response)
++
++    def get(self, url: str, **kwargs: Any) -> _Response:
++        return self.request("GET", url, **kwargs)
++
++    def post(self, url: str, **kwargs: Any) -> _Response:
++        return self.request("POST", url, **kwargs)
+ 
+ browser_version = "edge101"
+ ua = UserAgent(browsers=["edge"])
+@@ -18,7 +105,7 @@
+ base_url_not_cn = "https://klingai.com/"
+ 
+ 
+-def call_for_daily_check(session: requests.Session, is_cn: bool) -> bool:
++def call_for_daily_check(session: _Session, is_cn: bool) -> bool:
+     if is_cn:
+         r = session.get(f"{base_url}api/pay/reward?activity=login_bonus_daily")
+     else:
+@@ -40,7 +127,7 @@
+ 
+ class BaseGen:
+     def __init__(self, cookie: str) -> None:
+-        self.session: requests.Session = requests.Session()
++        self.session: _Session = _Session()
+         self.cookie = cookie
+         self.session.cookies, is_cn = self.parse_cookie_string(self.cookie)
+         self.session.headers["user-agent"] = ua.random
+@@ -71,17 +158,13 @@
+     def parse_cookie_string(cookie_string):
+         cookie = SimpleCookie()
+         cookie.load(cookie_string)
+-        cookies_dict = {}
+-        cookiejar = None
++        cookies_dict = _CookieJar()
+         is_cn = False
+         for key, morsel in cookie.items():
+             if key.startswith("kuaishou"):
+                 is_cn = True
+             cookies_dict[key] = morsel.value
+-            cookiejar = cookiejar_from_dict(
+-                cookies_dict, cookiejar=None, overwrite=True
+-            )
+-        return cookiejar, is_cn
++        return (cookies_dict or None), is_cn
+ 
+     def get_account_point(self) -> float:
+         bonus_req = self.session.get(self.daily_url)

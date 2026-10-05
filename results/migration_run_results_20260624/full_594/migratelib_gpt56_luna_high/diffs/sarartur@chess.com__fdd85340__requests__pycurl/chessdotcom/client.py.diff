@@ -1,0 +1,126 @@
+--- a/chessdotcom/client.py
++++ b/chessdotcom/client.py
+@@ -3,8 +3,10 @@
+ import time
+ import warnings
+ from functools import wraps
+-
+-import requests
++from io import BytesIO
++from urllib.parse import urlencode, urlparse
++
++import pycurl
+ from aiohttp import ClientSession
+ 
+ from .errors import ChessDotComClientError
+@@ -102,18 +104,103 @@
+         return options
+ 
+     def _do_sync_get_request(self, resource):
+-        r = requests.get(
+-            url=resource.url, **self._build_request_options(resource), timeout=30
++        options = self._build_request_options(resource)
++        url = resource.url
++
++        params = options.get("params")
++        if params:
++            if isinstance(params, str):
++                query_string = params
++            else:
++                query_string = urlencode(params, doseq=True)
++
++            url += ("&" if "?" in url else "?") + query_string
++
++        response_buffer = BytesIO()
++        response_headers_buffer = BytesIO()
++        curl = pycurl.Curl()
++
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.WRITEDATA, response_buffer)
++        curl.setopt(pycurl.HEADERFUNCTION, response_headers_buffer.write)
++        curl.setopt(pycurl.TIMEOUT, 30)
++        curl.setopt(
++            pycurl.FOLLOWLOCATION,
++            1 if options.get("allow_redirects", True) else 0,
+         )
++
++        headers = options["headers"]
++        if headers:
++            curl.setopt(
++                pycurl.HTTPHEADER,
++                ["{}: {}".format(header, value) for header, value in headers.items()],
++            )
++
++        verify = options.get("verify", True)
++        if isinstance(verify, str):
++            curl.setopt(pycurl.CAINFO, verify)
++            verify = True
++
++        curl.setopt(pycurl.SSL_VERIFYPEER, 1 if verify else 0)
++        curl.setopt(pycurl.SSL_VERIFYHOST, 2 if verify else 0)
++
++        proxies = options.get("proxies")
++        if isinstance(proxies, dict):
++            proxies = proxies.get(urlparse(url).scheme) or proxies.get("all")
++        if proxies:
++            curl.setopt(pycurl.PROXY, proxies)
++
++        auth = options.get("auth")
++        if isinstance(auth, (tuple, list)) and len(auth) == 2:
++            curl.setopt(pycurl.USERPWD, "{}:{}".format(auth[0], auth[1]))
++
++        cookies = options.get("cookies")
++        if isinstance(cookies, dict):
++            cookies = "; ".join(
++                "{}={}".format(name, value) for name, value in cookies.items()
++            )
++        if cookies:
++            curl.setopt(pycurl.COOKIE, cookies)
++
++        cert = options.get("cert")
++        if isinstance(cert, (tuple, list)):
++            if cert:
++                curl.setopt(pycurl.SSLCERT, cert[0])
++            if len(cert) > 1:
++                curl.setopt(pycurl.SSLKEY, cert[1])
++        elif cert:
++            curl.setopt(pycurl.SSLCERT, cert)
++
++        try:
++            curl.perform()
++            status_code = curl.getinfo(pycurl.HTTP_CODE)
++            response_text = response_buffer.getvalue().decode(
++                "utf-8", errors="replace"
++            )
++        finally:
++            curl.close()
++
++        response_headers = {}
++        for line in response_headers_buffer.getvalue().decode(
++            "iso-8859-1"
++        ).splitlines():
++            if line.startswith("HTTP/"):
++                response_headers = {}
++            elif ":" in line:
++                header, value = line.split(":", 1)
++                response_headers[header.strip()] = value.strip()
++
+         resource.times_requested += 1
+ 
+-        if r.status_code != 200:
+-            if self.rate_limit_handler.should_try_again(r.status_code, resource):
++        if status_code != 200:
++            if self.rate_limit_handler.should_try_again(status_code, resource):
+                 return self._do_sync_get_request(resource)
+             raise ChessDotComClientError(
+-                status_code=r.status_code, response_text=r.text, headers=r.headers
+-            )
+-        return resource.response_builder.build(r.text)
++                status_code=status_code,
++                response_text=response_text,
++                headers=response_headers,
++            )
++        return resource.response_builder.build(response_text)
+ 
+     async def _do_async_get_request(self, resource):
+         async with ClientSession(loop=self.loop_callback()) as session:

@@ -1,0 +1,145 @@
+--- a/segment/analytics/request.py
++++ b/segment/analytics/request.py
+@@ -1,16 +1,110 @@
++import asyncio
+ from datetime import date, datetime
++from gzip import GzipFile
+ from io import BytesIO
+-from gzip import GzipFile
++import json
+ import logging
+-import json
++from threading import Thread
++from urllib.parse import urlparse
++
++import aiohttp
+ from dateutil.tz import tzutc
+-from requests.auth import HTTPBasicAuth
+-from requests import sessions
+ 
++from segment.analytics.utils import remove_trailing_slash
+ from segment.analytics.version import VERSION
+-from segment.analytics.utils import remove_trailing_slash
+ 
+-_session = sessions.Session()
++
++class _Response:
++    """Small synchronous response wrapper for aiohttp responses.
++
++    The public client is synchronous, while aiohttp exposes responses through
++    an async context manager.  The response must therefore be copied before
++    the ``ClientSession`` is closed.
++    """
++
++    def __init__(self, status, headers, reason, body):
++        self.status_code = status
++        self.headers = headers
++        self.reason = reason
++        self.content = body
++
++    @property
++    def text(self):
++        return self.content.decode("utf-8", errors="replace")
++
++    def json(self):
++        return json.loads(self.text)
++
++
++def _proxy_url(proxies, url):
++    """Return the aiohttp proxy URL for a mapping or string proxy setting."""
++    if not proxies:
++        return None
++    if isinstance(proxies, dict):
++        scheme = urlparse(url).scheme
++        proxy = proxies.get(scheme) or proxies.get("all")
++    else:
++        proxy = proxies
++    if proxy and "://" not in proxy:
++        proxy = "http://" + proxy
++    return proxy
++
++
++async def _async_http_post(url, data, headers, timeout, proxies=None):
++    timeout_config = aiohttp.ClientTimeout(total=timeout)
++    request_args = {
++        "data": data,
++        "headers": headers,
++        "timeout": timeout_config,
++    }
++    proxy = _proxy_url(proxies, url)
++    if proxy:
++        request_args["proxy"] = proxy
++
++    async with aiohttp.ClientSession() as session:
++        async with session.post(url, **request_args) as response:
++            body = await response.read()
++            return _Response(
++                response.status,
++                response.headers,
++                response.reason,
++                body,
++            )
++
++
++def _run(coro):
++    """Run an aiohttp coroutine from the client's synchronous API.
++
++    ``asyncio.run`` is sufficient for normal calls.  If a caller invokes the
++    synchronous client from inside an already-running event loop, run the
++    request in a short-lived helper thread instead of raising the nested-loop
++    ``RuntimeError``.
++    """
++    try:
++        asyncio.get_running_loop()
++    except RuntimeError:
++        return asyncio.run(coro)
++
++    result = []
++    error = []
++
++    def run_in_thread():
++        try:
++            result.append(asyncio.run(coro))
++        except BaseException as exc:  # propagate the original exception
++            error.append(exc)
++
++    thread = Thread(target=run_in_thread)
++    thread.start()
++    thread.join()
++    if error:
++        raise error[0]
++    return result[0]
++
++
++def http_post(url, data, headers=None, timeout=15, proxies=None):
++    """Make a synchronous HTTP POST using aiohttp."""
++    return _run(_async_http_post(url, data, headers or {}, timeout, proxies))
+ 
+ 
+ def post(write_key, host=None, gzip=False, timeout=15, proxies=None, oauth_manager=None, **kwargs):
+@@ -42,21 +136,13 @@
+             gz.write(data.encode('utf-8'))
+         data = buf.getvalue()
+ 
+-    kwargs = {
+-        "data": data,
+-        "headers": headers,
+-        "timeout": 15,
+-    }
+-
+-    if proxies:
+-        kwargs['proxies'] = proxies
+-    res = None
+     try:
+-        res = _session.post(url, data=data, headers=headers, timeout=timeout)
++        res = http_post(url, data=data, headers=headers, timeout=timeout,
++                        proxies=proxies)
+     except Exception as e:
+         log.error(e)
+-        raise e
+-        
++        raise
++
+     if res.status_code == 200:
+         log.debug('data uploaded successfully')
+         return res

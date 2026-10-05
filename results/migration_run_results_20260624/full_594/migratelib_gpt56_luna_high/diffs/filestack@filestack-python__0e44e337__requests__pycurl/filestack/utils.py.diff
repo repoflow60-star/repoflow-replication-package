@@ -1,0 +1,242 @@
+--- a/filestack/utils.py
++++ b/filestack/utils.py
+@@ -1,27 +1,50 @@
+ import time
+ import string
+ import random
++import io
++import json
+ from functools import partial
+-import requests as original_requests
+-from requests.exceptions import HTTPError
++from urllib.parse import urlencode
++import pycurl
+ 
+ from filestack import config
+ from filestack.exceptions import FilestackHTTPError
+ 
+ 
+ def unique_id(length=10):
+-    return ''.join(random.choice(string.ascii_letters + string.digits) for i in range(length))
++    return ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(length))
++
++
++class _PycurlHTTPError(Exception):
++    pass
++
++
++class _PycurlResponse:
++    def __init__(self, status_code, content, headers, url):
++        self.status_code = status_code
++        self.content = content
++        self.text = content.decode('utf-8', errors='replace')
++        self.headers = headers
++        self.url = url
++        self.ok = status_code < 400
++
++    def json(self):
++        return json.loads(self.text)
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise _PycurlHTTPError(self.text)
+ 
+ 
+ class RequestsWrapper:
+     """
+-    This class wraps selected methods from requests package and adds
++    This class wraps selected methods from pycurl package and adds
+     default headers if no headers were specified.
+     """
+     def __getattr__(self, name):
+         if name in ('get', 'post', 'put', 'delete'):
+             return partial(self.handle_request, name)
+-        return original_requests.__getattribute__(name)
++        return pycurl.__getattribute__(name)
+ 
+     def handle_request(self, name, *args, **kwargs):
+         if 'headers' not in kwargs:
+@@ -29,12 +52,180 @@
+             kwargs['headers']['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
+             kwargs['headers']['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
+ 
+-        requests_method = getattr(original_requests, name)
+-        response = requests_method(*args, **kwargs)
++        if len(args) == 0:
++            url = kwargs.pop('url')
++        else:
++            url = args[0]
++
++        if len(args) > 1:
++            if name == 'get':
++                kwargs.setdefault('params', args[1])
++            else:
++                kwargs.setdefault('data', args[1])
++
++        params = kwargs.pop('params', None)
++        if params:
++            if isinstance(params, (dict, list, tuple)):
++                params = urlencode(params, doseq=True)
++
++            if '?' in url:
++                url = '{}&{}'.format(url, params)
++            else:
++                url = '{}?{}'.format(url, params)
++
++        headers = kwargs.pop('headers')
++        http_headers = []
++
++        if headers:
++            if hasattr(headers, 'items'):
++                for key, value in headers.items():
++                    http_headers.append('{}: {}'.format(key, value))
++            else:
++                http_headers = [str(header) for header in headers]
++
++        data = kwargs.pop('data', None)
++        json_data = kwargs.pop('json', None)
++        files = kwargs.pop('files', None)
++
++        if json_data is not None and data is None and files is None:
++            data = json.dumps(json_data)
++
++            if not any(header.lower().startswith('content-type:') for header in http_headers):
++                http_headers.append('Content-Type: application/json')
++
++        if isinstance(data, dict) and files is None:
++            data = urlencode(data, doseq=True)
++
++        curl = pycurl.Curl()
++        body_buffer = io.BytesIO()
++        header_buffer = io.BytesIO()
++
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.WRITEFUNCTION, body_buffer.write)
++        curl.setopt(pycurl.HEADERFUNCTION, header_buffer.write)
++        curl.setopt(pycurl.ENCODING, '')
++        curl.setopt(pycurl.FOLLOWLOCATION, 1 if kwargs.pop('allow_redirects', True) else 0)
++
++        if http_headers:
++            curl.setopt(pycurl.HTTPHEADER, http_headers)
++
++        timeout = kwargs.pop('timeout', None)
++        if timeout is not None:
++            if isinstance(timeout, tuple):
++                if timeout[0] is not None:
++                    curl.setopt(pycurl.CONNECTTIMEOUT, timeout[0])
++                if timeout[1] is not None:
++                    curl.setopt(pycurl.TIMEOUT, timeout[1])
++            else:
++                curl.setopt(pycurl.TIMEOUT, timeout)
++
++        verify = kwargs.pop('verify', True)
++        curl.setopt(pycurl.SSL_VERIFYPEER, 1 if verify else 0)
++        curl.setopt(pycurl.SSL_VERIFYHOST, 2 if verify else 0)
++
++        if isinstance(verify, str):
++            curl.setopt(pycurl.CAINFO, verify)
++
++        auth = kwargs.pop('auth', None)
++        if auth is not None:
++            curl.setopt(pycurl.USERPWD, '{}:{}'.format(auth[0], auth[1]))
++
++        proxies = kwargs.pop('proxies', None)
++        if proxies:
++            proxy_type = 'https' if url.startswith('https') else 'http'
++            proxy = proxies.get(proxy_type, proxies.get('all'))
++            if proxy:
++                curl.setopt(pycurl.PROXY, proxy)
++
++        cookies = kwargs.pop('cookies', None)
++        if cookies:
++            if hasattr(cookies, 'items'):
++                cookies = '; '.join('{}={}'.format(key, value) for key, value in cookies.items())
++            curl.setopt(pycurl.COOKIE, cookies)
++
++        cert = kwargs.pop('cert', None)
++        if cert is not None:
++            if isinstance(cert, tuple):
++                curl.setopt(pycurl.SSLCERT, cert[0])
++                curl.setopt(pycurl.SSLKEY, cert[1])
++            else:
++                curl.setopt(pycurl.SSLCERT, cert)
++
++        mime = None
++
++        if files is not None:
++            mime = curl.mime()
++
++            if isinstance(data, dict):
++                for key, value in data.items():
++                    part = mime.addpart()
++                    part.set_name(str(key))
++                    part.set_data(str(value))
++
++            for key, value in files.items():
++                filename = None
++                content_type = None
++                file_data = value
++
++                if isinstance(value, tuple):
++                    filename = value[0]
++                    file_data = value[1]
++
++                    if len(value) > 2:
++                        content_type = value[2]
++
++                part = mime.addpart()
++                part.set_name(str(key))
++
++                if hasattr(file_data, 'read'):
++                    part.set_data(file_data.read())
++                else:
++                    part.set_filedata(file_data)
++
++                if filename is not None:
++                    part.set_filename(filename)
++
++                if content_type is not None:
++                    part.set_type(content_type)
++
++        if name == 'get':
++            curl.setopt(pycurl.HTTPGET, 1)
++        elif name == 'post':
++            curl.setopt(pycurl.POST, 1)
++        else:
++            curl.setopt(pycurl.CUSTOMREQUEST, name.upper())
++
++        if mime is not None:
++            curl.setopt(pycurl.MIMEPOST, mime)
++        elif data is not None and name != 'get':
++            curl.setopt(pycurl.POSTFIELDS, data)
++
++        curl.perform()
++
++        status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        effective_url = curl.getinfo(pycurl.EFFECTIVE_URL)
++        content = body_buffer.getvalue()
++
++        response_headers = {}
++        header_text = header_buffer.getvalue().decode('iso-8859-1', errors='replace')
++
++        for header in header_text.splitlines():
++            if ':' in header:
++                key, value = header.split(':', 1)
++                response_headers[key.strip()] = value.strip()
++
++        curl.close()
++
++        response = _PycurlResponse(
++            status_code,
++            content,
++            response_headers,
++            effective_url
++        )
+ 
+         try:
+             response.raise_for_status()
+-        except HTTPError as e:
++        except _PycurlHTTPError as e:
+             raise FilestackHTTPError(response.text) from e
+ 
+         return response

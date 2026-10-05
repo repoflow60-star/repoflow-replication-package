@@ -1,0 +1,224 @@
+--- a/github_nonpublic_api/api.py
++++ b/github_nonpublic_api/api.py
+@@ -18,14 +18,114 @@
+ import functools
+ from enum import Enum
+ import re
++from http.cookiejar import CookieJar
+ from urllib.parse import urljoin
++from urllib.request import Request
+ 
+ import html5lib
+ import pyotp
+-import requests
++import urllib3
+ from absl import logging
+ from configobj import ConfigObj
+ from typing import Optional
++
++
++class _Response:
++    """Small response-compatible view of an urllib3 response.
++
++    urllib3 deliberately exposes a lower-level API. Keeping
++    this compatibility view here means the rest of this module can continue
++    to deal with responses returned by injected test sessions as well as
++    responses from the real HTTP session below.
++    """
++
++    def __init__(self, response, url: str, history=None):
++        self._response = response
++        self.url = response.url or url
++        self.history = history or []
++        self.status_code = response.status
++        self.headers = response.headers
++        self.content = response.data
++
++    @property
++    def text(self) -> str:
++        content_type = self.headers.get("Content-Type", "")
++        match = re.search(r"charset=\s*([\w.-]+)", content_type, re.IGNORECASE)
++        encoding = match.group(1) if match else "utf-8"
++        return self.content.decode(encoding, errors="replace")
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise urllib3.exceptions.HTTPError(
++                "HTTP status %s for %s" % (self.status_code, self.url)
++            )
++
++
++class Session:
++    """Cookie-preserving HTTP session backed by urllib3."""
++
++    _MAX_REDIRECTS = 30
++
++    def __init__(self, pool_manager=None):
++        self._pool_manager = (
++            pool_manager if pool_manager is not None else urllib3.PoolManager()
++        )
++        self.cookies = CookieJar()
++
++    def _headers_with_cookies(self, url: str, headers=None):
++        request = Request(url)
++        self.cookies.add_cookie_header(request)
++        request_headers = dict(headers or {})
++        cookie = request.get_header("Cookie")
++        if cookie:
++            request_headers["Cookie"] = cookie
++        return request_headers
++
++    def _save_cookies(self, url: str, response):
++        # urllib3's response.info() provides the email-message-like interface
++        # expected by CookieJar, while Request supplies the request metadata.
++        self.cookies.extract_cookies(response, Request(url))
++
++    def request(self, method: str, url: str, data=None, headers=None, **kwargs):
++        method = method.upper()
++        history = []
++        current_url = url
++
++        for _ in range(self._MAX_REDIRECTS + 1):
++            request_headers = self._headers_with_cookies(current_url, headers)
++            request_kwargs = dict(kwargs)
++            request_kwargs["redirect"] = False
++            if data is not None:
++                request_kwargs["fields"] = data
++                # HTML forms use application/x-www-form-urlencoded, as they
++                # do with a normal HTML form, rather than urllib3's multipart default.
++                request_kwargs["encode_multipart"] = False
++
++            response = self._pool_manager.request(
++                method, current_url, headers=request_headers, **request_kwargs
++            )
++            self._save_cookies(current_url, response)
++            wrapped_response = _Response(response, current_url, history)
++            redirect_location = response.get_redirect_location()
++            if not isinstance(redirect_location, str):
++                return wrapped_response
++
++            history.append(wrapped_response)
++            next_url = urljoin(current_url, redirect_location)
++            if response.status in (301, 302, 303) and method == "POST":
++                method = "GET"
++                data = None
++            current_url = next_url
++
++        raise urllib3.exceptions.MaxRetryError(
++            self._pool_manager, current_url, "too many redirects"
++        )
++
++    def get(self, url: str, **kwargs):
++        return self.request("GET", url, **kwargs)
++
++    def post(self, url: str, data=None, **kwargs):
++        return self.request("POST", url, data=data, **kwargs)
+ 
+ 
+ def _get_and_submit_form(
+@@ -85,13 +185,17 @@
+     username: str,
+     password: str,
+     tfa_callback,
+-    session: Optional[requests.Session] = None,
+-) -> requests.Session:
+-    """Create a requests.Session object with logged in GitHub cookies for the user."""
+-    session = session or requests.Session()
++    session: Optional[Session] = None,
++) -> Session:
++    """Create an urllib3-backed session with logged in GitHub cookies for the user."""
++    if isinstance(session, urllib3.PoolManager):
++        session = Session(session)
++    session = session or Session()
+ 
+     # Clear cookies before re-authentication
+-    session.cookies.clear()
++    cookies = getattr(session, "cookies", None)
++    if cookies is not None:
++        cookies.clear()
+ 
+     def _login_callback(data):
+         data.update(dict(login=username, password=password))
+@@ -150,8 +254,10 @@
+         username: str,
+         password: str,
+         tfa_callback=None,
+-        session: Optional[requests.Session] = None,
++        session: Optional[Session] = None,
+     ):
++        if isinstance(session, urllib3.PoolManager):
++            session = Session(session)
+         self._session = session or create_login_session(
+             username=username,
+             password=password,
+@@ -159,7 +265,7 @@
+             session=session,
+         )
+ 
+-    def request_usage(self, enterprise_name: str, days: int = 30) -> requests.Response:
++    def request_usage(self, enterprise_name: str, days: int = 30) -> _Response:
+         """Requests a GitHub usage report.
+ 
+         Github will send an email link when the report is available.
+@@ -183,7 +289,7 @@
+         contact_email: str,
+         org_usage: OrganizationUsage,
+         business_name: Optional[str] = None,
+-    ) -> requests.Response:
++    ) -> _Response:
+         """Create the specified GitHub organization.
+ 
+         Right now, only creates free tier organizations.
+@@ -207,7 +313,7 @@
+ 
+     def install_application_in_organization(
+         self, app_name: str, org_id: int
+-    ) -> requests.Response:
++    ) -> _Response:
+         """Installs the specified app on the given organization."""
+         url = _INSTALL_APP_URL.format(app_name=app_name, org_id=org_id)
+ 
+@@ -223,7 +329,7 @@
+ 
+     def toggle_app_suspended(
+         self, org_name: str, app_install_id: int
+-    ) -> requests.Response:
++    ) -> _Response:
+         """Set this applicaiton install to be suspended or not."""
+         url = _APP_SUSPEND_URL.format(org_name=org_name, app_install_id=app_install_id)
+ 
+@@ -235,14 +341,14 @@
+ 
+     def download_usage_report(
+         self, enterprise_name: str, report_id: int
+-    ) -> requests.Response:
++    ) -> _Response:
+         """Download a usage report based on an id recieved in an email"""
+         url = _USAGE_REPORT_URL.format(
+             enterprise_name=enterprise_name, report_id=report_id
+         )
+         return _get_url_with_session(session=self._session, url=url)
+ 
+-    def request_dormant_users_report(self, enterprise_name: str) -> requests.Response:
++    def request_dormant_users_report(self, enterprise_name: str) -> _Response:
+         """Requests a GitHub dormant users report.
+ 
+         Github will send an email link when the report is available.
+@@ -256,7 +362,7 @@
+             form_matcher=lambda form: form.attrib.get("action") == action,
+         )
+ 
+-    def download_dormant_users_report(self, enterprise_name: str) -> requests.Response:
++    def download_dormant_users_report(self, enterprise_name: str) -> _Response:
+         """Download a usage report based on an id received in an email"""
+         url = _REQUEST_DORMANTUSERS_URL.format(enterprise_name=enterprise_name)
+         page = _get_url_with_session(session=self._session, url=url)
+@@ -272,7 +378,7 @@
+         self,
+         org_name: str,
+         app_install_id: str,
+-    ) -> requests.Response:
++    ) -> _Response:
+         """Approve a request for updated permissions for a GitHub app installation in an org"""
+ 
+         return _get_and_submit_form(

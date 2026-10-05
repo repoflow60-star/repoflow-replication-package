@@ -1,0 +1,273 @@
+--- a/tdclient/api.py
++++ b/tdclient/api.py
+@@ -1,5 +1,7 @@
+ #!/usr/bin/env python
+ 
++import asyncio
++import base64
+ import contextlib
+ import csv
+ import email.utils
+@@ -11,15 +13,13 @@
+ import os
+ import socket
+ import ssl
+-import sys
+ import tempfile
+ import time
+ import urllib.parse as urlparse
+ from array import array
+ 
++import aiohttp
+ import msgpack
+-import urllib3
+-import urllib3.util
+ 
+ from tdclient import errors, version
+ from tdclient.bulk_import_api import BulkImportAPI
+@@ -47,6 +47,130 @@
+ except ImportError:
+     certifi = None
+ 
++
++class _ProxyInfo:
++    """Holds parsed proxy URL information."""
++
++    def __init__(self, url):
++        self.url = url
++
++
++class _AiohttpSession:
++    """Synchronous adapter around aiohttp.ClientSession providing urllib3-like request/urlopen/clear interface."""
++
++    def __init__(self, ssl_context=None, timeout=60, proxy_url=None, proxy_headers=None):
++        self._ssl_context = ssl_context
++        self._timeout = aiohttp.ClientTimeout(total=timeout)
++        self._proxy_url = proxy_url
++        self._proxy_headers = proxy_headers if proxy_headers is not None else {}
++        if proxy_url is not None:
++            parsed = urlparse.urlparse(proxy_url)
++            # strip any userinfo from the proxy URL for the public .proxy attribute
++            clean = urlparse.urlunparse(
++                urlparse.ParseResult(
++                    parsed.scheme,
++                    parsed.hostname + (":%d" % parsed.port if parsed.port else ""),
++                    parsed.path,
++                    parsed.params,
++                    parsed.query,
++                    parsed.fragment,
++                )
++            )
++            self.proxy = _ProxyInfo(clean)
++        else:
++            self.proxy = None
++        self.proxy_headers = self._proxy_headers
++
++    def _run(self, coro):
++        try:
++            loop = asyncio.get_event_loop()
++            if loop.is_closed():
++                raise RuntimeError("closed")
++        except RuntimeError:
++            loop = asyncio.new_event_loop()
++            asyncio.set_event_loop(loop)
++        return loop.run_until_complete(coro)
++
++    async def _do_request(self, method, url, headers=None, data=None, params=None):
++        connector = aiohttp.TCPConnector(ssl=self._ssl_context)
++        async with aiohttp.ClientSession(connector=connector, timeout=self._timeout) as session:
++            kwargs = {}
++            if self._proxy_url:
++                kwargs["proxy"] = self._proxy_url
++                if self._proxy_headers:
++                    kwargs["proxy_headers"] = self._proxy_headers
++            resp = await session.request(
++                method,
++                url,
++                headers=headers,
++                data=data,
++                params=params,
++                **kwargs,
++            )
++            body = await resp.read()
++            return _AiohttpResponse(resp.status, body, resp.headers)
++
++    def request(self, method, url, fields=None, headers=None, decode_content=None, preload_content=None, **kwargs):
++        """urllib3-compatible request method (fields -> query params for GET/DELETE, form data for POST)."""
++        params = None
++        data = None
++        if fields is not None:
++            if method.upper() in ("GET", "DELETE", "HEAD"):
++                params = fields
++            else:
++                data = aiohttp.FormData()
++                for key, value in fields.items():
++                    data.add_field(key, str(value))
++        return self._run(self._do_request(method, url, headers=headers, data=data, params=params))
++
++    def urlopen(self, method, url, body=None, headers=None, decode_content=None, preload_content=None, **kwargs):
++        """urllib3-compatible urlopen method (raw body bytes/stream)."""
++        data = None
++        if body is not None:
++            if hasattr(body, "read"):
++                data = body.read()
++            elif hasattr(body, "tobytes"):
++                data = body.tobytes()
++            else:
++                data = bytes(body)
++        return self._run(self._do_request(method, url, headers=headers, data=data))
++
++    def clear(self):
++        """No persistent pool to clear; aiohttp sessions are per-request."""
++        pass
++
++
++class _AiohttpResponse:
++    """Synchronous wrapper around an aiohttp response, providing the urllib3-like interface."""
++
++    def __init__(self, status, body, headers):
++        self.status = status
++        self._body = body
++        self._headers = headers
++        self._pos = 0
++
++    @property
++    def data(self):
++        return self._body
++
++    def read(self, size=None):
++        if self._pos >= len(self._body):
++            return b""
++        if size is None:
++            chunk = self._body[self._pos:]
++            self._pos = len(self._body)
++        else:
++            chunk = self._body[self._pos:self._pos + size]
++            self._pos += size
++        return chunk
++
++    def getheaders(self):
++        return list(self._headers.items())
++
++    def close(self):
++        pass
++
++
+ log = logging.getLogger(__name__)
+ 
+ APIError = errors.APIError
+@@ -144,23 +268,30 @@
+         return self._endpoint
+ 
+     def _init_http(self, http_proxy=None, **kwargs):
++        ssl_context = None
++        ca_certs = kwargs.get("ca_certs")
++        if ca_certs is not None:
++            ssl_context = ssl.create_default_context(cafile=ca_certs)
++        timeout = kwargs.get("timeout", 60)
+         if http_proxy is None:
+-            return urllib3.PoolManager(**kwargs)
++            return _AiohttpSession(ssl_context=ssl_context, timeout=timeout)
+         else:
+             if http_proxy.startswith("http://"):
+-                return self._init_http_proxy(http_proxy, **kwargs)
+-            else:
+-                return self._init_http_proxy("http://%s" % (http_proxy,), **kwargs)
+-
+-    def _init_http_proxy(self, http_proxy, **kwargs):
+-        pool_options = dict(kwargs)
++                return self._init_http_proxy(http_proxy, ssl_context=ssl_context, timeout=timeout)
++            else:
++                return self._init_http_proxy("http://%s" % (http_proxy,), ssl_context=ssl_context, timeout=timeout)
++
++    def _init_http_proxy(self, http_proxy, ssl_context=None, timeout=60, **kwargs):
+         p = urlparse.urlparse(http_proxy)
+         scheme = p.scheme
+         netloc = p.netloc
++        proxy_headers = {}
+         if "@" in netloc:
+             auth, netloc = netloc.split("@", 2)
+-            pool_options["proxy_headers"] = urllib3.make_headers(proxy_basic_auth=auth)
+-        return urllib3.ProxyManager("%s://%s" % (scheme, netloc), **pool_options)
++            encoded = base64.b64encode(auth.encode("latin-1")).decode("ascii")
++            proxy_headers = {"proxy-authorization": "Basic %s" % encoded}
++        proxy_url = "%s://%s" % (scheme, netloc)
++        return _AiohttpSession(ssl_context=ssl_context, timeout=timeout, proxy_url=proxy_url, proxy_headers=proxy_headers)
+ 
+     def get(self, path, params=None, headers=None, **kwargs):
+         headers = {} if headers is None else dict(headers)
+@@ -204,9 +335,9 @@
+                         self._max_cumul_retry_delay,
+                     )
+             except (
+-                urllib3.exceptions.TimeoutStateError,
+-                urllib3.exceptions.TimeoutError,
+-                urllib3.exceptions.PoolError,
++                aiohttp.ServerTimeoutError,
++                aiohttp.ClientConnectionError,
++                asyncio.TimeoutError,
+                 http.client.IncompleteRead,
+                 TimeoutError,
+                 socket.error,
+@@ -298,9 +429,9 @@
+                         self._max_cumul_retry_delay,
+                     )
+             except (
+-                urllib3.exceptions.TimeoutStateError,
+-                urllib3.exceptions.TimeoutError,
+-                urllib3.exceptions.PoolError,
++                aiohttp.ServerTimeoutError,
++                aiohttp.ClientConnectionError,
++                asyncio.TimeoutError,
+                 socket.error,
+             ):
+                 if not self._retry_post_requests:
+@@ -380,9 +511,9 @@
+             else:
+                 raise APIError("Error %d: %s", response.status, response.data)
+         except (
+-            urllib3.exceptions.TimeoutStateError,
+-            urllib3.exceptions.TimeoutError,
+-            urllib3.exceptions.PoolError,
++            aiohttp.ServerTimeoutError,
++            aiohttp.ClientConnectionError,
++            asyncio.TimeoutError,
+             socket.error,
+         ):
+             raise APIError("Error: %s" % (repr(response)))
+@@ -436,9 +567,9 @@
+                         self._max_cumul_retry_delay,
+                     )
+             except (
+-                urllib3.exceptions.TimeoutStateError,
+-                urllib3.exceptions.TimeoutError,
+-                urllib3.exceptions.PoolError,
++                aiohttp.ServerTimeoutError,
++                aiohttp.ClientConnectionError,
++                asyncio.TimeoutError,
+                 socket.error,
+             ):
+                 pass
+@@ -502,12 +633,6 @@
+                 method, url, fields=fields, headers=headers, **kwargs
+             )
+ 
+-        if urllib3.util.IS_PYOPENSSL and isinstance(body, bytearray):
+-            # workaround for https://github.com/pyca/pyopenssl/issues/621
+-            body = memoryview(body)
+-        if urllib3.util.IS_PYOPENSSL and isinstance(body, array):
+-            # workaround for https://github.com/pyca/pyopenssl/issues/621
+-            body = body.tobytes()
+         return self.http.urlopen(method, url, body=body, headers=headers, **kwargs)
+ 
+     def raise_error(self, msg, res, body):
+@@ -539,8 +664,7 @@
+         return js
+ 
+     def close(self):
+-        # urllib3 doesn't allow to close all connections immediately.
+-        # all connections in pool will be closed eventually during gc.
++        # aiohttp sessions are created per-request; clear is a no-op.
+         self.http.clear()
+ 
+     def _prepare_file(self, file_like, fmt, **kwargs):

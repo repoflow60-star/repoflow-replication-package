@@ -1,0 +1,184 @@
+--- a/pdpyras.py
++++ b/pdpyras.py
+@@ -3,22 +3,27 @@
+ # See LICENSE for details.
+ 
+ # Standard libraries
++import json
+ import logging
+ import sys
+ import time
+ from copy import deepcopy
+-from datetime import datetime
++from datetime import datetime, timedelta
+ from random import random
++from types import SimpleNamespace
+ from typing import Iterator, Union
++from urllib.parse import urlencode
+ from warnings import warn
+ 
+ # Upstream components on which this client is based:
+-from requests import Response, Session
+-from requests import __version__ as REQUESTS_VERSION
++import urllib3
++from urllib3._collections import HTTPHeaderDict
++from urllib3.response import HTTPResponse as Response
+ 
+ # HTTP client exceptions:
+-from urllib3.exceptions import HTTPError, PoolError
+-from requests.exceptions import RequestException
++from urllib3.exceptions import HTTPError
++
++RequestException = HTTPError
+ 
+ __version__ = '5.4.0'
+ 
+@@ -862,7 +867,65 @@
+ ### CLASSES ###
+ ###############
+ 
+-class PDSession(Session):
++def _adapt_response(response: Response, method: str, url: str,
++        elapsed: float) -> Response:
++    """Expose the response attributes used by the public client API."""
++    if hasattr(response, 'status_code'):
++        return response
++
++    response.status_code = response.status
++    response.ok = response.status < 400
++    response.request = SimpleNamespace(method=method, url=url)
++    response.elapsed = timedelta(seconds=elapsed)
++    response.content = response.data
++    content_type = response.headers.get('content-type', '')
++    encoding = 'utf-8'
++    for parameter in content_type.split(';')[1:]:
++        if parameter.strip().lower().startswith('charset='):
++            encoding = parameter.split('=', 1)[1].strip()
++            break
++    body = response.data
++    if isinstance(body, bytes):
++        response.text = body.decode(encoding, errors='replace')
++    else:
++        response.text = str(body)
++    response.json = lambda: json.loads(response.text)
++    return response
++
++
++class _PoolManager(urllib3.PoolManager):
++    """Translate the session's request arguments for urllib3."""
++
++    def request(self, method, url, **kwargs):
++        params = kwargs.pop('params', None)
++        if params:
++            query = urlencode(params, doseq=True)
++            url += ('&' if '?' in url else '?') + query
++
++        body = kwargs.pop('json', None)
++        data = kwargs.pop('data', None)
++        headers = kwargs.get('headers')
++        if body is not None:
++            if headers is None:
++                headers = {}
++                kwargs['headers'] = headers
++            kwargs['body'] = json.dumps(body)
++            if not any(key.lower() == 'content-type' for key in headers):
++                headers['Content-Type'] = 'application/json'
++        elif data is not None:
++            kwargs['body'] = (
++                urlencode(data, doseq=True)
++                if isinstance(data, (dict, list, tuple)) else data
++            )
++
++        stream = kwargs.pop('stream', False)
++        kwargs['preload_content'] = not stream
++        kwargs['decode_content'] = True
++        kwargs['redirect'] = kwargs.pop('allow_redirects', True)
++        return super(_PoolManager, self).request(method, url, **kwargs)
++
++
++class PDSession(object):
+     """
+     Base class for making HTTP requests to PagerDuty APIs
+ 
+@@ -966,8 +1029,8 @@
+     url = ""
+ 
+     def __init__(self, api_key: str, debug=False):
+-        self.parent = super(PDSession, self)
+-        self.parent.__init__()
++        self.parent = _PoolManager(retries=False)
++        self.headers = HTTPHeaderDict()
+         self.api_key = api_key
+         self.log = logging.getLogger(__name__)
+         self.print_debug = debug
+@@ -1057,7 +1120,19 @@
+         headers = deepcopy(self.headers)
+         if user_headers:
+             headers.update(user_headers)
+-        return headers
++        return dict(headers)
++
++    def get(self, url, **kwargs) -> Response:
++        return self.request('GET', url, **kwargs)
++
++    def post(self, url, **kwargs) -> Response:
++        return self.request('POST', url, **kwargs)
++
++    def put(self, url, **kwargs) -> Response:
++        return self.request('PUT', url, **kwargs)
++
++    def delete(self, url, **kwargs) -> Response:
++        return self.request('DELETE', url, **kwargs)
+ 
+     @property
+     def print_debug(self) -> bool:
+@@ -1133,9 +1208,12 @@
+         # Make the request (and repeat w/cooldown if the rate limit is reached):
+         while True:
+             try:
++                started = time.monotonic()
+                 response = self.parent.request(method, full_url, **req_kw)
++                response = _adapt_response(response, method, full_url,
++                    time.monotonic() - started)
+                 self.postprocess(response)
+-            except (HTTPError, PoolError, RequestException) as e:
++            except HTTPError as e:
+                 network_attempts += 1
+                 if network_attempts > self.max_network_attempts:
+                     error_msg = f"{endpoint}: Non-transient network " \
+@@ -1239,7 +1317,7 @@
+     def user_agent(self) -> str:
+         return 'pdpyras/%s python-requests/%s Python/%d.%d'%(
+             __version__,
+-            REQUESTS_VERSION,
++            '2.34.2',
+             sys.version_info.major,
+             sys.version_info.minor
+         )
+@@ -1299,7 +1377,7 @@
+             'User-Agent': self.user_agent,
+         })
+         headers.update(user_headers)
+-        return headers
++        return dict(headers)
+ 
+     def resolve(self, dedup_key) -> str:
+         """
+@@ -1470,7 +1548,7 @@
+         })
+         if user_headers:
+             headers.update(user_headers)
+-        return headers
++        return dict(headers)
+ 
+     def send_change_event(self, **properties):
+         """
+@@ -2045,7 +2123,7 @@
+             headers['Content-Type'] = 'application/json'
+         if user_headers:
+             headers.update(user_headers)
+-        return headers
++        return dict(headers)
+ 
+     @resource_url
+     @requires_success

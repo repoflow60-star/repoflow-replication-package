@@ -1,0 +1,378 @@
+--- a/mindsdb_sql/render/tortoise_render.py
++++ b/mindsdb_sql/render/tortoise_render.py
+@@ -0,0 +1,375 @@
++"""SQL rendering without a SQLAlchemy dependency.
++
++The parser in :mod:`mindsdb_sql` produces its own AST.  SQLAlchemy was
++previously used as an intermediate SQL builder for that AST, which made the
++renderer depend on an ORM that is not otherwise used by the project.  The
++renderer now emits SQL from the AST directly.  This also keeps rendering
++available when Tortoise is used as the project's ORM.
++"""
++
++from __future__ import annotations
++
++import datetime as dt
++import re
++from dataclasses import dataclass
++from typing import Any
++
++from mindsdb_sql.parser import ast
++from mindsdb_sql.parser.ast.base import ASTNode
++
++
++class RenderError(Exception):
++    """Raised when an AST cannot be rendered by this renderer."""
++
++
++@dataclass(frozen=True)
++class Dialect:
++    """Small dialect description used by the AST renderer.
++
++    It intentionally contains only quoting information.  Dialect-specific
++    SQL syntax remains the responsibility of the AST and its parser, just as
++    it is for Tortoise's query builder.
++    """
++
++    name: str
++    identifier_quote: str
++
++
++_DIALECTS = {
++    "mysql": Dialect("mysql", "`"),
++    "postgresql": Dialect("postgresql", '"'),
++    "postgres": Dialect("postgresql", '"'),
++    "sqlite": Dialect("sqlite", '"'),
++    "mssql": Dialect("mssql", "["),
++    "oracle": Dialect("oracle", '"'),
++    "Snowflake": Dialect("oracle", '"'),
++}
++
++
++class TortoiseRender:
++    """Render a mindsdb SQL AST to SQL.
++
++    ``TortoiseRender`` is deliberately independent of a database connection:
++    it only serializes an AST.  This is useful for the planner, which needs
++    SQL strings and parameter lists but does not initialize Tortoise.
++    """
++
++    def __init__(self, dialect_name: str | Any):
++        if isinstance(dialect_name, str):
++            try:
++                self.dialect = _DIALECTS[dialect_name]
++            except KeyError as exc:
++                raise ValueError(f"Unknown SQL dialect: {dialect_name}") from exc
++        else:
++            # Keep accepting dialect-like objects for callers that used to
++            # pass a SQLAlchemy dialect.  Only its name is relevant here.
++            name = getattr(dialect_name, "name", str(dialect_name))
++            self.dialect = _DIALECTS.get(name, Dialect(name, '"'))
++
++        # Kept for compatibility with callers that inspected the old
++        # renderer.  These are SQL type names rather than SQLAlchemy classes.
++        self.types_map = {
++            name: name for name in (
++                "BIGINT", "INT", "INTEGER", "FLOAT", "DOUBLE", "REAL",
++                "TEXT", "VARCHAR", "CHAR", "DATE", "DATETIME", "TIMESTAMP",
++                "TIME", "BOOLEAN", "BOOL", "DECIMAL", "NUMERIC", "JSON",
++            )
++        }
++        self.types_map["BOOL"] = "BOOLEAN"
++
++    # -- basic serialization helpers ---------------------------------
++
++    def _quote_identifier(self, value: Any) -> str:
++        value = str(value)
++        quote = self.dialect.identifier_quote
++        if quote == "[":
++            return "[" + value.replace("]", "]]") + "]"
++        return quote + value.replace(quote, quote * 2) + quote
++
++    def _literal(self, value: Any) -> str:
++        if value is None:
++            return "NULL"
++        if isinstance(value, bool):
++            return "TRUE" if value else "FALSE"
++        if isinstance(value, (dt.date, dt.datetime, dt.timedelta)):
++            value = str(value)
++        if isinstance(value, str):
++            return "'" + value.replace("'", "''") + "'"
++        return str(value)
++
++    def _parameter_sql(self, value: Any) -> str:
++        # The parser represents positional parameters as '?'.  Do not emit
++        # ':?' (AST's human-readable representation), which is not accepted
++        # by the SQL parser and was never sent to a database by the old
++        # renderer either.
++        return "?"
++
++    def _target_sql(self, target: Any) -> str:
++        """Render a SELECT target with SQLAlchemy-compatible labels.
++
++        SQLAlchemy labels an unaliased literal/function when it is selected.
++        The labels matter to clients consuming result-set metadata and are
++        therefore retained for compatibility.
++        """
++        rendered = target.to_string()
++        if getattr(target, "alias", None) is not None:
++            return rendered
++
++        if isinstance(target, (ast.Parameter, ast.Tuple, ast.Constant, ast.Function)):
++            rendered = self._expression_sql(target)
++
++        if isinstance(target, ast.Constant) and not isinstance(target, ast.Last):
++            value = "NULL" if target.value is None else str(target.value)
++            return f"{rendered} AS {self._quote_identifier(value)}"
++        if isinstance(target, ast.Function):
++            return f"{rendered} AS {self._quote_identifier(target.op)}"
++        return rendered
++
++    def _select_sql(self, query: Any) -> str:
++        # Use the AST's serializer for clauses and recursively render targets
++        # so aliases and parameter placeholders have the same semantics in
++        # every supported dialect.
++        if isinstance(query, (ast.Union, ast.Intersect, ast.Except)):
++            return self._combine_sql(query)
++        if any(isinstance(x, ast.Parameter) for x in [query.from_table] if x is not None):
++            raise NotImplementedError("A parameter cannot be used as a table")
++
++        out = "SELECT"
++        if query.distinct:
++            out += " DISTINCT"
++        out += " " + ", ".join(self._target_sql(t) for t in query.targets)
++
++        if query.cte is not None:
++            # CTEs are serialized by their own AST implementation.  They are
++            # placed before SELECT, so rebuild this prefix rather than using
++            # Select.to_string().
++            ctes = ", ".join(c.to_string() for c in query.cte)
++            out = "WITH " + ctes + " " + out
++
++        if query.from_table is not None:
++            out += " FROM " + self._from_sql(query.from_table)
++        if query.where is not None:
++            out += " WHERE " + self._expression_sql(query.where)
++        if query.group_by is not None:
++            out += " GROUP BY " + ", ".join(self._expression_sql(x) for x in query.group_by)
++        if query.having is not None:
++            out += " HAVING " + self._expression_sql(query.having)
++        if query.order_by is not None:
++            out += " ORDER BY " + ", ".join(x.to_string() for x in query.order_by)
++        if query.limit is not None:
++            out += " LIMIT " + query.limit.to_string()
++        if query.offset is not None:
++            out += " OFFSET " + query.offset.to_string()
++        if query.mode is not None:
++            out += " " + query.mode
++        return out
++
++    def _from_sql(self, value: Any) -> str:
++        if isinstance(value, ast.Join):
++            left = self._from_sql(value.left)
++            right = self._from_sql(value.right)
++            if value.implicit:
++                return f"{left}, {right}"
++            condition = " ON " + self._expression_sql(value.condition) if value.condition else " ON 1=1"
++            return f"{left} {value.join_type} {right}{condition}"
++        if isinstance(value, (ast.Select, ast.Union, ast.Intersect, ast.Except)):
++            if isinstance(value, (ast.Union, ast.Intersect, ast.Except)):
++                rendered = self._combine_sql(value)
++            else:
++                rendered = self._select_sql(value)
++            # A subquery in FROM always needs parentheses, even when it has
++            # no alias.  The AST only adds them automatically for aliases.
++            if getattr(value, "alias", None) is not None:
++                alias = value.alias.to_string()
++                return f"({rendered}) AS {alias}"
++            return f"({rendered})"
++        if isinstance(value, ast.NativeQuery):
++            return value.to_string()
++        if isinstance(value, ast.Parameter):
++            raise NotImplementedError("A parameter cannot be used as a table")
++        return value.to_string()
++
++    def _expression_sql(self, value: Any) -> str:
++        if isinstance(value, ast.Parameter):
++            return self._parameter_sql(value.value)
++        if isinstance(value, ast.Tuple):
++            return "(" + ", ".join(self._expression_sql(x) for x in value.items) + ")"
++        if isinstance(value, ast.Constant):
++            return self._literal(value.value)
++        if isinstance(value, ast.BinaryOperation):
++            left, right = value.args
++            return f"{self._expression_sql(left)} {value.op.upper()} {self._expression_sql(right)}"
++        if isinstance(value, ast.UnaryOperation):
++            return f"{value.op.upper()} {self._expression_sql(value.args[0])}"
++        if isinstance(value, ast.BetweenOperation):
++            a, b, c = value.args
++            return f"{self._expression_sql(a)} BETWEEN {self._expression_sql(b)} AND {self._expression_sql(c)}"
++        if isinstance(value, ast.Function):
++            args = ", ".join(self._expression_sql(x) for x in value.args)
++            if value.distinct:
++                args = "DISTINCT " + args
++            if value.from_arg is not None:
++                args += " FROM " + self._expression_sql(value.from_arg)
++            return f"{value.op}({args})"
++        if isinstance(value, ast.Exists):
++            return "EXISTS (" + self._select_sql(value.query) + ")"
++        if isinstance(value, ast.NotExists):
++            return "NOT EXISTS (" + self._select_sql(value.query) + ")"
++        if isinstance(value, ast.Interval):
++            return value.to_string()
++        return value.to_string()
++
++    def _combine_sql(self, query: Any) -> str:
++        left = self._select_sql(query.left)
++        right = self._select_sql(query.right)
++        operation = query.operation + (" ALL" if not query.unique else "")
++        return f"{left}\n{operation}\n{right}"
++
++    # -- public rendering API ----------------------------------------
++
++    def get_type(self, typename: Any) -> str:
++        if not isinstance(typename, str):
++            # Tortoise field classes expose their database type through the
++            # class name.  Accept those objects without requiring model setup.
++            name = getattr(typename, "__name__", typename.__class__.__name__)
++            typename = name
++        typename = str(typename).upper()
++        field_types = {
++            "INTFIELD": "INTEGER",
++            "BIGINTFIELD": "BIGINT",
++            "SMALLINTFIELD": "SMALLINT",
++            "FLOATFIELD": "FLOAT",
++            "DECIMALFIELD": "DECIMAL",
++            "CHARFIELD": "VARCHAR",
++            "TEXTFIELD": "TEXT",
++            "DATEFIELD": "DATE",
++            "DATETIMEFIELD": "DATETIME",
++            "TIMEDELTAFIELD": "INTERVAL",
++            "BOOLEANFIELD": "BOOLEAN",
++            "JSONFIELD": "JSON",
++        }
++        if typename in field_types:
++            return field_types[typename]
++        if re.match(r"^INT\d*$", typename):
++            return "BIGINT"
++        if re.match(r"^FLOAT\d*$", typename):
++            return "FLOAT"
++        return self.types_map.get(typename, typename)
++
++    def _render_insert(self, query: ast.Insert, with_params: bool):
++        if query.columns is None:
++            raise NotImplementedError("Columns are required in insert query")
++        table = query.table.to_string()
++        columns = ", ".join(str(column.name) for column in query.columns)
++        params = None
++        if query.values is not None:
++            rows = []
++            for row_index, row in enumerate(query.values):
++                if query.is_plain and with_params:
++                    # The execution API binds the complete matrix as one
++                    # parameter set.  Its SQL therefore contains one row of
++                    # placeholders, matching the former renderer contract.
++                    if row_index == 0:
++                        rows.append("(" + ", ".join("%s" for _ in row) + ")")
++                    params = query.values
++                else:
++                    rows.append("(" + ", ".join(self._expression_sql(x) if isinstance(x, ASTNode) else self._literal(x) for x in row) + ")")
++            return f"INSERT INTO {table} ({columns}) VALUES " + ", ".join(rows), params
++        if query.from_select is None:
++            raise NotImplementedError("Insert requires values or a SELECT")
++        return f"INSERT INTO {table} ({columns}) {self._select_sql(query.from_select)}", None
++
++    def _render_update(self, query: ast.Update):
++        sql = "UPDATE " + query.table.to_string()
++        if query.keys:
++            sql += " ON " + ", ".join(x.to_string() for x in query.keys)
++        sql += " SET " + ", ".join(f"{key}={self._expression_sql(value)}" for key, value in query.update_columns.items())
++        if query.from_select is not None:
++            alias = f" AS {query.from_select_alias.to_string()}" if query.from_select_alias else ""
++            sql += f" FROM ({self._select_sql(query.from_select)}){alias}"
++        if query.where is not None:
++            sql += " WHERE " + self._expression_sql(query.where)
++        return sql, None
++
++    def _render_delete(self, query: ast.Delete):
++        sql = "DELETE FROM " + query.table.to_string()
++        if query.where is not None:
++            sql += " WHERE " + self._expression_sql(query.where)
++        return sql, None
++
++    def _render_create(self, query: ast.CreateTable):
++        parts = []
++        for column in query.columns or []:
++            serial = isinstance(column.type, str) and column.type.lower() == "serial"
++            type_name = "INT" if serial else self.get_type(column.type)
++            if column.length is not None:
++                type_name += f"({column.length})"
++            item = f"{column.name} {type_name}"
++            if column.nullable is True:
++                item += " NULL"
++            elif column.nullable is False:
++                item += " NOT NULL"
++            if column.is_primary_key or serial:
++                item += " PRIMARY KEY"
++            if column.default is not None:
++                item += " DEFAULT " + str(column.default)
++            parts.append(item)
++        replace = " OR REPLACE" if query.is_replace else ""
++        if query.from_select is not None:
++            source = self._select_sql(query.from_select)
++        else:
++            source = ""
++        if parts:
++            body = "(" + ", ".join(parts) + ")"
++        else:
++            body = ""
++        if source:
++            body += " AS " + source
++        return f"CREATE{replace} TABLE {'IF NOT EXISTS ' if query.if_not_exists else ''}{query.name} {body}".rstrip(), None
++
++    def get_query(self, ast_query, with_params=False):
++        if isinstance(ast_query, (ast.Select, ast.Union, ast.Intersect, ast.Except)):
++            return self._select_sql(ast_query), None
++        if isinstance(ast_query, ast.Insert):
++            return self._render_insert(ast_query, with_params)
++        if isinstance(ast_query, ast.Update):
++            return self._render_update(ast_query)
++        if isinstance(ast_query, ast.Delete):
++            return self._render_delete(ast_query)
++        if isinstance(ast_query, ast.CreateTable):
++            return self._render_create(ast_query)
++        # DropTable's AST serializer already handles its dialect-neutral SQL.
++        if isinstance(ast_query, ast.DropTables):
++            return ast_query.to_string().strip(), None
++        raise NotImplementedError(f"Unknown statement: {ast_query.__class__.__name__}")
++
++    def get_string(self, ast_query, with_failback=True):
++        sql, _ = self.get_exec_params(ast_query, with_failback=with_failback, with_params=False)
++        return sql
++
++    def get_exec_params(self, ast_query, with_failback=True, with_params=True):
++        try:
++            sql, params = self.get_query(ast_query, with_params=with_params)
++            return sql, params
++        except (RenderError, NotImplementedError, AttributeError, KeyError):
++            if not with_failback:
++                raise
++            return ast_query.to_string().strip(), None
++
++
++# The old method names are retained as compatibility aliases.  Existing
++# integrations can migrate imports independently of the dependency change.
++SqlalchemyRender = TortoiseRender
++
++
++def render_dml_query(statement, dialect=None):
++    """Compatibility helper for callers of the former module-level API."""
++    return str(statement)
++
++
++def render_ddl_query(statement, dialect=None):
++    return str(statement)
++
++
++__all__ = ["RenderError", "TortoiseRender", "SqlalchemyRender"]
++

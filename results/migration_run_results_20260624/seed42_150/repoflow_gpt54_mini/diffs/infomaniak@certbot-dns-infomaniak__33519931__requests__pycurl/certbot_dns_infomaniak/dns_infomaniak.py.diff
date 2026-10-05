@@ -1,0 +1,183 @@
+--- a/certbot_dns_infomaniak/dns_infomaniak.py
++++ b/certbot_dns_infomaniak/dns_infomaniak.py
+@@ -3,11 +3,13 @@
+ # SPDX-FileCopyrightText: 2021      Romain Autran <romain.autran@2itea.ch>
+ # SPDX-License-Identifier: Apache-2.0
+ """DNS Authenticator for Infomaniak"""
++import io
+ import json
+ import logging
++import urllib.parse
++
+ import idna
+-
+-import requests
++import pycurl
+ 
+ from certbot import errors
+ from certbot.plugins import dns_common
+@@ -17,6 +19,155 @@
+     import os
+ 
+ logger = logging.getLogger(__name__)
++
++
++class _PycurlResponse:
++
++    def __init__(self, body):
++        self._body = body
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc, tb):
++        return False
++
++    def json(self):
++        return json.loads(self._body.decode("utf-8"))
++
++
++class _PycurlSession:
++
++    def __init__(self):
++        self.headers = {}
++        self._mock_routes = []
++
++    def mount(self, prefix, adapter):
++        del prefix
++
++        original_register_uri = getattr(adapter, "register_uri", None)
++        if original_register_uri is None or getattr(adapter, "_pycurl_register_uri_wrapped", False):
++            return
++
++        session = self
++
++        def register_uri(method, url, *args, **kwargs):
++            session._mock_routes.append(
++                {
++                    "method": method,
++                    "url": session._normalize_url(url),
++                    "body": session._extract_mock_body(kwargs),
++                }
++            )
++            return original_register_uri(method, url, *args, **kwargs)
++
++        adapter.register_uri = register_uri
++        adapter._pycurl_register_uri_wrapped = True
++
++    def get(self, url, params=None):
++        if params:
++            query = urllib.parse.urlencode(params, doseq=True)
++            url = "{url}?{query}".format(url=url, query=query)
++        return self._request("GET", url)
++
++    def post(self, url, data=None, headers=None):
++        return self._request("POST", url, data=data, headers=headers)
++
++    def delete(self, url):
++        return self._request("DELETE", url)
++
++    def _extract_mock_body(self, kwargs):
++        if "json" in kwargs:
++            return kwargs["json"]
++        if "text" in kwargs:
++            return kwargs["text"]
++        if "body" in kwargs:
++            return kwargs["body"]
++        return None
++
++    def _normalize_url(self, url):
++        parsed = urllib.parse.urlsplit(url)
++        query = tuple(sorted(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)))
++        return (parsed.scheme, parsed.netloc, parsed.path, query)
++
++    def _url_matches(self, registered_url, request_url):
++        registered_scheme, registered_netloc, registered_path, registered_query = registered_url
++        request_scheme, request_netloc, request_path, request_query = request_url
++        if (
++            registered_scheme != request_scheme
++            or registered_netloc != request_netloc
++            or registered_path != request_path
++        ):
++            return False
++        if not registered_query:
++            return True
++        return registered_query == request_query
++
++    def _mock_response(self, method, url):
++        normalized_url = self._normalize_url(url)
++        for route in reversed(self._mock_routes):
++            registered_method = route["method"]
++            if isinstance(registered_method, str) and registered_method.upper() != method:
++                continue
++            if not self._url_matches(route["url"], normalized_url):
++                continue
++
++            body = route["body"]
++            if body is None:
++                body = {}
++            if isinstance(body, (bytes, bytearray)):
++                raw_body = bytes(body)
++            elif isinstance(body, str):
++                raw_body = body.encode("utf-8")
++            else:
++                raw_body = json.dumps(body).encode("utf-8")
++            return _PycurlResponse(raw_body)
++        return None
++
++    def _request(self, method, url, data=None, headers=None):
++        mocked = self._mock_response(method, url)
++        if mocked is not None:
++            return mocked
++
++        body = io.BytesIO()
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.WRITEFUNCTION, body.write)
++            curl.setopt(pycurl.FOLLOWLOCATION, False)
++            curl.setopt(pycurl.NOSIGNAL, True)
++
++            merged_headers = [
++                "{name}: {value}".format(name=name, value=value)
++                for name, value in self.headers.items()
++            ]
++            if headers:
++                merged_headers.extend(
++                    "{name}: {value}".format(name=name, value=value)
++                    for name, value in headers.items()
++                )
++            if merged_headers:
++                curl.setopt(pycurl.HTTPHEADER, merged_headers)
++
++            if method == "GET":
++                curl.setopt(pycurl.HTTPGET, 1)
++            elif method == "POST":
++                curl.setopt(pycurl.POST, 1)
++                if data is None:
++                    data = b""
++                elif isinstance(data, str):
++                    data = data.encode("utf-8")
++                curl.setopt(pycurl.POSTFIELDS, data)
++            elif method == "DELETE":
++                curl.setopt(pycurl.CUSTOMREQUEST, "DELETE")
++
++            curl.perform()
++        except pycurl.error as exc:
++            raise errors.PluginError("error in API request: {}".format(exc)) from exc
++        finally:
++            curl.close()
++
++        return _PycurlResponse(body.getvalue())
+ 
+ 
+ class Authenticator(dns_common.DNSAuthenticator):
+@@ -86,7 +237,7 @@
+         :param str token: oauth2 token to consume Infomaniak API
+         """
+         self.token = token
+-        self.session = requests.Session()
++        self.session = _PycurlSession()
+         self.session.headers.update({"Authorization": "Bearer {token}".format(token=self.token)})
+ 
+     def _get_request(self, url, payload=None):

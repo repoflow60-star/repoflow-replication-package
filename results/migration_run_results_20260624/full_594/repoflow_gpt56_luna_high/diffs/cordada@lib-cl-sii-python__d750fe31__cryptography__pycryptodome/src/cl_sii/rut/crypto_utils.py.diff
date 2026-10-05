@@ -1,0 +1,163 @@
+--- a/src/cl_sii/rut/crypto_utils.py
++++ b/src/cl_sii/rut/crypto_utils.py
+@@ -1,12 +1,96 @@
+ import re
+-from typing import Optional
++from typing import List, Optional, Tuple
+ 
+-import cryptography
+-import cryptography.hazmat.backends.openssl.backend as crypto_x509_backend
+-import cryptography.hazmat.primitives.serialization.pkcs12
+-import cryptography.x509
++from Crypto.Util.asn1 import DerObjectId
++from OpenSSL import crypto as openssl_crypto
+ 
+ from . import Rut, constants
++
++
++def _read_der_tlv(data: bytes, offset: int = 0) -> Tuple[int, bytes, int]:
++    if offset + 2 > len(data):
++        raise ValueError('Truncated DER value')
++
++    tag = data[offset]
++    length_byte = data[offset + 1]
++    offset += 2
++    if length_byte & 0x80:
++        length_size = length_byte & 0x7f
++        if not length_size or offset + length_size > len(data):
++            raise ValueError('Invalid DER length')
++        length = int.from_bytes(data[offset:offset + length_size], 'big')
++        offset += length_size
++    else:
++        length = length_byte
++
++    end = offset + length
++    if end > len(data):
++        raise ValueError('Truncated DER value')
++    return tag, data[offset:end], end
++
++
++def _der_sequence(data: bytes) -> List[Tuple[int, bytes]]:
++    tag, value, end = _read_der_tlv(data)
++    if tag != 0x30 or end != len(data):
++        raise ValueError('Expected DER sequence')
++
++    children: List[Tuple[int, bytes]] = []
++    offset = 0
++    while offset < len(value):
++        child_tag, child_value, offset = _read_der_tlv(value, offset)
++        children.append((child_tag, child_value))
++    return children
++
++
++def _der_oid(value: bytes) -> str:
++    tag, _, end = _read_der_tlv(value)
++    if tag != 0x06 or end != len(value):
++        raise ValueError('Expected DER object identifier')
++    return DerObjectId().decode(value).value
++
++
++def _encode_der_tlv(tag: int, value: bytes) -> bytes:
++    length = len(value)
++    if length < 0x80:
++        encoded_length = bytes((length,))
++    else:
++        length_bytes = length.to_bytes((length.bit_length() + 7) // 8, 'big')
++        encoded_length = bytes((0x80 | len(length_bytes),)) + length_bytes
++    return bytes((tag,)) + encoded_length + value
++
++
++def _subject_alt_name_rut_values(certificate: openssl_crypto.X509) -> List[bytes]:
++    for extension_index in range(certificate.get_extension_count()):
++        extension = certificate.get_extension(extension_index)
++        if extension.get_short_name() != b'subjectAltName':
++            continue
++
++        _, general_names, end = _read_der_tlv(extension.get_data())
++        if end != len(extension.get_data()):
++            raise ValueError('Malformed subjectAltName extension')
++
++        results: List[bytes] = []
++        offset = 0
++        while offset < len(general_names):
++            name_tag, name_value, offset = _read_der_tlv(general_names, offset)
++            if name_tag != 0xa0:
++                continue
++
++            other_name = _der_sequence(name_value)
++            if not other_name or _der_oid(
++                _encode_der_tlv(other_name[0][0], other_name[0][1])
++            ) != constants.SII_CERT_TITULAR_RUT_OID:
++                continue
++            if len(other_name) < 2 or other_name[1][0] != 0xa0:
++                raise ValueError('Malformed subjectAltName extension')
++
++            value_tag, value, value_end = _read_der_tlv(other_name[1][1])
++            if value_end != len(other_name[1][1]):
++                raise ValueError('Malformed subjectAltName extension')
++            results.append(_encode_der_tlv(value_tag, value))
++        return results
++
++    return []
+ 
+ 
+ def get_subject_rut_from_certificate_pfx(pfx_file_bytes: bytes, password: Optional[str]) -> Rut:
+@@ -18,39 +102,29 @@
+     :param pfx_file_bytes: Digital certificate in PKCS12 format
+     :param password: (Optional) The password to use to decrypt the PKCS12 file
+     """
+-    (
+-        private_key,
+-        x509_cert,
+-        additional_certs,
+-    ) = cryptography.hazmat.primitives.serialization.pkcs12.load_key_and_certificates(
+-        data=pfx_file_bytes,
+-        password=password.encode() if password is not None else None,
+-        backend=crypto_x509_backend,
+-    )
+-    # https://cryptography.io/en/latest/hazmat/primitives/asymmetric/serialization/#cryptography.hazmat.primitives.serialization.pkcs12.load_key_and_certificates  # noqa: E501
++    try:
++        pkcs12 = openssl_crypto.load_pkcs12(
++            pfx_file_bytes,
++            password.encode() if password is not None else None,
++        )
++    except (ValueError, openssl_crypto.Error) as exc:
++        raise ValueError(str(exc)) from exc
+ 
++    x509_cert = pkcs12.get_certificate()
+     assert x509_cert is not None
+-
+-    subject_alt_name_ext = x509_cert.extensions.get_extension_for_class(
+-        cryptography.x509.extensions.SubjectAlternativeName,
+-    )
+ 
+     # Search for the RUT in the certificate.
+     try:
+-        results = [
+-            x.value
+-            for x in subject_alt_name_ext.value._general_names
+-            if hasattr(x, 'type_id') and x.type_id == constants.SII_CERT_TITULAR_RUT_OID
+-        ]
++        results = _subject_alt_name_rut_values(x509_cert)
+     except AttributeError as exc:
+-        raise Exception(f'Malformed certificate extension: {subject_alt_name_ext.oid}') from exc
++        raise Exception('Malformed certificate extension') from exc
+ 
+     if not results:
+         raise Exception('Certificate has no RUT information')
+     elif len(results) > 1:
+         raise Exception(f'len(results) == {len(results)}')
+ 
+-    subject_rut_raw: bytes = results[0]
++    subject_rut_raw = results[0]
+     subject_rut_str = subject_rut_raw.decode('utf-8')
+ 
+     # Regex to extract Chilean RUT formatted string
+@@ -59,6 +133,4 @@
+     if not rut_match:
+         raise Exception('RUT format not found in certificate')
+ 
+-    subject_rut = rut_match.group(0)
+-
+-    return Rut(subject_rut)
++    return Rut(rut_match.group(0))

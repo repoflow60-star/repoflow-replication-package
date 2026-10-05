@@ -1,0 +1,107 @@
+--- a/pastepwn/util/request.py
++++ b/pastepwn/util/request.py
+@@ -1,14 +1,22 @@
+ import logging
+-from threading import Lock
++from threading import Event, Lock, Thread
++from urllib.parse import urlparse
++from urllib.request import getproxies, proxy_bypass
+ 
+-from requests import Session, utils
+-from requests.exceptions import Timeout
++import treq
++from twisted.internet import reactor
++from twisted.internet.defer import TimeoutError as DeferredTimeoutError
++from twisted.internet.endpoints import HostnameEndpoint
++from twisted.internet.error import TCPTimedOutError, TimeoutError as ConnectTimeoutError
++from twisted.internet.threads import blockingCallFromThread
++from twisted.web.client import ProxyAgent
+ 
+ 
+ class Request:
+     _instance = None
+     _initialized = False
+     _lock = Lock()
++    _reactor_thread = None
+ 
+     def __new__(cls, *args, **kwargs):
+         # override method to implement singleton
+@@ -22,13 +30,49 @@
+     def __init__(self, proxies=None, headers=None):
+         if not self._initialized:
+             self.logger = logging.getLogger(__name__)
+-            self.session = Session()
+             self.proxies = proxies
+             self.headers = headers
+             self.logger.info("Using the following custom proxies: %s", proxies)
+-            system_proxies = utils.get_environ_proxies("https://example.com")
++            system_proxies = getproxies()
+             self.logger.info("Using the following system proxies: %s", system_proxies)
++            self._using_system_proxies = proxies is None
++            self._effective_proxies = system_proxies if proxies is None else proxies
++            self._start_reactor()
+             Request._initialized = True
++
++    @classmethod
++    def _start_reactor(cls):
++        if reactor.running:
++            return
++
++        started = Event()
++        reactor.callWhenRunning(started.set)
++        cls._reactor_thread = Thread(
++            target=reactor.run,
++            kwargs={"installSignalHandlers": False},
++            name="pastepwn-http-reactor",
++            daemon=True,
++        )
++        cls._reactor_thread.start()
++        started.wait()
++
++    def _proxy_agent(self, url):
++        parsed_url = urlparse(url)
++        if self._using_system_proxies and parsed_url.hostname and proxy_bypass(parsed_url.hostname):
++            return None
++
++        proxy_url = self._effective_proxies.get(parsed_url.scheme)
++        if not proxy_url:
++            return None
++
++        if "://" not in proxy_url:
++            proxy_url = "http://" + proxy_url
++        parsed_proxy = urlparse(proxy_url)
++        if not parsed_proxy.hostname:
++            raise ValueError("Invalid proxy URL: {}".format(proxy_url))
++
++        endpoint = HostnameEndpoint(reactor, parsed_proxy.hostname, parsed_proxy.port or 80)
++        return ProxyAgent(endpoint)
+ 
+     def _request_wrapper(self, data, timeout, *args, **kwargs):
+         headers = {"User-Agent": "pastepwn (https://github.com/d-Rickyy-b/pastepwn)"}
+@@ -36,14 +80,23 @@
+         if self.headers is not None:
+             headers.update(self.headers)
+ 
++        def request():
++            agent = self._proxy_agent(kwargs["url"])
++            request_kwargs = dict(kwargs, headers=headers, data=data, timeout=timeout)
++            if agent is not None:
++                request_kwargs["agent"] = agent
++            deferred = treq.request(*args, **request_kwargs)
++            deferred.addCallback(treq.content)
++            return deferred
++
+         try:
+-            response = self.session.request(*args, headers=headers, proxies=self.proxies, data=data, timeout=timeout, **kwargs)
+-        except Timeout:
++            body = blockingCallFromThread(reactor, request)
++        except (DeferredTimeoutError, ConnectTimeoutError, TCPTimedOutError, TimeoutError):
+             url = kwargs.get("url")
+             self.logger.warning("Timeout while requesting %s!", url)
+             return ""
+ 
+-        return response.content.decode("utf-8")
++        return body.decode("utf-8")
+ 
+     def get(self, url, data=None, timeout=5):
+         return self._request_wrapper(method="GET", url=url, data=data, timeout=timeout)

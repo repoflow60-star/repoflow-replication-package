@@ -1,0 +1,142 @@
+--- a/pastepwn/util/request.py
++++ b/pastepwn/util/request.py
+@@ -1,14 +1,23 @@
+ import logging
+-from threading import Lock
++import threading
++from threading import Event, Lock
++from urllib.parse import urlparse
++from urllib.request import getproxies
+ 
+-from requests import Session, utils
+-from requests.exceptions import Timeout
++import treq
++from twisted.internet import reactor
++from twisted.internet.defer import CancelledError, Deferred, maybeDeferred
++from twisted.internet.endpoints import HostnameEndpoint
++from twisted.internet.error import TimeoutError
++from twisted.web.client import ProxyAgent
+ 
+ 
+ class Request:
+     _instance = None
+     _initialized = False
+     _lock = Lock()
++    _reactor_lock = Lock()
++    _reactor_started = Event()
+ 
+     def __new__(cls, *args, **kwargs):
+         # override method to implement singleton
+@@ -22,13 +31,79 @@
+     def __init__(self, proxies=None, headers=None):
+         if not self._initialized:
+             self.logger = logging.getLogger(__name__)
+-            self.session = Session()
++            self.session = treq
+             self.proxies = proxies
+             self.headers = headers
+             self.logger.info("Using the following custom proxies: %s", proxies)
+-            system_proxies = utils.get_environ_proxies("https://example.com")
+-            self.logger.info("Using the following system proxies: %s", system_proxies)
++            self.system_proxies = getproxies()
++            self.logger.info("Using the following system proxies: %s", self.system_proxies)
+             Request._initialized = True
++
++    @staticmethod
++    def _run_reactor():
++        reactor.callWhenRunning(Request._reactor_started.set)
++        reactor.run(installSignalHandlers=False)
++
++    @classmethod
++    def _ensure_reactor(cls):
++        if reactor.running:
++            return
++
++        with cls._reactor_lock:
++            if reactor.running:
++                return
++            threading.Thread(target=cls._run_reactor, daemon=True).start()
++            cls._reactor_started.wait()
++
++    @classmethod
++    def _wait_for(cls, deferred, timeout):
++        result = []
++        completed = Event()
++
++        def succeeded(value):
++            result.append((True, value))
++            completed.set()
++            return value
++
++        def failed(failure):
++            result.append((False, failure))
++            completed.set()
++            return None
++
++        deferred.addCallbacks(succeeded, failed)
++
++        wait_timeout = None if timeout is None or timeout <= 0 else timeout
++        if not completed.wait(wait_timeout):
++            deferred.cancel()
++            raise TimeoutError()
++
++        success, value = result[0]
++        if not success:
++            value.raiseException()
++        return value
++
++    @staticmethod
++    def _call_in_reactor(function, *args, **kwargs):
++        result = Deferred()
++
++        def invoke():
++            maybeDeferred(function, *args, **kwargs).chainDeferred(result)
++
++        reactor.callFromThread(invoke)
++        return result
++
++    def _agent_for(self, url):
++        proxies = self.proxies if self.proxies is not None else self.system_proxies
++        if not isinstance(proxies, dict):
++            return None
++
++        proxy_url = proxies.get(urlparse(url).scheme)
++        if not proxy_url:
++            return None
++
++        proxy = urlparse(proxy_url)
++        endpoint = HostnameEndpoint(reactor, proxy.hostname, proxy.port or 8080)
++        return ProxyAgent(endpoint)
+ 
+     def _request_wrapper(self, data, timeout, *args, **kwargs):
+         headers = {"User-Agent": "pastepwn (https://github.com/d-Rickyy-b/pastepwn)"}
+@@ -37,13 +112,26 @@
+             headers.update(self.headers)
+ 
+         try:
+-            response = self.session.request(*args, headers=headers, proxies=self.proxies, data=data, timeout=timeout, **kwargs)
+-        except Timeout:
++            self._ensure_reactor()
++            response = self._wait_for(
++                self._call_in_reactor(
++                    self.session.request,
++                    *args,
++                    headers=headers,
++                    data=data,
++                    timeout=timeout,
++                    agent=self._agent_for(kwargs.get("url")),
++                    **kwargs,
++                ),
++                timeout,
++            )
++            response_body = self._wait_for(self._call_in_reactor(treq.content, response), timeout)
++        except (CancelledError, TimeoutError):
+             url = kwargs.get("url")
+             self.logger.warning("Timeout while requesting %s!", url)
+             return ""
+ 
+-        return response.content.decode("utf-8")
++        return response_body.decode("utf-8")
+ 
+     def get(self, url, data=None, timeout=5):
+         return self._request_wrapper(method="GET", url=url, data=data, timeout=timeout)

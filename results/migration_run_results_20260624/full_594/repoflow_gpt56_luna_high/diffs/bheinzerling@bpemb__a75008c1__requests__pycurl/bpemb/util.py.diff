@@ -1,0 +1,121 @@
+--- a/bpemb/util.py
++++ b/bpemb/util.py
+@@ -12,32 +12,84 @@
+ 
+ # source: https://github.com/allenai/allennlp/blob/master/allennlp/common/file_utils.py#L147  # NOQA
+ def http_get_temp(url: str, temp_file: IO) -> None:
+-    import requests
+-    import warnings
+-    from urllib3.exceptions import InsecureRequestWarning
++    import pycurl
++    from urllib.error import HTTPError
+ 
+-    # temporary fix for dealing with this SSL certificate issue:
+-    # https://github.com/bheinzerling/bpemb/issues/63
+-    with warnings.catch_warnings():
+-        warnings.simplefilter("ignore", InsecureRequestWarning)
+-        req = requests.get(url, stream=True, verify=False)
++    headers = {}
++    content_length = None
++    progress = None
++    status_code = None
+ 
+-    req.raise_for_status()
+-    content_length = req.headers.get('Content-Length')
+-    total = int(content_length) if content_length is not None else None
++    def handle_header(line):
++        nonlocal content_length, status_code
++        raw_line = line
++        if isinstance(line, bytes):
++            line = line.decode("iso-8859-1").strip()
++        else:
++            line = line.strip()
++        if line.upper().startswith("HTTP/"):
++            headers.clear()
++            content_length = None
++            status_code = None
++            parts = line.split()
++            if len(parts) > 1:
++                try:
++                    status_code = int(parts[1])
++                except ValueError:
++                    pass
++        elif ":" in line:
++            name, value = line.split(":", 1)
++            name = name.strip()
++            headers[name] = value.strip()
++            if name.lower() == "content-length":
++                content_length = int(value.strip())
++                if progress is not None:
++                    progress.total = content_length
++                    progress.refresh()
++        return len(raw_line)
++
++    def handle_body(chunk):
++        redirect = (
++            status_code is not None and 300 <= status_code < 400 and
++            any(name.lower() == "location" for name in headers)
++        )
++        if (status_code is not None and status_code >= 400) or redirect:
++            return len(chunk)
++        if chunk:
++            temp_file.write(chunk)
++            if progress is not None:
++                progress.update(len(chunk))
++        return len(chunk)
++
+     try:
+         from tqdm import tqdm
+-        progress = tqdm(unit="B", total=total)
++        progress = tqdm(unit="B", total=None)
+     except ImportError:
+         progress = None
+-    for chunk in req.iter_content(chunk_size=1024):
+-        if chunk:  # filter out keep-alive new chunks
+-            if progress is not None:
+-                progress.update(len(chunk))
+-            temp_file.write(chunk)
+-    if progress is not None:
+-        progress.close()
+-    return req.headers
++
++    curl = pycurl.Curl()
++    try:
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.FOLLOWLOCATION, 1)
++        curl.setopt(pycurl.SSL_VERIFYPEER, 0)
++        curl.setopt(pycurl.SSL_VERIFYHOST, 0)
++        curl.setopt(pycurl.ACCEPT_ENCODING, "")
++        curl.setopt(pycurl.HEADERFUNCTION, handle_header)
++        curl.setopt(pycurl.WRITEFUNCTION, handle_body)
++        curl.perform()
++        response_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        if response_code:
++            status_code = response_code
++    finally:
++        curl.close()
++        if progress is not None:
++            progress.close()
++
++    if status_code is not None and status_code >= 400:
++        raise HTTPError(
++            url, status_code, "HTTP Error {}".format(status_code), headers,
++            None)
++    return headers
+ 
+ 
+ # source: https://github.com/allenai/allennlp/blob/master/allennlp/common/file_utils.py#L147  # NOQA
+@@ -51,8 +103,11 @@
+         # shutil.copyfileobj() starts at current position, so go to the start
+         temp_file.seek(0)
+         outfile.parent.mkdir(exist_ok=True, parents=True)
+-        content_header = headers.get("Content-Type")
+-        if content_header and "gzip" in content_header:
++        content_header = next(
++            (value for name, value in headers.items()
++             if name.lower() == "content-type"), "")
++        archive_url = url.lower().split("?", 1)[0].endswith(".tar.gz")
++        if archive_url or "gzip" in content_header.lower():
+             import tarfile
+             tf = tarfile.open(fileobj=temp_file)
+             members = tf.getmembers()

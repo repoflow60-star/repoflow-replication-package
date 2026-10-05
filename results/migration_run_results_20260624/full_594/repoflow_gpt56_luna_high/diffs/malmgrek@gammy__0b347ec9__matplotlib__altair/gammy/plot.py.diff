@@ -1,0 +1,427 @@
+--- a/gammy/plot.py
++++ b/gammy/plot.py
+@@ -1,24 +1,39 @@
+-"""Plotting tools for Gammy models and formulae
+-
++"""Plotting tools for Gammy models and formulae.
++
++The plotting functions return Altair charts.  This keeps the plotting layer
++declarative and makes the resulting charts usable in notebooks and reports.
+ """
+ 
+-import logging
+ from typing import Callable, List, Optional, Union
+ 
++import altair as alt
+ import bayespy as bp
+-try:
+-    from mpl_toolkits.mplot3d import Axes3D
+-except ImportError:
+-    logging.info(
+-        "Failed importing Axes3D from mpl_toolkits.mplot3d."
+-    )
+-import matplotlib.pyplot as plt
+-from matplotlib.colors import SymLogNorm
+ import numpy as np
+ 
+ import gammy
+ from gammy import utils
+ from gammy.utils import pipe
++
++
++def _flat(values):
++    """Return values as a one-dimensional array of JSON-friendly scalars."""
++    values = np.asarray(values).reshape(-1)
++    return [value.item() if isinstance(value, np.generic) else value
++            for value in values]
++
++
++def _records(**columns):
++    """Build records for Altair without exposing NumPy scalar types."""
++    columns = {name: _flat(values) for name, values in columns.items()}
++    length = len(next(iter(columns.values()))) if columns else 0
++    return [
++        {name: values[i] for name, values in columns.items()}
++        for i in range(length)
++    ]
++
++
++def _data(records):
++    return alt.Data(values=records)
+ 
+ 
+ def validation_plot(
+@@ -34,40 +49,13 @@
+         color="r",
+         **kwargs
+ ):
+-    """Validation plot for a GAM object
+-
+-    Contains:
+-
+-        - Series plot with predicted vs. observed
+-        - Partial residual plots
+-
+-    Parameters
+-    ----------
+-    model : gammy.bayespy.GAM | gammy.numpy.GAM
+-        Visualized model
+-    input_data : np.ndarray
+-        Input data
+-    y : np.ndarray
+-        Observations
+-    grid_limits : List
+-        Grid limits, either `[a, b]` or `[[a_1, b_1], ..., [a_N, b_N]]`
+-    input_maps : List[Callable]
+-        List of input maps to be used for each pair of grid limits
+-    index : np.ndarray
+-        Optional x-axis for the series plot
+-    xlabels : List[str]
+-        Optional x-labels for the partial residual plots
+-    gridsize : int
+-        Number of points in the input dimensions discretizations
+-    color : str
+-        Color of scatter points
+-
++    """Validation plot for a GAM object.
++
++    Contains a prediction/observation series, a prediction-vs-observation
++    chart, and partial residual charts for each model term.
+     """
+ 
+     N = len(model.formula)
+-    N_rows = 2 + (N + 1) // 2
+-    fig = plt.figure(figsize=(8, 2 * N_rows))
+-    gs = fig.add_gridspec(2 + (N + 1) // 2, 2)
+     xlabels = xlabels or [None] * len(model.formula)
+     titles = titles or [None] * len(model.formula)
+     index = np.arange(len(input_data)) if index is None else index
+@@ -78,9 +66,7 @@
+             len(grid_limits) == input_data.shape[1] and
+             all([len(xs) == 2 for xs in grid_limits])
+         )
+-    ), (
+-        "Given grid limits do not match with the shape of input data."
+-    )
++    ), "Given grid limits do not match with the shape of input data."
+     assert len(model.formula.terms) == len(input_maps), (
+         "Must give exactly one input per model term."
+     )
+@@ -97,128 +83,181 @@
+     marginals = model.predict_variance_marginals(grid)
+     residuals = model.marginal_residuals(input_data, y)
+ 
+-    # Time series plot
+-    ax = fig.add_subplot(gs[0, :])
++    # Time series chart
+     (mu, sigma_theta) = model.predict_variance_theta(input_data)
+     lower = mu - 2 * np.sqrt(sigma_theta + model.inv_mean_tau)
+     upper = mu + 2 * np.sqrt(sigma_theta + model.inv_mean_tau)
+-    ax.plot(index, y, linewidth=0, marker="o", alpha=0.3, color=color)
+-    ax.plot(index, mu, color="k")
+-    ax.fill_between(index, lower, upper, color="k", alpha=0.3)
+-    ax.grid(True)
+-
+-    # XY-plot
+-    ax = fig.add_subplot(gs[1, :])
+-    ax.plot(mu, y, alpha=0.3, marker="o", lw=0, color=color)
+-    ax.plot([mu.min(), mu.max()], [mu.min(), mu.max()], c="k", label="x=y")
+-    ax.legend(loc="best")
+-    ax.grid(True)
+-    ax.set_xlabel("Predictions")
+-    ax.set_ylabel("Observations")
+-
+-    # Partial residual plots
++    series_data = _records(
++        index=index, observed=y, prediction=mu, lower=lower, upper=upper
++    )
++    series = alt.layer(
++        alt.Chart(_data(series_data)).mark_area(
++            color="black", opacity=0.3
++        ).encode(
++            x=alt.X("index:Q", title=None),
++            y=alt.Y("lower:Q", title=None),
++            y2="upper:Q"
++        ),
++        alt.Chart(_data(series_data)).mark_point(
++            color=color,
++            opacity=kwargs.get("alpha", 0.3),
++            size=kwargs.get("s", 30)
++        ).encode(
++            x="index:Q", y="observed:Q"
++        ),
++        alt.Chart(_data(series_data)).mark_line(color="black").encode(
++            x="index:Q", y="prediction:Q"
++        )
++    ).properties(title="Predictions and observations")
++
++    # Prediction-vs-observation chart
++    xy_data = _records(prediction=mu, observed=y)
++    limits = [np.min(mu), np.max(mu)]
++    diagonal_data = _records(prediction=limits, observed=limits)
++    xy = alt.layer(
++        alt.Chart(_data(xy_data)).mark_point(
++            color=color, opacity=0.3, size=kwargs.get("s", 30)
++        ).encode(
++            x=alt.X("prediction:Q", title="Predictions"),
++            y=alt.Y("observed:Q", title="Observations")
++        ),
++        alt.Chart(_data(diagonal_data)).mark_line(
++            color="black"
++        ).encode(x="prediction:Q", y="observed:Q")
++    ).properties(title="Predictions versus observations")
++
++    # Partial residual charts
++    partials = []
+     for i, ((mu, sigma), res, input_map, xlabel, title) in enumerate(
+         zip(marginals, residuals, input_maps, xlabels, titles)
+     ):
+         x = input_map(grid)
+         if len(x.shape) == 1 or x.shape[1] == 1:
+-            ax = fig.add_subplot(gs[2 + i // 2, i % 2])
+             (lower, upper) = (
+                 mu - 2 * np.sqrt(sigma),
+                 mu + 2 * np.sqrt(sigma)
+             )
+-            ax.scatter(input_map(input_data), res, color=color, **kwargs)
+-            ax.plot(x, mu, c='k', lw=2)
+-            ax.fill_between(x, lower, upper, alpha=0.3, color="k")
+-            ax.set_xlabel(xlabel)
++            curve_data = _records(
++                x=x, mean=mu, lower=lower, upper=upper
++            )
++            observed_data = _records(
++                x=input_map(input_data), residual=res
++            )
++            partial = alt.layer(
++                alt.Chart(_data(curve_data)).mark_area(
++                    color="black", opacity=0.3
++                ).encode(
++                    x=alt.X("x:Q", title=xlabel),
++                    y=alt.Y("lower:Q", title="Partial residual"),
++                    y2="upper:Q"
++                ),
++                alt.Chart(_data(observed_data)).mark_point(
++                    color=color,
++                    opacity=kwargs.get("alpha", 0.3),
++                    size=kwargs.get("s", 30)
++                ).encode(x="x:Q", y="residual:Q"),
++                alt.Chart(_data(curve_data)).mark_line(
++                    color="black", size=2
++                ).encode(x="x:Q", y="mean:Q")
++            ).properties(title=title)
+         elif x.shape[1] == 2:
+-            ax = fig.add_subplot(gs[2 + i // 2, i % 2], projection="3d")
+             u, v = np.meshgrid(x[:, 0], x[:, 1])
+-            w = np.hstack((
+-                u.reshape(-1, 1), v.reshape(-1, 1)
+-            ))
+-            # Override mu and sigma on purpose!
++            w = np.hstack((u.reshape(-1, 1), v.reshape(-1, 1)))
++            # Override mu and sigma on purpose, as in the original surface.
+             (mu, sigma) = model.predict_variance_marginal(w, i)
+-            mu_mesh = mu.reshape(u.shape)
+-            ax.plot_surface(u, v, mu_mesh)
++            surface_data = _records(
++                x=u.reshape(-1), y=v.reshape(-1), mean=mu.reshape(-1)
++            )
++            partial = alt.Chart(_data(surface_data)).mark_rect().encode(
++                x=alt.X("x:Q", title=xlabel),
++                y=alt.Y("y:Q", title=None),
++                color=alt.Color("mean:Q", title="Prediction")
++            ).properties(title=title)
+         else:
+             raise NotImplementedError("High-dimensional plots not supported.")
+-        ax.set_title(title)
+-        ax.grid(True)
+-
+-    fig.tight_layout()
+-    return fig
++        partials.append(partial)
++
++    if partials:
++        partial_grid = (
++            alt.hconcat(*partials) if len(partials) > 1 else partials[0]
++        )
++        return alt.vconcat(series, xy, partial_grid)
++    return alt.vconcat(series, xy)
+ 
+ 
+ def gaussian1d_density_plot(model: gammy.bayespy.GAM):
+-    """Plot 1-D density for each parameter
+-
+-    """
+-    N = len(model.formula)
+-    N_rows = 2 + (N + 1) // 2
+-    fig = plt.figure(figsize=(8, 2 * N_rows))
+-    gs = fig.add_gridspec(N + 1, 1)
++    """Plot 1-D density for each parameter."""
++    charts = []
+ 
+     # Plot inverse gamma
+-    ax = fig.add_subplot(gs[0])
+     (b, a) = (-model.tau.phi[0], model.tau.phi[1])
+     mu = a / b
+     grid = np.arange(0.5 * mu, 1.5 * mu, mu / 300)
+-    ax.plot(grid, model.tau.pdf(grid))
+-    ax.set_title(r"$\tau$ = noise inverse variance")
+-    ax.grid(True)
++    density_data = _records(x=grid, density=model.tau.pdf(grid))
++    charts.append(
++        alt.Chart(_data(density_data)).mark_line().encode(
++            x=alt.X("x:Q", title="tau"), y=alt.Y("density:Q", title="Density")
++        ).properties(title=r"$\tau$ = noise inverse variance")
++    )
+ 
+     # Plot marginal thetas
+     for i, theta in enumerate(model.theta_marginals):
+-        ax = fig.add_subplot(gs[i + 1])
+         mus = theta.get_moments()[0]
+         mus = np.array([mus]) if mus.shape == () else mus
+         cov = utils.solve_covariance(theta.get_moments())
+         stds = pipe(
+-            np.array([cov]) if cov.shape == ()
+-            else np.diag(cov),
++            np.array([cov]) if cov.shape == () else np.diag(cov),
+             np.sqrt
+         )
+         left = (mus - 4 * stds).min()
+         right = (mus + 4 * stds).max()
+         grid = np.arange(left, right, (right - left) / 300)
+-        for (mu, std) in zip(mus, stds):
+-            node = bp.nodes.GaussianARD(mu, 1 / std ** 2)
+-            ax.plot(grid, node.pdf(grid))
+-        ax.set_title(r"$\theta_{0}$".format(i))
+-        ax.grid(True)
+-
+-    fig.tight_layout()
+-    return fig
++        density_data = []
++        for component, (mean, std) in enumerate(zip(mus, stds)):
++            node = bp.nodes.GaussianARD(mean, 1 / std ** 2)
++            density_data.extend(_records(
++                x=grid,
++                density=node.pdf(grid),
++                component=[component] * len(grid)
++            ))
++        charts.append(
++            alt.Chart(_data(density_data)).mark_line().encode(
++                x=alt.X("x:Q", title="Value"),
++                y=alt.Y("density:Q", title="Density"),
++                color=alt.Color("component:N", legend=None)
++            ).properties(title=r"$\theta_{{{0}}}$".format(i))
++        )
++
++    return alt.vconcat(*charts)
+ 
+ 
+ def gaussian2d_density_plot(model: gammy.bayespy.GAM, i, j):
+-    """Plot 2-D joint distribution of indices i and j
+-
++    """Plot 2-D joint distribution of indices i and j."""
++    raise NotImplementedError
++
++
++def covariance_plot(model, ax=None, linthresh=0.1, **kwargs):
++    """Plot the covariance matrix as a symlog-scaled heatmap.
++
++    The tuple return is retained for callers that unpack the old result; both
++    values are Altair chart objects because Altair has no separate axes or
++    image artist objects.
+     """
+-    raise NotImplementedError
+-
+-
+-def covariance_plot(model, ax=None, linthresh=0.1, **kwargs):
+-    """Covariance matrix
+-
+-    """
+-
+-    ax = plt.figure().gca() if ax is None else ax
+-
+-    C = model.covariance_theta
+-    im = ax.imshow(
+-        C,
+-        norm=SymLogNorm(
+-            vmin=np.min(C),
+-            vmax=np.max(C),
+-            linthresh=linthresh,
+-            base=10
+-        ),
+-        **kwargs
+-    )
+-
+-    return (ax, im)
++    C = np.asarray(model.covariance_theta)
++    rows, columns = np.indices(C.shape)
++    covariance_data = _records(
++        row=rows.reshape(-1), column=columns.reshape(-1), value=C.reshape(-1)
++    )
++    chart = alt.Chart(_data(covariance_data)).mark_rect().encode(
++        x=alt.X("column:O", title=None),
++        y=alt.Y("row:O", title=None),
++        color=alt.Color(
++            "value:Q",
++            title="Covariance",
++            scale=alt.Scale(type="symlog", constant=linthresh)
++        )
++    ).properties(title="Covariance matrix")
++    return chart, chart
+ 
+ 
+ def basis_plot(
+@@ -227,28 +266,32 @@
+         input_maps,
+         gridsize=20
+ ):
+-    """Plot all basis functions
+-
+-    """
+-    # Figure definition
+-    N = len(formula)
+-    fig = plt.figure(figsize=(8, max(4 * N // 2, 8)))
+-    gs = fig.add_gridspec(N, 1)
+-
++    """Plot all basis functions."""
+     # Data and predictions
+-    grid = (
+-        pipe(
+-            grid_limits,
+-            utils.listmap(lambda x: np.linspace(x[0], x[1], gridsize)),
+-            lambda x: np.array(x).T
+-        )
+-    )
+-
+-    # Plot stuff
++    grid = pipe(
++        grid_limits,
++        utils.listmap(lambda x: np.linspace(x[0], x[1], gridsize)),
++        lambda x: np.array(x).T
++    )
++
++    charts = []
+     for i, (basis, input_map) in enumerate(zip(formula.terms, input_maps)):
+-        ax = fig.add_subplot(gs[i])
+         x = input_map(grid)
+-        for f in basis:
+-            ax.plot(x, f(grid))
+-
+-    return fig
++        rows = []
++        for component, f in enumerate(basis):
++            rows.extend(_records(
++                x=x, value=f(grid), component=[component] * len(_flat(x))
++            ))
++        charts.append(
++            alt.Chart(_data(rows)).mark_line().encode(
++                x=alt.X("x:Q", title=None),
++                y=alt.Y("value:Q", title=None),
++                color=alt.Color("component:N", legend=None)
++            ).properties(title="Term {0}".format(i))
++        )
++
++    if len(charts) == 1:
++        return charts[0]
++    if charts:
++        return alt.vconcat(*charts)
++    return alt.Chart(_data([])).mark_line()

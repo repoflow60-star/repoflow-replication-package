@@ -1,0 +1,208 @@
+--- a/qtrade/questrade.py
++++ b/qtrade/questrade.py
+@@ -1,16 +1,106 @@
+ """Core module for Questrade API wrapper."""
+ 
+ import logging
++import threading
+ from typing import Any, Dict, List, Optional, Union
+ 
+-import requests
++import treq
+ import yaml
++from twisted.internet.defer import inlineCallbacks, returnValue
++from twisted.internet.selectreactor import SelectReactor
++from twisted.internet.threads import blockingCallFromThread
+ 
+ from .utility import TokenDict, get_access_token_yaml, validate_access_token
+ 
+ log = logging.getLogger(__name__)  # pylint: disable=C0103
+ 
+ TOKEN_URL = "https://login.questrade.com/oauth2/token?grant_type=refresh_token&refresh_token="
++
++
++_REACTOR = SelectReactor()
++_REACTOR_LOCK = threading.Lock()
++_REACTOR_READY = threading.Event()
++_REACTOR_THREAD = None
++
++
++def _run_reactor():
++    """Run the reactor used to bridge treq's Deferred API to this sync wrapper."""
++    _REACTOR.callWhenRunning(_REACTOR_READY.set)
++    _REACTOR.run(installSignalHandlers=False)
++
++
++def _start_reactor():
++    global _REACTOR_THREAD  # pylint: disable=global-statement
++
++    if _REACTOR_THREAD is None:
++        with _REACTOR_LOCK:
++            if _REACTOR_THREAD is None:
++                _REACTOR_THREAD = threading.Thread(target=_run_reactor, daemon=True)
++                _REACTOR_THREAD.start()
++    _REACTOR_READY.wait()
++
++
++@inlineCallbacks
++def _treq_request(
++    method,
++    url,
++    headers=None,
++    params=None,
++    data=None,
++    json=None,
++    timeout=None,
++    decode_json=True,
++):
++    request_headers = None
++    if headers is not None:
++        request_headers = {
++            str(key).encode("ascii"): [str(value).encode("utf-8")]
++            for key, value in headers.items()
++        }
++
++    request_kwargs = {
++        "headers": request_headers,
++        "params": params,
++        "data": data,
++        "json": json,
++        "reactor": _REACTOR,
++    }
++    if timeout is not None:
++        request_kwargs["timeout"] = timeout
++
++    response = yield treq.request(method, url, **request_kwargs)
++    if response.code >= 400:
++        raise RuntimeError("HTTP request failed with status {}".format(response.code))
++    if decode_json:
++        result = yield treq.json_content(response)
++        returnValue(result)
++    yield treq.content(response)
++    returnValue(response)
++
++
++def _request(
++    method,
++    url,
++    headers=None,
++    params=None,
++    data=None,
++    json=None,
++    timeout=None,
++    decode_json=True,
++):
++    _start_reactor()
++    return blockingCallFromThread(
++        _REACTOR,
++        _treq_request,
++        method,
++        url,
++        headers=headers,
++        params=params,
++        data=data,
++        json=json,
++        timeout=timeout,
++        decode_json=decode_json,
++    )
+ 
+ 
+ class Questrade:
+@@ -38,7 +128,6 @@
+     ):
+         self.access_token: TokenDict
+         self.headers = None
+-        self.session = requests.Session()
+ 
+         self.access_code = access_code
+         self.token_yaml = token_yaml
+@@ -50,8 +139,6 @@
+                 + " "
+                 + self.access_token["access_token"]
+             }
+-            # add headers to session
+-            self.session.headers.update(self.headers)
+         else:
+             self._get_access_token(save_yaml=save_yaml)
+ 
+@@ -91,9 +178,15 @@
+         else:
+             log.error("Access token not set...")
+             raise Exception("Access token not set...")
+-        resp = self.session.request(method, url, params=params, data=data, json=json, timeout=30)
+-        resp.raise_for_status()
+-        return resp.json()
++        return _request(
++            method,
++            url,
++            headers=self.headers,
++            params=params,
++            data=data,
++            json=json,
++            timeout=30,
++        )
+ 
+     def save_token_to_yaml(self, yaml_path: str = "access_token.yml"):
+         """Save the token payload as a yaml-file.
+@@ -131,9 +224,7 @@
+         """
+         url = TOKEN_URL + str(self.access_code)
+         log.info("Getting access token...")
+-        data = requests.get(url)
+-        data.raise_for_status()
+-        response = data.json()
++        response = _request("get", url)
+ 
+         # validate response
+         validate_access_token(**response)
+@@ -152,8 +243,6 @@
+             + self.access_token["access_token"]
+         }
+ 
+-        self.session.headers.update(self.headers)
+-
+         # save access token
+         if save_yaml:
+             log.info("Saving yaml file to {}...".format(yaml_path))  # pylint: disable=W1202
+@@ -191,9 +280,7 @@
+ 
+         url = TOKEN_URL + str(old_access_token["refresh_token"])
+         log.info("Refreshing access token...")
+-        data = requests.get(url)
+-        data.raise_for_status()
+-        response = data.json()
++        response = _request("get", url)
+ 
+         # validate response
+         validate_access_token(**response)
+@@ -211,9 +298,6 @@
+             + " "
+             + self.access_token["access_token"]
+         }
+-
+-        # update headers
+-        self.session.headers.update(self.headers)
+ 
+         # save access token
+         if from_yaml:
+@@ -606,8 +690,7 @@
+         """
+         uri = self.access_token["api_server"] + "/v1/accounts/" + str(acct_id) + "/orders"
+         log.info("Posting order...")
+-        data = self.session.post(uri, json=order_dict)
+-        data.raise_for_status()
++        _request("post", uri, headers=self.headers, json=order_dict, decode_json=False)
+         response = self._send_message(
+             "post", "accounts/" + str(acct_id) + "/orders", json=order_dict
+         )
+@@ -753,10 +836,6 @@
+         response = self._send_message("post", "markets/quotes/options", json=payload)
+         return response
+ 
+-    def __del__(self):
+-        """Close session when class instance is deleted."""
+-        self.session.close()
+-
+     @staticmethod
+     def _valid_intervals():
+         return set(["OneDay", "OneWeek", "OneMonth", "OneYear"])

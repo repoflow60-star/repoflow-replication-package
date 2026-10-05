@@ -1,0 +1,148 @@
+--- a/pyschlage/auth.py
++++ b/pyschlage/auth.py
+@@ -2,15 +2,32 @@
+ 
+ from __future__ import annotations
+ 
++import json
++from collections.abc import Mapping
+ from functools import wraps
+ from typing import Callable
++from urllib.parse import urlencode, urlsplit, urlunsplit
+ 
+ from botocore.exceptions import ClientError
+ import pycognito
+ from pycognito import utils
+-import requests
++import urllib3
++from urllib3.response import BaseHTTPResponse
+ 
+ from .exceptions import NotAuthorizedError, UnknownError
++
++
++class _AuthRequest:
++    """Small request object understood by pycognito's requests auth plugin.
++
++    ``RequestsSrpAuth`` only needs a mutable ``headers`` attribute.  Keeping
++    this adapter local lets the transport use urllib3 without creating a
++    dependency on requests in this package.
++    """
++
++    def __init__(self, headers: dict[str, str] | None = None) -> None:
++        self.headers = {} if headers is None else headers
++
+ 
+ _DEFAULT_TIMEOUT = 60
+ _NOT_AUTHORIZED_ERRORS = (
+@@ -30,11 +47,11 @@
+ 
+ def _translate_auth_errors(
+     # pylint: disable=invalid-name
+-    fn: Callable[..., requests.Response],
++    fn: Callable[..., BaseHTTPResponse],
+     # pylint: enable=invalid-name
+-) -> Callable[..., requests.Response]:
++) -> Callable[..., BaseHTTPResponse]:
+     @wraps(fn)
+-    def wrapper(*args, **kwargs) -> requests.Response:
++    def wrapper(*args, **kwargs) -> BaseHTTPResponse:
+         try:
+             return fn(*args, **kwargs)
+         except ClientError as ex:
+@@ -50,20 +67,24 @@
+ 
+ def _translate_http_errors(
+     # pylint: disable=invalid-name
+-    fn: Callable[..., requests.Response],
++    fn: Callable[..., BaseHTTPResponse],
+     # pylint: enable=invalid-name
+-) -> Callable[..., requests.Response]:
++) -> Callable[..., BaseHTTPResponse]:
+     @wraps(fn)
+-    def wrapper(*args, **kwargs) -> requests.Response:
++    def wrapper(*args, **kwargs) -> BaseHTTPResponse:
+         resp = fn(*args, **kwargs)
+         try:
+-            resp.raise_for_status()
++            if resp.status >= 400:
++                raise urllib3.exceptions.HTTPError(
++                    f"{resp.status} {resp.reason or ''}".strip()
++                )
+             return resp
+-        except requests.HTTPError as ex:
++        except urllib3.exceptions.HTTPError as ex:
++            reason = resp.reason
+             try:
+-                message = resp.json().get("message", resp.reason)
+-            except requests.JSONDecodeError:
+-                message = resp.reason
++                message = resp.json().get("message", reason)
++            except (AttributeError, json.JSONDecodeError, UnicodeDecodeError):
++                message = reason
+             raise UnknownError(message) from ex
+ 
+     return wrapper
+@@ -100,7 +121,7 @@
+         :raise pyschlage.exceptions.NotAuthorizedError: When authentication fails.
+         :raise pyschlage.exceptions.UnknownError: On other errors.
+         """
+-        self.auth(requests.Request())
++        self.auth(_AuthRequest())
+ 
+     @property
+     def user_id(self) -> str:
+@@ -117,15 +138,48 @@
+     @_translate_auth_errors
+     def request(
+         self, method: str, path: str, base_url: str = BASE_URL, **kwargs
+-    ) -> requests.Response:
++    ) -> BaseHTTPResponse:
+         """Performs a request against the Schlage WiFi cloud service.
+ 
+         :meta private:
+         """
+-        kwargs["auth"] = self.auth
+-        if "headers" not in kwargs:
+-            kwargs["headers"] = {}
+-        kwargs["headers"]["X-Api-Key"] = API_KEY
++        headers = dict(kwargs.pop("headers", {}))
++        headers["X-Api-Key"] = API_KEY
++
++        # pycognito's auth plugin is written for requests, but it only relies
++        # on a request's mutable headers.  Apply it before handing the request
++        # to urllib3, which has no auth keyword of its own.
++        auth = kwargs.pop("auth", self.auth)
++        if auth is not None:
++            auth_request = auth(_AuthRequest(headers))
++            if auth_request is not None and isinstance(
++                auth_request.headers, Mapping
++            ):
++                headers = dict(auth_request.headers)
++
++        params = kwargs.pop("params", None)
++        if params:
++            if isinstance(params, Mapping):
++                params = [
++                    (key, value)
++                    for key, value in params.items()
++                    if value is not None
++                ]
++            else:
++                params = [(key, value) for key, value in params if value is not None]
++            split_url = urlsplit(f"{base_url}/{path.lstrip('/')}")
++            query = urlencode(params, doseq=True)
++            if query:
++                query = f"{split_url.query}&{query}" if split_url.query else query
++                url = urlunsplit(split_url._replace(query=query))
++            else:
++                url = urlunsplit(split_url)
++        else:
++            url = f"{base_url}/{path.lstrip('/')}"
++
++        if "data" in kwargs:
++            kwargs["body"] = kwargs.pop("data")
++        kwargs["headers"] = headers
+         kwargs.setdefault("timeout", _DEFAULT_TIMEOUT)
+         # pylint: disable=missing-timeout
+-        return requests.request(method, f"{base_url}/{path.lstrip('/')}", **kwargs)
++        return urllib3.request(method, url, **kwargs)

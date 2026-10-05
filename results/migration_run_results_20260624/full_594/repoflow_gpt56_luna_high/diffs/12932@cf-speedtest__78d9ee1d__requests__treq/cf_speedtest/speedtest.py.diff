@@ -1,0 +1,281 @@
+--- a/cf_speedtest/speedtest.py
++++ b/cf_speedtest/speedtest.py
+@@ -4,16 +4,25 @@
+ import argparse
+ import math
+ import statistics
++import threading
+ import time
+ from timeit import default_timer as timer
+-
+-import requests
+-import urllib3
++from urllib.parse import urlparse
++
++import treq
++from twisted.internet import defer, reactor
++from twisted.internet.endpoints import TCP4ClientEndpoint
++from twisted.internet.ssl import CertificateOptions
++from twisted.internet.threads import blockingCallFromThread
++from twisted.web.client import Agent, ProxyAgent
+ 
+ import cf_speedtest.locations as locations
+ import cf_speedtest.options as options
+ 
+-REQ_SESSION = requests.Session()
++# Keep the existing module-level request entry point while using treq for all
++# network operations.  It also leaves one stable integration point for callers
++# that replace the request client.
++REQ_SESSION = treq
+ 
+ CGI_ENDPOINT = 'https://speed.cloudflare.com/cdn-cgi/trace'
+ DOWNLOAD_ENDPOINT = 'https://speed.cloudflare.com/__down?measId=0&bytes={}'
+@@ -29,6 +38,12 @@
+ PROXY_DICT = None
+ VERIFY_SSL = True
+ OUTPUT_FILE = None
++
++_REACTOR_LOCK = threading.Lock()
++_REACTOR_READY = threading.Event()
++_REACTOR_THREAD = None
++_REQUEST_AGENT = None
++_REQUEST_AGENT_KEY = None
+ 
+ # Could use python's statistics library, but quantiles are only available
+ # in version 3.8 and above
+@@ -55,22 +70,150 @@
+                     pass
+     return 0.0
+ 
++
++def _request_agent():
++    global _REQUEST_AGENT, _REQUEST_AGENT_KEY
++
++    proxy_key = tuple(sorted((PROXY_DICT or {}).items()))
++    agent_key = proxy_key, VERIFY_SSL
++    if _REQUEST_AGENT_KEY == agent_key:
++        return _REQUEST_AGENT
++
++    if PROXY_DICT:
++        proxy_url = PROXY_DICT.get('https') or PROXY_DICT.get('http')
++        parsed_proxy = urlparse(proxy_url)
++        if parsed_proxy.scheme not in ('http', 'https'):
++            raise ValueError('treq supports HTTP(S) proxies only')
++        if not parsed_proxy.hostname:
++            raise ValueError('proxy must include a host')
++        proxy_port = parsed_proxy.port or (443 if parsed_proxy.scheme == 'https' else 80)
++        agent = ProxyAgent(
++            TCP4ClientEndpoint(reactor, parsed_proxy.hostname, proxy_port),
++        )
++    elif not VERIFY_SSL:
++        agent = Agent(reactor, contextFactory=CertificateOptions(trustRoot=None))
++    else:
++        agent = Agent(reactor)
++
++    _REQUEST_AGENT = agent
++    _REQUEST_AGENT_KEY = agent_key
++    return agent
++
++
++def _start_reactor():
++    reactor.callWhenRunning(_REACTOR_READY.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor():
++    global _REACTOR_THREAD
++
++    if reactor.running:
++        _REACTOR_READY.set()
++        return
++
++    with _REACTOR_LOCK:
++        if _REACTOR_THREAD is None and not reactor.running:
++            _REACTOR_THREAD = threading.Thread(
++                target=_start_reactor,
++                name='cf-speedtest-reactor',
++                daemon=True,
++            )
++            _REACTOR_THREAD.start()
++    _REACTOR_READY.wait()
++
++
++def _run_deferred(operation):
++    _ensure_reactor()
++    return blockingCallFromThread(reactor, operation)
++
++
++def _response_header(response, name: str):
++    headers = getattr(response, 'headers', {})
++    get_raw_headers = getattr(headers, 'getRawHeaders', None)
++    if get_raw_headers:
++        try:
++            values = get_raw_headers(name)
++        except (TypeError, AttributeError):
++            values = None
++        if not values:
++            try:
++                values = get_raw_headers(name.encode('ascii'))
++            except (TypeError, AttributeError):
++                values = None
++        if values:
++            value = values[0]
++            return value.decode('utf-8') if isinstance(value, bytes) else value
++        return None
++
++    if name in headers:
++        value = headers[name]
++    elif name.lower() in headers:
++        value = headers[name.lower()]
++    else:
++        return None
++    if isinstance(value, (list, tuple)):
++        value = value[0]
++    return value.decode('utf-8') if isinstance(value, bytes) else value
++
++
++def _raise_for_status(response) -> None:
++    raise_for_status = getattr(response, 'raise_for_status', None)
++    if callable(raise_for_status):
++        raise_for_status()
++        return
++    if response.code >= 400:
++        raise RuntimeError(f'HTTP request failed with status code {response.code}')
++
++
++@defer.inlineCallbacks
++def _get_response(url: str):
++    response = yield defer.maybeDeferred(
++        REQ_SESSION.get, url, agent=_request_agent(),
++    )
++    _raise_for_status(response)
++    return response
++
++
++@defer.inlineCallbacks
++def _get_with_content(url: str):
++    response = yield _get_response(url)
++    content = getattr(response, 'content', None)
++    if not isinstance(content, (bytes, bytearray)):
++        content = yield treq.content(response)
++    return response, bytes(content)
++
++
++@defer.inlineCallbacks
++def _post_with_content(url: str, **kwargs):
++    response = yield defer.maybeDeferred(
++        REQ_SESSION.post, url, agent=_request_agent(), **kwargs,
++    )
++    _raise_for_status(response)
++    return response
++
++
++@defer.inlineCallbacks
++def _get_text(url: str):
++    response = yield _get_response(url)
++    text = getattr(response, 'text', None)
++    if not isinstance(text, str):
++        text = yield treq.text_content(response)
++    return text
++
+ # given an amount of bytes, upload it and return the elapsed seconds taken
+ 
+ 
+ def upload_test(total_bytes: int) -> int | float:
+     start = timer()
+ 
+-    r = REQ_SESSION.post(
+-        UPLOAD_ENDPOINT, data=bytearray(
+-            total_bytes,
+-        ), headers=UPLOAD_HEADERS, verify=VERIFY_SSL, proxies=PROXY_DICT,
+-    )
+-    r.raise_for_status()
++    r = _run_deferred(lambda: _post_with_content(
++        UPLOAD_ENDPOINT, data=bytes(total_bytes), headers=UPLOAD_HEADERS,
++    ))
+     total_time_taken = timer() - start
+ 
+     # trust what the server says as time taken
+-    server_time_taken = get_server_timing(r.headers['Server-Timing'])
++    server_time_taken = get_server_timing(_response_header(r, 'Server-Timing'))
+ 
+     if OUTPUT_FILE:
+         with open(OUTPUT_FILE, 'a', encoding='utf-8') as datafile:
+@@ -87,13 +230,11 @@
+     endpoint = DOWNLOAD_ENDPOINT.format(total_bytes)
+     start = timer()
+ 
+-    r = REQ_SESSION.get(endpoint, verify=VERIFY_SSL, proxies=PROXY_DICT)
+-    r.raise_for_status()
+-
++    r, content = _run_deferred(lambda: _get_with_content(endpoint))
+     total_time_taken = timer() - start
+ 
+-    content_size = len(r.content)
+-    server_time_taken = get_server_timing(r.headers['Server-Timing'])
++    content_size = len(content)
++    server_time_taken = get_server_timing(_response_header(r, 'Server-Timing'))
+ 
+     if OUTPUT_FILE:
+         with open(OUTPUT_FILE, 'a', encoding='utf-8') as datafile:
+@@ -110,16 +251,14 @@
+     endpoint = DOWNLOAD_ENDPOINT.format(0)
+ 
+     start = timer()
+-    r = REQ_SESSION.get(endpoint, verify=VERIFY_SSL,  proxies=PROXY_DICT)
+-    r.raise_for_status()
+-
++    r, content = _run_deferred(lambda: _get_with_content(endpoint))
+     total_time_taken = timer() - start
+-    server_time_taken = get_server_timing(r.headers['Server-Timing'])
++    server_time_taken = get_server_timing(_response_header(r, 'Server-Timing'))
+ 
+     if OUTPUT_FILE:
+         with open(OUTPUT_FILE, 'a', encoding='utf-8') as datafile:
+             datafile.write(
+-                f'{time.time()},down,{len(r.content)},{total_time_taken},{server_time_taken}\n',
++                f'{time.time()},down,{len(content)},{total_time_taken},{server_time_taken}\n',
+             )
+ 
+     return total_time_taken - server_time_taken
+@@ -128,10 +267,7 @@
+ 
+ 
+ def get_our_country() -> str:
+-    r = REQ_SESSION.get(CGI_ENDPOINT, verify=VERIFY_SSL,  proxies=PROXY_DICT)
+-    r.raise_for_status()
+-
+-    cgi_data = r.text
++    cgi_data = _run_deferred(lambda: _get_text(CGI_ENDPOINT))
+     cgi_dict = {
+         k: v for k, v in [
+             line.split(
+@@ -144,15 +280,10 @@
+ 
+ 
+ def preamble() -> str:
+-    r = REQ_SESSION.get(
+-        DOWNLOAD_ENDPOINT.format(
+-            0,
+-        ), verify=VERIFY_SSL,  proxies=PROXY_DICT,
+-    )
+-    r.raise_for_status()
+-
+-    our_ip = r.headers.get('cf-meta-ip')
+-    colo = r.headers.get('cf-meta-colo')
++    response = _run_deferred(lambda: _get_response(DOWNLOAD_ENDPOINT.format(0)))
++
++    our_ip = _response_header(response, 'cf-meta-ip')
++    colo = _response_header(response, 'cf-meta-colo')
+     server_city = colo
+     server_country = next(
+         (
+@@ -290,8 +421,6 @@
+ 
+ def main(argv=None) -> int:
+     global PROXY_DICT, VERIFY_SSL, OUTPUT_FILE
+-    # disable annoying warning when using verify=False in requests.get("x", verify=False)
+-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+ 
+     parser = argparse.ArgumentParser()
+     parser_with_args = options.add_run_options(parser)

@@ -1,0 +1,149 @@
+--- a/ldnlib/base.py
++++ b/ldnlib/base.py
+@@ -1,5 +1,117 @@
+ from rdflib import Graph, URIRef
+-import requests
++import json
++from urllib.parse import urlencode, urlsplit, urlunsplit
++
++import urllib3
++
++
++http = urllib3.PoolManager()
++
++
++def _has_header(headers, name):
++    name = name.lower()
++    return any(key.lower() == name for key in headers)
++
++
++def _header_values(headers, name):
++    if hasattr(headers, 'getlist'):
++        return headers.getlist(name)
++    for key, value in headers.items():
++        if key.lower() == name.lower():
++            return value if isinstance(value, (list, tuple)) else [value]
++    return []
++
++
++def _request(method, url, **kwargs):
++    """Issue a request using the options accepted by this package."""
++    kwargs = dict(kwargs)
++    redirect = kwargs.pop('allow_redirects', True)
++
++    params = kwargs.pop('params', None)
++    if params:
++        if isinstance(params, (str, bytes)):
++            query = params.decode() if isinstance(params, bytes) else params
++        else:
++            if isinstance(params, dict):
++                params = params.items()
++            params = [(key, value) for key, value in params
++                      if value is not None]
++            query = urlencode(params, doseq=True)
++        parts = urlsplit(url)
++        current_query = parts.query
++        if current_query and query:
++            query = '{}&{}'.format(current_query, query)
++        else:
++            query = current_query or query
++        url = urlunsplit((parts.scheme, parts.netloc, parts.path, query,
++                          parts.fragment))
++
++    body = kwargs.pop('data', None)
++    json_data = kwargs.pop('json', None)
++    headers = dict(kwargs.pop('headers', None) or {})
++    if json_data is not None and body is None:
++        body = json.dumps(json_data)
++        if not _has_header(headers, 'content-type'):
++            headers['content-type'] = 'application/json'
++    elif isinstance(body, (dict, list, tuple)):
++        body = urlencode(body, doseq=True)
++        if not _has_header(headers, 'content-type'):
++            headers['content-type'] = 'application/x-www-form-urlencoded'
++
++    auth = kwargs.pop('auth', None)
++    if auth is not None and not _has_header(headers, 'authorization'):
++        username, password = auth
++        credentials = '{}:{}'.format(username, password)
++        auth_header = urllib3.util.make_headers(basic_auth=credentials)
++        headers['authorization'] = auth_header['authorization']
++
++    request_kwargs = dict(kwargs)
++    request_kwargs['headers'] = headers
++    request_kwargs['redirect'] = redirect
++    if body is not None:
++        request_kwargs['body'] = body
++    return http.request(method, url, **request_kwargs)
++
++
++def _raise_for_status(response):
++    if response.status >= 400:
++        raise urllib3.exceptions.HTTPError(
++            'HTTP error {}'.format(response.status))
++
++
++def _response_text(response):
++    data = response.data
++    if not isinstance(data, bytes):
++        return data
++
++    content_type = response.headers.get('content-type', '')
++    charset = 'utf-8'
++    for parameter in content_type.split(';')[1:]:
++        name, separator, value = parameter.strip().partition('=')
++        if separator and name.lower() == 'charset':
++            charset = value.strip().strip('"')
++            break
++    return data.decode(charset, errors='replace')
++
++
++def _response_links(response):
++    links = {}
++    for value in _header_values(response.headers, 'link'):
++        for item in value.split(','):
++            parts = item.split(';')
++            if not parts or not parts[0].strip().startswith('<'):
++                continue
++            link_url = parts[0].strip()[1:-1]
++            parameters = {}
++            for parameter in parts[1:]:
++                name, separator, parameter_value = parameter.strip().partition(
++                    '=')
++                if separator:
++                    parameters[name.lower()] = parameter_value.strip().strip(
++                        '"')
++            for relation in parameters.get('rel', '').split():
++                links[relation] = {'url': link_url}
++    return links
+ 
+ 
+ class BaseLDN(object):
+@@ -15,17 +127,19 @@
+         self.accept_headers = kwargs.get('accept_headers', self.ACCEPT_HEADERS)
+ 
+     def __discover_head(self, target, **kwargs):
+-        r = requests.head(target, **kwargs)
+-        r.raise_for_status()
+-        if self.LDP_INBOX in r.links:
+-            return r.links[self.LDP_INBOX].get('url')
++        r = _request('HEAD', target, **kwargs)
++        _raise_for_status(r)
++        links = _response_links(r)
++        if self.LDP_INBOX in links:
++            return links[self.LDP_INBOX].get('url')
+ 
+     def __discover_get(self, target, **kwargs):
+-        r = requests.get(target, **kwargs)
+-        r.raise_for_status()
++        r = _request('GET', target, **kwargs)
++        _raise_for_status(r)
+         # TODO -- check for HTML
+-        g = Graph().parse(data=r.text, format=self.content_type_to_mime_type(
+-            r.headers['content-type']))
++        g = Graph().parse(
++            data=_response_text(r),
++            format=self.content_type_to_mime_type(r.headers['content-type']))
+ 
+         for (subject, inbox) in g[:URIRef(self.LDP_INBOX)]:
+             return str(inbox)

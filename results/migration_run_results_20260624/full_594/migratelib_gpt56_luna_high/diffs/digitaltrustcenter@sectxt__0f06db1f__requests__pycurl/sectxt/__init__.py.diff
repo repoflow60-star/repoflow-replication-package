@@ -1,0 +1,168 @@
+--- a/sectxt/__init__.py
++++ b/sectxt/__init__.py
+@@ -2,6 +2,7 @@
+ # SPDX-License-Identifier: EUPL-1.2
+ #
+ import codecs
++import io
+ 
+ import langcodes
+ import re
+@@ -22,11 +23,74 @@
+     from typing import TypedDict
+ 
+ import dateutil.parser
+-import requests
++import pycurl
+ 
+ __version__ = "0.9.6"
+ 
+-s = requests.Session()
++s = pycurl.Curl()
++
++
++def _pycurl_ssl_error(error) -> bool:
++    return bool(error.args) and error.args[0] in (
++        getattr(pycurl, "CURLE_SSL_CONNECT_ERROR", None),
++        getattr(pycurl, "CURLE_SSL_CERTPROBLEM", None),
++        getattr(pycurl, "CURLE_SSL_CIPHER", None),
++        getattr(pycurl, "CURLE_SSL_ENGINE_NOTFOUND", None),
++        getattr(pycurl, "CURLE_SSL_ENGINE_SETFAILED", None),
++        getattr(pycurl, "CURLE_SSL_ENGINE_INITFAILED", None),
++        getattr(pycurl, "CURLE_PEER_FAILED_VERIFICATION", None),
++        getattr(pycurl, "CURLE_SSL_CACERT", None),
++        getattr(pycurl, "CURLE_SSL_CACERT_BADFILE", None),
++        getattr(pycurl, "CURLE_SSL_ISSUER", None),
++        getattr(pycurl, "CURLE_SSL_INVALIDCERTSTATUS", None),
++        getattr(pycurl, "CURLE_SSL_PINNEDPUBKEYNOTMATCH", None),
++    )
++
++
++def _pycurl_get(url: str, verify: bool = True):
++    content = io.BytesIO()
++    response_headers = {}
++
++    def header_function(header):
++        if isinstance(header, bytes):
++            header = header.decode("iso-8859-1")
++        header = header.rstrip("\r\n")
++
++        if header.startswith("HTTP/"):
++            response_headers.clear()
++        elif ":" in header:
++            key, value = header.split(":", 1)
++            response_headers[key.lower()] = value.strip()
++
++    s.reset()
++    s.setopt(pycurl.URL, url)
++    s.setopt(
++        pycurl.HTTPHEADER,
++        [
++            'User-Agent: Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
++            'Gecko/20100101 Firefox/12.0'
++        ]
++    )
++    s.setopt(pycurl.TIMEOUT, 5)
++    s.setopt(pycurl.FOLLOWLOCATION, 1)
++    s.setopt(pycurl.MAXREDIRS, 30)
++    s.setopt(pycurl.SSL_VERIFYPEER, 1 if verify else 0)
++    s.setopt(pycurl.SSL_VERIFYHOST, 2 if verify else 0)
++    s.setopt(pycurl.WRITEDATA, content)
++    s.setopt(pycurl.HEADERFUNCTION, header_function)
++    s.perform()
++
++    effective_url = s.getinfo(pycurl.EFFECTIVE_URL)
++    if isinstance(effective_url, bytes):
++        effective_url = effective_url.decode("utf-8")
++
++    return {
++        "status_code": s.getinfo(pycurl.HTTP_CODE),
++        "history": s.getinfo(pycurl.REDIRECT_COUNT),
++        "url": effective_url,
++        "headers": response_headers,
++        "content": content.getvalue(),
++    }
+ 
+ 
+ class ErrorDict(TypedDict):
+@@ -557,35 +621,25 @@
+                 for path in [".well-known/security.txt", "security.txt"]:
+                     url = urlunsplit((scheme, self._loc, path, None, None))
+                     try:
+-                        resp = requests.get(
+-                            url,
+-                            headers={
+-                                'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                              'Gecko/20100101 Firefox/12.0'},
+-                            timeout=5
+-                        )
+-                    except requests.exceptions.SSLError:
+-                        if not any(d["code"] == "invalid_cert" for d in self._errors):
+-                            self._add_error(
+-                                "invalid_cert",
+-                                "security.txt must be served with a valid TLS certificate.",
+-                            )
+-                        try:
+-                            resp = requests.get(
+-                                url,
+-                                headers={
+-                                    'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0) '
+-                                                  'Gecko/20100101 Firefox/12.0'},
+-                                timeout=5,
+-                                verify=False
+-                            )
+-                        except:
++                        resp = _pycurl_get(url)
++                    except pycurl.error as e:
++                        if _pycurl_ssl_error(e):
++                            if not any(d["code"] == "invalid_cert" for d in self._errors):
++                                self._add_error(
++                                    "invalid_cert",
++                                    "security.txt must be served with a valid TLS certificate.",
++                                )
++                            try:
++                                resp = _pycurl_get(url, verify=False)
++                            except:
++                                continue
++                        else:
+                             continue
+                     except:
+                         continue
+-                    if resp.status_code == 200:
+-                        if resp.history:
+-                            if not resp.url.endswith(path):
++                    if resp["status_code"] == 200:
++                        if resp["history"]:
++                            if not resp["url"].endswith(path):
+                                 continue
+                         self._path = path
+                         self._url = url
+@@ -603,13 +657,13 @@
+                                 "(legacy place), but must be placed under "
+                                 "the '/.well-known/' path.",
+                             )
+-                        if "content-type" not in resp.headers:
++                        if "content-type" not in resp["headers"]:
+                             self._add_error(
+                                 "no_content_type", "HTTP Content-Type header must be sent."
+                             )
+                         else:
+                             m = Message()
+-                            m['content-type'] = resp.headers["content-type"]
++                            m['content-type'] = resp["headers"]["content-type"]
+                             params = dict(m.get_params())
+                             if "text/plain" not in params:
+                                 self._add_error(
+@@ -625,9 +679,9 @@
+                                     "Charset parameter in Content-Type header must be "
+                                     "'utf-8' if present.",
+                                 )
+-                        self._content = resp.content
+-                        if resp.history:
+-                            self._urls = [resp.history[0].url, resp.url]
++                        self._content = resp["content"]
++                        if resp["history"]:
++                            self._urls = [url, resp["url"]]
+                         else:
+                             self._urls = [url]
+                         super()._process()

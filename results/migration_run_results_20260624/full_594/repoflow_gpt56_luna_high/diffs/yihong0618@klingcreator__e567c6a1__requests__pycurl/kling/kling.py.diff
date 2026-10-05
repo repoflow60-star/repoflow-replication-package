@@ -1,0 +1,180 @@
+--- a/kling/kling.py
++++ b/kling/kling.py
+@@ -1,14 +1,16 @@
+ import argparse
++from io import BytesIO
++import json as jsonlib
+ import os
+ import time
+ import contextlib
+ from typing import Optional
+ from enum import Enum
+ from http.cookies import SimpleCookie
++from urllib.parse import urlencode
+ 
+ from fake_useragent import UserAgent
+-import requests
+-from requests.utils import cookiejar_from_dict
++import pycurl
+ from rich import print
+ import threading
+ 
+@@ -18,7 +20,130 @@
+ base_url_not_cn = "https://klingai.com/"
+ 
+ 
+-def call_for_daily_check(session: requests.Session, is_cn: bool) -> bool:
++class _PycurlResponse:
++    def __init__(self, content: bytes, status_code: int) -> None:
++        self.content = content
++        self.status_code = status_code
++
++    @property
++    def ok(self) -> bool:
++        return self.status_code < 400
++
++    @property
++    def text(self) -> str:
++        return self.content.decode("utf-8", errors="replace")
++
++    def json(self):
++        return jsonlib.loads(self.text)
++
++    def __str__(self) -> str:
++        return f"<Response [{self.status_code}]>"
++
++
++class _PycurlSession:
++    def __init__(self) -> None:
++        self.cookies = None
++        self.headers = {}
++
++    def _request(
++        self,
++        method: str,
++        url: str,
++        data=None,
++        json_data=None,
++        params=None,
++        headers=None,
++    ) -> _PycurlResponse:
++        if params:
++            query = urlencode(params, doseq=True)
++            url = f"{url}{'&' if '?' in url else '?'}{query}"
++
++        request_headers = dict(self.headers)
++        if headers:
++            request_headers.update(headers)
++
++        if json_data is not None:
++            request_body = jsonlib.dumps(json_data).encode("utf-8")
++            request_headers.setdefault("Content-Type", "application/json")
++        elif data is None:
++            request_body = b""
++        elif isinstance(data, str):
++            request_body = data.encode("utf-8")
++        elif isinstance(data, dict):
++            request_body = urlencode(data, doseq=True).encode("utf-8")
++        else:
++            request_body = data
++
++        response_body = BytesIO()
++
++        def collect_cookie(header_line) -> int:
++            raw_header = header_line
++            if isinstance(header_line, bytes):
++                header_line = header_line.decode("iso-8859-1", errors="replace")
++            header_line = header_line.strip()
++            if header_line.lower().startswith("set-cookie:"):
++                response_cookie = SimpleCookie()
++                response_cookie.load(header_line.split(":", 1)[1].strip())
++                if response_cookie:
++                    if self.cookies is None:
++                        self.cookies = {}
++                    for key, morsel in response_cookie.items():
++                        self.cookies[key] = morsel.value
++            return len(raw_header)
++
++        curl = pycurl.Curl()
++        try:
++            curl.setopt(pycurl.URL, url)
++            curl.setopt(pycurl.WRITEDATA, response_body)
++            curl.setopt(pycurl.HEADERFUNCTION, collect_cookie)
++            curl.setopt(pycurl.FOLLOWLOCATION, True)
++            if request_headers:
++                curl.setopt(
++                    pycurl.HTTPHEADER,
++                    [f"{key}: {value}" for key, value in request_headers.items()],
++                )
++            if self.cookies:
++                curl.setopt(
++                    pycurl.COOKIE,
++                    "; ".join(
++                        f"{key}={value}" for key, value in self.cookies.items()
++                    ),
++                )
++            if method == "POST":
++                curl.setopt(pycurl.POST, True)
++                curl.setopt(pycurl.POSTFIELDS, request_body)
++                curl.setopt(pycurl.POSTFIELDSIZE, len(request_body))
++            else:
++                curl.setopt(pycurl.HTTPGET, True)
++            curl.perform()
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        finally:
++            curl.close()
++
++        return _PycurlResponse(response_body.getvalue(), status_code)
++
++    def get(self, url: str, params=None, headers=None) -> _PycurlResponse:
++        return self._request("GET", url, params=params, headers=headers)
++
++    def post(
++        self,
++        url: str,
++        data=None,
++        json=None,
++        params=None,
++        headers=None,
++    ) -> _PycurlResponse:
++        return self._request(
++            "POST",
++            url,
++            data=data,
++            json_data=json,
++            params=params,
++            headers=headers,
++        )
++
++
++def call_for_daily_check(session: _PycurlSession, is_cn: bool) -> bool:
+     if is_cn:
+         r = session.get(f"{base_url}api/pay/reward?activity=login_bonus_daily")
+     else:
+@@ -40,7 +165,7 @@
+ 
+ class BaseGen:
+     def __init__(self, cookie: str) -> None:
+-        self.session: requests.Session = requests.Session()
++        self.session = _PycurlSession()
+         self.cookie = cookie
+         self.session.cookies, is_cn = self.parse_cookie_string(self.cookie)
+         self.session.headers["user-agent"] = ua.random
+@@ -72,16 +197,12 @@
+         cookie = SimpleCookie()
+         cookie.load(cookie_string)
+         cookies_dict = {}
+-        cookiejar = None
+         is_cn = False
+         for key, morsel in cookie.items():
+             if key.startswith("kuaishou"):
+                 is_cn = True
+             cookies_dict[key] = morsel.value
+-            cookiejar = cookiejar_from_dict(
+-                cookies_dict, cookiejar=None, overwrite=True
+-            )
+-        return cookiejar, is_cn
++        return cookies_dict or None, is_cn
+ 
+     def get_account_point(self) -> float:
+         bonus_req = self.session.get(self.daily_url)

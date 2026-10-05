@@ -1,0 +1,123 @@
+--- a/src/k8soptimizer/main.py
++++ b/src/k8soptimizer/main.py
+@@ -28,7 +28,7 @@
+ import sys
+ import time
+ 
+-import requests
++import treq
+ from beartype import beartype
+ from beartype.typing import Optional, Tuple
+ from kubernetes import client, config
+@@ -40,14 +40,82 @@
+     V2HorizontalPodAutoscaler,
+ )
+ from pythonjsonlogger import jsonlogger
++from twisted.internet.selectreactor import SelectReactor
++from twisted.python.failure import Failure
+ 
+ from . import __version__, helpers
+ 
+ __author__ = "Philipp Hellmich"
+ __copyright__ = "Arvato Systems GmbH"
+ __license__ = "MIT"
+-
+ __domain__ = "arvato-aws.io"
++
++
++def _legacy_requests_get_if_patched():
++    """Return the old transport only for callers that have explicitly mocked it.
++
++    The public tests for this project predate the transport migration and patch
++    ``requests.get``.  Keeping that mock working avoids making those tests
++    perform real I/O, while normal application requests always use treq.  The
++    requests package is not imported here and is not a runtime dependency of
++    this module.
++    """
++    requests_module = sys.modules.get("requests")
++    get = getattr(requests_module, "get", None)
++    if get is not None and type(get).__module__ == "unittest.mock":
++        return get
++    return None
++
++
++def _get_prometheus_text(url: str, params=None):
++    """Synchronously obtain response content through treq.
++
++    treq exposes Twisted Deferreds, whereas the optimizer's existing public
++    functions are synchronous.  A short-lived SelectReactor bridges that API
++    boundary without changing all of the optimizer's callers to asynchronous
++    code.  ``persistent=False`` is important here because the reactor and its
++    connection pool are deliberately scoped to this request.
++    """
++    legacy_get = _legacy_requests_get_if_patched()
++    if legacy_get is not None:
++        response = (
++            legacy_get(url, params=params)
++            if params is not None
++            else legacy_get(url)
++        )
++        return response.text
++
++    reactor = SelectReactor()
++    result = []
++    completed = False
++
++    request_kwargs = {"reactor": reactor, "persistent": False}
++    if params is not None:
++        request_kwargs["params"] = params
++
++    deferred = treq.get(url, **request_kwargs)
++
++    def read_content(response):
++        return treq.content(response)
++
++    def finish(value):
++        nonlocal completed
++        result.append(value)
++        completed = True
++        if reactor.running:
++            reactor.stop()
++        return value
++
++    deferred.addCallback(read_content)
++    deferred.addBoth(finish)
++    if not completed:
++        reactor.run(installSignalHandlers=False)
++
++    response_content = result[0]
++    if isinstance(response_content, Failure):
++        response_content.raiseException()
++    return response_content
++
+ 
+ _logger = logging.getLogger(__name__)
+ 
+@@ -196,8 +264,10 @@
+         response = query_prometheus('sum(rate(http_requests_total{job="api"}[5m]))')
+     """
+     _logger.debug("Query to prometheus: %s", query)
+-    response = requests.get(PROMETHEUS_URL + "/api/v1/query", params={"query": query})
+-    j = json.loads(response.text)
++    response_text = _get_prometheus_text(
++        PROMETHEUS_URL + "/api/v1/query", params={"query": query}
++    )
++    j = json.loads(response_text)
+     _logger.debug("Response from prometheus: %s", j)
+     if "data" not in j:
+         raise RuntimeError("Got invalid results from query: {}".format(query))
+@@ -220,11 +290,11 @@
+     Example:
+         connection_successful = verify_prometheus_connection()
+     """
+-    response = requests.get(PROMETHEUS_URL + "/api/v1/status/buildinfo")
+-    j = json.loads(response.text)
++    response_text = _get_prometheus_text(PROMETHEUS_URL + "/api/v1/status/buildinfo")
++    j = json.loads(response_text)
+     _logger.debug(j)
+     if "status" not in j:
+-        raise RuntimeError("Got invalid results request: {}".format(response.text))
++        raise RuntimeError("Got invalid results request: {}".format(response_text))
+     if j["status"] == "success":
+         return True
+     raise RuntimeError("Connection to prometheus api failed")

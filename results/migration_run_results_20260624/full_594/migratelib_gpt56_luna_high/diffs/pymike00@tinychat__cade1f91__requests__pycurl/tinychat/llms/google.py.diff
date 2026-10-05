@@ -1,0 +1,144 @@
+--- a/tinychat/llms/google.py
++++ b/tinychat/llms/google.py
+@@ -1,11 +1,108 @@
+ import json
++import queue
++import threading
+ from typing import Generator
+ 
+-import requests
++import pycurl
+ from sseclient import SSEClient
+ 
+ from tinychat.llms.base import BaseLLMClient
+ from tinychat.settings import GOOGLE_API_KEY_NAME
++
++
++class _PycurlResponse:
++    def __init__(self, url: str, headers: dict, data: dict) -> None:
++        self.status_code = None
++        self._chunks = queue.Queue()
++        self._headers_ready = threading.Event()
++        self._error = None
++        self._closed = False
++
++        self._curl = pycurl.Curl()
++        self._curl.setopt(pycurl.URL, url)
++        self._curl.setopt(
++            pycurl.HTTPHEADER,
++            [f"{key}: {value}" for key, value in headers.items()],
++        )
++        self._curl.setopt(pycurl.POST, 1)
++        self._curl.setopt(
++            pycurl.POSTFIELDS,
++            json.dumps(data).encode("utf-8"),
++        )
++        self._curl.setopt(pycurl.WRITEFUNCTION, self._write_callback)
++        self._curl.setopt(pycurl.HEADERFUNCTION, self._header_callback)
++        self._curl.setopt(pycurl.NOSIGNAL, 1)
++
++        self._thread = threading.Thread(target=self._perform)
++        self._thread.daemon = True
++        self._thread.start()
++
++    def _header_callback(self, header: bytes) -> int:
++        if header.startswith(b"HTTP/"):
++            parts = header.split()
++            if len(parts) > 1:
++                self.status_code = int(parts[1])
++        elif (
++            header in (b"\r\n", b"\n")
++            and self.status_code is not None
++            and self.status_code != 100
++        ):
++            self._headers_ready.set()
++        return len(header)
++
++    def _write_callback(self, chunk: bytes) -> int:
++        if self._closed:
++            return 0
++        self._chunks.put(chunk)
++        return len(chunk)
++
++    def _perform(self) -> None:
++        try:
++            self._curl.perform()
++        except Exception as error:
++            self._error = error
++        finally:
++            if self.status_code is None:
++                try:
++                    self.status_code = self._curl.getinfo(pycurl.RESPONSE_CODE)
++                except Exception:
++                    pass
++            self._headers_ready.set()
++            self._chunks.put(None)
++            self._curl.close()
++
++    def wait_for_headers(self) -> None:
++        self._headers_ready.wait()
++        if self._error is not None:
++            raise self._error
++
++    def iter_content(self, chunk_size=None, decode_unicode=False):
++        while True:
++            chunk = self._chunks.get()
++            if chunk is None:
++                if self._error is not None:
++                    raise self._error
++                return
++            yield chunk
++
++    def iter_lines(self, chunk_size=None, decode_unicode=False):
++        buffer = b""
++        for chunk in self.iter_content(
++            chunk_size=chunk_size,
++            decode_unicode=decode_unicode,
++        ):
++            buffer += chunk
++            while b"\n" in buffer:
++                line, buffer = buffer.split(b"\n", 1)
++                yield line.rstrip(b"\r")
++        if buffer:
++            yield buffer.rstrip(b"\r")
++
++    def __iter__(self):
++        return self.iter_content()
++
++    def close(self) -> None:
++        self._closed = True
+ 
+ 
+ class GoogleAIClient(BaseLLMClient):
+@@ -61,13 +158,14 @@
+             "safetySettings": self.SAFETY_SETTINGS,
+             "generationConfig": self.generation_config,
+         }
+-        response = requests.post(
++        response = _PycurlResponse(
+             self.gemini_endpoint,
+-            headers=self.gemini_headers,  # type: ignore
+-            json=data,
+-            stream=True,
++            self.gemini_headers,
++            data,
+         )
++        response.wait_for_headers()
+         if response.status_code != 200:
++            response.close()
+             raise ValueError(
+                 f"Server responded with an error. Status Code: {response.status_code}"
+             )
+@@ -105,9 +203,9 @@
+         Yield stream responses from the client as they are received.
+ 
+         This method sends the user input to the client and then yields each piece
+-        of the language model's response as it is received in real-time. After the
+-        streaming is complete, it updates the message list with the user input and
+-        the full language model response.
++        of the language model's response as it is received in real-time. After
++        the streaming is complete, it updates the message list with the user input
++        and the full language model response.
+ 
+         :param user_input: The input string from the user to be sent to the model.
+         :return: A generator yielding the model's response in streamed parts.

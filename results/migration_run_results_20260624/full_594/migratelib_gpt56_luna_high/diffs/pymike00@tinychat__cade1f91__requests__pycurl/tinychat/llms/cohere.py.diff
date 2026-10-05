@@ -1,0 +1,109 @@
+--- a/tinychat/llms/cohere.py
++++ b/tinychat/llms/cohere.py
+@@ -1,7 +1,7 @@
+ import json
+ from typing import Generator
+ 
+-import requests
++import pycurl
+ 
+ from tinychat.llms.base import BaseLLMClient
+ from tinychat.settings import COHERE_API_KEY_NAME
+@@ -20,25 +20,73 @@
+ 
+     def perform_stream_request(
+         self, user_input: str, chat_history: list[dict]
+-    ) -> requests.Response:
++    ) -> Generator[bytes, None, None]:
+         data = {
+             "chat_history": chat_history,
+             "message": user_input,
+             "temperature": self.temperature,
+             "stream": True,
+         }
+-        response = requests.post(
+-            self.COHERE_CHAT_API_URL,
+-            headers=self.default_headers(),
+-            json=data,
+-            stream=True,
++
++        curl = pycurl.Curl()
++        multi = pycurl.CurlMulti()
++        response_chunks = []
++        status_code = 0
++
++        def write_function(chunk: bytes) -> int:
++            response_chunks.append(chunk)
++            return len(chunk)
++
++        def header_function(header: bytes) -> int:
++            nonlocal status_code
++            if header.startswith(b"HTTP/"):
++                try:
++                    status_code = int(header.split()[1])
++                except (IndexError, ValueError):
++                    pass
++            return len(header)
++
++        curl.setopt(pycurl.URL, self.COHERE_CHAT_API_URL)
++        curl.setopt(
++            pycurl.HTTPHEADER,
++            [
++                f"{key}: {value}"
++                for key, value in self.default_headers().items()
++            ],
+         )
+-        if response.status_code != 200:
+-            raise ValueError(f"Server responded with error: {response.status_code}")
++        curl.setopt(pycurl.POST, 1)
++        curl.setopt(pycurl.POSTFIELDS, json.dumps(data).encode("utf-8"))
++        curl.setopt(pycurl.WRITEFUNCTION, write_function)
++        curl.setopt(pycurl.HEADERFUNCTION, header_function)
++
++        multi.add_handle(curl)
++
+         try:
+-            return response
+-        except ValueError:
+-            raise ValueError("Invalid response format received from server.")
++            num_handles = 1
++            while num_handles:
++                while True:
++                    result, num_handles = multi.perform()
++                    if result != pycurl.E_CALL_MULTI_PERFORM:
++                        break
++
++                if status_code and status_code != 200:
++                    raise ValueError(
++                        f"Server responded with error: {status_code}"
++                    )
++
++                while response_chunks:
++                    yield response_chunks.pop(0)
++
++                if num_handles:
++                    multi.select(1.0)
++
++            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++            if status_code != 200:
++                raise ValueError(f"Server responded with error: {status_code}")
++        finally:
++            multi.remove_handle(curl)
++            curl.close()
++            multi.close()
+ 
+ 
+ class CohereHandler:
+@@ -71,9 +119,9 @@
+         Yield stream responses from the client as they are received.
+ 
+         This method sends the user input to the client and then yields each piece
+-        of the language model's response as it is received in real-time. After the
+-        streaming is complete, it updates the message list with the user input and
+-        the full language model response.
++        of the language model's response as it is received in real-time. After
++        the streaming is complete, it updates the message list with the user input
++        and the full language model response.
+ 
+         :param user_input: The input string from the user to be sent to the model.
+         :return: A generator yielding the model's response in streamed parts.

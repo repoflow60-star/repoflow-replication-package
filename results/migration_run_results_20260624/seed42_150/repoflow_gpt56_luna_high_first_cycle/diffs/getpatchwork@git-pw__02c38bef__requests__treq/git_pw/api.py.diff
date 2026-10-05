@@ -1,0 +1,343 @@
+--- a/git_pw/api.py
++++ b/git_pw/api.py
+@@ -3,15 +3,21 @@
+ """
+ 
+ from functools import update_wrapper
++import base64
++import json
+ import logging
+ import os.path
+ import re
+ import sys
+ import tempfile
++import threading
+ import typing as ty
++from urllib.parse import urlencode
+ 
+ import click
+-import requests
++import treq
++from twisted.internet import reactor
++from twisted.web.http_headers import Headers
+ 
+ import git_pw
+ from git_pw import config
+@@ -22,30 +28,113 @@
+ Filters = ty.List[ty.Tuple[str, str]]
+ 
+ 
+-class HTTPTokenAuth(requests.auth.AuthBase):
+-    """Attaches HTTP Token Authentication to the given Request object."""
+-
+-    def __init__(self, token: str):
+-        self.token = token
+-
+-    def __call__(
+-        self,
+-        r: requests.PreparedRequest,
+-    ) -> requests.PreparedRequest:
+-        r.headers['Authorization'] = self._token_auth_str(self.token)
+-        return r
+-
+-    @staticmethod
+-    def _token_auth_str(token: str) -> str:
+-        """Return a Token auth string."""
+-        return 'Token {}'.format(token.strip())
+-
+-
+-def _get_auth(optional: bool = False) -> ty.Optional[requests.auth.AuthBase]:
++class _Response:
++    """Synchronous response view used by the existing API functions."""
++
++    def __init__(self, response: ty.Any, content: bytes):
++        self.status_code = response.code
++        self.headers = {
++            _decode(header).lower(): ', '.join(
++                _decode(value) for value in values
++            )
++            for header, values in response.headers.getAllRawHeaders()
++        }
++        self.content = content
++
++    def raise_for_status(self) -> None:
++        if self.status_code >= 400:
++            raise _RequestError(self)
++
++    def json(self) -> ty.Any:
++        return json.loads(self.content)
++
++    def iter_content(self, chunk_size: int):
++        for offset in range(0, len(self.content), chunk_size):
++            yield self.content[offset : offset + chunk_size]
++
++
++class _RequestError(Exception):
++    def __init__(self, response: _Response):
++        super().__init__(
++            'HTTP request failed with status {}'.format(response.status_code)
++        )
++        self.response = response
++
++
++def _decode(value: ty.Any) -> str:
++    if isinstance(value, bytes):
++        return value.decode('latin-1')
++    return value
++
++
++_REACTOR_LOCK = threading.Lock()
++_REACTOR_READY = threading.Event()
++_REACTOR_THREAD: ty.Optional[threading.Thread] = None
++
++
++def _run_reactor() -> None:
++    reactor.callWhenRunning(_REACTOR_READY.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor() -> None:
++    global _REACTOR_THREAD
++
++    with _REACTOR_LOCK:
++        if _REACTOR_THREAD is None:
++            _REACTOR_THREAD = threading.Thread(
++                target=_run_reactor,
++                name='git-pw-treq-reactor',
++                daemon=True,
++            )
++            _REACTOR_THREAD.start()
++
++    _REACTOR_READY.wait()
++
++
++def _blocking(operation: ty.Callable[[], ty.Any]) -> ty.Any:
++    """Wait for a treq Deferred without changing the public sync API."""
++    _ensure_reactor()
++
++    completed = threading.Event()
++    result: ty.Dict[str, ty.Any] = {}
++
++    def invoke() -> None:
++        try:
++            deferred = operation()
++        except BaseException as exc:
++            result['exception'] = exc
++            completed.set()
++            return
++
++        def succeeded(value: ty.Any) -> ty.Any:
++            result['value'] = value
++            completed.set()
++            return value
++
++        def failed(failure: ty.Any) -> None:
++            result['failure'] = failure
++            completed.set()
++
++        deferred.addCallbacks(succeeded, failed)
++
++    reactor.callFromThread(invoke)
++    completed.wait()
++
++    if 'exception' in result:
++        raise result['exception']
++    if 'failure' in result:
++        result['failure'].raiseException()
++
++    return result['value']
++
++
++def _get_auth(optional: bool = False) -> ty.Optional[str]:
+     if CONF.token:
+-        return HTTPTokenAuth(CONF.token)
++        return 'Token {}'.format(CONF.token.strip())
+     elif CONF.username and CONF.password:
+-        return requests.auth.HTTPBasicAuth(CONF.username, CONF.password)
++        credentials = '{}:{}'.format(CONF.username, CONF.password).encode()
++        return 'Basic {}'.format(base64.b64encode(credentials).decode())
+     elif not optional:
+         LOG.error('Authentication information missing')
+         LOG.error(
+@@ -60,6 +149,26 @@
+     return {
+         'User-Agent': 'git-pw ({})'.format(git_pw.__version__),
+     }
++
++
++def _request_headers(optional_auth: bool, form_data: bool = False) -> Headers:
++    headers = _get_headers()
++    auth = _get_auth(optional=optional_auth)
++    if auth:
++        headers['Authorization'] = auth
++    if form_data:
++        headers['Content-Type'] = 'application/x-www-form-urlencoded'
++
++    return Headers(
++        {
++            key.encode('ascii'): [value.encode('utf-8')]
++            for key, value in headers.items()
++        }
++    )
++
++
++def _form_data(data: ty.List[ty.Tuple[str, ty.Any]]) -> bytes:
++    return urlencode(data, doseq=True).encode('utf-8')
+ 
+ 
+ def _get_server() -> str:
+@@ -107,11 +216,12 @@
+ 
+ def _handle_error(
+     operation: str,
+-    exc: requests.exceptions.RequestException,
++    exc: Exception,
+ ) -> None:
+-    if exc.response is not None and exc.response.content:
++    response = getattr(exc, 'response', None)
++    if response is not None and response.content:
+         # server errors should always be reported
+-        if exc.response.status_code in range(500, 512):  # 5xx Server Error
++        if response.status_code in range(500, 512):  # 5xx Server Error
+             LOG.error(
+                 'Server error. Please report this issue to '
+                 'https://github.com/getpatchwork/patchwork'
+@@ -119,10 +229,10 @@
+             raise
+ 
+         # we make the assumption that all responses will be JSON encoded
+-        if exc.response.status_code == 404:
++        if response.status_code == 404:
+             LOG.error('Resource not found')
+         else:
+-            LOG.error(exc.response.json())
++            LOG.error(response.json())
+     else:
+         LOG.error(
+             'Failed to %s resource. Is your configuration '
+@@ -140,23 +250,23 @@
+     url: str,
+     params: ty.Optional[Filters] = None,
+     stream: bool = False,
+-) -> requests.Response:
++) -> _Response:
+     """Make GET request and handle errors."""
+     LOG.debug('GET %s', url)
+ 
+     try:
+-        # TODO(stephenfin): We only use a subset of the types possible for
+-        # 'params' (namely a list of tuples) but it doesn't seem possible to
+-        # indicate this
+-        rsp = requests.get(
+-            url,
+-            auth=_get_auth(optional=True),
+-            headers=_get_headers(),
+-            stream=stream,
+-            params=params,
+-        )  # type: ignore
++        response = _blocking(
++            lambda: treq.get(
++                url,
++                headers=_request_headers(optional_auth=True),
++                params=params,
++            )
++        )
++        rsp = _Response(
++            response, _blocking(lambda: treq.content(response))
++        )
+         rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++    except Exception as exc:
+         _handle_error('fetch', exc)
+ 
+     LOG.debug('Got response')
+@@ -167,16 +277,25 @@
+ def _post(
+     url: str,
+     data: ty.List[ty.Tuple[str, ty.Any]],
+-) -> requests.Response:
++) -> _Response:
+     """Make POST request and handle errors."""
+     LOG.debug('POST %s, data=%r', url, data)
+ 
+     try:
+-        rsp = requests.post(
+-            url, auth=_get_auth(), headers=_get_headers(), data=data
++        response = _blocking(
++            lambda: treq.post(
++                url,
++                headers=_request_headers(
++                    optional_auth=False, form_data=True
++                ),
++                data=_form_data(data),
++            )
++        )
++        rsp = _Response(
++            response, _blocking(lambda: treq.content(response))
+         )
+         rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++    except Exception as exc:
+         _handle_error('create', exc)
+ 
+     LOG.debug('Got response')
+@@ -187,19 +306,26 @@
+ def _patch(
+     url: str,
+     data: ty.List[ty.Tuple[str, ty.Any]],
+-) -> requests.Response:
++) -> _Response:
+     """Make PATCH request and handle errors."""
+     LOG.debug('PATCH %s, data=%r', url, data)
+ 
+     try:
+-        rsp = requests.patch(
+-            url,
+-            auth=_get_auth(),
+-            headers=_get_headers(),
+-            data=data,
++        response = _blocking(
++            lambda: treq.request(
++                'PATCH',
++                url,
++                headers=_request_headers(
++                    optional_auth=False, form_data=True
++                ),
++                data=_form_data(data),
++            )
++        )
++        rsp = _Response(
++            response, _blocking(lambda: treq.content(response))
+         )
+         rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++    except Exception as exc:
+         _handle_error('update', exc)
+ 
+     LOG.debug('Got response')
+@@ -207,14 +333,22 @@
+     return rsp
+ 
+ 
+-def _delete(url: str) -> requests.Response:
++def _delete(url: str) -> _Response:
+     """Make DELETE request and handle errors."""
+     LOG.debug('DELETE %s', url)
+ 
+     try:
+-        rsp = requests.delete(url, auth=_get_auth(), headers=_get_headers())
++        response = _blocking(
++            lambda: treq.delete(
++                url,
++                headers=_request_headers(optional_auth=False),
++            )
++        )
++        rsp = _Response(
++            response, _blocking(lambda: treq.content(response))
++        )
+         rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++    except Exception as exc:
+         _handle_error('delete', exc)
+ 
+     LOG.debug('Got response')

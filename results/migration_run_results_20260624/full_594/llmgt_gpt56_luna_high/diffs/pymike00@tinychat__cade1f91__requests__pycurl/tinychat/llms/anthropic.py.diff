@@ -1,0 +1,148 @@
+--- a/tinychat/llms/anthropic.py
++++ b/tinychat/llms/anthropic.py
+@@ -1,11 +1,124 @@
++import codecs
+ import json
++import queue
++import threading
+ from typing import Generator
+ 
+-import requests
++import pycurl
+ from sseclient import SSEClient
+ 
+ from tinychat.llms.base import BaseLLMClient
+ from tinychat.settings import ANTHROPIC_API_KEY_NAME
++
++
++class _PycurlResponse:
++    def __init__(self, url: str, headers: dict, data: dict) -> None:
++        self.status_code = None
++        self.headers = {}
++        self.encoding = "utf-8"
++        self._chunks = queue.Queue()
++        self._error = None
++        self._read_buffer = b""
++        self._headers_ready = threading.Event()
++
++        self._url = url
++        self._request_headers = headers
++        self._data = data
++
++        self._thread = threading.Thread(target=self._perform)
++        self._thread.daemon = True
++        self._thread.start()
++        self._headers_ready.wait()
++
++    def _header_callback(self, data: bytes) -> int:
++        header = data.decode("iso-8859-1").strip()
++        if header.startswith("HTTP/"):
++            self.status_code = int(header.split()[1])
++        elif ":" in header:
++            key, value = header.split(":", 1)
++            self.headers[key.strip()] = value.strip()
++        return len(data)
++
++    def _write_callback(self, data: bytes) -> int:
++        self._chunks.put(data)
++        return len(data)
++
++    def _perform(self) -> None:
++        curl = pycurl.Curl()
++        curl.setopt(pycurl.URL, self._url)
++        curl.setopt(
++            pycurl.HTTPHEADER,
++            [
++                f"{key}: {value}"
++                for key, value in self._request_headers.items()
++            ],
++        )
++        curl.setopt(pycurl.POST, 1)
++        curl.setopt(pycurl.POSTFIELDS, json.dumps(self._data))
++        curl.setopt(pycurl.HEADERFUNCTION, self._header_callback)
++        curl.setopt(pycurl.WRITEFUNCTION, self._write_callback)
++
++        try:
++            curl.perform()
++            if self.status_code is None:
++                self.status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++        except Exception as error:
++            self._error = error
++        finally:
++            self._headers_ready.set()
++            self._chunks.put(None)
++            curl.close()
++
++    def iter_content(self, chunk_size=1, decode_unicode=False):
++        decoder = codecs.getincrementaldecoder("utf-8")() if decode_unicode else None
++
++        while True:
++            chunk = self._chunks.get()
++            if chunk is None:
++                if self._error is not None:
++                    raise self._error
++                if decoder is not None:
++                    remaining = decoder.decode(b"", final=True)
++                    if remaining:
++                        yield remaining
++                break
++
++            if decoder is not None:
++                decoded_chunk = decoder.decode(chunk)
++                if decoded_chunk:
++                    yield decoded_chunk
++            else:
++                yield chunk
++
++    def read(self, size=-1):
++        if size == 0:
++            return b""
++
++        while size < 0 or len(self._read_buffer) < size:
++            chunk = self._chunks.get()
++            if chunk is None:
++                if self._error is not None:
++                    raise self._error
++                break
++            self._read_buffer += chunk
++
++            if size > 0 and len(self._read_buffer) >= size:
++                break
++
++        if size < 0:
++            result = self._read_buffer
++            self._read_buffer = b""
++            return result
++
++        result = self._read_buffer[:size]
++        self._read_buffer = self._read_buffer[size:]
++        return result
++
++    def raise_for_status(self):
++        if self.status_code is not None and self.status_code >= 400:
++            raise ValueError(
++                f"Server responded with an error. Status Code: {self.status_code}"
++            )
+ 
+ 
+ class AnthropicAIClient(BaseLLMClient):
+@@ -41,11 +154,10 @@
+             "stream": True,
+             "max_tokens": 2048,
+         }
+-        response = requests.post(
++        response = _PycurlResponse(
+             self.ANTHROPIC_MESSAGES_API_URL,
+             headers=self.anthropic_headers(),  # type: ignore
+-            json=data,
+-            stream=True,
++            data=data,
+         )
+         if response.status_code != 200:
+             raise ValueError(
+@@ -97,4 +209,4 @@
+                 response_piece = event_data["delta"]["text"]
+                 lm_response += response_piece
+                 yield response_piece
+-        self._messages.append({"role": "assistant", "content": lm_response})
++        self._messages.append({"role": "assistant", "content": lm_response})

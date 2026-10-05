@@ -1,0 +1,307 @@
+--- a/filestack/utils.py
++++ b/filestack/utils.py
+@@ -1,9 +1,12 @@
++import io
++import json
+ import time
+ import string
+ import random
++import urllib.parse
+ from functools import partial
+-import requests as original_requests
+-from requests.exceptions import HTTPError
++
++import pycurl
+ 
+ from filestack import config
+ from filestack.exceptions import FilestackHTTPError
+@@ -13,34 +16,279 @@
+     return ''.join(random.choice(string.ascii_letters + string.digits) for i in range(length))
+ 
+ 
++class PyCurlResponse:
++    """
++    A response object compatible with the requests.Response interface,
++    built on top of pycurl.
++    """
++    def __init__(self, status_code, body_bytes, headers_dict):
++        self.status_code = status_code
++        self._body_bytes = body_bytes
++        self.headers = headers_dict
++
++    @property
++    def ok(self):
++        return 200 <= self.status_code < 300
++
++    @property
++    def content(self):
++        return self._body_bytes
++
++    @property
++    def text(self):
++        return self._body_bytes.decode('utf-8', errors='replace')
++
++    def json(self):
++        return json.loads(self._body_bytes.decode('utf-8'))
++
++    def iter_content(self, chunk_size=8192):
++        """Yield body in chunks (all data already in memory)."""
++        data = self._body_bytes
++        offset = 0
++        while offset < len(data):
++            yield data[offset:offset + chunk_size]
++            offset += chunk_size
++
++    def raise_for_status(self):
++        if not self.ok:
++            raise _HTTPError(
++                'HTTP Error: {} for url'.format(self.status_code),
++                response=self
++            )
++
++
++class _HTTPError(Exception):
++    """Internal HTTP error used by raise_for_status."""
++    def __init__(self, message, response=None):
++        super().__init__(message)
++        self.response = response
++
++
++def _parse_headers(header_bytes):
++    """Parse raw HTTP header bytes into a case-insensitive dict."""
++    result = {}
++    lines = header_bytes.decode('utf-8', errors='replace').splitlines()
++    for line in lines[1:]:  # skip status line
++        if ':' in line:
++            key, _, value = line.partition(':')
++            result[key.strip()] = value.strip()
++    return result
++
++
++def _build_url_with_params(url, params):
++    if not params:
++        return url
++    encoded = urllib.parse.urlencode(params)
++    separator = '&' if '?' in url else '?'
++    return url + separator + encoded
++
++
++def _perform_request(method, url, params=None, headers=None, json_data=None,
++                     data=None, files=None):
++    """
++    Core pycurl-based HTTP request function.
++
++    Supports GET, POST, PUT, DELETE with JSON body, raw data body,
++    query params, and custom headers.
++    """
++    c = pycurl.Curl()
++    try:
++        full_url = _build_url_with_params(url, params)
++        c.setopt(pycurl.URL, full_url.encode('utf-8') if isinstance(full_url, str) else full_url)
++        c.setopt(pycurl.FOLLOWLOCATION, 1)
++
++        body_buffer = io.BytesIO()
++        header_buffer = io.BytesIO()
++
++        c.setopt(pycurl.WRITEDATA, body_buffer)
++        c.setopt(pycurl.HEADERFUNCTION, header_buffer.write)
++
++        request_headers = {}
++        if headers:
++            request_headers.update(headers)
++
++        if method == 'GET':
++            c.setopt(pycurl.HTTPGET, 1)
++
++        elif method == 'POST':
++            if json_data is not None:
++                post_body = json.dumps(json_data).encode('utf-8')
++                request_headers['Content-Type'] = 'application/json'
++                c.setopt(pycurl.POST, 1)
++                c.setopt(pycurl.POSTFIELDS, post_body)
++                c.setopt(pycurl.POSTFIELDSIZE, len(post_body))
++            elif files is not None:
++                # multipart/form-data upload
++                form_fields = []
++                if data:
++                    for k, v in data.items():
++                        form_fields.append((k, v))
++                for field_name, file_tuple in files.items():
++                    # file_tuple: (filename, file_obj, mimetype)
++                    filename, file_obj, mimetype = file_tuple
++                    file_bytes = file_obj.read() if hasattr(file_obj, 'read') else file_obj
++                    form_fields.append(
++                        (field_name, (pycurl.FORM_BUFFER, filename,
++                                      pycurl.FORM_BUFFERPTR, file_bytes,
++                                      pycurl.FORM_CONTENTTYPE, mimetype))
++                    )
++                c.setopt(pycurl.HTTPPOST, form_fields)
++            elif data is not None:
++                if isinstance(data, dict):
++                    post_body = urllib.parse.urlencode(data).encode('utf-8')
++                elif isinstance(data, str):
++                    post_body = data.encode('utf-8')
++                else:
++                    post_body = data
++                c.setopt(pycurl.POST, 1)
++                c.setopt(pycurl.POSTFIELDS, post_body)
++                c.setopt(pycurl.POSTFIELDSIZE, len(post_body))
++            else:
++                c.setopt(pycurl.POST, 1)
++                c.setopt(pycurl.POSTFIELDS, b'')
++                c.setopt(pycurl.POSTFIELDSIZE, 0)
++
++        elif method == 'PUT':
++            if data is not None:
++                if isinstance(data, (bytes, bytearray)):
++                    put_body = data
++                elif isinstance(data, str):
++                    put_body = data.encode('utf-8')
++                else:
++                    put_body = data
++                put_buf = io.BytesIO(put_body)
++                c.setopt(pycurl.UPLOAD, 1)
++                c.setopt(pycurl.READDATA, put_buf)
++                c.setopt(pycurl.INFILESIZE, len(put_body))
++            else:
++                c.setopt(pycurl.UPLOAD, 1)
++                c.setopt(pycurl.INFILESIZE, 0)
++
++        elif method == 'DELETE':
++            c.setopt(pycurl.CUSTOMREQUEST, 'DELETE')
++
++        if request_headers:
++            curl_headers = ['{}: {}'.format(k, v) for k, v in request_headers.items()]
++            c.setopt(pycurl.HTTPHEADER, curl_headers)
++
++        c.perform()
++
++        status_code = c.getinfo(pycurl.RESPONSE_CODE)
++        headers_dict = _parse_headers(header_buffer.getvalue())
++        body_bytes = body_buffer.getvalue()
++
++        return PyCurlResponse(status_code, body_bytes, headers_dict)
++
++    finally:
++        c.close()
++
++
+ class RequestsWrapper:
+     """
+-    This class wraps selected methods from requests package and adds
++    This class wraps pycurl to provide a requests-compatible interface and adds
+     default headers if no headers were specified.
+     """
+     def __getattr__(self, name):
+         if name in ('get', 'post', 'put', 'delete'):
+             return partial(self.handle_request, name)
+-        return original_requests.__getattribute__(name)
+-
+-    def handle_request(self, name, *args, **kwargs):
++        raise AttributeError('RequestsWrapper has no attribute {!r}'.format(name))
++
++    def handle_request(self, method, *args, **kwargs):
+         if 'headers' not in kwargs:
+-            kwargs['headers'] = config.HEADERS
++            kwargs['headers'] = dict(config.HEADERS)
+             kwargs['headers']['Filestack-Trace-Id'] = '{}-{}'.format(int(time.time()), unique_id())
+             kwargs['headers']['Filestack-Trace-Span'] = 'pythonsdk-{}'.format(unique_id())
+ 
+-        requests_method = getattr(original_requests, name)
+-        response = requests_method(*args, **kwargs)
++        # Extract arguments compatible with _perform_request
++        url = args[0] if args else kwargs.pop('url', None)
++        params = kwargs.pop('params', None)
++        headers = kwargs.pop('headers', None)
++        json_data = kwargs.pop('json', None)
++        data = kwargs.pop('data', None)
++        files = kwargs.pop('files', None)
++        # stream is accepted but ignored (we buffer in memory)
++        kwargs.pop('stream', None)
+ 
+         try:
++            response = _perform_request(
++                method.upper(), url,
++                params=params,
++                headers=headers,
++                json_data=json_data,
++                data=data,
++                files=files,
++            )
+             response.raise_for_status()
+-        except HTTPError as e:
+-            raise FilestackHTTPError(response.text) from e
++        except _HTTPError as e:
++            raise FilestackHTTPError(e.response.text) from e
+ 
+         return response
+ 
+ 
+-requests = RequestsWrapper()
++class _RetrySession:
++    """
++    Minimal session-like object with retry support for POST requests.
++    Used by intelligent_ingestion.py for the multipart/complete endpoint.
++    """
++    def __init__(self):
++        self._max_retries = 7
++        self._backoff_factor = 0.2
++        self._retry_statuses = {202}
++        self._headers = {}
++
++    def mount(self, prefix, adapter):
++        # Extract retry config from HTTPAdapter if possible
++        if hasattr(adapter, 'max_retries') and hasattr(adapter.max_retries, 'total'):
++            self._max_retries = adapter.max_retries.total
++            self._backoff_factor = getattr(adapter.max_retries, 'backoff_factor', 0.2)
++            self._retry_statuses = set(getattr(adapter.max_retries, 'status_forcelist', [202]))
++
++    def post(self, url, json=None, headers=None, **kwargs):
++        merged_headers = dict(self._headers)
++        if headers:
++            merged_headers.update(headers)
++
++        last_response = None
++        for attempt in range(self._max_retries + 1):
++            if attempt > 0:
++                sleep_time = self._backoff_factor * (2 ** (attempt - 1))
++                time.sleep(sleep_time)
++
++            response = _perform_request(
++                'POST', url,
++                headers=merged_headers if merged_headers else None,
++                json_data=json,
++            )
++            last_response = response
++
++            if response.status_code not in self._retry_statuses:
++                break
++
++        return last_response
++
++
++class _HTTPAdapter:
++    """Minimal HTTPAdapter that stores retry config."""
++    def __init__(self, max_retries=None):
++        self.max_retries = max_retries
++
++
++class _AdaptersNamespace:
++    HTTPAdapter = _HTTPAdapter
++
++
++class RequestsWrapperWithSession(RequestsWrapper):
++    """Extended wrapper that also supports Session() and adapters."""
++
++    def Session(self):
++        return _RetrySession()
++
++    @property
++    def adapters(self):
++        return _AdaptersNamespace()
++
++
++requests = RequestsWrapperWithSession()
+ 
+ 
+ def return_transform_task(transformation, params):

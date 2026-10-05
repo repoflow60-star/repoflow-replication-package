@@ -1,0 +1,138 @@
+--- a/kling/kling.py
++++ b/kling/kling.py
+@@ -1,14 +1,15 @@
+ import argparse
++import json as json_module
+ import os
+ import time
+ import contextlib
+ from typing import Optional
+ from enum import Enum
+ from http.cookies import SimpleCookie
++from urllib.parse import urlencode
+ 
+ from fake_useragent import UserAgent
+-import requests
+-from requests.utils import cookiejar_from_dict
++import urllib3
+ from rich import print
+ import threading
+ 
+@@ -18,7 +19,89 @@
+ base_url_not_cn = "https://klingai.com/"
+ 
+ 
+-def call_for_daily_check(session: requests.Session, is_cn: bool) -> bool:
++class _Urllib3ResponseAdapter:
++    """Expose the response attributes used by the existing API on HTTPResponse."""
++
++    def __init__(self, response) -> None:
++        self._response = response
++
++    @property
++    def status(self):
++        status = getattr(self._response, "status", None)
++        if isinstance(status, int):
++            return status
++        return getattr(self._response, "status_code", status)
++
++    @property
++    def status_code(self):
++        return self.status
++
++    @property
++    def ok(self) -> bool:
++        response_ok = getattr(self._response, "ok", None)
++        if isinstance(response_ok, bool):
++            return response_ok
++        return self.status < 400
++
++    @property
++    def content(self):
++        return self._response.data
++
++    @property
++    def text(self) -> str:
++        return self.content.decode("utf-8", errors="replace")
++
++    def json(self):
++        response_json = getattr(self._response, "json", None)
++        if callable(response_json):
++            return response_json()
++        return json_module.loads(self.content)
++
++    def __getattr__(self, name):
++        return getattr(self._response, name)
++
++
++class _Urllib3Session:
++    def __init__(self) -> None:
++        self._pool = urllib3.PoolManager()
++        self.cookies: dict[str, str] = {}
++        self.headers: dict[str, str] = {}
++
++    def _request(self, method: str, url: str, **kwargs):
++        params = kwargs.pop("params", None)
++        if params:
++            separator = "&" if "?" in url else "?"
++            url = f"{url}{separator}{urlencode(params, doseq=True)}"
++
++        headers = dict(self.headers)
++        headers.update(kwargs.pop("headers", {}))
++        if "data" in kwargs:
++            kwargs["body"] = kwargs.pop("data")
++        if self.cookies and not any(
++            key.lower() == "cookie" for key in headers
++        ):
++            headers["Cookie"] = "; ".join(
++                f"{key}={value}" for key, value in self.cookies.items()
++            )
++
++        response = self._pool.request(method, url, headers=headers, **kwargs)
++        return _Urllib3ResponseAdapter(response)
++
++    def get(self, url: str, **kwargs):
++        return self._request("GET", url, **kwargs)
++
++    def post(
++        self, url: str, json: Optional[dict] = None, **kwargs
++    ):
++        if json is not None:
++            kwargs["body"] = json_module.dumps(json).encode("utf-8")
++            headers = dict(kwargs.pop("headers", {}))
++            headers.setdefault("Content-Type", "application/json")
++            kwargs["headers"] = headers
++        return self._request("POST", url, **kwargs)
++
++
++def call_for_daily_check(session: _Urllib3Session, is_cn: bool) -> bool:
+     if is_cn:
+         r = session.get(f"{base_url}api/pay/reward?activity=login_bonus_daily")
+     else:
+@@ -40,7 +123,7 @@
+ 
+ class BaseGen:
+     def __init__(self, cookie: str) -> None:
+-        self.session: requests.Session = requests.Session()
++        self.session: _Urllib3Session = _Urllib3Session()
+         self.cookie = cookie
+         self.session.cookies, is_cn = self.parse_cookie_string(self.cookie)
+         self.session.headers["user-agent"] = ua.random
+@@ -72,16 +155,12 @@
+         cookie = SimpleCookie()
+         cookie.load(cookie_string)
+         cookies_dict = {}
+-        cookiejar = None
+         is_cn = False
+         for key, morsel in cookie.items():
+             if key.startswith("kuaishou"):
+                 is_cn = True
+             cookies_dict[key] = morsel.value
+-            cookiejar = cookiejar_from_dict(
+-                cookies_dict, cookiejar=None, overwrite=True
+-            )
+-        return cookiejar, is_cn
++        return cookies_dict, is_cn
+ 
+     def get_account_point(self) -> float:
+         bonus_req = self.session.get(self.daily_url)

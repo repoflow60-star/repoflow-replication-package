@@ -1,0 +1,393 @@
+--- a/git_pw/api.py
++++ b/git_pw/api.py
+@@ -3,15 +3,18 @@
+ """
+ 
+ from functools import update_wrapper
++import io
++import json
+ import logging
+ import os.path
+ import re
+ import sys
+ import tempfile
+ import typing as ty
++from urllib.parse import urlencode, urlsplit, urlunsplit
+ 
+ import click
+-import requests
++import pycurl
+ 
+ import git_pw
+ from git_pw import config
+@@ -22,30 +25,83 @@
+ Filters = ty.List[ty.Tuple[str, str]]
+ 
+ 
+-class HTTPTokenAuth(requests.auth.AuthBase):
+-    """Attaches HTTP Token Authentication to the given Request object."""
+-
+-    def __init__(self, token: str):
+-        self.token = token
+-
+-    def __call__(
++class HTTPError(Exception):
++    """An HTTP response with an unsuccessful status code."""
++
++    def __init__(self, response: "Response"):
++        self.response = response
++        super().__init__(
++            'HTTP error {}'.format(response.status_code),
++        )
++
++
++class Headers(dict):
++    """Case-insensitive mapping for HTTP response headers."""
++
++    def __getitem__(self, key: str) -> str:
++        return super().__getitem__(key.lower())
++
++    def get(
+         self,
+-        r: requests.PreparedRequest,
+-    ) -> requests.PreparedRequest:
+-        r.headers['Authorization'] = self._token_auth_str(self.token)
+-        return r
+-
+-    @staticmethod
+-    def _token_auth_str(token: str) -> str:
+-        """Return a Token auth string."""
+-        return 'Token {}'.format(token.strip())
+-
+-
+-def _get_auth(optional: bool = False) -> ty.Optional[requests.auth.AuthBase]:
++        key: str,
++        default: ty.Optional[str] = None,
++    ) -> ty.Optional[str]:
++        return super().get(key.lower(), default)
++
++    def __contains__(self, key: object) -> bool:
++        return super().__contains__(
++            key.lower() if isinstance(key, str) else key
++        )
++
++
++class Response:
++    """Small response wrapper exposing the HTTP response features we use.
++
++    PycURL provides a low-level interface and does not have a response object.
++    Keeping this wrapper local means the rest of git-pw can continue to deal
++    with response bodies, headers, and JSON in the same way as before.
++    """
++
++    def __init__(
++        self,
++        content: bytes,
++        status_code: int,
++        headers: ty.Dict[str, str],
++    ):
++        self.content = content
++        self.status_code = status_code
++        # HTTP header names are case insensitive.  Header names are stored in
++        # lower case so callers can use either the spelling returned by a
++        # server or the spelling used by HTTP clients.
++        self.headers = Headers(
++            {name.lower(): value for name, value in headers.items()}
++        )
++
++    def json(self) -> ty.Any:
++        return json.loads(self.content)
++
++    def iter_content(self, chunk_size: int = 1024) -> ty.Iterator[bytes]:
++        for offset in range(0, len(self.content), chunk_size):
++            yield self.content[offset : offset + chunk_size]
++
++    def raise_for_status(self) -> None:
++        if self.status_code >= 400:
++            raise HTTPError(self)
++
++
++# The first item identifies the authentication method.  This keeps the
++# authentication details separate from the curl options used below.
++Auth = ty.Union[
++    ty.Tuple[ty.Literal['token'], str],
++    ty.Tuple[ty.Literal['basic'], ty.Tuple[str, str]],
++]
++
++
++def _get_auth(optional: bool = False) -> ty.Optional[Auth]:
+     if CONF.token:
+-        return HTTPTokenAuth(CONF.token)
++        return ('token', CONF.token.strip())
+     elif CONF.username and CONF.password:
+-        return requests.auth.HTTPBasicAuth(CONF.username, CONF.password)
++        return ('basic', (CONF.username, CONF.password))
+     elif not optional:
+         LOG.error('Authentication information missing')
+         LOG.error(
+@@ -105,13 +161,107 @@
+         sys.exit(1)
+ 
+ 
++def _encode_params(
++    url: str,
++    params: ty.Optional[Filters],
++) -> str:
++    """Append request parameters to *url* using curl-compatible encoding."""
++    if not params:
++        return url
++
++    # Omit parameters whose value is None rather than sending the literal
++    # string "None".
++    encoded = urlencode(
++        [(key, value) for key, value in params if value is not None],
++        doseq=True,
++    )
++    if not encoded:
++        return url
++
++    parts = urlsplit(url)
++    query = '&'.join(filter(None, (parts.query, encoded)))
++    return urlunsplit(
++        (parts.scheme, parts.netloc, parts.path, query, parts.fragment)
++    )
++
++
++def _request(
++    method: str,
++    url: str,
++    *,
++    params: ty.Optional[Filters] = None,
++    data: ty.Optional[ty.List[ty.Tuple[str, ty.Any]]] = None,
++) -> Response:
++    """Execute one HTTP request using pycurl."""
++    url = _encode_params(url, params)
++    body = io.BytesIO()
++    response_headers: ty.Dict[str, str] = {}
++
++    def header_callback(raw_header: bytes) -> int:
++        # A redirect or an interim 1xx response starts a new header block.
++        # Keep only the headers belonging to the final response.
++        header = raw_header.decode('latin-1').rstrip('\r\n')
++        if header.startswith('HTTP/'):
++            response_headers.clear()
++        elif ':' in header:
++            name, value = header.split(':', 1)
++            response_headers[name.strip().lower()] = value.strip()
++        return len(raw_header)
++
++    curl = pycurl.Curl()
++    try:
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.HTTPGET, method == 'GET')
++        curl.setopt(pycurl.WRITEFUNCTION, body.write)
++        curl.setopt(pycurl.HEADERFUNCTION, header_callback)
++        curl.setopt(pycurl.FOLLOWLOCATION, True)
++        # Ask libcurl to negotiate and transparently decode supported
++        # compression formats, as a high-level HTTP client would.
++        curl.setopt(pycurl.ACCEPT_ENCODING, '')
++
++        headers = _get_headers()
++        auth = _get_auth(optional=method == 'GET')
++        if auth:
++            if auth[0] == 'token':
++                headers['Authorization'] = 'Token {}'.format(auth[1])
++            else:
++                username, password = auth[1]
++                curl.setopt(pycurl.HTTPAUTH, pycurl.HTTPAUTH_BASIC)
++                curl.setopt(pycurl.USERPWD, '{}:{}'.format(username, password))
++
++        if data is not None:
++            # Encode a list of form fields, including repeated fields, as
++            # application/x-www-form-urlencoded data.
++            curl.setopt(pycurl.POSTFIELDS, urlencode(data, doseq=True))
++            headers.setdefault(
++                'Content-Type', 'application/x-www-form-urlencoded'
++            )
++
++        if method == 'POST':
++            curl.setopt(pycurl.POST, True)
++        elif method not in ('GET', 'POST'):
++            curl.setopt(pycurl.CUSTOMREQUEST, method)
++
++        curl.setopt(
++            pycurl.HTTPHEADER,
++            ['{}: {}'.format(name, value) for name, value in headers.items()],
++        )
++        curl.perform()
++        status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++    finally:
++        curl.close()
++
++    return Response(body.getvalue(), status_code, response_headers)
++
++
+ def _handle_error(
+     operation: str,
+-    exc: requests.exceptions.RequestException,
++    exc: ty.Union[HTTPError, pycurl.error],
+ ) -> None:
+-    if exc.response is not None and exc.response.content:
++    response = getattr(exc, 'response', None)
++    if response is not None and response.content:
+         # server errors should always be reported
+-        if exc.response.status_code in range(500, 512):  # 5xx Server Error
++        if response.status_code in range(500, 512):  # 5xx Server Error
+             LOG.error(
+                 'Server error. Please report this issue to '
+                 'https://github.com/getpatchwork/patchwork'
+@@ -119,10 +269,10 @@
+             raise
+ 
+         # we make the assumption that all responses will be JSON encoded
+-        if exc.response.status_code == 404:
++        if response.status_code == 404:
+             LOG.error('Resource not found')
+         else:
+-            LOG.error(exc.response.json())
++            LOG.error(response.json())
+     else:
+         LOG.error(
+             'Failed to %s resource. Is your configuration '
+@@ -140,85 +290,65 @@
+     url: str,
+     params: ty.Optional[Filters] = None,
+     stream: bool = False,
+-) -> requests.Response:
++) -> Response:
+     """Make GET request and handle errors."""
+     LOG.debug('GET %s', url)
+ 
+     try:
+-        # TODO(stephenfin): We only use a subset of the types possible for
+-        # 'params' (namely a list of tuples) but it doesn't seem possible to
+-        # indicate this
+-        rsp = requests.get(
+-            url,
+-            auth=_get_auth(optional=True),
+-            headers=_get_headers(),
+-            stream=stream,
+-            params=params,
+-        )  # type: ignore
++        rsp = _request('GET', url, params=params)
+         rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++    except (HTTPError, pycurl.error) as exc:
+         _handle_error('fetch', exc)
+ 
+     LOG.debug('Got response')
+-
+     return rsp
+ 
+ 
+ def _post(
+     url: str,
+     data: ty.List[ty.Tuple[str, ty.Any]],
+-) -> requests.Response:
++) -> Response:
+     """Make POST request and handle errors."""
+     LOG.debug('POST %s, data=%r', url, data)
+ 
+     try:
+-        rsp = requests.post(
+-            url, auth=_get_auth(), headers=_get_headers(), data=data
+-        )
++        rsp = _request('POST', url, data=data)
+         rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++    except (HTTPError, pycurl.error) as exc:
+         _handle_error('create', exc)
+ 
+     LOG.debug('Got response')
+-
+     return rsp
+ 
+ 
+ def _patch(
+     url: str,
+     data: ty.List[ty.Tuple[str, ty.Any]],
+-) -> requests.Response:
++) -> Response:
+     """Make PATCH request and handle errors."""
+     LOG.debug('PATCH %s, data=%r', url, data)
+ 
+     try:
+-        rsp = requests.patch(
+-            url,
+-            auth=_get_auth(),
+-            headers=_get_headers(),
+-            data=data,
+-        )
++        rsp = _request('PATCH', url, data=data)
+         rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++    except (HTTPError, pycurl.error) as exc:
+         _handle_error('update', exc)
+ 
+     LOG.debug('Got response')
+-
+     return rsp
+ 
+ 
+-def _delete(url: str) -> requests.Response:
++def _delete(url: str) -> Response:
+     """Make DELETE request and handle errors."""
+     LOG.debug('DELETE %s', url)
+ 
+     try:
+-        rsp = requests.delete(url, auth=_get_auth(), headers=_get_headers())
++        rsp = _request('DELETE', url)
+         rsp.raise_for_status()
+-    except requests.exceptions.RequestException as exc:
++    except (HTTPError, pycurl.error) as exc:
+         _handle_error('delete', exc)
+ 
+     LOG.debug('Got response')
+-
+     return rsp
+ 
+ 
+@@ -260,35 +390,39 @@
+ 
+     # we don't catch anything here because we should break if these are missing
+     header = re.search(
+-        'filename=(.+)',
++        r'filename=(?:"([^"]+)"|([^;]+))',
+         rsp.headers.get('content-disposition') or '',
+     )
+     if not header:
+         LOG.error('Filename was expected but was not provided in response')
+         sys.exit(1)
++    filename = (header.group(1) or header.group(2)).strip()
+ 
+     if output == '-':
+         output_path = output
+         output_file = sys.stdout.buffer
++        close_output = False
+     else:
+         if output:
+             output_path = output
+             if os.path.isdir(output):
+-                output_path = os.path.join(output, header.group(1))
++                output_path = os.path.join(output, filename)
+         else:
+             output_path = os.path.join(
+                 tempfile.mkdtemp(prefix='git-pw'),
+-                header.group(1),
++                filename,
+             )
+         LOG.debug('Saving to %s', output_path)
+         output_file = open(output_path, 'wb')
++        close_output = True
+ 
+     try:
+         # we use iter_content because patches can be binary
+         for block in rsp.iter_content(1024):
+             output_file.write(block)
+     finally:
+-        output_file.close()
++        if close_output:
++            output_file.close()
+ 
+     return output_path
+ 

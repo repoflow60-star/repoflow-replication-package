@@ -1,0 +1,110 @@
+--- a/fints/connection.py
++++ b/fints/connection.py
+@@ -1,8 +1,10 @@
+ import base64
+ import io
+ import logging
++import threading
+ 
+-import requests
++import treq
++from twisted.internet import reactor
+ from fints.utils import Password, log_configuration
+ 
+ from .exceptions import *
+@@ -10,6 +12,65 @@
+ from .types import SegmentSequence
+ 
+ logger = logging.getLogger(__name__)
++
++_reactor_ready = threading.Event()
++_reactor_lock = threading.Lock()
++_reactor_thread = None
++
++
++def _run_reactor():
++    reactor.callWhenRunning(_reactor_ready.set)
++    reactor.run(installSignalHandlers=False)
++
++
++def _ensure_reactor():
++    global _reactor_thread
++
++    with _reactor_lock:
++        if not reactor.running:
++            if _reactor_thread is None or not _reactor_thread.is_alive():
++                _reactor_ready.clear()
++                _reactor_thread = threading.Thread(target=_run_reactor, name='fints-treq-reactor', daemon=True)
++                _reactor_thread.start()
++
++    if not reactor.running:
++        _reactor_ready.wait()
++
++
++def _post(url, data, headers):
++    """Perform a treq request while retaining the connection's sync API."""
++    _ensure_reactor()
++    result = {}
++    completed = threading.Event()
++
++    def failed(failure):
++        result['failure'] = failure
++        completed.set()
++
++    def received(response):
++        result['status_code'] = response.code
++        response.content().addCallbacks(received_content, failed)
++
++    def received_content(content):
++        result['content'] = content
++        completed.set()
++
++    def request():
++        try:
++            treq.post(url, data=data, headers=headers).addCallbacks(received, failed)
++        except BaseException as exc:
++            result['exception'] = exc
++            completed.set()
++
++    reactor.callFromThread(request)
++    completed.wait()
++
++    if 'exception' in result:
++        raise result['exception']
++    if 'failure' in result:
++        result['failure'].raiseException()
++
++    return result['status_code'], result['content']
+ 
+ 
+ def reduce_message_for_log(msg):
+@@ -27,7 +88,6 @@
+ class FinTSHTTPSConnection:
+     def __init__(self, url):
+         self.url = url
+-        self.session = requests.session()
+ 
+     def send(self, msg: FinTSMessage):
+         log_out = io.StringIO()
+@@ -37,17 +97,17 @@
+             logger.debug("Sending {}>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>\n{}\n>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>\n".format("(abbrv.)" if log_configuration.reduced else "", log_out.getvalue()))
+             log_out.truncate(0)
+ 
+-        r = self.session.post(
++        status_code, content = _post(
+             self.url, data=base64.b64encode(msg.render_bytes()),
+             headers={
+                 'Content-Type': 'text/plain',
+             },
+         )
+ 
+-        if r.status_code < 200 or r.status_code > 299:
+-            raise FinTSConnectionError('Bad status code {}'.format(r.status_code))
++        if status_code < 200 or status_code > 299:
++            raise FinTSConnectionError('Bad status code {}'.format(status_code))
+ 
+-        response = base64.b64decode(r.content.decode('iso-8859-1'))
++        response = base64.b64decode(content.decode('iso-8859-1'))
+         retval = FinTSInstituteMessage(segments=response)
+ 
+         with Password.protect():

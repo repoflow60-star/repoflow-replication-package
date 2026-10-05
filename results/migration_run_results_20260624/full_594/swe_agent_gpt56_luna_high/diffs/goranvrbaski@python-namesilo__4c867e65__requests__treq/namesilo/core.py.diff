@@ -1,0 +1,100 @@
+--- a/namesilo/core.py
++++ b/namesilo/core.py
+@@ -1,11 +1,63 @@
+ import os
+-import requests
++from threading import Event, Lock, Thread
++
++import treq
+ import xmltodict
++from twisted.internet import defer, reactor
++from twisted.internet.threads import blockingCallFromThread
+ 
+ from typing import List, Tuple
+ 
+ from namesilo.common import DomainInfo
+ from namesilo.exceptions import exception_codes
++
++
++# Compatibility alias for the old patch point; the HTTP client is treq.
++requests = treq
++
++_reactor_lock = Lock()
++_reactor_started = Event()
++_reactor_thread = None
++
++
++def _start_reactor():
++    """Start a reactor that can be used by the synchronous public API."""
++    global _reactor_thread
++
++    if reactor.running:
++        return
++
++    with _reactor_lock:
++        if reactor.running:
++            return
++
++        def run_reactor():
++            reactor.callWhenRunning(_reactor_started.set)
++            reactor.run(installSignalHandlers=False)
++
++        _reactor_thread = Thread(
++            target=run_reactor,
++            name="namesilo-treq-reactor",
++            daemon=True,
++        )
++        _reactor_thread.start()
++        _reactor_started.wait()
++
++
++def _wait_for_deferred(value):
++    """Synchronously obtain a Deferred's result using the treq reactor."""
++    if not isinstance(value, defer.Deferred):
++        return value
++
++    _start_reactor()
++    return blockingCallFromThread(reactor, lambda: value)
++
++
++def _get_response(url):
++    """Call treq on its reactor thread for safe synchronous use."""
++    _start_reactor()
++    return blockingCallFromThread(reactor, lambda: treq.get(url))
++
+ 
+ __author__ = 'goran.vrbaski'
+ 
+@@ -105,14 +157,24 @@
+             raise exception_codes[error_code[0]](error_code[1])
+ 
+     def _get_content_xml(self, url: str) -> dict:
+-        api_request = requests.get(os.path.join(self._base_url, url))
+-        if api_request.status_code != 200:
+-            raise Exception(
+-                f"API responded with status code: {api_request.status_code}"
+-            )
+-
+-        content = xmltodict.parse(api_request.content.decode())
+-        return content
++        api_request = _get_response(os.path.join(self._base_url, url))
++        api_request = _wait_for_deferred(api_request)
++
++        # requests exposed ``status_code`` and ``content`` as attributes;
++        # treq exposes ``code`` and an asynchronous ``content()`` method.
++        status_code = getattr(api_request, 'status_code', None)
++        if status_code is None:
++            status_code = api_request.code
++
++        if status_code != 200:
++            raise Exception(f"API responded with status code: {status_code}")
++
++        content = getattr(api_request, 'content', b'')
++        if callable(content):
++            _start_reactor()
++            content = blockingCallFromThread(reactor, content)
++        content = _wait_for_deferred(content)
++        return xmltodict.parse(content.decode())
+ 
+     def check_domain(self, domain_name: str) -> bool:
+         """

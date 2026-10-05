@@ -1,0 +1,150 @@
+--- a/olclient/openlibrary.py
++++ b/olclient/openlibrary.py
+@@ -2,6 +2,7 @@
+ 
+ 
+ import json
++from http.cookies import SimpleCookie
+ from typing import List, Dict, Optional, Any
+ 
+ import jsonschema
+@@ -12,8 +13,8 @@
+ from urllib.request import pathname2url
+ 
+ import backoff
+-import requests
+-from requests import Response
++import urllib3
++from urllib3.response import HTTPResponse as Response
+ 
+ from olclient import common
+ from olclient.config import Config
+@@ -21,6 +22,68 @@
+ from olclient.utils import merge_unique_lists
+ 
+ logger = logging.getLogger('openlibrary')
++
++
++class _Session:
++
++    def __init__(self):
++        self._pool = urllib3.PoolManager(retries=False)
++        self.cookies = SimpleCookie()
++
++    def _request(self, method, url, data=None, headers=None, files=None):
++        headers = dict(headers or {})
++        if self.cookies and 'Cookie' not in headers:
++            headers['Cookie'] = '; '.join(
++                '{}={}'.format(key, morsel.value)
++                for key, morsel in self.cookies.items()
++            )
++
++        if files is not None:
++            response = self._pool.request(
++                method,
++                url,
++                fields=files,
++                headers=headers,
++                encode_multipart=True,
++            )
++        else:
++            if isinstance(data, dict):
++                data = urlencode(data)
++                headers.setdefault(
++                    'Content-Type',
++                    'application/x-www-form-urlencoded',
++                )
++            response = self._pool.request(
++                method,
++                url,
++                body=data,
++                headers=headers,
++            )
++
++        for set_cookie in response.headers.getlist('Set-Cookie'):
++            self.cookies.load(set_cookie)
++
++        return response
++
++    def get(self, url):
++        return self._request('GET', url)
++
++    def post(self, url, data=None, headers=None, files=None):
++        return self._request(
++            'POST',
++            url,
++            data=data,
++            headers=headers,
++            files=files,
++        )
++
++    def put(self, url, data=None, headers=None):
++        return self._request(
++            'PUT',
++            url,
++            data=data,
++            headers=headers,
++        )
+ 
+ 
+ class OpenLibrary:
+@@ -51,9 +114,10 @@
+     VALID_IDS = ['isbn_10', 'isbn_13', 'lccn', 'ocaid']
+     BACKOFF_KWARGS = {
+         'wait_gen': backoff.expo,
+-        'exception': requests.exceptions.RequestException,
+-        'giveup': lambda e: hasattr(e.response, 'status_code')
+-        and 400 <= e.response.status_code < 500,
++        'exception': urllib3.exceptions.HTTPError,
++        'giveup': lambda e: hasattr(e, 'response')
++        and hasattr(e.response, 'status')
++        and 400 <= e.response.status < 500,
+         'max_tries': 5,
+     }
+ 
+@@ -62,14 +126,14 @@
+     WORKS_PAGINATION_OFFSET = 0
+ 
+     def __init__(self, credentials=None, base_url='https://openlibrary.org'):
+-        self.session = requests.Session()
++        self.session = _Session()
+         self.base_url = base_url
+         credentials = credentials or Config().get_config().get('s3', None)
+         if credentials:
+             self.login(credentials)
+ 
+     def login(self, credentials):
+-        """Login to Open Library with given credentials, ensures the requests
++        """Login to Open Library with given credentials, ensures the urllib3
+         session has valid cookies for future requests.
+         """
+ 
+@@ -147,7 +211,12 @@
+     def get_ol_response(self, path):
+         """Makes best effort to perform request w/ exponential backoff"""
+         response = self.session.get(self.base_url + path)
+-        response.raise_for_status()
++        if response.status >= 400:
++            error = urllib3.exceptions.HTTPError(
++                f'{response.status} {response.reason}'
++            )
++            error.response = response
++            raise error
+         return response
+ 
+     @property
+@@ -851,7 +920,7 @@
+             return self.session.post(url, data=data)
+ 
+         response = _create_book_post(url, data=data)
+-        _olid = self._extract_olid_from_url(response.url, url_type="books")
++        _olid = self._extract_olid_from_url(response.geturl(), url_type="books")
+         if _olid == 'add':
+             raise ValueError('Creation failed, book may already exist!')
+         return self.Edition.get(_olid)
+@@ -910,4 +979,4 @@
+         try:
+             return re.search(ol_url_pattern, url).group(1)
+         except AttributeError:
+-            return None  # No match
++            return None  # No match

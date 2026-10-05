@@ -1,0 +1,243 @@
+--- a/whatsapp_api_client_python/API.py
++++ b/whatsapp_api_client_python/API.py
+@@ -1,9 +1,11 @@
+ import json
+ import logging
++import time
++from io import BytesIO
+ from typing import Any, NoReturn, Optional
+-
+-from requests import Response, Session
+-from requests.adapters import HTTPAdapter, Retry
++from urllib.parse import urlencode
++
++import pycurl
+ 
+ from .response import Response as GreenAPIResponse
+ from .tools import (
+@@ -18,6 +20,182 @@
+     serviceMethods,
+     webhooks
+ )
++
++
++class PycurlResponse:
++    def __init__(self, status_code: int, text: str):
++        self.status_code = status_code
++        self.text = text
++
++
++class PycurlSession:
++    def __init__(self):
++        self.headers = {}
++        self.retry_total = 0
++        self.retry_backoff_factor = 0.0
++        self.retry_status_forcelist = []
++
++    def request(self, method: str, url: str, **arguments: Any) -> PycurlResponse:
++        params = arguments.get("params")
++        if params:
++            separator = "&" if "?" in url else "?"
++            url = f"{url}{separator}{urlencode(params, doseq=True)}"
++
++        headers = arguments.get("headers")
++        request_headers = [
++            f"{key}: {value}" for key, value in self.headers.items()
++        ]
++
++        if headers:
++            if isinstance(headers, dict):
++                request_headers.extend(
++                    f"{key}: {value}" for key, value in headers.items()
++                )
++            else:
++                request_headers.extend(headers)
++
++        json_payload = arguments.get("json")
++        data = arguments.get("data")
++        files = arguments.get("files")
++        timeout = arguments.get("timeout")
++        retry_count = 0
++
++        while True:
++            response_buffer = BytesIO()
++            curl = pycurl.Curl()
++
++            try:
++                curl.setopt(pycurl.URL, url)
++                curl.setopt(pycurl.CUSTOMREQUEST, method)
++                curl.setopt(pycurl.WRITEDATA, response_buffer)
++                curl.setopt(pycurl.HTTPHEADER, request_headers)
++                curl.setopt(
++                    pycurl.FOLLOWLOCATION,
++                    arguments.get("allow_redirects", True)
++                )
++
++                if timeout is not None:
++                    curl.setopt(pycurl.TIMEOUT, timeout)
++
++                if files:
++                    mime = curl.mime()
++
++                    if data:
++                        for name, value in data.items():
++                            part = mime.addpart()
++                            part.set_name(str(name))
++
++                            if isinstance(value, bytes):
++                                part.set_data(value)
++                            else:
++                                part.set_data(str(value).encode("utf-8"))
++
++                    for name, value in files.items():
++                        part = mime.addpart()
++                        part.set_name(str(name))
++
++                        file_name = name
++                        content_type = None
++                        file_content = value
++
++                        if isinstance(value, tuple):
++                            file_name = value[0]
++                            file_content = value[1]
++
++                            if len(value) > 2:
++                                content_type = value[2]
++
++                        if hasattr(file_content, "read"):
++                            file_content = file_content.read()
++
++                        if isinstance(file_content, str):
++                            part.set_file(file_content)
++                        else:
++                            if isinstance(file_content, bytes):
++                                part.set_data(file_content)
++                            else:
++                                part.set_data(
++                                    str(file_content).encode("utf-8")
++                                )
++
++                        if file_name:
++                            part.set_filename(str(file_name))
++
++                        if content_type:
++                            part.set_type(content_type)
++
++                    curl.setopt(pycurl.MIMEPOST, mime)
++                elif json_payload is not None:
++                    if not any(
++                        header.lower().startswith("content-type:")
++                        for header in request_headers
++                    ):
++                        request_headers.append(
++                            "Content-Type: application/json"
++                        )
++                        curl.setopt(pycurl.HTTPHEADER, request_headers)
++
++                    curl.setopt(
++                        pycurl.POSTFIELDS,
++                        json.dumps(json_payload).encode("utf-8")
++                    )
++                elif data is not None:
++                    if isinstance(data, dict):
++                        if not any(
++                            header.lower().startswith("content-type:")
++                            for header in request_headers
++                        ):
++                            request_headers.append(
++                                "Content-Type: "
++                                "application/x-www-form-urlencoded"
++                            )
++                            curl.setopt(pycurl.HTTPHEADER, request_headers)
++
++                        data = urlencode(data, doseq=True).encode("utf-8")
++                    elif isinstance(data, str):
++                        data = data.encode("utf-8")
++
++                    curl.setopt(pycurl.POSTFIELDS, data)
++
++                curl.perform()
++
++                status_code = curl.getinfo(pycurl.RESPONSE_CODE)
++                response_text = response_buffer.getvalue().decode(
++                    "utf-8", errors="replace"
++                )
++            except Exception:
++                curl.close()
++
++                if retry_count >= self.retry_total:
++                    raise
++
++                retry_count += 1
++
++                if retry_count > 1:
++                    time.sleep(
++                        self.retry_backoff_factor
++                        * (2 ** (retry_count - 1))
++                    )
++
++                continue
++
++            curl.close()
++
++            if (
++                status_code in self.retry_status_forcelist
++                and retry_count < self.retry_total
++            ):
++                retry_count += 1
++
++                if retry_count > 1:
++                    time.sleep(
++                        self.retry_backoff_factor
++                        * (2 ** (retry_count - 1))
++                    )
++
++                continue
++
++            return PycurlResponse(status_code, response_text)
+ 
+ 
+ class GreenApi:
+@@ -49,7 +227,7 @@
+         self.idInstance = idInstance
+         self.apiTokenInstance = apiTokenInstance
+ 
+-        self.session = Session()
++        self.session = PycurlSession()
+         self.__prepare_session()
+ 
+         self.account = account.Account(self)
+@@ -116,7 +294,7 @@
+ 
+         return GreenAPIResponse(response.status_code, response.text)
+ 
+-    def __handle_response(self, response: Response) -> Optional[NoReturn]:
++    def __handle_response(self, response: PycurlResponse) -> Optional[NoReturn]:
+         status_code = response.status_code
+         if status_code != 200 or self.debug_mode:
+             try:
+@@ -161,15 +339,9 @@
+     def __prepare_session(self) -> None:
+         self.session.headers["Connection"] = "close"
+ 
+-        retry = Retry(
+-            total=3,
+-            backoff_factor=1.0,
+-            allowed_methods=None,
+-            status_forcelist=[429]
+-        )
+-
+-        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
++        self.session.retry_total = 3
++        self.session.retry_backoff_factor = 1.0
++        self.session.retry_status_forcelist = [429]
+ 
+ 
+ class GreenAPI(GreenApi):
+@@ -177,4 +349,4 @@
+ 
+ 
+ class GreenAPIError(Exception):
+-    pass
++    pass

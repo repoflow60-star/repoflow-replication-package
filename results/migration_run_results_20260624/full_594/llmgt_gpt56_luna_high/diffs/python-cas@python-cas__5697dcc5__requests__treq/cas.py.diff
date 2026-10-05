@@ -1,0 +1,237 @@
+--- a/cas.py
++++ b/cas.py
+@@ -2,7 +2,12 @@
+ import logging
+ from uuid import uuid4
+ 
+-import requests
++import treq
++from treq.client import HTTPClient
++from twisted.internet import reactor
++from twisted.internet.defer import inlineCallbacks, returnValue
++from twisted.internet.ssl import CertificateOptions
++from twisted.web.client import Agent
+ from lxml import etree
+ from six.moves.urllib import parse as urllib_parse
+ 
+@@ -79,7 +84,11 @@
+         self.renew = renew
+         self.username_attribute = username_attribute
+         self.verify_ssl_certificate = verify_ssl_certificate
+-        self.session = session or requests.sessions.Session()
++        if self.verify_ssl_certificate:
++            agent = Agent(reactor)
++        else:
++            agent = Agent(reactor, contextFactory=CertificateOptions(verify=False))
++        self.session = session or HTTPClient(reactor, agent=agent)
+ 
+     def verify_ticket(self, ticket):
+         """Verify ticket.
+@@ -131,6 +140,7 @@
+         query = urllib_parse.urlencode(params)
+         return ''.join([url, '?', query])
+ 
++    @inlineCallbacks
+     def get_proxy_ticket(self, pgt):
+         """Get proxy ticket given the proxy granting ticket
+ 
+@@ -140,23 +150,24 @@
+         Raises:
+             CASError: Non 200 http code or bad XML body.
+         """
+-        response = self.session.get(self.get_proxy_url(pgt), verify=self.verify_ssl_certificate)
+-        if response.status_code == 200:
++        response = yield self.session.get(self.get_proxy_url(pgt))
++        if response.code == 200:
++            content = yield treq.content(response)
+             from lxml import etree
+-            root = etree.fromstring(response.content)
++            root = etree.fromstring(content)
+             tickets = root.xpath(
+                 "//cas:proxyTicket",
+                 namespaces={"cas": "http://www.yale.edu/tp/cas"}
+             )
+             if len(tickets) == 1:
+-                return tickets[0].text
++                returnValue(tickets[0].text)
+             errors = root.xpath(
+                 "//cas:authenticationFailure",
+                 namespaces={"cas": "http://www.yale.edu/tp/cas"}
+             )
+             if len(errors) == 1:
+                 raise CASError(errors[0].attrib['code'], errors[0].text)
+-        raise CASError("Bad http code %s" % response.status_code)
++        raise CASError("Bad http code %s" % response.code)
+ 
+ 
+ class CASClientV1(CASClientBase):
+@@ -164,6 +175,7 @@
+ 
+     logout_redirect_param_name = 'url'
+ 
++    @inlineCallbacks
+     def verify_ticket(self, ticket):
+         """Verifies CAS 1.0 authentication ticket.
+ 
+@@ -172,20 +184,16 @@
+         params = [('ticket', ticket), ('service', self.service_url)]
+         url = (urllib_parse.urljoin(self.server_url, 'validate') + '?' +
+                urllib_parse.urlencode(params))
+-        page = self.session.get(
+-            url,
+-            stream=True,
+-            verify=self.verify_ssl_certificate
++        page = yield self.session.get(
++            url
+         )
+-        try:
+-            page_iterator = page.iter_lines(chunk_size=8192)
+-            verified = next(page_iterator).strip()
+-            if verified == 'yes':
+-                return next(page_iterator).strip(), None, None
+-            else:
+-                return None, None, None
+-        finally:
+-            page.close()
++        page_content = yield treq.content(page)
++        page_iterator = iter(page_content.splitlines())
++        verified = next(page_iterator).strip()
++        if verified == 'yes':
++            returnValue((next(page_iterator).strip(), None, None))
++        else:
++            returnValue((None, None, None))
+ 
+ 
+ class CASClientV2(CASClientBase):
+@@ -199,11 +207,13 @@
+         self.proxy_callback = proxy_callback
+         super(CASClientV2, self).__init__(*args, **kwargs)
+ 
++    @inlineCallbacks
+     def verify_ticket(self, ticket):
+         """Verifies CAS 2.0+/3.0+ XML-based authentication ticket and returns extended attributes"""
+-        response = self.get_verification_response(ticket)
+-        return self.verify_response(response)
+-
++        response = yield self.get_verification_response(ticket)
++        returnValue(self.verify_response(response))
++
++    @inlineCallbacks
+     def get_verification_response(self, ticket):
+         params = {
+             'ticket': ticket,
+@@ -212,15 +222,11 @@
+         if self.proxy_callback:
+             params.update({'pgtUrl': self.proxy_callback})
+         base_url = urllib_parse.urljoin(self.server_url, self.url_suffix)
+-        page = self.session.get(
++        page = yield self.session.get(
+             base_url,
+-            params=params,
+-            verify=self.verify_ssl_certificate
++            params=params
+         )
+-        try:
+-            return page.content
+-        finally:
+-            page.close()
++        returnValue((yield treq.content(page)))
+ 
+     @classmethod
+     def parse_attributes_xml_element(cls, element):
+@@ -319,6 +325,7 @@
+ class CASClientWithSAMLV1(CASClientV2, SingleLogoutMixin):
+     """CASClient 3.0+ with SAML"""
+ 
++    @inlineCallbacks
+     def verify_ticket(self, ticket, **kwargs):
+         """Verifies CAS 3.0+ XML-based authentication ticket and returns extended attributes.
+ 
+@@ -333,37 +340,32 @@
+         except ImportError:
+             from elementtree import ElementTree
+ 
+-        page = self.fetch_saml_validation(ticket)
+-
+-        try:
+-            user = None
+-            attributes = {}
+-            response = page.content
+-            tree = ElementTree.fromstring(response)
+-            # Find the authentication status
+-            success = tree.find('.//' + SAML_1_0_PROTOCOL_NS + 'StatusCode')
+-            if success is not None and success.attrib['Value'].endswith('Success'):
+-                # User is validated
+-                name_identifier = tree.find('.//' + SAML_1_0_ASSERTION_NS + 'NameIdentifier')
+-                if name_identifier is not None:
+-                    user = name_identifier.text
+-                attrs = tree.findall('.//' + SAML_1_0_ASSERTION_NS + 'Attribute')
+-                for at in attrs:
+-                    if self.username_attribute in list(at.attrib.values()):
+-                        user = at.find(SAML_1_0_ASSERTION_NS + 'AttributeValue').text
+-                        attributes['uid'] = user
+-
+-                    values = at.findall(SAML_1_0_ASSERTION_NS + 'AttributeValue')
+-                    if len(values) > 1:
+-                        values_array = []
+-                        for v in values:
+-                            values_array.append(v.text)
+-                            attributes[at.attrib['AttributeName']] = values_array
+-                    else:
+-                        attributes[at.attrib['AttributeName']] = values[0].text
+-            return user, attributes, None
+-        finally:
+-            page.close()
++        page = yield self.fetch_saml_validation(ticket)
++
++        response = yield treq.content(page)
++        tree = ElementTree.fromstring(response)
++        # Find the authentication status
++        success = tree.find('.//' + SAML_1_0_PROTOCOL_NS + 'StatusCode')
++        if success is not None and success.attrib['Value'].endswith('Success'):
++            # User is validated
++            name_identifier = tree.find('.//' + SAML_1_0_ASSERTION_NS + 'NameIdentifier')
++            if name_identifier is not None:
++                user = name_identifier.text
++            attrs = tree.findall('.//' + SAML_1_0_ASSERTION_NS + 'Attribute')
++            for at in attrs:
++                if self.username_attribute in list(at.attrib.values()):
++                    user = at.find(SAML_1_0_ASSERTION_NS + 'AttributeValue').text
++                    attributes['uid'] = user
++
++                values = at.findall(SAML_1_0_ASSERTION_NS + 'AttributeValue')
++                if len(values) > 1:
++                    values_array = []
++                    for v in values:
++                        values_array.append(v.text)
++                        attributes[at.attrib['AttributeName']] = values_array
++                else:
++                    attributes[at.attrib['AttributeName']] = values[0].text
++        returnValue((user, attributes, None))
+ 
+     def fetch_saml_validation(self, ticket):
+         """We do the SAML validation"""
+@@ -382,7 +384,7 @@
+         )
+         return self.session.post(
+             saml_validate_url,
+-            self.get_saml_assertion(ticket),
++            data=self.get_saml_assertion(ticket),
+             params=params,
+             headers=headers)
+ 
+@@ -417,7 +419,7 @@
+                         </samlp:AssertionArtifact>
+                     </samlp:Request>
+                 </SOAP-ENV:Body>
+-            </SOAP-ENV:Envelope>
++                </SOAP-ENV:Envelope>
+ 
+         see https://djangocas.dev/docs/4.0/CAS-Protocol-Specification.html#samlvalidate-cas-3-0
+         """
+@@ -431,4 +433,4 @@
+             request_id=request_id,
+             timestamp=timestamp,
+             ticket=ticket,
+-        ).encode('utf8')
++        ).encode('utf8')

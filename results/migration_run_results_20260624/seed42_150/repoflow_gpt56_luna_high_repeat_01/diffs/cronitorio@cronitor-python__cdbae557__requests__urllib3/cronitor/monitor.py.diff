@@ -1,0 +1,194 @@
+--- a/cronitor/monitor.py
++++ b/cronitor/monitor.py
+@@ -3,29 +3,45 @@
+ import logging
+ import json
+ import os
+-import requests
+ from yaml.loader import SafeLoader
+ 
+ 
+ import cronitor
++import urllib3
+ from urllib3.util.retry import Retry
+-from requests.adapters import HTTPAdapter
++from urllib3.util.request import make_headers
+ 
+ logger = logging.getLogger(__name__)
+ 
+-# https://stackoverflow.com/questions/49121365/implementing-retry-for-requests-in-python
+ def retry_session(retries, session=None, backoff_factor=0.3):
+-    session = session or requests.Session()
+     retry = Retry(
+         total=retries,
+         read=retries,
+         connect=retries,
+         backoff_factor=backoff_factor,
+     )
+-    adapter = HTTPAdapter(max_retries=retry)
+-    session.mount('http://', adapter)
+-    session.mount('https://', adapter)
+-    return session
++    return session or urllib3.PoolManager(retries=retry)
++
++
++def _auth_headers(headers, api_key):
++    headers = {key: value for key, value in headers.items() if value is not None}
++    if api_key is not None:
++        headers.update(make_headers(basic_auth='{}:'.format(api_key)))
++    return headers
++
++
++def _response_status(response):
++    status = getattr(response, 'status', None)
++    if isinstance(status, int):
++        return status
++    return getattr(response, 'status_code', status)
++
++
++def _response_text(response):
++    data = getattr(response, 'data', None)
++    if not isinstance(data, (bytes, str)):
++        data = getattr(response, 'text', data)
++    return data.decode('utf-8') if isinstance(data, bytes) else data
+ 
+ JSON = 'json'
+ YAML = 'yaml'
+@@ -41,14 +57,17 @@
+     def as_yaml(cls, api_key=None, api_version=None):
+         timeout = cronitor.timeout or 10
+         api_key = api_key or cronitor.api_key
+-        resp = cls._req.get('%s.yaml' % cls._monitor_api_url(),
+-                        auth=(api_key, ''),
+-                        headers=dict(cls._headers, **{'Content-Type': 'application/yaml', 'Cronitor-Version': api_version}),
+-                        timeout=timeout)
+-        if resp.status_code == 200:
+-            return resp.text
+-        else:
+-            raise cronitor.APIError("Unexpected error %s" % resp.text)
++        headers = dict(cls._headers, **{'Content-Type': 'application/yaml', 'Cronitor-Version': api_version})
++        resp = cls._req.request(
++            'GET',
++            '%s.yaml' % cls._monitor_api_url(),
++            headers=_auth_headers(headers, api_key),
++            timeout=timeout,
++        )
++        if _response_status(resp) == 200:
++            return _response_text(resp)
++        else:
++            raise cronitor.APIError("Unexpected error %s" % _response_text(resp))
+ 
+     @classmethod
+     def put(cls, monitors=None, **kwargs):
+@@ -99,21 +118,24 @@
+             data = json.dumps(payload)
+             url = cls._monitor_api_url()
+ 
+-        resp = cls._req.put(url,
+-                        auth=(api_key, ''),
+-                        data=data,
+-                        headers=dict(cls._headers, **{'Content-Type': content_type, 'Cronitor-Version': api_version}),
+-                        timeout=timeout)
+-
+-        if resp.status_code == 200:
++        headers = dict(cls._headers, **{'Content-Type': content_type, 'Cronitor-Version': api_version})
++        resp = cls._req.request(
++            'PUT',
++            url,
++            body=data,
++            headers=_auth_headers(headers, api_key),
++            timeout=timeout,
++        )
++
++        if _response_status(resp) == 200:
+             if request_format == YAML:
+-                return yaml.load(resp.text, Loader=SafeLoader)
++                return yaml.load(_response_text(resp), Loader=SafeLoader)
+             else:
+-                return resp.json().get('monitors', [])
+-        elif resp.status_code == 400:
+-            raise cronitor.APIValidationError(resp.text)
+-        else:
+-            raise cronitor.APIError("Unexpected error %s" % resp.text)
++                return json.loads(_response_text(resp)).get('monitors', [])
++        elif _response_status(resp) == 400:
++            raise cronitor.APIValidationError(_response_text(resp))
++        else:
++            raise cronitor.APIError("Unexpected error %s" % _response_text(resp))
+ 
+     def __init__(self, key, api_key=None, api_version=None, env=None):
+         self.key = key
+@@ -135,15 +157,16 @@
+         self._data = Struct(**data)
+ 
+     def delete(self):
+-        resp = requests.delete(
+-                    self._monitor_api_url(self.key),
+-                    auth=(self.api_key, ''),
+-                    headers=self._headers,
+-                    timeout=10)
+-
+-        if resp.status_code == 204:
++        resp = self._req.request(
++            'DELETE',
++            self._monitor_api_url(self.key),
++            headers=_auth_headers(self._headers, self.api_key),
++            timeout=10,
++        )
++
++        if _response_status(resp) == 204:
+             return True
+-        elif resp.status_code == 404:
++        elif _response_status(resp) == 404:
+             raise cronitor.MonitorNotFound("Monitor '%s' not found" % self.key)
+         else:
+             raise cronitor.APIError("An unexpected error occured when deleting '%s'" % self.key)
+@@ -153,7 +176,8 @@
+             logger.error('No API key detected. Set cronitor.api_key or initialize Monitor with kwarg api_key.')
+             return
+ 
+-        return self._req.get(url=self._ping_api_url(), params=self._clean_params(params), timeout=5, headers=self._headers)
++        fields = {key: value for key, value in self._clean_params(params).items() if value is not None}
++        return self._req.request('GET', self._ping_api_url(), fields=fields, timeout=5, headers=self._headers)
+ 
+     def ok(self):
+         self.ping(state=cronitor.State.OK)
+@@ -163,7 +187,12 @@
+             logger.error('No API key detected. Set cronitor.api_key or initialize Monitor with kwarg api_key.')
+             return
+ 
+-        return self._req.get(url='{}/pause/{}'.format(self._monitor_api_url(self.key), hours), auth=(self.api_key, ''), timeout=5, headers=self._headers)
++        return self._req.request(
++            'GET',
++            '{}/pause/{}'.format(self._monitor_api_url(self.key), hours),
++            timeout=5,
++            headers=_auth_headers(self._headers, self.api_key),
++        )
+ 
+     def unpause(self):
+         return self.pause(0)
+@@ -172,14 +201,17 @@
+         if not self.api_key:
+             raise cronitor.AuthenticationError('No api_key detected. Set cronitor.api_key or initialize Monitor with kwarg.')
+ 
+-        resp = requests.get(self._monitor_api_url(self.key),
+-                            timeout=10,
+-                            auth=(self.api_key, ''),
+-                            headers=dict(self._headers, **{'Content-Type': 'application/json', 'Cronitor-Version': self.api_verion}))
+-
+-        if resp.status_code == 404:
++        headers = dict(self._headers, **{'Content-Type': 'application/json', 'Cronitor-Version': self.api_verion})
++        resp = self._req.request(
++            'GET',
++            self._monitor_api_url(self.key),
++            timeout=10,
++            headers=_auth_headers(headers, self.api_key),
++        )
++
++        if _response_status(resp) == 404:
+             raise cronitor.MonitorNotFound("Monitor '%s' not found" % self.key)
+-        return resp.json()
++        return json.loads(_response_text(resp))
+ 
+     def _clean_params(self, params):
+         metrics = None
